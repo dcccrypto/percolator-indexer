@@ -1,0 +1,44 @@
+{
+  "name": "@percolator/indexer",
+  "version": "0.1.0",
+  "description": "Percolator Indexer — market discovery, stats collection, and trade indexing for Solana perpetual futures",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.8",
+    "@percolator/sdk": "github:dcccrypto/percolator-sdk",
+    "@percolator/shared": "github:dcccrypto/percolator-shared",
+    "@solana/web3.js": "^1.98.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7",
+    "hono": "^4.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^4.0.18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dcccrypto/percolator-indexer.git"
+  },
+  "keywords": [
+    "solana",
+    "percolator",
+    "indexer",
+    "defi",
+    "perpetuals"
+  ]
+}
