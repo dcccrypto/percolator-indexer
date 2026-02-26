@@ -301,8 +301,10 @@ export class StatsCollector {
               oiShort = oiLong;
             }
 
-            // Use on-chain price directly (no OracleService dependency)
-            const priceE6 = marketConfig.authorityPriceE6;
+            // Use on-chain price: prefer authorityPriceE6, fall back to lastEffectivePriceE6 (for Pyth-pinned markets)
+            const priceE6 = marketConfig.authorityPriceE6 > 0n
+              ? marketConfig.authorityPriceE6
+              : marketConfig.lastEffectivePriceE6;
             const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
 
             // Calculate 24h volume from trades table
