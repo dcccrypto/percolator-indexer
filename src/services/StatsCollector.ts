@@ -34,6 +34,9 @@ import {
   captureException,
   addBreadcrumb,
 } from "@percolator/shared";
+// Local bigint sanitization — prevents PG overflow from u64::MAX sentinels (PERC-206).
+// TODO: Switch to @percolator/shared once the shared package is republished.
+import { sanitizeBigIntForDb, sanitizeBigIntToString } from "../utils/bigint-sanitize.js";
 
 const logger = createLogger("indexer:stats-collector");
 
@@ -179,8 +182,8 @@ export class StatsCollector {
           const mintAddress = market.config.collateralMint.toBase58();
           const admin = market.header.admin.toBase58();
           const oracleAuthority = market.config.oracleAuthority.toBase58();
-          const priceE6 = Number(market.config.authorityPriceE6);
-          const initialMarginBps = Number(market.params.initialMarginBps);
+          const priceE6 = sanitizeBigIntForDb(market.config.authorityPriceE6);
+          const initialMarginBps = sanitizeBigIntForDb(market.params.initialMarginBps, 100);
           
           // Fetch actual mint decimals from on-chain
           let mintDecimals = 9; // fallback
@@ -284,6 +287,8 @@ export class StatsCollector {
             }
 
             // Calculate open interest (separate long/short)
+            // Note: positionSize is i128 on-chain; only aggregate into oiLong/oiShort
+            // which are then sanitized before DB insertion below.
             let oiLong = 0n;
             let oiShort = 0n;
             try {
@@ -296,16 +301,20 @@ export class StatsCollector {
                 }
               }
             } catch {
-              // If account parsing fails, use engine aggregate
-              oiLong = engine.totalOpenInterest > 0n ? engine.totalOpenInterest / 2n : 0n;
+              // If account parsing fails, use engine aggregate (also sanitized)
+              const rawOi = engine.totalOpenInterest;
+              oiLong = rawOi > 0n ? rawOi / 2n : 0n;
               oiShort = oiLong;
             }
 
             // Use on-chain price: prefer authorityPriceE6, fall back to lastEffectivePriceE6 (for Pyth-pinned markets)
-            const priceE6 = marketConfig.authorityPriceE6 > 0n
+            // Sanitize: sentinel values (u64::MAX) should not produce a price
+            const rawPriceE6 = marketConfig.authorityPriceE6 > 0n
               ? marketConfig.authorityPriceE6
               : marketConfig.lastEffectivePriceE6;
-            const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
+            const safePriceE6 = sanitizeBigIntForDb(rawPriceE6);
+            const priceE6 = rawPriceE6; // keep bigint for oracle log comparison
+            const priceUsd = safePriceE6 > 0 ? safePriceE6 / 1_000_000 : null;
 
             // Calculate 24h volume from trades table
             let volume24h: number | null = null;
@@ -318,49 +327,51 @@ export class StatsCollector {
             }
 
             // Upsert market stats with ALL RiskEngine fields (migration 010)
+            // All bigint → Number conversions go through sanitizeBigIntForDb()
+            // to replace u64::MAX sentinels and prevent PG bigint overflow.
             await upsertMarketStats({
               slab_address: slabAddress,
               last_price: priceUsd,
               mark_price: priceUsd, // Same as last_price for now (no funding adjustment)
               index_price: priceUsd,
-              open_interest_long: Number(oiLong),
-              open_interest_short: Number(oiShort),
-              insurance_fund: Number(engine.insuranceFund.balance),
+              open_interest_long: sanitizeBigIntForDb(oiLong),
+              open_interest_short: sanitizeBigIntForDb(oiShort),
+              insurance_fund: sanitizeBigIntForDb(engine.insuranceFund.balance),
               total_accounts: engine.numUsedAccounts,
-              funding_rate: Number(engine.fundingRateBpsPerSlotLast),
+              funding_rate: sanitizeBigIntForDb(engine.fundingRateBpsPerSlotLast),
               volume_24h: volume24h,
               // Hidden features (migration 007)
-              total_open_interest: Number(engine.totalOpenInterest),
-              net_lp_pos: engine.netLpPos.toString(),
-              lp_sum_abs: Number(engine.lpSumAbs),
-              lp_max_abs: Number(engine.lpMaxAbs),
-              insurance_balance: Number(engine.insuranceFund.balance),
-              insurance_fee_revenue: Number(engine.insuranceFund.feeRevenue),
-              warmup_period_slots: Number(params.warmupPeriodSlots),
+              total_open_interest: sanitizeBigIntForDb(engine.totalOpenInterest),
+              net_lp_pos: sanitizeBigIntToString(engine.netLpPos),
+              lp_sum_abs: sanitizeBigIntForDb(engine.lpSumAbs),
+              lp_max_abs: sanitizeBigIntForDb(engine.lpMaxAbs),
+              insurance_balance: sanitizeBigIntForDb(engine.insuranceFund.balance),
+              insurance_fee_revenue: sanitizeBigIntForDb(engine.insuranceFund.feeRevenue),
+              warmup_period_slots: sanitizeBigIntForDb(params.warmupPeriodSlots),
               // Complete RiskEngine state fields (migration 010)
-              vault_balance: Number(engine.vault),
-              lifetime_liquidations: Number(engine.lifetimeLiquidations),
-              lifetime_force_closes: Number(engine.lifetimeForceCloses),
-              c_tot: Number(engine.cTot),
-              pnl_pos_tot: Number(engine.pnlPosTot),
-              last_crank_slot: Number(engine.lastCrankSlot),
-              max_crank_staleness_slots: Number(engine.maxCrankStalenessSlots),
+              vault_balance: sanitizeBigIntForDb(engine.vault),
+              lifetime_liquidations: sanitizeBigIntForDb(engine.lifetimeLiquidations),
+              lifetime_force_closes: sanitizeBigIntForDb(engine.lifetimeForceCloses),
+              c_tot: sanitizeBigIntForDb(engine.cTot),
+              pnl_pos_tot: sanitizeBigIntForDb(engine.pnlPosTot),
+              last_crank_slot: sanitizeBigIntForDb(engine.lastCrankSlot),
+              max_crank_staleness_slots: sanitizeBigIntForDb(engine.maxCrankStalenessSlots),
               // RiskParams fields (migration 010)
-              maintenance_fee_per_slot: params.maintenanceFeePerSlot.toString(),
-              liquidation_fee_bps: Number(params.liquidationFeeBps),
-              liquidation_fee_cap: params.liquidationFeeCap.toString(),
-              liquidation_buffer_bps: Number(params.liquidationBufferBps),
+              maintenance_fee_per_slot: sanitizeBigIntToString(params.maintenanceFeePerSlot),
+              liquidation_fee_bps: sanitizeBigIntForDb(params.liquidationFeeBps),
+              liquidation_fee_cap: sanitizeBigIntToString(params.liquidationFeeCap),
+              liquidation_buffer_bps: sanitizeBigIntForDb(params.liquidationBufferBps),
               updated_at: new Date().toISOString(),
             });
 
             // Log oracle price to DB (rate-limited per market)
-            if (priceE6 > 0n) {
+            if (safePriceE6 > 0) {
               const lastLog = this.lastOracleLogTime.get(slabAddress) ?? 0;
               if (Date.now() - lastLog >= ORACLE_LOG_INTERVAL_MS) {
                 try {
                   await insertOraclePrice({
                     slab_address: slabAddress,
-                    price_e6: priceE6.toString(),
+                    price_e6: sanitizeBigIntToString(rawPriceE6),
                     timestamp: Math.floor(Date.now() / 1000),
                   });
                   this.lastOracleLogTime.set(slabAddress, Date.now());
@@ -378,11 +389,11 @@ export class StatsCollector {
               try {
                 await getSupabase().from('oi_history').insert({
                   market_slab: slabAddress,
-                  slot: Number(engine.lastCrankSlot),
-                  total_oi: Number(engine.totalOpenInterest),
-                  net_lp_pos: Number(engine.netLpPos),
-                  lp_sum_abs: Number(engine.lpSumAbs),
-                  lp_max_abs: Number(engine.lpMaxAbs),
+                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
+                  total_oi: sanitizeBigIntForDb(engine.totalOpenInterest),
+                  net_lp_pos: sanitizeBigIntForDb(engine.netLpPos),
+                  lp_sum_abs: sanitizeBigIntForDb(engine.lpSumAbs),
+                  lp_max_abs: sanitizeBigIntForDb(engine.lpMaxAbs),
                 });
                 this.lastOiHistoryTime.set(slabAddress, Date.now());
               } catch (e) {
@@ -398,9 +409,9 @@ export class StatsCollector {
               try {
                 await getSupabase().from('insurance_history').insert({
                   market_slab: slabAddress,
-                  slot: Number(engine.lastCrankSlot),
-                  balance: Number(engine.insuranceFund.balance),
-                  fee_revenue: Number(engine.insuranceFund.feeRevenue),
+                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
+                  balance: sanitizeBigIntForDb(engine.insuranceFund.balance),
+                  fee_revenue: sanitizeBigIntForDb(engine.insuranceFund.feeRevenue),
                 });
                 this.lastInsHistoryTime.set(slabAddress, Date.now());
               } catch (e) {
@@ -415,11 +426,11 @@ export class StatsCollector {
               try {
                 await getSupabase().from('funding_history').insert({
                   market_slab: slabAddress,
-                  slot: Number(engine.lastCrankSlot),
-                  rate_bps_per_slot: Number(engine.fundingRateBpsPerSlotLast),
-                  net_lp_pos: Number(engine.netLpPos),
-                  price_e6: Number(priceE6),
-                  funding_index_qpb_e6: engine.fundingIndexQpbE6.toString(),
+                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
+                  rate_bps_per_slot: sanitizeBigIntForDb(engine.fundingRateBpsPerSlotLast),
+                  net_lp_pos: sanitizeBigIntForDb(engine.netLpPos),
+                  price_e6: sanitizeBigIntForDb(priceE6),
+                  funding_index_qpb_e6: sanitizeBigIntToString(engine.fundingIndexQpbE6),
                 });
                 this.lastFundingHistoryTime.set(slabAddress, Date.now());
               } catch (e) {
