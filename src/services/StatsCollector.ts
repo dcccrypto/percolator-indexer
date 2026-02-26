@@ -121,7 +121,8 @@ export class StatsCollector {
           // Fetch actual mint decimals from on-chain
           let mintDecimals = 9; // fallback
           try {
-            const mintInfo = await connection.getAccountInfo(market.config.collateralMint);
+            const conn = getConnection();
+            const mintInfo = await conn.getAccountInfo(market.config.collateralMint);
             if (mintInfo && mintInfo.data.length >= 45) {
               // SPL Token Mint layout: decimals is a u8 at offset 44
               mintDecimals = mintInfo.data[44];
