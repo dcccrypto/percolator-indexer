@@ -27,6 +27,7 @@ import {
   get24hVolume,
   getMarkets,
   insertMarket,
+  updateMarketDecimals,
   getSupabase,
   withRetry,
   createLogger,
@@ -84,6 +85,66 @@ export class StatsCollector {
   }
 
   /**
+   * Fix decimals on existing markets by reading the on-chain mint account.
+   * This self-heals markets that were registered with incorrect fallback decimals.
+   */
+  private async fixExistingMarketDecimals(
+    onChainMarkets: Map<string, { market: DiscoveredMarket }>,
+    dbMarkets: Array<{ slab_address: string; mint_address: string; decimals: number }>,
+  ): Promise<void> {
+    const conn = getConnection();
+
+    // Build a map of mint → on-chain decimals (cache to avoid duplicate RPC calls)
+    const mintDecimalsCache = new Map<string, number>();
+
+    for (const dbMarket of dbMarkets) {
+      const onChain = onChainMarkets.get(dbMarket.slab_address);
+      if (!onChain) continue;
+
+      const mintAddress = dbMarket.mint_address;
+
+      // Look up or fetch on-chain decimals
+      let onChainDecimals = mintDecimalsCache.get(mintAddress);
+      if (onChainDecimals === undefined) {
+        try {
+          const mintInfo = await conn.getAccountInfo(onChain.market.config.collateralMint);
+          if (mintInfo && mintInfo.data.length >= 45) {
+            onChainDecimals = mintInfo.data[44]; // SPL Token Mint: decimals at offset 44
+          } else {
+            continue; // Can't determine — skip
+          }
+          mintDecimalsCache.set(mintAddress, onChainDecimals);
+        } catch (err) {
+          logger.warn("Failed to fetch mint decimals for existing market", {
+            slabAddress: dbMarket.slab_address,
+            mintAddress,
+            error: err instanceof Error ? err.message : err,
+          });
+          continue;
+        }
+      }
+
+      // If DB decimals don't match on-chain, fix them
+      if (dbMarket.decimals !== onChainDecimals) {
+        try {
+          await updateMarketDecimals(dbMarket.slab_address, onChainDecimals);
+          logger.info("Fixed market decimals", {
+            slabAddress: dbMarket.slab_address,
+            oldDecimals: dbMarket.decimals,
+            newDecimals: onChainDecimals,
+            mintAddress,
+          });
+        } catch (err) {
+          logger.warn("Failed to fix market decimals", {
+            slabAddress: dbMarket.slab_address,
+            error: err instanceof Error ? err.message : err,
+          });
+        }
+      }
+    }
+  }
+
+  /**
    * Auto-register missing markets: compare on-chain markets vs DB and insert any missing.
    */
   private async syncMarkets(): Promise<void> {
@@ -103,6 +164,9 @@ export class StatsCollector {
           missingMarkets.push([slabAddress, state]);
         }
       }
+
+      // Fix decimals on existing markets whose on-chain mint decimals differ from DB
+      await this.fixExistingMarketDecimals(onChainMarkets, dbMarkets);
 
       if (missingMarkets.length === 0) return;
 
