@@ -118,6 +118,19 @@ export class StatsCollector {
           const priceE6 = Number(market.config.authorityPriceE6);
           const initialMarginBps = Number(market.params.initialMarginBps);
           
+          // Fetch actual mint decimals from on-chain
+          let mintDecimals = 9; // fallback
+          try {
+            const conn = getConnection();
+            const mintInfo = await conn.getAccountInfo(market.config.collateralMint);
+            if (mintInfo && mintInfo.data.length >= 45) {
+              // SPL Token Mint layout: decimals is a u8 at offset 44
+              mintDecimals = mintInfo.data[44];
+            }
+          } catch (err) {
+            logger.warn("Failed to fetch mint decimals, using default 9", { mintAddress, error: err instanceof Error ? err.message : err });
+          }
+
           // Derive fields as specified
           const symbol = mintAddress.substring(0, 8);
           const name = `Market ${slabAddress.substring(0, 8)}`;
@@ -128,7 +141,7 @@ export class StatsCollector {
             mint_address: mintAddress,
             symbol,
             name,
-            decimals: 9,
+            decimals: mintDecimals,
             deployer: admin,
             oracle_authority: oracleAuthority,
             initial_price_e6: priceE6,
