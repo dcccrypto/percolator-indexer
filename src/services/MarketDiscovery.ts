@@ -8,19 +8,50 @@ export class MarketDiscovery {
   private markets = new Map<string, { market: DiscoveredMarket }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   
+  /**
+   * discoverMarkets with exponential backoff on 429 / rate-limit errors. (issue #840)
+   * Falls back to primary connection on retry so we aren't hammering one endpoint.
+   */
+  private async discoverWithRetry(
+    programId: PublicKey,
+    maxRetries = 4,
+  ): Promise<DiscoveredMarket[]> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      // Alternate between fallback (lower-priority) and primary connection on retries
+      const conn = attempt === 0 ? getFallbackConnection() : getConnection();
+      try {
+        return await discoverMarkets(conn, programId);
+      } catch (e) {
+        lastErr = e;
+        const msg = e instanceof Error ? e.message.toLowerCase() : String(e).toLowerCase();
+        const is429 = msg.includes("429") || msg.includes("too many requests") || msg.includes("rate limit");
+        if (!is429 || attempt >= maxRetries - 1) throw e;
+        const delayMs = Math.min(500 * Math.pow(2, attempt), 30_000); // 500ms → 1s → 2s → 4s
+        logger.warn("discoverMarkets rate-limited, backing off", {
+          programId: programId.toBase58(),
+          attempt: attempt + 1,
+          delayMs,
+        });
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    throw lastErr;
+  }
+
   async discover(): Promise<DiscoveredMarket[]> {
     const programIds = config.allProgramIds;
-    const conn = getFallbackConnection();
     const all: DiscoveredMarket[] = [];
     
     for (const id of programIds) {
       try {
-        const found = await discoverMarkets(conn, new PublicKey(id));
+        const found = await this.discoverWithRetry(new PublicKey(id));
         all.push(...found);
       } catch (e) {
         logger.warn("Failed to discover on program", { programId: id, error: e });
       }
-      await new Promise(r => setTimeout(r, 2000));
+      // Pause between program IDs to reduce RPC burst pressure
+      await new Promise(r => setTimeout(r, 2_000));
     }
     
     for (const market of all) {
