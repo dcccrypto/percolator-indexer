@@ -9,7 +9,8 @@ export class MarketDiscovery {
   private timer: ReturnType<typeof setInterval> | null = null;
   
   /**
-   * discoverMarkets with exponential backoff on 429 / rate-limit errors. (issue #840)
+   * discoverMarkets with exponential backoff on transient RPC errors (issue #840).
+   * Retries on: 429/rate-limit, 502/503/504 (Cloudflare/Helius transient failures).
    * Falls back to primary connection on retry so we aren't hammering one endpoint.
    */
   private async discoverWithRetry(
@@ -25,13 +26,19 @@ export class MarketDiscovery {
       } catch (e) {
         lastErr = e;
         const msg = e instanceof Error ? e.message.toLowerCase() : String(e).toLowerCase();
-        const is429 = msg.includes("429") || msg.includes("too many requests") || msg.includes("rate limit");
-        if (!is429 || attempt >= maxRetries - 1) throw e;
+        const isRateLimit = msg.includes("429") || msg.includes("too many requests") || msg.includes("rate limit");
+        const isTransient = msg.includes("502") || msg.includes("503") || msg.includes("504")
+          || msg.includes("bad gateway") || msg.includes("service unavailable")
+          || msg.includes("gateway timeout") || msg.includes("econnreset")
+          || msg.includes("econnrefused") || msg.includes("etimedout");
+        const isRetryable = isRateLimit || isTransient;
+        if (!isRetryable || attempt >= maxRetries - 1) throw e;
         const delayMs = Math.min(500 * Math.pow(2, attempt), 30_000); // 500ms → 1s → 2s → 4s
-        logger.warn("discoverMarkets rate-limited, backing off", {
+        logger.warn("discoverMarkets transient RPC error, backing off", {
           programId: programId.toBase58(),
           attempt: attempt + 1,
           delayMs,
+          error: msg.substring(0, 120),
         });
         await new Promise((r) => setTimeout(r, delayMs));
       }

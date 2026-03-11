@@ -95,6 +95,28 @@ describe('MarketDiscovery', () => {
       expect(markets.has('Market311111111111111111111111111111111')).toBe(true);
     });
 
+    it('should retry on 502 bad gateway errors', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market502111111111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+
+      // First call throws 502, second succeeds
+      vi.mocked(core.discoverMarkets)
+        .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+        .mockResolvedValueOnce([mockMarket] as any) // retry on primary conn
+        .mockResolvedValueOnce([]); // second program ID
+
+      const result = await marketDiscovery.discover();
+
+      // discoverMarkets called 3 times: 1 failure + 1 retry + 1 for second program
+      expect(core.discoverMarkets).toHaveBeenCalledTimes(3);
+      expect(result).toHaveLength(1);
+    }, 10000);
+
     it('should handle errors per program without crashing all', async () => {
       const mockMarket = {
         slabAddress: { toBase58: () => 'Market411111111111111111111111111111111' },
