@@ -51,6 +51,9 @@ const COLLECT_INTERVAL_MS = 120_000;
 /** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
 const ORACLE_LOG_INTERVAL_MS = 60_000;
 
+/** How many consecutive parse failures before a market is permanently skipped */
+const PARSE_FAIL_SKIP_THRESHOLD = 10;
+
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private _running = false;
@@ -61,9 +64,23 @@ export class StatsCollector {
   private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
 
+  /** Consecutive parse-failure count per slab — reset on first successful parse */
+  private parseFailureCount = new Map<string, number>();
+  /** Slabs that have failed PARSE_FAIL_SKIP_THRESHOLD times in a row — skip until rediscovery */
+  readonly permanentlySkippedSlabs = new Set<string>();
+
   constructor(
     private readonly marketProvider: MarketProvider,
   ) {}
+
+  /**
+   * Re-enable a slab that was permanently skipped.
+   * Called by market rediscovery when a slab appears with a new layout version.
+   */
+  clearSkippedSlab(slabAddress: string): void {
+    this.permanentlySkippedSlabs.delete(slabAddress);
+    this.parseFailureCount.delete(slabAddress);
+  }
 
   start(): void {
     if (this._running) return;
@@ -249,6 +266,8 @@ export class StatsCollector {
 
       // Process markets in batches of 5 to avoid RPC rate limits
       // Use getMultipleAccountsInfo for batch fetching to reduce RPC round trips
+      let parseErrors = 0;
+
       const entries = Array.from(markets.entries());
       for (let i = 0; i < entries.length; i += 5) {
         const batch = entries.slice(i, i + 5);
@@ -268,6 +287,9 @@ export class StatsCollector {
           // Process each account
           await Promise.all(batch.map(async ([slabAddress, state], batchIndex) => {
             try {
+              // Skip slabs that have consistently failed parsing — re-enabled on rediscovery
+              if (this.permanentlySkippedSlabs.has(slabAddress)) return;
+
               const accountInfo = accountInfos[batchIndex];
               if (!accountInfo?.data) return;
 
@@ -281,8 +303,29 @@ export class StatsCollector {
               engine = parseEngine(data);
               marketConfig = parseConfig(data);
               params = parseParams(data);
+              // Successful parse — reset consecutive failure counter
+              this.parseFailureCount.delete(slabAddress);
             } catch (parseErr) {
-              // Slab too small or invalid — skip
+              // Slab too small or invalid layout — track separately from DB errors
+              parseErrors++;
+              const failCount = (this.parseFailureCount.get(slabAddress) ?? 0) + 1;
+              this.parseFailureCount.set(slabAddress, failCount);
+
+              if (failCount >= PARSE_FAIL_SKIP_THRESHOLD) {
+                this.permanentlySkippedSlabs.add(slabAddress);
+                logger.warn("Market permanently skipped after repeated parse failures", {
+                  slabAddress,
+                  failCount,
+                  error: parseErr instanceof Error ? parseErr.message : parseErr,
+                });
+              } else {
+                logger.debug("Market parse failed — will retry next cycle", {
+                  slabAddress,
+                  failCount,
+                  threshold: PARSE_FAIL_SKIP_THRESHOLD,
+                  error: parseErr instanceof Error ? parseErr.message : parseErr,
+                });
+              }
               return;
             }
 
@@ -456,15 +499,22 @@ export class StatsCollector {
         }
       }
 
-      if (updated > 0 || errors > 0) {
-        console.log(`[StatsCollector] Updated ${updated}/${markets.size} markets (${errors} errors)`);
-        if (errors > 0) {
-          addBreadcrumb("StatsCollector completed with errors", {
-            updated,
-            errors,
-            totalMarkets: markets.size,
-          });
-        }
+      const skipped = this.permanentlySkippedSlabs.size;
+      const logParts = [
+        `Updated ${updated}/${markets.size} markets`,
+        `${errors} DB errors`,
+        `${parseErrors} parse failures`,
+        ...(skipped > 0 ? [`${skipped} permanently skipped`] : []),
+      ];
+      console.log(`[StatsCollector] ${logParts.join(", ")}`);
+      if (errors > 0 || parseErrors > 0) {
+        addBreadcrumb("StatsCollector completed with errors", {
+          updated,
+          errors,
+          parseErrors,
+          permanentlySkipped: skipped,
+          totalMarkets: markets.size,
+        });
       }
     } catch (err) {
       console.error("[StatsCollector] Collection failed:", err);
