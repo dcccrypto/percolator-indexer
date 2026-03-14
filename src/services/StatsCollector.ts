@@ -359,11 +359,13 @@ export class StatsCollector {
             const priceE6 = rawPriceE6; // keep bigint for oracle log comparison
             const priceUsd = safePriceE6 > 0 ? safePriceE6 / 1_000_000 : null;
 
-            // Calculate 24h volume from trades table
+            // Calculate 24h volume and trade count from trades table
             let volume24h: number | null = null;
+            let tradeCount24h: number = 0;
             try {
-              const { volume } = await get24hVolume(slabAddress);
+              const { volume, tradeCount } = await get24hVolume(slabAddress);
               volume24h = Number(volume);
+              tradeCount24h = tradeCount;
             } catch (volErr) {
               // Non-fatal — volume calculation failure shouldn't break stats collection
               logger.warn("24h volume calculation failed", { slabAddress, error: volErr instanceof Error ? volErr.message : volErr });
@@ -383,6 +385,7 @@ export class StatsCollector {
               total_accounts: engine.numUsedAccounts,
               funding_rate: sanitizeBigIntForDb(engine.fundingRateBpsPerSlotLast),
               volume_24h: volume24h,
+              trade_count_24h: tradeCount24h,
               // Hidden features (migration 007)
               total_open_interest: sanitizeBigIntForDb(engine.totalOpenInterest),
               net_lp_pos: sanitizeBigIntToString(engine.netLpPos),
