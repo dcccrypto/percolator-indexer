@@ -5,7 +5,7 @@ const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
 
 vi.mock('@percolator/sdk', () => ({
-  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11 },
+  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
 }));
 
 vi.mock('@percolator/shared', () => ({
@@ -200,6 +200,47 @@ describe('TradeIndexerPolling', () => {
       );
     }, 10000);
   });
+
+  it('should index TradeCpiV2 instructions (PERC-154 — tag 35 with trailing bump byte)', async () => {
+      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+
+      mockGetSignaturesForAddress.mockResolvedValue([
+        { signature: VALID_SIG, err: null },
+      ]);
+
+      // TradeCpiV2 layout: tag(1) + lp_idx(2) + user_idx(2) + size(16) + bump(1) = 22 bytes
+      const ixData = new Uint8Array(22);
+      ixData[0] = 35; // IX_TAG.TradeCpiV2
+      ixData[5] = 0x40;  // size byte
+      ixData[21] = 0xab; // bump byte (ignored by indexer)
+
+      vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
+
+      mockGetParsedTransaction.mockResolvedValue({
+        meta: { err: null, logMessages: [] },
+        transaction: {
+          message: {
+            instructions: [{
+              programId: new PublicKey(PROGRAM_ID),
+              accounts: [new PublicKey(TRADER)],
+              data: 'base58encodeddata',
+            }],
+          },
+        },
+      });
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+
+      expect(shared.insertTrade).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB,
+          trader: TRADER,
+          tx_signature: VALID_SIG,
+        })
+      );
+    }, 10000);
 
   describe('error handling', () => {
     it('should skip errored transactions from signatures', async () => {

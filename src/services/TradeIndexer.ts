@@ -4,8 +4,19 @@ import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets,
 
 const logger = createLogger("indexer:trade-indexer");
 
-/** Trade instruction tags we want to index */
-const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi]);
+/** Trade instruction tags we want to index.
+ *
+ * Layout for all three:
+ *   tag(1) + lp_idx(u16=2) + user_idx(u16=2) + size(i128=16) = 21 bytes minimum
+ * TradeCpiV2 (PERC-154) adds a trailing bump(u8=1) but the size field is at the
+ * same offset, so the existing parseTradeSize(data.slice(5,21)) call is correct
+ * for all three tags.
+ */
+const TRADE_TAGS = new Set<number>([
+  IX_TAG.TradeNoCpi,
+  IX_TAG.TradeCpi,
+  IX_TAG.TradeCpiV2, // PERC-154: same layout as TradeCpi + trailing bump byte
+]);
 
 /** How many recent signatures to fetch per slab per cycle */
 const MAX_SIGNATURES = 50;
