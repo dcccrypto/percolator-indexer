@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -27,7 +27,7 @@ jobs:
       - run: pnpm test
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-22.04
     timeout-minutes: 15
     needs: build-and-test
     if: github.ref == 'refs/heads/main'
