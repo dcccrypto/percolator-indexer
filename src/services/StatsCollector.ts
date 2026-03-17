@@ -218,7 +218,11 @@ export class StatsCollector {
           // Derive fields as specified
           const symbol = mintAddress.substring(0, 8);
           const name = `Market ${slabAddress.substring(0, 8)}`;
-          const maxLeverage = Math.floor(10000 / initialMarginBps);
+          // Guard: initialMarginBps of 0 produces Infinity (10000/0) which JSON-serialises
+          // to null and violates the NOT NULL constraint on max_leverage. Fall back to 100
+          // (= 100x leverage, equivalent to 1% initial margin) for uninitialised slabs.
+          const safeMarginBps = initialMarginBps > 0 ? initialMarginBps : 100;
+          const maxLeverage = Math.floor(10000 / safeMarginBps);
           
           await insertMarket({
             slab_address: slabAddress,
