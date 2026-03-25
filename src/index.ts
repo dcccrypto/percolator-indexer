@@ -87,8 +87,17 @@ setInterval(async () => {
 }, 30_000); // Check every 30s
 
 async function start() {
-  await discovery.discover();
-  discovery.start();
+  // Validate NODE_ENV at startup
+  const validNodeEnvs = ["production", "development", "test"];
+  if (process.env.NODE_ENV && !validNodeEnvs.includes(process.env.NODE_ENV)) {
+    logger.error("Invalid NODE_ENV configuration", {
+      nodeEnv: process.env.NODE_ENV,
+      validOptions: validNodeEnvs.join(", ")
+    });
+    throw new Error(`Invalid NODE_ENV: ${process.env.NODE_ENV}. Must be one of: ${validNodeEnvs.join(", ")}`);
+  }
+
+  await discovery.start();
   statsCollector.start();
   tradeIndexer.start();
   insuranceService.start();

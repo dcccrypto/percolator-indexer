@@ -27,16 +27,24 @@ import {
   get24hVolume,
   getMarkets,
   insertMarket,
-  updateMarketDecimals,
   getSupabase,
   withRetry,
   createLogger,
   captureException,
   addBreadcrumb,
 } from "@percolator/shared";
-// Local bigint sanitization — prevents PG overflow from u64::MAX sentinels (PERC-206).
-// TODO: Switch to @percolator/shared once the shared package is republished.
-import { sanitizeBigIntForDb, sanitizeBigIntToString } from "../utils/bigint-sanitize.js";
+
+/**
+ * How often to sync volume/trade_count for ALL DB markets, including those not
+ * in the on-chain market provider (stale/uncranked markets). This ensures
+ * volume_24h and trade_count_24h stay accurate even for markets that are no
+ * longer being actively cranked on-chain.
+ *
+ * Runs every 5 minutes — less frequent than the full collect cycle (2 min)
+ * because it issues a single bulk trade fetch + N upserts (cheap), but still
+ * infrequent enough to avoid hammering the DB under high trade volume.
+ */
+const VOLUME_SYNC_INTERVAL_MS = 5 * 60_000;
 
 const logger = createLogger("indexer:stats-collector");
 
@@ -51,36 +59,22 @@ const COLLECT_INTERVAL_MS = 120_000;
 /** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
 const ORACLE_LOG_INTERVAL_MS = 60_000;
 
-/** How many consecutive parse failures before a market is permanently skipped */
-const PARSE_FAIL_SKIP_THRESHOLD = 10;
-
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private volumeTimer: ReturnType<typeof setInterval> | null = null;
+  private volumeInitTimeout: ReturnType<typeof setTimeout> | null = null;
   private _running = false;
   private _collecting = false;
+  private _syncingVolume = false;
   private lastOracleLogTime = new Map<string, number>();
   private lastFundingLogSlot = new Map<string, number>();
   private lastOiHistoryTime = new Map<string, number>();
   private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
 
-  /** Consecutive parse-failure count per slab — reset on first successful parse */
-  private parseFailureCount = new Map<string, number>();
-  /** Slabs that have failed PARSE_FAIL_SKIP_THRESHOLD times in a row — skip until rediscovery */
-  readonly permanentlySkippedSlabs = new Set<string>();
-
   constructor(
     private readonly marketProvider: MarketProvider,
   ) {}
-
-  /**
-   * Re-enable a slab that was permanently skipped.
-   * Called by market rediscovery when a slab appears with a new layout version.
-   */
-  clearSkippedSlab(slabAddress: string): void {
-    this.permanentlySkippedSlabs.delete(slabAddress);
-    this.parseFailureCount.delete(slabAddress);
-  }
 
   start(): void {
     if (this._running) return;
@@ -92,7 +86,12 @@ export class StatsCollector {
     // Periodic collection
     this.timer = setInterval(() => this.collect(), COLLECT_INTERVAL_MS);
 
-    logger.info("StatsCollector started", { intervalMs: COLLECT_INTERVAL_MS });
+    // Volume sync for ALL DB markets (including uncranked ones) — runs independently.
+    // First sync after 30s to let the indexer warm up, then every 5 minutes.
+    this.volumeInitTimeout = setTimeout(() => this.syncVolumeForAllDBMarkets(), 30_000);
+    this.volumeTimer = setInterval(() => this.syncVolumeForAllDBMarkets(), VOLUME_SYNC_INTERVAL_MS);
+
+    logger.info("StatsCollector started", { intervalMs: COLLECT_INTERVAL_MS, volumeSyncIntervalMs: VOLUME_SYNC_INTERVAL_MS });
   }
 
   stop(): void {
@@ -101,66 +100,97 @@ export class StatsCollector {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.volumeTimer) {
+      clearInterval(this.volumeTimer);
+      this.volumeTimer = null;
+    }
+    if (this.volumeInitTimeout) {
+      clearTimeout(this.volumeInitTimeout);
+      this.volumeInitTimeout = null;
+    }
     logger.info("StatsCollector stopped");
   }
 
   /**
-   * Fix decimals on existing markets by reading the on-chain mint account.
-   * This self-heals markets that were registered with incorrect fallback decimals.
+   * Sync volume_24h and trade_count_24h for ALL markets in the DB.
+   *
+   * StatsCollector.collect() only processes markets discovered on-chain. Markets
+   * that are deployed but no longer actively cranked (e.g. test markets, stale slabs)
+   * fall out of the on-chain provider map and never get their volume updated.
+   *
+   * This method fetches all trades in the last 24h, aggregates by slab_address, and
+   * bulk-upserts volume_24h + trade_count_24h for every market that has trades.
+   * It intentionally does NOT reset volume to 0 for markets with no trades — those
+   * are left unchanged (they'll naturally reach 0 as their last trades age out and
+   * the on-chain collect cycle picks them up).
+   *
+   * Bug fixed: GH#1171 — volume_24h = 0 for all markets despite trades existing.
    */
-  private async fixExistingMarketDecimals(
-    onChainMarkets: Map<string, { market: DiscoveredMarket }>,
-    dbMarkets: Array<{ slab_address: string; mint_address: string; decimals: number }>,
-  ): Promise<void> {
-    const conn = getConnection();
+  private async syncVolumeForAllDBMarkets(): Promise<void> {
+    if (this._syncingVolume || !this._running) return;
+    this._syncingVolume = true;
 
-    // Build a map of mint → on-chain decimals (cache to avoid duplicate RPC calls)
-    const mintDecimalsCache = new Map<string, number>();
+    try {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-    for (const dbMarket of dbMarkets) {
-      const onChain = onChainMarkets.get(dbMarket.slab_address);
-      if (!onChain) continue;
+      // Single bulk fetch: all trades in last 24h (capped at 10k rows to avoid OOM)
+      const { data: trades, error } = await getSupabase()
+        .from("trades")
+        .select("slab_address, size")
+        .gte("created_at", since)
+        .limit(10_000);
 
-      const mintAddress = dbMarket.mint_address;
+      if (error) {
+        logger.warn("syncVolumeForAllDBMarkets: trade fetch failed", { error: error.message });
+        return;
+      }
 
-      // Look up or fetch on-chain decimals
-      let onChainDecimals = mintDecimalsCache.get(mintAddress);
-      if (onChainDecimals === undefined) {
+      if (!trades || trades.length === 0) return;
+
+      // Warn if we hit the row cap — volume will be under-reported for that window
+      if (trades.length === 10_000) {
+        logger.warn("syncVolumeForAllDBMarkets: trade fetch hit 10k row limit — volume may be under-reported", { since, limit: 10_000 });
+      }
+
+      // Aggregate volume + trade count by slab_address in memory
+      const volumeMap = new Map<string, { volume: bigint; count: number }>();
+      for (const trade of trades) {
+        const current = volumeMap.get(trade.slab_address) ?? { volume: 0n, count: 0 };
         try {
-          const mintInfo = await conn.getAccountInfo(onChain.market.config.collateralMint);
-          if (mintInfo && mintInfo.data.length >= 45) {
-            onChainDecimals = mintInfo.data[44]; // SPL Token Mint: decimals at offset 44
-          } else {
-            continue; // Can't determine — skip
-          }
-          mintDecimalsCache.set(mintAddress, onChainDecimals);
-        } catch (err) {
-          logger.warn("Failed to fetch mint decimals for existing market", {
-            slabAddress: dbMarket.slab_address,
-            mintAddress,
-            error: err instanceof Error ? err.message : err,
-          });
-          continue;
+          const raw = BigInt(trade.size);
+          const abs = raw < 0n ? -raw : raw;
+          volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
+        } catch {
+          const abs = BigInt(Math.abs(Number(trade.size)));
+          volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
         }
       }
 
-      // If DB decimals don't match on-chain, fix them
-      if (dbMarket.decimals !== onChainDecimals) {
+      // Upsert volume stats for each market that has trades
+      let updated = 0;
+      for (const [slabAddress, { volume, count }] of volumeMap.entries()) {
         try {
-          await updateMarketDecimals(dbMarket.slab_address, onChainDecimals);
-          logger.info("Fixed market decimals", {
-            slabAddress: dbMarket.slab_address,
-            oldDecimals: dbMarket.decimals,
-            newDecimals: onChainDecimals,
-            mintAddress,
+          await upsertMarketStats({
+            slab_address: slabAddress,
+            volume_24h: Number(volume),
+            trade_count_24h: count,
           });
+          updated++;
         } catch (err) {
-          logger.warn("Failed to fix market decimals", {
-            slabAddress: dbMarket.slab_address,
+          logger.warn("syncVolumeForAllDBMarkets: upsert failed", {
+            slabAddress: slabAddress.slice(0, 8),
             error: err instanceof Error ? err.message : err,
           });
         }
       }
+
+      if (updated > 0) {
+        logger.info("Volume sync complete", { marketsUpdated: updated, totalTrades: trades.length });
+      }
+    } catch (err) {
+      logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
+    } finally {
+      this._syncingVolume = false;
     }
   }
 
@@ -185,51 +215,104 @@ export class StatsCollector {
         }
       }
 
-      // Fix decimals on existing markets whose on-chain mint decimals differ from DB
-      await this.fixExistingMarketDecimals(onChainMarkets, dbMarkets);
-
       if (missingMarkets.length === 0) return;
 
       logger.info("New markets found", { count: missingMarkets.length });
 
       // Insert missing markets
+      const connection = getConnection();
       for (const [slabAddress, state] of missingMarkets) {
         try {
           const market = state.market;
           const mintAddress = market.config.collateralMint.toBase58();
           const admin = market.header.admin.toBase58();
           const oracleAuthority = market.config.oracleAuthority.toBase58();
-          const priceE6 = sanitizeBigIntForDb(market.config.authorityPriceE6);
-          const initialMarginBps = sanitizeBigIntForDb(market.params.initialMarginBps, 100);
-          
-          // Fetch actual mint decimals from on-chain
-          let mintDecimals = 9; // fallback
-          try {
-            const conn = getConnection();
-            const mintInfo = await conn.getAccountInfo(market.config.collateralMint);
-            if (mintInfo && mintInfo.data.length >= 45) {
-              // SPL Token Mint layout: decimals is a u8 at offset 44
-              mintDecimals = mintInfo.data[44];
-            }
-          } catch (err) {
-            logger.warn("Failed to fetch mint decimals, using default 9", { mintAddress, error: err instanceof Error ? err.message : err });
+          const priceE6 = Number(market.config.authorityPriceE6);
+          const initialMarginBps = Number(market.params.initialMarginBps);
+
+          // Guard: skip slabs with invalid/zero initialMarginBps — division by zero
+          // gives Infinity which violates the NOT NULL integer constraint in DB.
+          // These are corrupted/incomplete on-chain accounts; skip gracefully.
+          if (!initialMarginBps || initialMarginBps <= 0 || !Number.isFinite(initialMarginBps)) {
+            logger.warn("Skipping market registration — invalid initialMarginBps (corrupted slab?)", {
+              slabAddress,
+              initialMarginBps,
+            });
+            continue;
           }
 
-          // Derive fields as specified
-          const symbol = mintAddress.substring(0, 8);
-          const name = `Market ${slabAddress.substring(0, 8)}`;
-          // Guard: initialMarginBps of 0 produces Infinity (10000/0) which JSON-serialises
-          // to null and violates the NOT NULL constraint on max_leverage. Fall back to 100
-          // (= 100x leverage, equivalent to 1% initial margin) for uninitialised slabs.
-          const safeMarginBps = initialMarginBps > 0 ? initialMarginBps : 100;
-          const maxLeverage = Math.floor(10000 / safeMarginBps);
+          const maxLeverage = Math.floor(10000 / initialMarginBps);
+
+          // Guard: ensure computed maxLeverage is a valid positive integer.
+          // Math.floor(Infinity) = Infinity, NaN can propagate via type coercion, and
+          // JSON serialisation converts Infinity/NaN to null — violating the DB NOT NULL
+          // constraint (error code 23502). Slab 7dVewVxW triggers this path.
+          if (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || !Number.isInteger(maxLeverage)) {
+            logger.warn("Skipping market registration — computed maxLeverage is invalid", {
+              slabAddress,
+              initialMarginBps,
+              maxLeverage,
+            });
+            continue;
+          }
           
+          // Try to resolve token metadata from on-chain (Helius DAS / Metaplex)
+          let symbol = mintAddress.substring(0, 8); // fallback
+          let name = `Market ${slabAddress.substring(0, 8)}`; // fallback
+          let decimals = 9;
+          try {
+            const mintPubkey = new PublicKey(mintAddress);
+            const mintInfo = await connection.getParsedAccountInfo(mintPubkey);
+            if (mintInfo.value?.data && "parsed" in mintInfo.value.data) {
+              decimals = mintInfo.value.data.parsed.info.decimals ?? 9;
+            }
+            // Try Helius DAS API if the RPC endpoint supports it
+            const endpoint = connection.rpcEndpoint;
+            if (endpoint.includes("helius-rpc.com")) {
+              const dasRes = await fetch(endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: `das-${mintAddress}`,
+                  method: "getAsset",
+                  params: { id: mintAddress, options: { showFungible: true } },
+                }),
+                signal: AbortSignal.timeout(5000),
+              });
+              if (dasRes.ok) {
+                const dasJson = await dasRes.json();
+                const metadata = dasJson?.result?.content?.metadata;
+                const tokenInfo = dasJson?.result?.token_info;
+                const dasSym = metadata?.symbol || tokenInfo?.symbol;
+                const dasName = metadata?.name;
+                const dasDecimals = tokenInfo?.decimals;
+                if (dasSym) symbol = dasSym;
+                if (dasName) name = dasName;
+                if (dasDecimals != null) decimals = dasDecimals;
+              }
+            }
+          } catch (metaErr) {
+            logger.debug("Token metadata resolution failed, using fallback", { mintAddress, error: metaErr instanceof Error ? metaErr.message : metaErr });
+          }
+
+          // Validate decimals: SPL tokens use 0-18. Values outside this range
+          // indicate corrupted metadata (wrong byte offset, garbage DAS response).
+          if (decimals < 0 || decimals > 18 || !Number.isInteger(decimals)) {
+            logger.warn("Invalid token decimals detected, clamping to default", {
+              mintAddress, rawDecimals: decimals, fallback: 6,
+            });
+            decimals = 6;
+          }
+          
+          // Clamp decimals to sane range — some on-chain mints have garbage values
+          const clampedDecimals = Math.min(Math.max(decimals, 0), 18);
           await insertMarket({
             slab_address: slabAddress,
             mint_address: mintAddress,
             symbol,
             name,
-            decimals: mintDecimals,
+            decimals: clampedDecimals,
             deployer: admin,
             oracle_authority: oracleAuthority,
             initial_price_e6: priceE6,
@@ -240,7 +323,7 @@ export class StatsCollector {
             status: "active",
           });
 
-          logger.info("Market registered", { slabAddress, symbol });
+          logger.info("Market registered", { slabAddress, symbol, name });
         } catch (err) {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });
         }
@@ -264,15 +347,29 @@ export class StatsCollector {
       const markets = this.marketProvider.getMarkets();
       if (markets.size === 0) return;
 
+      // GH#1218: load indexer_excluded flags from DB to skip corrupt slabs.
+      // These are slabs where on-chain state is permanently corrupt and re-syncing
+      // would overwrite the zeroed DB values with garbage data.
+      let excludedSlabs: Set<string> = new Set();
+      try {
+        const dbMarkets = await getMarkets();
+        excludedSlabs = new Set(
+          dbMarkets.filter((m) => m.indexer_excluded === true).map((m) => m.slab_address),
+        );
+        if (excludedSlabs.size > 0) {
+          logger.info("StatsCollector: skipping indexer_excluded slabs", { count: excludedSlabs.size, slabs: Array.from(excludedSlabs) });
+        }
+      } catch {
+        // Non-fatal — proceed without exclusion list rather than halting all stats collection
+      }
+
       const connection = getConnection();
       let updated = 0;
       let errors = 0;
 
       // Process markets in batches of 5 to avoid RPC rate limits
       // Use getMultipleAccountsInfo for batch fetching to reduce RPC round trips
-      let parseErrors = 0;
-
-      const entries = Array.from(markets.entries());
+      const entries = Array.from(markets.entries()).filter(([slabAddress]) => !excludedSlabs.has(slabAddress));
       for (let i = 0; i < entries.length; i += 5) {
         const batch = entries.slice(i, i + 5);
         const slabPubkeys = batch.map(([slabAddress]) => new PublicKey(slabAddress));
@@ -291,9 +388,6 @@ export class StatsCollector {
           // Process each account
           await Promise.all(batch.map(async ([slabAddress, state], batchIndex) => {
             try {
-              // Skip slabs that have consistently failed parsing — re-enabled on rediscovery
-              if (this.permanentlySkippedSlabs.has(slabAddress)) return;
-
               const accountInfo = accountInfos[batchIndex];
               if (!accountInfo?.data) return;
 
@@ -307,35 +401,12 @@ export class StatsCollector {
               engine = parseEngine(data);
               marketConfig = parseConfig(data);
               params = parseParams(data);
-              // Successful parse — reset consecutive failure counter
-              this.parseFailureCount.delete(slabAddress);
             } catch (parseErr) {
-              // Slab too small or invalid layout — track separately from DB errors
-              parseErrors++;
-              const failCount = (this.parseFailureCount.get(slabAddress) ?? 0) + 1;
-              this.parseFailureCount.set(slabAddress, failCount);
-
-              if (failCount >= PARSE_FAIL_SKIP_THRESHOLD) {
-                this.permanentlySkippedSlabs.add(slabAddress);
-                logger.warn("Market permanently skipped after repeated parse failures", {
-                  slabAddress,
-                  failCount,
-                  error: parseErr instanceof Error ? parseErr.message : parseErr,
-                });
-              } else {
-                logger.debug("Market parse failed — will retry next cycle", {
-                  slabAddress,
-                  failCount,
-                  threshold: PARSE_FAIL_SKIP_THRESHOLD,
-                  error: parseErr instanceof Error ? parseErr.message : parseErr,
-                });
-              }
+              // Slab too small or invalid — skip
               return;
             }
 
             // Calculate open interest (separate long/short)
-            // Note: positionSize is i128 on-chain; only aggregate into oiLong/oiShort
-            // which are then sanitized before DB insertion below.
             let oiLong = 0n;
             let oiShort = 0n;
             try {
@@ -348,24 +419,52 @@ export class StatsCollector {
                 }
               }
             } catch {
-              // If account parsing fails, use engine aggregate (also sanitized)
-              const rawOi = engine.totalOpenInterest;
-              oiLong = rawOi > 0n ? rawOi / 2n : 0n;
+              // If account parsing fails, use engine aggregate
+              oiLong = engine.totalOpenInterest > 0n ? engine.totalOpenInterest / 2n : 0n;
               oiShort = oiLong;
             }
 
-            // Use on-chain price: prefer authorityPriceE6, fall back to lastEffectivePriceE6 (for Pyth-pinned markets)
-            // Sanitize: sentinel values (u64::MAX) should not produce a price
-            const rawPriceE6 = marketConfig.authorityPriceE6 > 0n
-              ? marketConfig.authorityPriceE6
-              : marketConfig.lastEffectivePriceE6;
-            const safePriceE6 = sanitizeBigIntForDb(rawPriceE6);
-            const priceE6 = rawPriceE6; // keep bigint for oracle log comparison
-            const priceUsd = safePriceE6 > 0 ? safePriceE6 / 1_000_000 : null;
+            // PERC-816/817: Dust vault guard — enforce the invariant that OI must be 0
+            // when the vault has no meaningful liquidity. This prevents phantom OI from
+            // being re-written by the indexer for markets that were created but never
+            // received real LP deposits (e.g. creation-deposit splits leave dust in vault).
+            // Threshold: 1,000,000 micro-units (≤ 1 USDC at 6 decimals, dust at 9 decimals).
+            // Uses inclusive (<=) to catch vault == 1_000_000 — the exact creation-deposit
+            // seed amount the program writes at market creation. A market with vault at
+            // the creation boundary has received no real LP deposits.
+            // Also enforces: total_accounts = 0 → OI must be 0 (no open positions).
+            const MIN_VAULT_FOR_OI = 1_000_000n;
+            const hasDustVault = engine.vault <= MIN_VAULT_FOR_OI;
+            const hasNoAccounts = engine.numUsedAccounts === 0;
+            if (hasDustVault || hasNoAccounts) {
+              oiLong = 0n;
+              oiShort = 0n;
+            }
+
+            // Use on-chain price with oracle-mode-aware resolution
+            // Oracle modes:
+            //   - pyth-pinned: oracleAuthority == [0;32] → use lastEffectivePriceE6
+            //   - hyperp: indexFeedId == [0;32] → use lastEffectivePriceE6 (index price)
+            //   - admin: both non-zero → use authorityPriceE6 (authority-pushed price)
+            const zeroKeyBytes = new Uint8Array(32);
+            const isHyperpMode = marketConfig.indexFeedId.equals(new PublicKey(zeroKeyBytes));
+            const isPythPinned = !isHyperpMode && marketConfig.oracleAuthority.equals(new PublicKey(zeroKeyBytes));
+            let priceE6: bigint;
+            if (isPythPinned || isHyperpMode) {
+              // Pyth-pinned and hyperp: use lastEffectivePriceE6 (on-chain resolved price)
+              // For hyperp, authorityPriceE6 is the mark price which can be inflated
+              priceE6 = marketConfig.lastEffectivePriceE6;
+            } else {
+              // Admin oracle: prefer authorityPriceE6, fall back to lastEffectivePriceE6
+              priceE6 = marketConfig.authorityPriceE6 > 0n
+                ? marketConfig.authorityPriceE6
+                : marketConfig.lastEffectivePriceE6;
+            }
+            const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
 
             // Calculate 24h volume and trade count from trades table
             let volume24h: number | null = null;
-            let tradeCount24h: number = 0;
+            let tradeCount24h: number | null = null;
             try {
               const { volume, tradeCount } = await get24hVolume(slabAddress);
               volume24h = Number(volume);
@@ -375,53 +474,106 @@ export class StatsCollector {
               logger.warn("24h volume calculation failed", { slabAddress, error: volErr instanceof Error ? volErr.message : volErr });
             }
 
+            // Safe bigint→number conversions for PostgreSQL storage.
+            // PG BIGINT is signed 64-bit: max 9223372036854775807 (~9.2e18)
+            // PG NUMERIC is arbitrary precision — use string for those columns.
+            const U64_MAX = 18446744073709551615n;
+            const PG_BIGINT_MAX = 9223372036854775807n;
+
+            /** For NUMERIC columns: convert to number, capping at u64::MAX sentinel */
+            const safeBigNum = (v: bigint): number => {
+              if (v >= U64_MAX || v < 0n) return 0;
+              return Number(v);
+            };
+
+            /** For BIGINT columns: cap at PG signed bigint max to prevent overflow */
+            const safePgBigint = (v: bigint): number => {
+              if (v >= U64_MAX || v < 0n) return 0;
+              if (v > PG_BIGINT_MAX) return Number(PG_BIGINT_MAX);
+              return Number(v);
+            };
+
+            // Sanity-check parsed engine values: if the slab layout detection
+            // failed (wrong tier), the parser reads garbage from wrong offsets.
+            // Telltale sign: values like 9.8e34 OI or 1.8e25 insurance.
+            // Max sane value: 1e13 (~$10M USD in micro-USDC). Previously 1e18 which
+            // let through corrupt values from wrong slab tier detection (see #491).
+            const MAX_SANE_VALUE = 1e13;
+            // Max sane counter value: liquidation/force-close counts shouldn't exceed 1e12
+            const MAX_SANE_COUNTER = 1e12;
+            const isSaneEngine = (
+              safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
+              safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
+              safeBigNum(engine.cTot) < MAX_SANE_VALUE &&
+              safeBigNum(engine.vault) < MAX_SANE_VALUE &&
+              safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
+              safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
+            );
+
+            if (!isSaneEngine) {
+              logger.warn("Insane engine state values detected (likely wrong slab layout), skipping stats update", {
+                slabAddress,
+                totalOI: safeBigNum(engine.totalOpenInterest),
+                insurance: safeBigNum(engine.insuranceFund.balance),
+                cTot: safeBigNum(engine.cTot),
+                vault: safeBigNum(engine.vault),
+                lifetimeLiquidations: safeBigNum(engine.lifetimeLiquidations),
+                lifetimeForceCloses: safeBigNum(engine.lifetimeForceCloses),
+              });
+              return;
+            }
+
             // Upsert market stats with ALL RiskEngine fields (migration 010)
-            // All bigint → Number conversions go through sanitizeBigIntForDb()
-            // to replace u64::MAX sentinels and prevent PG bigint overflow.
+            // Note: NUMERIC columns use safeBigNum(), BIGINT columns use safePgBigint()
             await upsertMarketStats({
               slab_address: slabAddress,
               last_price: priceUsd,
               mark_price: priceUsd, // Same as last_price for now (no funding adjustment)
               index_price: priceUsd,
-              open_interest_long: sanitizeBigIntForDb(oiLong),
-              open_interest_short: sanitizeBigIntForDb(oiShort),
-              insurance_fund: sanitizeBigIntForDb(engine.insuranceFund.balance),
-              total_accounts: engine.numUsedAccounts,
-              funding_rate: sanitizeBigIntForDb(engine.fundingRateBpsPerSlotLast),
-              volume_24h: volume24h,
-              trade_count_24h: tradeCount24h,
+              open_interest_long: safeBigNum(oiLong),          // NUMERIC
+              open_interest_short: safeBigNum(oiShort),        // NUMERIC
+              insurance_fund: safeBigNum(engine.insuranceFund.balance), // NUMERIC
+              total_accounts: engine.numUsedAccounts,          // INTEGER
+              funding_rate: Number(engine.fundingRateBpsPerSlotLast), // NUMERIC
+              volume_24h: volume24h,                           // NUMERIC
+              trade_count_24h: tradeCount24h,                  // INT4
               // Hidden features (migration 007)
-              total_open_interest: sanitizeBigIntForDb(engine.totalOpenInterest),
-              net_lp_pos: sanitizeBigIntToString(engine.netLpPos),
-              lp_sum_abs: sanitizeBigIntForDb(engine.lpSumAbs),
-              lp_max_abs: sanitizeBigIntForDb(engine.lpMaxAbs),
-              insurance_balance: sanitizeBigIntForDb(engine.insuranceFund.balance),
-              insurance_fee_revenue: sanitizeBigIntForDb(engine.insuranceFund.feeRevenue),
-              warmup_period_slots: sanitizeBigIntForDb(params.warmupPeriodSlots),
+              // GH#1250: Use computed oiLong + oiShort (from parsed accounts) rather than
+              // engine.totalOpenInterest. The engine field can be non-zero even when all
+              // accounts are closed (OI counter not decremented on force-close / reclaim),
+              // producing misleading OI with vault=0 and accounts=0.
+              // The computed sum is authoritative: it directly reflects live position sizes.
+              total_open_interest: safeBigNum(oiLong + oiShort), // NUMERIC
+              net_lp_pos: engine.netLpPos.toString(),          // NUMERIC
+              lp_sum_abs: safeBigNum(engine.lpSumAbs),         // NUMERIC
+              lp_max_abs: safeBigNum(engine.lpMaxAbs),         // NUMERIC
+              insurance_balance: safeBigNum(engine.insuranceFund.balance), // NUMERIC
+              insurance_fee_revenue: safeBigNum(engine.insuranceFund.feeRevenue), // NUMERIC
+              warmup_period_slots: safePgBigint(params.warmupPeriodSlots), // BIGINT
               // Complete RiskEngine state fields (migration 010)
-              vault_balance: sanitizeBigIntForDb(engine.vault),
-              lifetime_liquidations: sanitizeBigIntForDb(engine.lifetimeLiquidations),
-              lifetime_force_closes: sanitizeBigIntForDb(engine.lifetimeForceCloses),
-              c_tot: sanitizeBigIntForDb(engine.cTot),
-              pnl_pos_tot: sanitizeBigIntForDb(engine.pnlPosTot),
-              last_crank_slot: sanitizeBigIntForDb(engine.lastCrankSlot),
-              max_crank_staleness_slots: sanitizeBigIntForDb(engine.maxCrankStalenessSlots),
+              vault_balance: safeBigNum(engine.vault),         // NUMERIC
+              lifetime_liquidations: safeBigNum(engine.lifetimeLiquidations), // NUMERIC (migration 024)
+              lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses),  // NUMERIC (migration 024)
+              c_tot: safeBigNum(engine.cTot),                  // NUMERIC
+              pnl_pos_tot: safeBigNum(engine.pnlPosTot),       // NUMERIC
+              last_crank_slot: safePgBigint(engine.lastCrankSlot), // BIGINT
+              max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots), // BIGINT
               // RiskParams fields (migration 010)
-              maintenance_fee_per_slot: sanitizeBigIntToString(params.maintenanceFeePerSlot),
-              liquidation_fee_bps: sanitizeBigIntForDb(params.liquidationFeeBps),
-              liquidation_fee_cap: sanitizeBigIntToString(params.liquidationFeeCap),
-              liquidation_buffer_bps: sanitizeBigIntForDb(params.liquidationBufferBps),
+              maintenance_fee_per_slot: params.maintenanceFeePerSlot.toString(), // TEXT
+              liquidation_fee_bps: safePgBigint(params.liquidationFeeBps), // BIGINT
+              liquidation_fee_cap: params.liquidationFeeCap.toString(),    // TEXT
+              liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps), // BIGINT
               updated_at: new Date().toISOString(),
             });
 
             // Log oracle price to DB (rate-limited per market)
-            if (safePriceE6 > 0) {
+            if (priceE6 > 0n) {
               const lastLog = this.lastOracleLogTime.get(slabAddress) ?? 0;
               if (Date.now() - lastLog >= ORACLE_LOG_INTERVAL_MS) {
                 try {
                   await insertOraclePrice({
                     slab_address: slabAddress,
-                    price_e6: sanitizeBigIntToString(rawPriceE6),
+                    price_e6: priceE6.toString(),
                     timestamp: Math.floor(Date.now() / 1000),
                   });
                   this.lastOracleLogTime.set(slabAddress, Date.now());
@@ -433,19 +585,26 @@ export class StatsCollector {
             }
 
             // Log OI history (rate-limited per market)
+            // History tables have FK to market_stats(slab_address). If the market
+            // hasn't been inserted yet, we get FK violation (23503) — skip gracefully.
             const OI_HISTORY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
             const lastOiLog = this.lastOiHistoryTime.get(slabAddress) ?? 0;
             if (Date.now() - lastOiLog >= OI_HISTORY_INTERVAL_MS) {
               try {
-                await getSupabase().from('oi_history').insert({
+                const { error: oiErr } = await getSupabase().from('oi_history').insert({
                   market_slab: slabAddress,
-                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
-                  total_oi: sanitizeBigIntForDb(engine.totalOpenInterest),
-                  net_lp_pos: sanitizeBigIntForDb(engine.netLpPos),
-                  lp_sum_abs: sanitizeBigIntForDb(engine.lpSumAbs),
-                  lp_max_abs: sanitizeBigIntForDb(engine.lpMaxAbs),
+                  slot: safePgBigint(engine.lastCrankSlot),        // BIGINT
+                  total_oi: safeBigNum(engine.totalOpenInterest),  // NUMERIC
+                  net_lp_pos: safeBigNum(engine.netLpPos),         // NUMERIC
+                  lp_sum_abs: safeBigNum(engine.lpSumAbs),         // NUMERIC
+                  lp_max_abs: safeBigNum(engine.lpMaxAbs),         // NUMERIC
                 });
-                this.lastOiHistoryTime.set(slabAddress, Date.now());
+                // Ignore FK violations (23503) and unique constraint violations (23505)
+                if (oiErr && oiErr.code !== '23503' && oiErr.code !== '23505') {
+                  logger.warn("OI history log failed", { slabAddress, error: oiErr.message, code: oiErr.code });
+                } else {
+                  this.lastOiHistoryTime.set(slabAddress, Date.now());
+                }
               } catch (e) {
                 // Non-fatal
                 logger.warn("OI history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
@@ -457,13 +616,17 @@ export class StatsCollector {
             const lastInsLog = this.lastInsHistoryTime.get(slabAddress) ?? 0;
             if (Date.now() - lastInsLog >= INS_HISTORY_INTERVAL_MS) {
               try {
-                await getSupabase().from('insurance_history').insert({
+                const { error: insErr } = await getSupabase().from('insurance_history').insert({
                   market_slab: slabAddress,
-                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
-                  balance: sanitizeBigIntForDb(engine.insuranceFund.balance),
-                  fee_revenue: sanitizeBigIntForDb(engine.insuranceFund.feeRevenue),
+                  slot: safePgBigint(engine.lastCrankSlot),                // BIGINT
+                  balance: safeBigNum(engine.insuranceFund.balance),       // NUMERIC
+                  fee_revenue: safeBigNum(engine.insuranceFund.feeRevenue), // NUMERIC
                 });
-                this.lastInsHistoryTime.set(slabAddress, Date.now());
+                if (insErr && insErr.code !== '23503' && insErr.code !== '23505') {
+                  logger.warn("Insurance history log failed", { slabAddress, error: insErr.message, code: insErr.code });
+                } else {
+                  this.lastInsHistoryTime.set(slabAddress, Date.now());
+                }
               } catch (e) {
                 logger.warn("Insurance history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
               }
@@ -474,17 +637,21 @@ export class StatsCollector {
             const lastFundLog = this.lastFundingHistoryTime.get(slabAddress) ?? 0;
             if (Date.now() - lastFundLog >= FUNDING_HISTORY_INTERVAL_MS) {
               try {
-                await getSupabase().from('funding_history').insert({
+                const { error: fundErr } = await getSupabase().from('funding_history').insert({
                   market_slab: slabAddress,
-                  slot: sanitizeBigIntForDb(engine.lastCrankSlot),
-                  rate_bps_per_slot: sanitizeBigIntForDb(engine.fundingRateBpsPerSlotLast),
-                  net_lp_pos: sanitizeBigIntForDb(engine.netLpPos),
-                  price_e6: sanitizeBigIntForDb(priceE6),
-                  funding_index_qpb_e6: sanitizeBigIntToString(engine.fundingIndexQpbE6),
+                  slot: safePgBigint(engine.lastCrankSlot),                    // BIGINT
+                  rate_bps_per_slot: Number(engine.fundingRateBpsPerSlotLast), // NUMERIC
+                  net_lp_pos: safeBigNum(engine.netLpPos),                     // NUMERIC
+                  price_e6: safeBigNum(priceE6),                               // NUMERIC
+                  funding_index_qpb_e6: engine.fundingIndexQpbE6.toString(),   // TEXT
                 });
-                this.lastFundingHistoryTime.set(slabAddress, Date.now());
+                if (fundErr && fundErr.code !== '23503' && fundErr.code !== '23505') {
+                  logger.warn("Funding history log failed", { slabAddress, error: fundErr.message, code: fundErr.code });
+                } else {
+                  this.lastFundingHistoryTime.set(slabAddress, Date.now());
+                }
               } catch (e) {
-                console.warn(`[StatsCollector] Funding history log failed for ${slabAddress}:`, e instanceof Error ? e.message : e);
+                logger.warn("Funding history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
               }
             }
 
@@ -506,22 +673,15 @@ export class StatsCollector {
         }
       }
 
-      const skipped = this.permanentlySkippedSlabs.size;
-      const logParts = [
-        `Updated ${updated}/${markets.size} markets`,
-        `${errors} DB errors`,
-        `${parseErrors} parse failures`,
-        ...(skipped > 0 ? [`${skipped} permanently skipped`] : []),
-      ];
-      console.log(`[StatsCollector] ${logParts.join(", ")}`);
-      if (errors > 0 || parseErrors > 0) {
-        addBreadcrumb("StatsCollector completed with errors", {
-          updated,
-          errors,
-          parseErrors,
-          permanentlySkipped: skipped,
-          totalMarkets: markets.size,
-        });
+      if (updated > 0 || errors > 0) {
+        console.log(`[StatsCollector] Updated ${updated}/${markets.size} markets (${errors} errors)`);
+        if (errors > 0) {
+          addBreadcrumb("StatsCollector completed with errors", {
+            updated,
+            errors,
+            totalMarkets: markets.size,
+          });
+        }
       }
     } catch (err) {
       console.error("[StatsCollector] Collection failed:", err);
