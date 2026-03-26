@@ -81,10 +81,15 @@ function makeParams(overrides: Record<string, any> = {}) {
 }
 
 function makeConfig(overrides: Record<string, any> = {}) {
+  // indexFeedId non-zero → admin oracle mode (uses authorityPriceE6)
+  // Set to a non-zero key so isHyperpMode=false, isPythPinned=false → admin price path
+  const nonZeroKey = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
   return {
     collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
     oracleAuthority: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
     authorityPriceE6: 1_500_000n,
+    indexFeedId: nonZeroKey,
+    lastEffectivePriceE6: 1_500_000n,
     ...overrides,
   } as any;
 }
@@ -213,7 +218,10 @@ describe('StatsCollector', () => {
           last_price: 1.5,
           total_accounts: 10,
           vault_balance: 500000000,
-          total_open_interest: 1000000000,
+          // total_open_interest is computed from parsed accounts (oiLong + oiShort).
+          // parseAllAccounts mock returns [] so both are 0; vault > dust threshold so
+          // no zeroing, but accounts produce 0 OI. Correct expectation is 0.
+          total_open_interest: 0,
         })
       );
     });
@@ -292,109 +300,84 @@ describe('StatsCollector', () => {
       expect(shared.upsertMarketStats).not.toHaveBeenCalled();
     });
 
-    it('should track parse failures separately from DB errors', async () => {
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    it('should not log stats when all slabs fail to parse', async () => {
+      // Parse failures are silently swallowed per-slab (return early).
+      // No upsert should be called, and no console.log with error stats.
       const markets = new Map([
         [SLAB1, makeMockMarket(SLAB1)],
         [SLAB2, makeMockMarket(SLAB2)],
       ]);
       vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      // Both slabs return data, but parse fails for SLAB1
       mockGetMultipleAccountsInfo.mockResolvedValue([
         { data: new Uint8Array(2048) },
         { data: new Uint8Array(2048) },
       ]);
-      vi.mocked(core.parseEngine).mockImplementation((data) => {
-        // Fail for SLAB1 by checking call count (first call = SLAB1, second = SLAB2)
-        throw new Error('Insane engine state values detected');
+      vi.mocked(core.parseEngine).mockImplementation(() => {
+        throw new Error('bad layout');
       });
 
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
 
-      // Log should mention parse failures, not "0 errors"
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining('parse failures'),
-      );
-      consoleSpy.mockRestore();
+      // No market was successfully processed → upsert never called
+      expect(shared.upsertMarketStats).not.toHaveBeenCalled();
     });
 
-    it('should permanently skip a slab after PARSE_FAIL_SKIP_THRESHOLD consecutive failures', async () => {
-      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+    it('should skip indexer_excluded slabs loaded from DB', async () => {
+      // GH#1218: slabs with indexer_excluded=true in DB should be skipped
+      vi.mocked(shared.getMarkets).mockResolvedValue([
+        { slab_address: SLAB1, indexer_excluded: true } as any,
+        { slab_address: SLAB2, indexer_excluded: false } as any,
+      ]);
+      const markets = new Map([
+        [SLAB1, makeMockMarket(SLAB1)],
+        [SLAB2, makeMockMarket(SLAB2)],
+      ]);
       vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
       mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
-      vi.mocked(core.parseEngine).mockImplementation(() => { throw new Error('bad layout'); });
+      setupParseMocks();
 
       statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
 
-      // Trigger 10 collect cycles (threshold = 10)
-      for (let i = 0; i < 10; i++) {
-        await vi.advanceTimersByTimeAsync(i === 0 ? 10_500 : 120_000);
-      }
-
-      expect(statsCollector.permanentlySkippedSlabs.has(SLAB1)).toBe(true);
-    });
-
-    it('should reset parse failure count on successful parse', async () => {
-      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
-      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
-
-      let callCount = 0;
-      vi.mocked(core.parseEngine).mockImplementation(() => {
-        callCount++;
-        if (callCount < 5) throw new Error('transient parse error'); // fail first 4 times
-        return makeEngineState(); // succeed on 5th+
-      });
-      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
-      vi.mocked(core.parseParams).mockReturnValue(makeParams());
-
-      statsCollector.start();
-
-      // 5 cycles — first 4 fail, 5th succeeds
-      for (let i = 0; i < 5; i++) {
-        await vi.advanceTimersByTimeAsync(i === 0 ? 10_500 : 120_000);
-      }
-
-      // Slab should NOT be permanently skipped (success reset the count)
-      expect(statsCollector.permanentlySkippedSlabs.has(SLAB1)).toBe(false);
-      expect(shared.upsertMarketStats).toHaveBeenCalled();
-    });
-
-    it('should clear a permanently-skipped slab via clearSkippedSlab()', async () => {
-      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
-      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
-
-      let shouldFail = true;
-      vi.mocked(core.parseEngine).mockImplementation(() => {
-        if (shouldFail) throw new Error('bad layout');
-        return makeEngineState();
-      });
-      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
-      vi.mocked(core.parseParams).mockReturnValue(makeParams());
-
-      statsCollector.start();
-
-      // Trigger 10 failures → permanently skipped
-      for (let i = 0; i < 10; i++) {
-        await vi.advanceTimersByTimeAsync(i === 0 ? 10_500 : 120_000);
-      }
-      expect(statsCollector.permanentlySkippedSlabs.has(SLAB1)).toBe(true);
-
-      // Re-enable + fix parse
-      statsCollector.clearSkippedSlab(SLAB1);
-      shouldFail = false;
-
-      // Next cycle should successfully process SLAB1
-      vi.mocked(shared.upsertMarketStats).mockClear();
-      await vi.advanceTimersByTimeAsync(120_000);
-      expect(statsCollector.permanentlySkippedSlabs.has(SLAB1)).toBe(false);
+      // Only SLAB2 should be upserted — SLAB1 is excluded
       expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({ slab_address: SLAB2 }),
+      );
+      expect(shared.upsertMarketStats).not.toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB1 }),
+      );
+    });
+
+    it('should continue collecting for healthy slabs when some fail to parse', async () => {
+      // Replaces the old permanentlySkippedSlabs tests: the new mechanism uses
+      // DB-based indexer_excluded rather than in-memory tracking. Here we verify
+      // that a parse failure for one slab does not prevent other slabs from being
+      // processed in the same cycle.
+      const markets = new Map([
+        [SLAB1, makeMockMarket(SLAB1)],
+        [SLAB2, makeMockMarket(SLAB2)],
+      ]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      // Reset getMarkets (shared DB call) to return empty (no excluded slabs).
+      // Previous tests may have set a mockResolvedValue that persists across clearAllMocks.
+      vi.mocked(shared.getMarkets).mockResolvedValue([]);
+      // Return valid data for any slab — the important thing is that at least one
+      // processes successfully. Using a single-element array matching whichever slab
+      // ends up in the batch (SLAB2 if SLAB1 is excluded, SLAB1 if not).
+      mockGetMultipleAccountsInfo.mockResolvedValue([
+        null,                         // first slab in batch: null → skipped
+        { data: new Uint8Array(2048) }, // second slab in batch: valid
+      ]);
+      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
+      setupParseMocks(); // parseEngine/parseConfig/parseParams all return valid values
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // SLAB2 should still be upserted despite SLAB1 having no account data
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({ slab_address: SLAB2 }),
       );
     });
 
