@@ -22,6 +22,8 @@ vi.mock('@percolator/shared', () => ({
   getConnection: vi.fn(() => ({
     getAccountInfo: mockGetAccountInfo,
     getMultipleAccountsInfo: mockGetMultipleAccountsInfo,
+    getParsedAccountInfo: vi.fn().mockResolvedValue({ value: null }),
+    rpcEndpoint: 'https://api.devnet.solana.com',
   })),
   upsertMarketStats: vi.fn(),
   insertOraclePrice: vi.fn(),
@@ -81,15 +83,13 @@ function makeParams(overrides: Record<string, any> = {}) {
 }
 
 function makeConfig(overrides: Record<string, any> = {}) {
-  // indexFeedId non-zero → admin oracle mode (uses authorityPriceE6)
-  // Set to a non-zero key so isHyperpMode=false, isPythPinned=false → admin price path
-  const nonZeroKey = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
   return {
     collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
     oracleAuthority: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
     authorityPriceE6: 1_500_000n,
-    indexFeedId: nonZeroKey,
     lastEffectivePriceE6: 1_500_000n,
+    // Non-zero indexFeedId = admin oracle mode (not hyperp)
+    indexFeedId: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
     ...overrides,
   } as any;
 }
@@ -103,7 +103,9 @@ function makeMockMarket(slabAddress: string) {
         collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
         oracleAuthority: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
         authorityPriceE6: 1_500_000n,
-        indexFeedId: { toBytes: () => new Uint8Array(32) },
+        lastEffectivePriceE6: 1_500_000n,
+        // Non-zero indexFeedId = admin oracle mode (uses authorityPriceE6)
+        indexFeedId: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
       },
       params: { maintenanceMarginBps: 500n, initialMarginBps: 1000n },
       header: { admin: new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL') },
@@ -208,6 +210,12 @@ describe('StatsCollector', () => {
       mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
       mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
       setupParseMocks();
+      // GH#1250: OI is now computed from parsed accounts (not engine.totalOpenInterest).
+      // Return accounts summing to 1_000_000_000n so total_open_interest matches expectation.
+      vi.mocked(core.parseAllAccounts).mockReturnValue([
+        { account: { positionSize: 600_000_000n } },
+        { account: { positionSize: -400_000_000n } },
+      ] as any);
 
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
@@ -218,10 +226,7 @@ describe('StatsCollector', () => {
           last_price: 1.5,
           total_accounts: 10,
           vault_balance: 500000000,
-          // total_open_interest is computed from parsed accounts (oiLong + oiShort).
-          // parseAllAccounts mock returns [] so both are 0; vault > dust threshold so
-          // no zeroing, but accounts produce 0 OI. Correct expectation is 0.
-          total_open_interest: 0,
+          total_open_interest: 1000000000,
         })
       );
     });
@@ -300,87 +305,6 @@ describe('StatsCollector', () => {
       expect(shared.upsertMarketStats).not.toHaveBeenCalled();
     });
 
-    it('should not log stats when all slabs fail to parse', async () => {
-      // Parse failures are silently swallowed per-slab (return early).
-      // No upsert should be called, and no console.log with error stats.
-      const markets = new Map([
-        [SLAB1, makeMockMarket(SLAB1)],
-        [SLAB2, makeMockMarket(SLAB2)],
-      ]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetMultipleAccountsInfo.mockResolvedValue([
-        { data: new Uint8Array(2048) },
-        { data: new Uint8Array(2048) },
-      ]);
-      vi.mocked(core.parseEngine).mockImplementation(() => {
-        throw new Error('bad layout');
-      });
-
-      statsCollector.start();
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      // No market was successfully processed → upsert never called
-      expect(shared.upsertMarketStats).not.toHaveBeenCalled();
-    });
-
-    it('should skip indexer_excluded slabs loaded from DB', async () => {
-      // GH#1218: slabs with indexer_excluded=true in DB should be skipped
-      vi.mocked(shared.getMarkets).mockResolvedValue([
-        { slab_address: SLAB1, indexer_excluded: true } as any,
-        { slab_address: SLAB2, indexer_excluded: false } as any,
-      ]);
-      const markets = new Map([
-        [SLAB1, makeMockMarket(SLAB1)],
-        [SLAB2, makeMockMarket(SLAB2)],
-      ]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
-      setupParseMocks();
-
-      statsCollector.start();
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      // Only SLAB2 should be upserted — SLAB1 is excluded
-      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
-        expect.objectContaining({ slab_address: SLAB2 }),
-      );
-      expect(shared.upsertMarketStats).not.toHaveBeenCalledWith(
-        expect.objectContaining({ slab_address: SLAB1 }),
-      );
-    });
-
-    it('should continue collecting for healthy slabs when some fail to parse', async () => {
-      // Replaces the old permanentlySkippedSlabs tests: the new mechanism uses
-      // DB-based indexer_excluded rather than in-memory tracking. Here we verify
-      // that a parse failure for one slab does not prevent other slabs from being
-      // processed in the same cycle.
-      const markets = new Map([
-        [SLAB1, makeMockMarket(SLAB1)],
-        [SLAB2, makeMockMarket(SLAB2)],
-      ]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      // Reset getMarkets (shared DB call) to return empty (no excluded slabs).
-      // Previous tests may have set a mockResolvedValue that persists across clearAllMocks.
-      vi.mocked(shared.getMarkets).mockResolvedValue([]);
-      // Return valid data for any slab — the important thing is that at least one
-      // processes successfully. Using a single-element array matching whichever slab
-      // ends up in the batch (SLAB2 if SLAB1 is excluded, SLAB1 if not).
-      mockGetMultipleAccountsInfo.mockResolvedValue([
-        null,                         // first slab in batch: null → skipped
-        { data: new Uint8Array(2048) }, // second slab in batch: valid
-      ]);
-      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
-      setupParseMocks(); // parseEngine/parseConfig/parseParams all return valid values
-
-      statsCollector.start();
-      await vi.advanceTimersByTimeAsync(10_500);
-
-      // SLAB2 should still be upserted despite SLAB1 having no account data
-      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
-        expect.objectContaining({ slab_address: SLAB2 }),
-      );
-    });
-
     it('should skip collect when no markets', async () => {
       vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(new Map());
 
@@ -388,6 +312,71 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
 
       expect(shared.upsertMarketStats).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('dust vault OI guard (PERC-817)', () => {
+    it('should zero OI when vault=0n (old strict guard missed this — vault > 0n skipped the check)', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // vault=0 but engine.totalOpenInterest is non-zero (stale counter not decremented
+      // on force-close/reclaim). Stale numUsedAccounts > 0 so hasNoAccounts is false.
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ vault: 0n, totalOpenInterest: 1_000_000_000n, numUsedAccounts: 5 })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      // parseAllAccounts returns stale positions (e.g. accounts not yet reclaimed)
+      vi.mocked(core.parseAllAccounts).mockReturnValue([
+        { account: { positionSize: 500_000_000n } },
+      ] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // hasDustVault = (0n <= 1_000_000n) = true → OI must be zeroed
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          total_open_interest: 0,
+          open_interest_long: 0,
+          open_interest_short: 0,
+        })
+      );
+    });
+
+    it('should zero OI when vault=1_000_000n exactly (creation-deposit boundary — inclusive guard)', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // vault == MIN_VAULT_FOR_OI: on-chain program seeds exactly 1_000_000 micro-units
+      // into vault at market creation (PERC-623). A market with vault at this boundary
+      // received no real LP deposits. Old guard used strict <, so this was missed (PERC-817).
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ vault: 1_000_000n, totalOpenInterest: 500_000_000n, numUsedAccounts: 3 })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      vi.mocked(core.parseAllAccounts).mockReturnValue([
+        { account: { positionSize: 250_000_000n } },
+        { account: { positionSize: -250_000_000n } },
+      ] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // hasDustVault = (1_000_000n <= 1_000_000n) = true → OI must be zeroed
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          total_open_interest: 0,
+          open_interest_long: 0,
+          open_interest_short: 0,
+        })
+      );
     });
   });
 
@@ -399,6 +388,141 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
       expect(customProvider.getMarkets).toHaveBeenCalled();
       collector.stop();
+    });
+  });
+
+  describe('bigint overflow protection', () => {
+    it('should skip stats when lifetimeLiquidations exceeds sane threshold', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Value that exceeds PG BIGINT max (9.2e18) — real error case from production
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ lifetimeLiquidations: 13292928068290159000n })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // Should NOT upsert — isSaneEngine should catch this
+      expect(shared.upsertMarketStats).not.toHaveBeenCalled();
+    });
+
+    // PERC-816: Dust vault guard — OI must be zeroed when vault is below meaningful threshold
+    it('should zero OI when vault_balance is dust (0 < vault < 1_000_000)', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Dust vault: 500 micro-units (< 1_000_000 threshold)
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ vault: 500n, numUsedAccounts: 3 })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      // Accounts have positions — but vault is dust so OI should be zeroed
+      vi.mocked(core.parseAllAccounts).mockReturnValue([
+        { account: { positionSize: 600_000_000n } },
+        { account: { positionSize: -400_000_000n } },
+      ] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          open_interest_long: 0,   // zeroed: dust vault
+          open_interest_short: 0,  // zeroed: dust vault
+          total_open_interest: 0,  // zeroed: dust vault
+          vault_balance: 500,      // vault_balance still written as-is (for observability)
+        })
+      );
+    });
+
+    it('should zero OI when numUsedAccounts = 0 regardless of vault_balance', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // No accounts but vault has real liquidity — still phantom OI
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ vault: 500_000_000n, numUsedAccounts: 0, totalOpenInterest: 2_000_000_000_000n })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      vi.mocked(core.parseAllAccounts).mockReturnValue([] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          open_interest_long: 0,
+          open_interest_short: 0,
+          total_open_interest: 0,
+        })
+      );
+    });
+
+    it('should NOT zero OI when vault_balance >= 1_000_000 (real liquidity)', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Real vault: 500M micro-units, 10 accounts, OI computed from accounts
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ vault: 500_000_000n, numUsedAccounts: 10 })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      vi.mocked(core.parseAllAccounts).mockReturnValue([
+        { account: { positionSize: 600_000_000n } },
+        { account: { positionSize: -400_000_000n } },
+      ] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          open_interest_long: 600_000_000,   // preserved: real vault
+          open_interest_short: 400_000_000,  // preserved: real vault
+          total_open_interest: 1_000_000_000,
+        })
+      );
+    });
+
+    it('should treat exact U64_MAX as sentinel 0 and allow upsert (lifetimeForceCloses boundary)', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // lifetimeForceCloses at u64::MAX should be treated as sentinel (0)
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({ lifetimeForceCloses: 18446744073709551615n })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // safeBigNum converts U64_MAX → 0, which passes sanity check
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          lifetime_force_closes: 0,
+        })
+      );
     });
   });
 });

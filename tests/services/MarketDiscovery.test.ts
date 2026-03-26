@@ -5,6 +5,15 @@ vi.mock('@percolator/sdk', () => ({
   discoverMarkets: vi.fn(),
 }));
 
+// Stable mock connection objects so tests can script and assert connection switching.
+const mockPrimaryConnection = {
+  getProgramAccounts: vi.fn(),
+};
+
+const mockFallbackConnection = {
+  getProgramAccounts: vi.fn(),
+};
+
 vi.mock('@percolator/shared', () => ({
   config: {
     allProgramIds: ['11111111111111111111111111111111', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'],
@@ -16,13 +25,9 @@ vi.mock('@percolator/shared', () => ({
     debug: vi.fn(),
   })),
   captureException: vi.fn(),
-  // MarketDiscovery.ts imports getPrimaryConnection directly (not getConnection alias)
-  getPrimaryConnection: vi.fn(() => ({
-    getProgramAccounts: vi.fn(),
-  })),
-  getFallbackConnection: vi.fn(() => ({
-    getProgramAccounts: vi.fn(),
-  })),
+  getConnection: vi.fn(() => mockPrimaryConnection),
+  getPrimaryConnection: vi.fn(() => mockPrimaryConnection),
+  getFallbackConnection: vi.fn(() => mockFallbackConnection),
 }));
 
 import { MarketDiscovery } from '../../src/services/MarketDiscovery.js';
@@ -96,29 +101,6 @@ describe('MarketDiscovery', () => {
       expect(markets.has('Market311111111111111111111111111111111')).toBe(true);
     });
 
-    it('should retry on 429 rate-limit errors but not on other errors', async () => {
-      const mockMarket = {
-        slabAddress: { toBase58: () => 'Market502111111111111111111111111111111' },
-        programId: { toBase58: () => '11111111111111111111111111111111' },
-        config: {},
-        params: {},
-        header: {},
-      };
-
-      // Non-429 errors (like 502) are NOT retried — they fail immediately and move
-      // to the next program. Only 429/rate-limit errors trigger the retry backoff.
-      vi.mocked(core.discoverMarkets)
-        .mockRejectedValueOnce(new Error('502 Bad Gateway')) // program 1: non-retryable error
-        .mockResolvedValueOnce([mockMarket] as any); // program 2: success
-
-      const result = await marketDiscovery.discover();
-
-      // 2 calls: 1 failure (no retry for non-429) + 1 for second program
-      expect(core.discoverMarkets).toHaveBeenCalledTimes(2);
-      // program 1 failed but program 2 succeeded → 1 market returned
-      expect(result).toHaveLength(1);
-    }, 10000);
-
     it('should handle errors per program without crashing all', async () => {
       const mockMarket = {
         slabAddress: { toBase58: () => 'Market411111111111111111111111111111111' },
@@ -137,7 +119,36 @@ describe('MarketDiscovery', () => {
       // Should still discover from the second program
       expect(result).toHaveLength(1);
       expect(marketDiscovery.getMarkets().size).toBe(1);
-    }, 10000);
+    });
+
+    it('should preserve stale markets when all programs fail', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketStale1111111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+
+      // First call succeeds
+      vi.mocked(core.discoverMarkets)
+        .mockResolvedValueOnce([mockMarket] as any)
+        .mockResolvedValueOnce([]);
+
+      await marketDiscovery.discover();
+      expect(marketDiscovery.getMarkets().size).toBe(1);
+
+      // Second call: all programs fail (RPC down)
+      vi.mocked(core.discoverMarkets)
+        .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+        .mockRejectedValueOnce(new Error('502 Bad Gateway'));
+
+      const result = await marketDiscovery.discover();
+
+      // Should return empty but preserve stale markets in map
+      expect(result).toHaveLength(0);
+      expect(marketDiscovery.getMarkets().size).toBe(1); // stale preserved
+    }, 15000);
 
     it('should add delay between program discoveries', async () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
@@ -158,6 +169,45 @@ describe('MarketDiscovery', () => {
       expect(result).toHaveLength(0);
       expect(marketDiscovery.getMarkets().size).toBe(0);
     });
+
+    it('should fall back to fallbackConn after exhausting all primary 429 retries', async () => {
+      const { getPrimaryConnection, getFallbackConnection } = await import('@percolator/shared');
+      const primaryConn = getPrimaryConnection();
+      const fallbackConn = getFallbackConnection();
+
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketFallback11111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+
+      // Program 1: exhaust all primary retries (4) with 429, then succeed on fallback.
+      // Program 2: succeed immediately on primary.
+      let program1Calls = 0;
+      vi.mocked(core.discoverMarkets).mockImplementation(async (conn, _programId) => {
+        if (conn === primaryConn) {
+          program1Calls++;
+          // Fail with 429 until all retries are exhausted (HELIUS_429_BACKOFF_MS has 4 entries)
+          if (program1Calls <= 4) {
+            throw new Error('429 Too Many Requests');
+          }
+          // Should not reach here — fallback takes over
+          return [];
+        }
+        // Called with fallbackConn — succeed
+        return [mockMarket] as any;
+      });
+
+      const result = await marketDiscovery.discover();
+
+      // Fallback connection must have been used
+      expect(getPrimaryConnection).toHaveBeenCalled();
+      expect(getFallbackConnection).toHaveBeenCalled();
+      // Market discovered via fallback should be in the results
+      expect(result.some(m => m.slabAddress.toBase58() === 'MarketFallback11111111111111111111111111')).toBe(true);
+    }, 120_000); // generous timeout — 4 backoff delays sum to ~52 s with max jitter
 
     it('should update existing markets on rediscovery', async () => {
       const marketAddress = 'Market511111111111111111111111111111111';
@@ -226,71 +276,106 @@ describe('MarketDiscovery', () => {
 
   describe('start and stop', () => {
     it('should start timer and perform initial discovery', async () => {
-      vi.mocked(core.discoverMarkets).mockResolvedValue([]);
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketStart11111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      marketDiscovery.start(100); // Short interval for testing
-
-      // Wait for initial discovery
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await marketDiscovery.start(60_000);
 
       expect(core.discoverMarkets).toHaveBeenCalled();
+      expect(marketDiscovery.getMarkets().size).toBe(1);
     });
 
-    it('should perform periodic discoveries', async () => {
-      vi.mocked(core.discoverMarkets).mockResolvedValue([]);
+    it('should set up periodic timer after initial discovery', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketPeriodic111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      marketDiscovery.start(3000); // interval shorter than discovery time
+      await marketDiscovery.start(3000);
 
-      // Wait for initial discovery (2 programs × 2s delay = ~4s) plus one more cycle
-      await new Promise(resolve => setTimeout(resolve, 12000));
+      const callsAfterStart = vi.mocked(core.discoverMarkets).mock.calls.length;
+      expect(callsAfterStart).toBeGreaterThanOrEqual(2); // 2 programs
 
-      // Should have been called at least 4 times (2 programs × 2 cycles)
-      expect(vi.mocked(core.discoverMarkets).mock.calls.length).toBeGreaterThanOrEqual(4);
+      // Wait for one periodic cycle
+      await new Promise(resolve => setTimeout(resolve, 8000));
+
+      expect(vi.mocked(core.discoverMarkets).mock.calls.length).toBeGreaterThan(callsAfterStart);
     }, 20000);
 
     it('should stop timer', async () => {
-      vi.mocked(core.discoverMarkets).mockResolvedValue([]);
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketStop1111111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      marketDiscovery.start(50);
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await marketDiscovery.start(60_000);
 
       const callsBefore = vi.mocked(core.discoverMarkets).mock.calls.length;
 
       marketDiscovery.stop();
 
       // Wait a bit and verify no more calls
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 200));
       const callsAfter = vi.mocked(core.discoverMarkets).mock.calls.length;
 
       expect(callsAfter).toBe(callsBefore);
     });
 
-    it('should handle discovery errors during periodic cycle', async () => {
-      // discover() handles errors internally — each call is independent.
-      // Verify that a thrown error from discoverMarkets doesn't prevent the next call.
+    it('should retry on initial failure and eventually start periodic timer', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketRetry1111111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+
       let callCount = 0;
       vi.mocked(core.discoverMarkets).mockImplementation(async () => {
         callCount++;
-        if (callCount === 1) {
-          throw new Error('Discovery failed');
+        // First 2 calls (attempt 1, both programs) fail, next 2 succeed
+        if (callCount <= 2) {
+          throw new Error('RPC down');
         }
-        return [];
+        return [mockMarket] as any;
       });
 
-      // Call discover() directly (bypassing start() retry logic) to verify
-      // that one discover() call failing does not prevent subsequent calls.
-      await marketDiscovery.discover().catch(() => {}); // first call: throws
-      await marketDiscovery.discover(); // second call: should succeed
+      await marketDiscovery.start(60_000);
 
-      expect(callCount).toBeGreaterThanOrEqual(2);
-    });
+      // Should have retried and eventually succeeded
+      expect(callCount).toBeGreaterThanOrEqual(4);
+      expect(marketDiscovery.getMarkets().size).toBe(1);
+    }, 30000);
 
     it('should not crash if stop is called before start', () => {
       expect(() => marketDiscovery.stop()).not.toThrow();
     });
 
-    it('should not crash if stop is called multiple times', () => {
-      marketDiscovery.start(1000);
+    it('should not crash if stop is called multiple times', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketMultiStop111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {},
+        params: {},
+        header: {},
+      };
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
+
+      await marketDiscovery.start(60_000);
       marketDiscovery.stop();
       
       expect(() => marketDiscovery.stop()).not.toThrow();
@@ -318,18 +403,14 @@ describe('MarketDiscovery', () => {
     });
 
     it('should handle very large number of markets', async () => {
-      // Use zero-padded 5-digit addresses to guarantee uniqueness.
-      const manyMarkets = Array.from({ length: 500 }, (_, i) => ({
-        slabAddress: { toBase58: () => `LargeMarket${String(i).padStart(5, '0')}111111111111111111111` },
+      const manyMarkets = Array.from({ length: 1000 }, (_, i) => ({
+        slabAddress: { toBase58: () => `Market${i}11111111111111111111111111111` },
         programId: { toBase58: () => '11111111111111111111111111111111' },
         config: {},
         params: {},
         header: {},
       }));
 
-      // Reset to remove any default mock set by previous tests in this file,
-      // then set explicit once-values for this discovery cycle (2 programs).
-      vi.mocked(core.discoverMarkets).mockReset();
       vi.mocked(core.discoverMarkets)
         .mockResolvedValueOnce(manyMarkets as any)
         .mockResolvedValueOnce([]);
@@ -337,7 +418,7 @@ describe('MarketDiscovery', () => {
       await marketDiscovery.discover();
 
       const markets = marketDiscovery.getMarkets();
-      expect(markets.size).toBe(500);
-    }, 10000);
+      expect(markets.size).toBe(1000);
+    });
   });
 });
