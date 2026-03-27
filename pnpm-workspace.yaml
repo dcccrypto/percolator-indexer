@@ -1,0 +1,7 @@
+onlyBuiltDependencies:
+  - "@percolator/sdk"
+  - "@percolator/shared"
+  - esbuild
+  - bufferutil
+  - utf-8-validate
+  - bigint-buffer
