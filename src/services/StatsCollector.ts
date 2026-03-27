@@ -195,6 +195,57 @@ export class StatsCollector {
   }
 
   /**
+   * GH#1748: Auto-register a single market that's missing from the markets table.
+   * Called when upsertMarketStats hits a FK violation (23503). Uses minimal metadata
+   * from the already-parsed on-chain config/params to avoid a second RPC round-trip.
+   * Skips DAS metadata resolution (uses fallback symbol/name) to keep it fast.
+   */
+  private async autoRegisterMarket(
+    slabAddress: string,
+    marketConfig: MarketConfig,
+    params: RiskParams,
+  ): Promise<void> {
+    const mintAddress = marketConfig.collateralMint.toBase58();
+    const admin = marketConfig.oracleAuthority.toBase58(); // best available deployer proxy
+    const oracleAuthority = marketConfig.oracleAuthority.toBase58();
+    const priceE6 = Number(marketConfig.authorityPriceE6);
+    const initialMarginBps = Number(params.initialMarginBps);
+
+    // Compute max_leverage with safety clamp (same guards as syncMarkets)
+    let maxLeverage = initialMarginBps > 0 ? Math.floor(10000 / initialMarginBps) : 1;
+    if (!Number.isFinite(maxLeverage) || maxLeverage <= 0) maxLeverage = 1;
+
+    // Resolve decimals from on-chain mint
+    let decimals = 6; // safe default for USDC-collateralised markets
+    try {
+      const connection = getConnection();
+      const mintPubkey = new PublicKey(mintAddress);
+      const mintInfo = await connection.getParsedAccountInfo(mintPubkey);
+      if (mintInfo.value?.data && "parsed" in mintInfo.value.data) {
+        decimals = mintInfo.value.data.parsed.info.decimals ?? 6;
+      }
+    } catch {
+      // Non-fatal — use default
+    }
+
+    await insertMarket({
+      slab_address: slabAddress,
+      mint_address: mintAddress,
+      symbol: mintAddress.substring(0, 8),
+      name: `Market ${slabAddress.substring(0, 8)}`,
+      decimals,
+      deployer: admin,
+      oracle_authority: oracleAuthority,
+      initial_price_e6: priceE6,
+      max_leverage: maxLeverage,
+      trading_fee_bps: 10,
+      lp_collateral: null,
+      matcher_context: null,
+      status: "active",
+    });
+  }
+
+  /**
    * Auto-register missing markets: compare on-chain markets vs DB and insert any missing.
    */
   private async syncMarkets(): Promise<void> {
@@ -525,7 +576,7 @@ export class StatsCollector {
 
             // Upsert market stats with ALL RiskEngine fields (migration 010)
             // Note: NUMERIC columns use safeBigNum(), BIGINT columns use safePgBigint()
-            await upsertMarketStats({
+            const statsPayload = {
               slab_address: slabAddress,
               last_price: priceUsd,
               mark_price: priceUsd, // Same as last_price for now (no funding adjustment)
@@ -564,7 +615,32 @@ export class StatsCollector {
               liquidation_fee_cap: params.liquidationFeeCap.toString(),    // TEXT
               liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps), // BIGINT
               updated_at: new Date().toISOString(),
-            });
+            };
+
+            try {
+              await upsertMarketStats(statsPayload);
+            } catch (upsertErr: any) {
+              // GH#1748: FK violation (23503) means slab is not in the markets table.
+              // Auto-register it with minimal metadata, then retry the stats upsert.
+              if (upsertErr?.code === '23503') {
+                logger.warn("FK miss on market_stats upsert — auto-registering missing market", {
+                  slabAddress,
+                });
+                try {
+                  await this.autoRegisterMarket(slabAddress, marketConfig, params);
+                  await upsertMarketStats(statsPayload);
+                  logger.info("Auto-registered market and retried stats upsert successfully", { slabAddress });
+                } catch (regErr) {
+                  logger.warn("Auto-registration or retry failed", {
+                    slabAddress,
+                    error: regErr instanceof Error ? regErr.message : regErr,
+                  });
+                  throw regErr;
+                }
+              } else {
+                throw upsertErr;
+              }
+            }
 
             // Log oracle price to DB (rate-limited per market)
             if (priceE6 > 0n) {
