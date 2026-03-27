@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build-and-test
-    if: github.ref == "refs/heads/main"
+    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build Docker image
