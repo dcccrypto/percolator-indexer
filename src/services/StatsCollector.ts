@@ -349,12 +349,18 @@ export class StatsCollector {
               };
 
               // Sanity check (mirrors collect())
+              // MAX_SANE_VALUE guards instantaneous balances (OI, insurance, vault) against
+              // garbage values produced by wrong slab-tier layout detection (~9.8e34).
+              // MAX_SANE_CUMULATIVE guards cTot separately: it's a running lifetime total
+              // so it grows without bound on active markets (seen at 1.99e13 after 52h) and
+              // must not be capped at the same threshold as point-in-time balances. (GH#1789)
               const MAX_SANE_VALUE = 1e13;
+              const MAX_SANE_CUMULATIVE = 1e18; // lifetime total — unbounded but < u64::MAX garbage
               const MAX_SANE_COUNTER = 1e12;
               const isSaneEngine = (
                 safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
                 safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
-                safeBigNum(engine.cTot) < MAX_SANE_VALUE &&
+                safeBigNum(engine.cTot) < MAX_SANE_CUMULATIVE &&
                 safeBigNum(engine.vault) < MAX_SANE_VALUE &&
                 safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
                 safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
@@ -741,12 +747,16 @@ export class StatsCollector {
             // Max sane value: 1e13 (~$10M USD in micro-USDC). Previously 1e18 which
             // let through corrupt values from wrong slab tier detection (see #491).
             const MAX_SANE_VALUE = 1e13;
+            // cTot is a cumulative lifetime-collateral total — it grows without bound on
+            // active markets (observed at 1.99e13 after 52h of trading). Use a separate
+            // higher threshold so legitimate admin-oracle markets aren't skipped. (GH#1789)
+            const MAX_SANE_CUMULATIVE = 1e18; // still far below u64::MAX garbage (~1.8e19)
             // Max sane counter value: liquidation/force-close counts shouldn't exceed 1e12
             const MAX_SANE_COUNTER = 1e12;
             const isSaneEngine = (
               safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
               safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
-              safeBigNum(engine.cTot) < MAX_SANE_VALUE &&
+              safeBigNum(engine.cTot) < MAX_SANE_CUMULATIVE &&
               safeBigNum(engine.vault) < MAX_SANE_VALUE &&
               safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
               safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
