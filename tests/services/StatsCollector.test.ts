@@ -540,7 +540,7 @@ describe('StatsCollector', () => {
         makeEngineState({
           totalOpenInterest: 2_000_000_000_000n, // 2e12 — fine
           insuranceFund: { balance: 56_640_937_500n, feeRevenue: 0n }, // ~5.7e10 — fine
-          cTot: 19_893_970_198_000n, // 1.99e13 — exceeds old 1e13 cap, should pass new 1e18 cap
+          cTot: 19_893_970_198_000n, // 1.99e13 — exceeds old 1e13 cap, passes 2e18 cumulative cap
           vault: 1_000_000n, // 1e6 — fine
           lifetimeLiquidations: 0n,
           lifetimeForceCloses: 0n,
@@ -561,16 +561,49 @@ describe('StatsCollector', () => {
       );
     });
 
-    it('should skip stats when cTot is garbage (>= 1e18 indicates wrong slab layout) — GH#1789', async () => {
+    // GH#1799: slab 3ZKKwsKoo5UP28cYmMpvGpwoFpWLVgEWLQJCejJnECQn has cTot=1.1e18
+    // (legitimate high-volume market) but was blocked by the 1e18 threshold from GH#1789.
+    // Raised to 2e18 — still 9x below u64::MAX garbage (~1.84e19).
+    it('should allow upsert when cTot is 1.1e18 (slab 3ZKKwsK — high-volume market) — GH#1799', async () => {
       const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
       vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
       mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
 
-      // Garbage cTot from wrong slab-tier detection: 9.8e34 is a typical corrupt value
-      // Use 2e18 as test case — still clearly garbage but avoids u64::MAX sentinel path
       vi.mocked(core.parseEngine).mockReturnValue(
         makeEngineState({
-          cTot: 2_000_000_000_000_000_000n, // 2e18 — above MAX_SANE_CUMULATIVE=1e18
+          totalOpenInterest: 2_000_000_000_000n, // 2e12 — fine
+          insuranceFund: { balance: 56_640_937_500n, feeRevenue: 0n }, // ~5.7e10 — fine
+          cTot: 1_100_012_321_792_688_500n, // 1.1e18 — below new 2e18 cap, should pass
+          vault: 1_000_000n,
+          lifetimeLiquidations: 0n,
+          lifetimeForceCloses: 0n,
+        })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          c_tot: 1_100_012_321_792_688_500,
+        })
+      );
+    });
+
+    it('should skip stats when cTot is garbage (>= 2e18 indicates wrong slab layout) — GH#1799', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Garbage cTot from wrong slab-tier detection: 9.8e34 is a typical corrupt value.
+      // GH#1799: threshold raised to 2e18 to allow slab 3ZKKwsK (cTot=1.1e18).
+      // Use 3e18 as test case — still clearly garbage but avoids u64::MAX sentinel path.
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({
+          cTot: 3_000_000_000_000_000_000n, // 3e18 — above MAX_SANE_CUMULATIVE=2e18
         })
       );
       vi.mocked(core.parseConfig).mockReturnValue(makeConfig());

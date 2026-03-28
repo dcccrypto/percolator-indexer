@@ -354,8 +354,10 @@ export class StatsCollector {
               // MAX_SANE_CUMULATIVE guards cTot separately: it's a running lifetime total
               // so it grows without bound on active markets (seen at 1.99e13 after 52h) and
               // must not be capped at the same threshold as point-in-time balances. (GH#1789)
+              // GH#1799: raised from 1e18 → 2e18 — slab 3ZKKwsK has legitimate cTot=1.1e18.
+              // u64::MAX garbage is ~1.84e19, so 2e18 is still 9x below the noise floor.
               const MAX_SANE_VALUE = 1e13;
-              const MAX_SANE_CUMULATIVE = 1e18; // lifetime total — unbounded but < u64::MAX garbage
+              const MAX_SANE_CUMULATIVE = 2e18; // lifetime total — unbounded but < u64::MAX garbage (~1.84e19)
               const MAX_SANE_COUNTER = 1e12;
               const isSaneEngine = (
                 safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
@@ -750,7 +752,8 @@ export class StatsCollector {
             // cTot is a cumulative lifetime-collateral total — it grows without bound on
             // active markets (observed at 1.99e13 after 52h of trading). Use a separate
             // higher threshold so legitimate admin-oracle markets aren't skipped. (GH#1789)
-            const MAX_SANE_CUMULATIVE = 1e18; // still far below u64::MAX garbage (~1.8e19)
+            // GH#1799: raised from 1e18 → 2e18 — slab 3ZKKwsK has legitimate cTot=1.1e18.
+            const MAX_SANE_CUMULATIVE = 2e18; // still far below u64::MAX garbage (~1.84e19)
             // Max sane counter value: liquidation/force-close counts shouldn't exceed 1e12
             const MAX_SANE_COUNTER = 1e12;
             const isSaneEngine = (
