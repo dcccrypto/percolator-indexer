@@ -357,12 +357,12 @@ export class StatsCollector {
               // GH#1799: raised from 1e18 → 2e18 — slab 3ZKKwsK has legitimate cTot=1.1e18.
               // u64::MAX garbage is ~1.84e19, so 2e18 is still 9x below the noise floor.
               const MAX_SANE_VALUE = 1e13;
-              const MAX_SANE_CUMULATIVE = 2e18; // lifetime total — unbounded but < u64::MAX garbage (~1.84e19)
+              const MAX_SANE_CUMULATIVE = 2_000_000_000_000_000_000n; // bigint literal — avoids Number precision loss above MAX_SAFE_INTEGER (GH#31)
               const MAX_SANE_COUNTER = 1e12;
               const isSaneEngine = (
                 safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
                 safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
-                safeBigNum(engine.cTot) < MAX_SANE_CUMULATIVE &&
+                engine.cTot < MAX_SANE_CUMULATIVE &&
                 safeBigNum(engine.vault) < MAX_SANE_VALUE &&
                 safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
                 safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
@@ -753,13 +753,13 @@ export class StatsCollector {
             // active markets (observed at 1.99e13 after 52h of trading). Use a separate
             // higher threshold so legitimate admin-oracle markets aren't skipped. (GH#1789)
             // GH#1799: raised from 1e18 → 2e18 — slab 3ZKKwsK has legitimate cTot=1.1e18.
-            const MAX_SANE_CUMULATIVE = 2e18; // still far below u64::MAX garbage (~1.84e19)
+            const MAX_SANE_CUMULATIVE = 2_000_000_000_000_000_000n; // bigint literal — avoids Number precision loss above MAX_SAFE_INTEGER (GH#31)
             // Max sane counter value: liquidation/force-close counts shouldn't exceed 1e12
             const MAX_SANE_COUNTER = 1e12;
             const isSaneEngine = (
               safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
               safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
-              safeBigNum(engine.cTot) < MAX_SANE_CUMULATIVE &&
+              engine.cTot < MAX_SANE_CUMULATIVE &&
               safeBigNum(engine.vault) < MAX_SANE_VALUE &&
               safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
               safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
