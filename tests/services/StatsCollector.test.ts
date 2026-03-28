@@ -524,6 +524,63 @@ describe('StatsCollector', () => {
         })
       );
     });
+
+    // GH#1789: admin-oracle markets with cTot just above 1e13 were being skipped
+    // because cTot (cumulative lifetime collateral total) was checked against the same
+    // 1e13 threshold as instantaneous balances (OI, vault, insurance). After 52h of
+    // trading, cTot reached 1.99e13 which is ~20x the 1e13 guard and completely legitimate.
+    it('should allow upsert when cTot exceeds 1e13 (cumulative lifetime total) — GH#1789', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Reproduce the exact values from devops alert: cTot=19893970198000 (~1.99e13)
+      // All point-in-time values are well within 1e13; only cTot is elevated.
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({
+          totalOpenInterest: 2_000_000_000_000n, // 2e12 — fine
+          insuranceFund: { balance: 56_640_937_500n, feeRevenue: 0n }, // ~5.7e10 — fine
+          cTot: 19_893_970_198_000n, // 1.99e13 — exceeds old 1e13 cap, should pass new 1e18 cap
+          vault: 1_000_000n, // 1e6 — fine
+          lifetimeLiquidations: 0n,
+          lifetimeForceCloses: 0n,
+        })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // Must NOT be skipped — upsert should have been called
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          c_tot: 19_893_970_198_000,
+        })
+      );
+    });
+
+    it('should skip stats when cTot is garbage (>= 1e18 indicates wrong slab layout) — GH#1789', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Garbage cTot from wrong slab-tier detection: 9.8e34 is a typical corrupt value
+      // Use 2e18 as test case — still clearly garbage but avoids u64::MAX sentinel path
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({
+          cTot: 2_000_000_000_000_000_000n, // 2e18 — above MAX_SANE_CUMULATIVE=1e18
+        })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(shared.upsertMarketStats).not.toHaveBeenCalled();
+    });
   });
 
   // GH#1748: SKR/SEEKER slab Bk7XfKWs3Sr was silently skipped by syncMarkets when
