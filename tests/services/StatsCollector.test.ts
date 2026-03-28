@@ -525,4 +525,78 @@ describe('StatsCollector', () => {
       );
     });
   });
+
+  // GH#1748: SKR/SEEKER slab Bk7XfKWs3Sr was silently skipped by syncMarkets when
+  // initialMarginBps=0, causing FK violation on market_stats insert (stats never written).
+  // Fix: use default max_leverage=10 instead of skipping; ensure market is registered.
+  describe('GH#1748 — market registration with invalid initialMarginBps', () => {
+    it('should register a market with max_leverage=10 when initialMarginBps=0', async () => {
+      // Slab is NOT in the DB (getMarkets returns empty), is discovered on-chain with initialMarginBps=0
+      vi.mocked(shared.getMarkets).mockResolvedValue([]);
+      const marketWithZeroMargin = {
+        market: {
+          slabAddress: new PublicKey(SLAB1),
+          programId: new PublicKey('11111111111111111111111111111111'),
+          config: {
+            collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
+            oracleAuthority: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
+            authorityPriceE6: 1_500_000n,
+            lastEffectivePriceE6: 1_500_000n,
+            indexFeedId: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
+          },
+          params: { maintenanceMarginBps: 500n, initialMarginBps: 0n }, // zero margin
+          header: { admin: new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL') },
+        },
+      };
+      const markets = new Map([[SLAB1, marketWithZeroMargin]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+      setupParseMocks();
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // insertMarket should have been called with max_leverage=10 (safe default, not skipped)
+      expect(shared.insertMarket).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          max_leverage: 10,
+        })
+      );
+    });
+
+    it('should register a market with max_leverage=10 when initialMarginBps produces invalid leverage', async () => {
+      vi.mocked(shared.getMarkets).mockResolvedValue([]);
+      const marketWithHugeMargin = {
+        market: {
+          slabAddress: new PublicKey(SLAB1),
+          programId: new PublicKey('11111111111111111111111111111111'),
+          config: {
+            collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
+            oracleAuthority: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
+            authorityPriceE6: 1_500_000n,
+            lastEffectivePriceE6: 1_500_000n,
+            indexFeedId: new PublicKey('SysvarC1ock11111111111111111111111111111111'),
+          },
+          params: { maintenanceMarginBps: 500n, initialMarginBps: 99999n }, // produces maxLeverage < 1
+          header: { admin: new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL') },
+        },
+      };
+      const markets = new Map([[SLAB1, marketWithHugeMargin]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+      setupParseMocks();
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // initialMarginBps=99999 → Math.floor(10000/99999)=0 → invalid → should use default 10
+      expect(shared.insertMarket).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          max_leverage: 10,
+        })
+      );
+    });
+  });
 });

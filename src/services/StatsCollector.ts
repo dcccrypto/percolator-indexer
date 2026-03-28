@@ -230,30 +230,37 @@ export class StatsCollector {
           const priceE6 = Number(market.config.authorityPriceE6);
           const initialMarginBps = Number(market.params.initialMarginBps);
 
-          // Guard: skip slabs with invalid/zero initialMarginBps — division by zero
-          // gives Infinity which violates the NOT NULL integer constraint in DB.
-          // These are corrupted/incomplete on-chain accounts; skip gracefully.
+          // Compute maxLeverage from initialMarginBps.
+          // Guard against division-by-zero or garbage values (e.g. uninitialized slab
+          // where initialMarginBps=0). Previously we skipped these slabs entirely, which
+          // caused FK violations on market_stats inserts when the slab was cranked before
+          // being registered in the markets table (GH#1748: SKR slab Bk7XfKWs3Sr).
+          //
+          // Fix: use a safe default of max_leverage=10 (1000bps = 10% initial margin)
+          // instead of skipping, so the market row exists in DB and stats can be written.
+          // This is conservative and prevents the FK miss that stalls stats collection.
+          let maxLeverage: number;
           if (!initialMarginBps || initialMarginBps <= 0 || !Number.isFinite(initialMarginBps)) {
-            logger.warn("Skipping market registration — invalid initialMarginBps (corrupted slab?)", {
+            logger.warn("Invalid initialMarginBps — registering market with default max_leverage=10 (GH#1748)", {
               slabAddress,
               initialMarginBps,
             });
-            continue;
+            maxLeverage = 10;
+          } else {
+            maxLeverage = Math.floor(10000 / initialMarginBps);
           }
-
-          const maxLeverage = Math.floor(10000 / initialMarginBps);
 
           // Guard: ensure computed maxLeverage is a valid positive integer.
           // Math.floor(Infinity) = Infinity, NaN can propagate via type coercion, and
           // JSON serialisation converts Infinity/NaN to null — violating the DB NOT NULL
           // constraint (error code 23502). Slab 7dVewVxW triggers this path.
           if (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || !Number.isInteger(maxLeverage)) {
-            logger.warn("Skipping market registration — computed maxLeverage is invalid", {
+            logger.warn("Computed maxLeverage is invalid — registering with default max_leverage=10 (GH#1748)", {
               slabAddress,
               initialMarginBps,
               maxLeverage,
             });
-            continue;
+            maxLeverage = 10;
           }
           
           // Try to resolve token metadata from on-chain (Helius DAS / Metaplex)
