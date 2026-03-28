@@ -46,6 +46,25 @@ import {
  */
 const VOLUME_SYNC_INTERVAL_MS = 5 * 60_000;
 
+/**
+ * How often to sync full stats (OI, vault, price, insurance) for DB-registered
+ * markets that are NOT in the live MarketDiscovery map.
+ *
+ * "Orphan" markets — typically admin-oracle slabs where the keeper is not the
+ * oracle authority — can fall out of the in-memory discovery map after an
+ * indexer redeploy or RPC hiccup. When they do, StatsCollector.collect() never
+ * processes them and stats_updated_at goes stale indefinitely (GH#1774).
+ *
+ * This sync reads their on-chain slab data directly (same as collect()) and
+ * upserts stats into the DB, keeping them current regardless of whether
+ * MarketDiscovery re-discovers them.
+ *
+ * Runs every 10 minutes — slower than the main cycle because orphan markets
+ * are typically inactive (no positions, no LP), so sub-minute freshness is
+ * not required. Batched at 5 slabs per RPC call to avoid rate limits.
+ */
+const ORPHAN_STATS_SYNC_INTERVAL_MS = 10 * 60_000;
+
 const logger = createLogger("indexer:stats-collector");
 
 /** Market provider interface — allows different market discovery strategies */
@@ -63,9 +82,12 @@ export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
   private volumeInitTimeout: ReturnType<typeof setTimeout> | null = null;
+  private orphanStatsTimer: ReturnType<typeof setInterval> | null = null;
+  private orphanStatsInitTimeout: ReturnType<typeof setTimeout> | null = null;
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  private _syncingOrphanStats = false;
   private lastOracleLogTime = new Map<string, number>();
   private lastFundingLogSlot = new Map<string, number>();
   private lastOiHistoryTime = new Map<string, number>();
@@ -91,7 +113,17 @@ export class StatsCollector {
     this.volumeInitTimeout = setTimeout(() => this.syncVolumeForAllDBMarkets(), 30_000);
     this.volumeTimer = setInterval(() => this.syncVolumeForAllDBMarkets(), VOLUME_SYNC_INTERVAL_MS);
 
-    logger.info("StatsCollector started", { intervalMs: COLLECT_INTERVAL_MS, volumeSyncIntervalMs: VOLUME_SYNC_INTERVAL_MS });
+    // Orphan stats sync — updates OI/vault/price for DB-registered markets not in the
+    // live discovery map (e.g. admin-oracle foreign slabs, GH#1774).
+    // First run after 60s (let discovery complete), then every 10 minutes.
+    this.orphanStatsInitTimeout = setTimeout(() => this.syncStatsForOrphanDBMarkets(), 60_000);
+    this.orphanStatsTimer = setInterval(() => this.syncStatsForOrphanDBMarkets(), ORPHAN_STATS_SYNC_INTERVAL_MS);
+
+    logger.info("StatsCollector started", {
+      intervalMs: COLLECT_INTERVAL_MS,
+      volumeSyncIntervalMs: VOLUME_SYNC_INTERVAL_MS,
+      orphanStatsSyncIntervalMs: ORPHAN_STATS_SYNC_INTERVAL_MS,
+    });
   }
 
   stop(): void {
@@ -107,6 +139,14 @@ export class StatsCollector {
     if (this.volumeInitTimeout) {
       clearTimeout(this.volumeInitTimeout);
       this.volumeInitTimeout = null;
+    }
+    if (this.orphanStatsTimer) {
+      clearInterval(this.orphanStatsTimer);
+      this.orphanStatsTimer = null;
+    }
+    if (this.orphanStatsInitTimeout) {
+      clearTimeout(this.orphanStatsInitTimeout);
+      this.orphanStatsInitTimeout = null;
     }
     logger.info("StatsCollector stopped");
   }
@@ -191,6 +231,201 @@ export class StatsCollector {
       logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
     } finally {
       this._syncingVolume = false;
+    }
+  }
+
+  /**
+   * GH#1774: Sync full stats for DB-registered markets NOT in the live MarketDiscovery map.
+   *
+   * These "orphan" markets are typically admin-oracle slabs where the keeper is not the
+   * oracle authority (foreignOracleSkipped). They can fall out of the in-memory discovery
+   * map after an indexer redeploy or an RPC 429 hiccup that caused a partial discovery
+   * result. When that happens StatsCollector.collect() never processes them and
+   * stats_updated_at becomes permanently stale.
+   *
+   * This method:
+   *   1. Fetches all markets from DB
+   *   2. Computes the set NOT in the live discovery map
+   *   3. For each orphan: fetches on-chain slab data + upserts stats (same logic as collect())
+   *
+   * Runs every 10 minutes. Orphan markets are typically inactive so sub-minute freshness
+   * is not required.
+   */
+  private async syncStatsForOrphanDBMarkets(): Promise<void> {
+    if (this._syncingOrphanStats || !this._running) return;
+    this._syncingOrphanStats = true;
+
+    try {
+      const dbMarkets = await getMarkets();
+      if (!dbMarkets || dbMarkets.length === 0) return;
+
+      const liveSlabs = new Set(this.marketProvider.getMarkets().keys());
+      const orphans = dbMarkets.filter(
+        (m) => !liveSlabs.has(m.slab_address) && !m.indexer_excluded,
+      );
+
+      if (orphans.length === 0) return;
+
+      logger.info("Syncing stats for orphan DB markets", { count: orphans.length });
+
+      const connection = getConnection();
+      let updated = 0;
+      let errors = 0;
+
+      // Process in batches of 5 (same as collect()) to avoid RPC rate limits
+      for (let i = 0; i < orphans.length; i += 5) {
+        const batch = orphans.slice(i, i + 5);
+        const slabPubkeys = batch.map((m) => new PublicKey(m.slab_address));
+
+        try {
+          const accountInfos = await withRetry(
+            () => connection.getMultipleAccountsInfo(slabPubkeys),
+            { maxRetries: 3, baseDelayMs: 1000, label: `orphan-stats-batch-${i / 5 + 1}` },
+          );
+
+          await Promise.all(batch.map(async (dbMarket, batchIdx) => {
+            try {
+              const accountInfo = accountInfos[batchIdx];
+              if (!accountInfo?.data) return;
+
+              const data = new Uint8Array(accountInfo.data);
+
+              let engine: ReturnType<typeof parseEngine>;
+              let marketConfig: ReturnType<typeof parseConfig>;
+              let params: ReturnType<typeof parseParams>;
+              try {
+                engine = parseEngine(data);
+                marketConfig = parseConfig(data);
+                params = parseParams(data);
+              } catch {
+                // Slab too small or unrecognized layout — skip
+                return;
+              }
+
+              // Oracle-mode-aware price resolution (mirrors collect())
+              const zeroKeyBytes = new Uint8Array(32);
+              const isHyperpMode = marketConfig.indexFeedId.equals(new PublicKey(zeroKeyBytes));
+              const isPythPinned = !isHyperpMode && marketConfig.oracleAuthority.equals(new PublicKey(zeroKeyBytes));
+              let priceE6: bigint;
+              if (isPythPinned || isHyperpMode) {
+                priceE6 = marketConfig.lastEffectivePriceE6;
+              } else {
+                priceE6 = marketConfig.authorityPriceE6 > 0n
+                  ? marketConfig.authorityPriceE6
+                  : marketConfig.lastEffectivePriceE6;
+              }
+              const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
+
+              // Dust vault guard (mirrors collect())
+              const MIN_VAULT_FOR_OI = 1_000_000n;
+              const hasDustVault = engine.vault <= MIN_VAULT_FOR_OI;
+              const hasNoAccounts = engine.numUsedAccounts === 0;
+
+              let oiLong = 0n;
+              let oiShort = 0n;
+              if (!hasDustVault && !hasNoAccounts) {
+                try {
+                  const accounts = parseAllAccounts(data);
+                  for (const { account } of accounts) {
+                    if (account.positionSize > 0n) oiLong += account.positionSize;
+                    else if (account.positionSize < 0n) oiShort += -account.positionSize;
+                  }
+                } catch {
+                  oiLong = engine.totalOpenInterest > 0n ? engine.totalOpenInterest / 2n : 0n;
+                  oiShort = oiLong;
+                }
+              }
+
+              const U64_MAX = 18446744073709551615n;
+              const PG_BIGINT_MAX = 9223372036854775807n;
+              const safeBigNum = (v: bigint): number => {
+                if (v >= U64_MAX || v < 0n) return 0;
+                return Number(v);
+              };
+              const safePgBigint = (v: bigint): number => {
+                if (v >= U64_MAX || v < 0n) return 0;
+                if (v > PG_BIGINT_MAX) return Number(PG_BIGINT_MAX);
+                return Number(v);
+              };
+
+              // Sanity check (mirrors collect())
+              const MAX_SANE_VALUE = 1e13;
+              const MAX_SANE_COUNTER = 1e12;
+              const isSaneEngine = (
+                safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
+                safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
+                safeBigNum(engine.cTot) < MAX_SANE_VALUE &&
+                safeBigNum(engine.vault) < MAX_SANE_VALUE &&
+                safeBigNum(engine.lifetimeLiquidations) < MAX_SANE_COUNTER &&
+                safeBigNum(engine.lifetimeForceCloses) < MAX_SANE_COUNTER
+              );
+              if (!isSaneEngine) {
+                logger.warn("Orphan market: insane engine values, skipping", {
+                  slabAddress: dbMarket.slab_address.slice(0, 8),
+                });
+                return;
+              }
+
+              await upsertMarketStats({
+                slab_address: dbMarket.slab_address,
+                last_price: priceUsd,
+                mark_price: priceUsd,
+                index_price: priceUsd,
+                open_interest_long: safeBigNum(oiLong),
+                open_interest_short: safeBigNum(oiShort),
+                insurance_fund: safeBigNum(engine.insuranceFund.balance),
+                total_accounts: engine.numUsedAccounts,
+                funding_rate: Number(engine.fundingRateBpsPerSlotLast),
+                total_open_interest: safeBigNum(oiLong + oiShort),
+                net_lp_pos: engine.netLpPos.toString(),
+                lp_sum_abs: safeBigNum(engine.lpSumAbs),
+                lp_max_abs: safeBigNum(engine.lpMaxAbs),
+                insurance_balance: safeBigNum(engine.insuranceFund.balance),
+                insurance_fee_revenue: safeBigNum(engine.insuranceFund.feeRevenue),
+                warmup_period_slots: safePgBigint(params.warmupPeriodSlots),
+                vault_balance: safeBigNum(engine.vault),
+                lifetime_liquidations: safeBigNum(engine.lifetimeLiquidations),
+                lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses),
+                c_tot: safeBigNum(engine.cTot),
+                pnl_pos_tot: safeBigNum(engine.pnlPosTot),
+                last_crank_slot: safePgBigint(engine.lastCrankSlot),
+                max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots),
+                maintenance_fee_per_slot: params.maintenanceFeePerSlot.toString(),
+                liquidation_fee_bps: safePgBigint(params.liquidationFeeBps),
+                liquidation_fee_cap: params.liquidationFeeCap.toString(),
+                liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps),
+                updated_at: new Date().toISOString(),
+              });
+
+              updated++;
+            } catch (err) {
+              errors++;
+              logger.warn("Orphan stats upsert failed", {
+                slabAddress: dbMarket.slab_address.slice(0, 8),
+                error: err instanceof Error ? err.message : err,
+              });
+            }
+          }));
+        } catch (batchErr) {
+          errors += batch.length;
+          logger.warn("Orphan stats batch fetch failed", {
+            error: batchErr instanceof Error ? batchErr.message : batchErr,
+          });
+        }
+
+        // Small delay between batches to avoid RPC rate limits
+        if (i + 5 < orphans.length) {
+          await new Promise((r) => setTimeout(r, 1_000));
+        }
+      }
+
+      if (updated > 0 || errors > 0) {
+        logger.info("Orphan stats sync complete", { updated, errors, totalOrphans: orphans.length });
+      }
+    } catch (err) {
+      logger.warn("syncStatsForOrphanDBMarkets failed", { error: err instanceof Error ? err.message : err });
+    } finally {
+      this._syncingOrphanStats = false;
     }
   }
 
