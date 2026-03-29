@@ -359,8 +359,12 @@ export class StatsCollector {
               const MAX_SANE_VALUE = 1e13;
               const MAX_SANE_CUMULATIVE = 2_000_000_000_000_000_000n; // bigint literal — avoids Number precision loss above MAX_SAFE_INTEGER (GH#31)
               const MAX_SANE_COUNTER = 1e12;
+              // GH#33: dust-vault / empty markets (cTot=0, vault=1M) have their OI zeroed
+              // by the guard above — the raw engine.totalOpenInterest is not written to DB
+              // and may contain garbage from wrong-tier parsing. Skip the OI sanity component
+              // for these markets so stats still get written (insurance, vault, price etc).
               const isSaneEngine = (
-                safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
+                (hasDustVault || hasNoAccounts || safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE) &&
                 safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
                 engine.cTot < MAX_SANE_CUMULATIVE &&
                 safeBigNum(engine.vault) < MAX_SANE_VALUE &&
@@ -756,8 +760,12 @@ export class StatsCollector {
             const MAX_SANE_CUMULATIVE = 2_000_000_000_000_000_000n; // bigint literal — avoids Number precision loss above MAX_SAFE_INTEGER (GH#31)
             // Max sane counter value: liquidation/force-close counts shouldn't exceed 1e12
             const MAX_SANE_COUNTER = 1e12;
+            // GH#33: dust-vault / empty markets (cTot=0, vault=1M) have their OI zeroed
+            // by the guard above — the raw engine.totalOpenInterest is not written to DB
+            // and may contain garbage from wrong-tier parsing. Skip the OI sanity component
+            // for these markets so stats still get written (insurance, vault, price etc).
             const isSaneEngine = (
-              safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE &&
+              (hasDustVault || hasNoAccounts || safeBigNum(engine.totalOpenInterest) < MAX_SANE_VALUE) &&
               safeBigNum(engine.insuranceFund.balance) < MAX_SANE_VALUE &&
               engine.cTot < MAX_SANE_CUMULATIVE &&
               safeBigNum(engine.vault) < MAX_SANE_VALUE &&
