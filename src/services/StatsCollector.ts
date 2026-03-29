@@ -28,6 +28,7 @@ import {
   getMarkets,
   insertMarket,
   getSupabase,
+  getNetwork,
   withRetry,
   createLogger,
   captureException,
@@ -861,6 +862,7 @@ export class StatsCollector {
                   net_lp_pos: safeBigNum(engine.netLpPos),         // NUMERIC
                   lp_sum_abs: safeBigNum(engine.lpSumAbs),         // NUMERIC
                   lp_max_abs: safeBigNum(engine.lpMaxAbs),         // NUMERIC
+                  network: getNetwork(),                            // PERC-8192: stamp network
                 });
                 // Ignore FK violations (23503) and unique constraint violations (23505)
                 if (oiErr && oiErr.code !== '23503' && oiErr.code !== '23505') {
@@ -884,6 +886,7 @@ export class StatsCollector {
                   slot: safePgBigint(engine.lastCrankSlot),                // BIGINT
                   balance: safeBigNum(engine.insuranceFund.balance),       // NUMERIC
                   fee_revenue: safeBigNum(engine.insuranceFund.feeRevenue), // NUMERIC
+                  network: getNetwork(),                                    // PERC-8192: stamp network
                 });
                 if (insErr && insErr.code !== '23503' && insErr.code !== '23505') {
                   logger.warn("Insurance history log failed", { slabAddress, error: insErr.message, code: insErr.code });
@@ -907,6 +910,7 @@ export class StatsCollector {
                   net_lp_pos: safeBigNum(engine.netLpPos),                     // NUMERIC
                   price_e6: safeBigNum(priceE6),                               // NUMERIC
                   funding_index_qpb_e6: engine.fundingIndexQpbE6.toString(),   // TEXT
+                  network: getNetwork(),                                        // PERC-8192: stamp network
                 });
                 if (fundErr && fundErr.code !== '23503' && fundErr.code !== '23505') {
                   logger.warn("Funding history log failed", { slabAddress, error: fundErr.message, code: fundErr.code });

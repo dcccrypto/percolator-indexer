@@ -1,4 +1,4 @@
-import { getSupabase, config, getConnection, createLogger } from "@percolator/shared";
+import { getSupabase, getNetwork, config, getConnection, createLogger } from "@percolator/shared";
 import { deriveInsuranceLpMint } from "@percolator/sdk";
 import type { DiscoveredMarket } from "@percolator/sdk";
 import { PublicKey } from "@solana/web3.js";
@@ -90,7 +90,7 @@ export class InsuranceLPService {
         const redemptionRateE6 =
           lpSupply > 0 ? Math.floor((insuranceBalance * 1_000_000) / lpSupply) : REDEMPTION_RATE_E6_DEFAULT;
 
-        // Record snapshot
+        // Record snapshot — stamp network to prevent devnet/mainnet mixing (PERC-8192)
         const db = getSupabase();
         await db.from("insurance_snapshots").insert({
           slab,
@@ -98,6 +98,7 @@ export class InsuranceLPService {
           lp_supply: lpSupply,
           redemption_rate_e6: redemptionRateE6,
           snapshot_slot: Number(engine.lastCrankSlot),
+          network: getNetwork(),
         });
 
         // Compute APY from history
@@ -163,6 +164,7 @@ export class InsuranceLPService {
       .from("insurance_lp_events")
       .select("*")
       .eq("slab", slab)
+      .eq("network", getNetwork())
       .order("created_at", { ascending: false })
       .limit(limit);
 
@@ -176,7 +178,8 @@ export class InsuranceLPService {
       .from("insurance_lp_events")
       .select("user_wallet")
       .eq("slab", slab)
-      .eq("event_type", "deposit");
+      .eq("event_type", "deposit")
+      .eq("network", getNetwork());
 
     if (error) throw error;
     if (!data) return 0;
