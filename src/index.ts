@@ -114,9 +114,12 @@ async function start() {
 }
 
 start().catch((err) => {
-  logger.error("Failed to start indexer", { error: err });
+  logger.error("Failed to start indexer — staying alive for healthcheck + retry", {
+    error: err instanceof Error ? err.message : String(err),
+  });
   captureException(err, { tags: { context: "indexer-startup" } });
-  process.exit(1);
+  // Don't exit — keep process alive so Railway healthcheck passes
+  // Discovery will retry on its interval and pick up markets when they exist
 });
 
 async function shutdown(signal: string): Promise<void> {
