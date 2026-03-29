@@ -616,6 +616,51 @@ describe('StatsCollector', () => {
     });
   });
 
+  // GH#33: empty admin-oracle markets (cTot=0, vault=1_000_000) were going stale
+  // because engine.totalOpenInterest (not written to DB for dust-vault markets) could
+  // be a garbage value from wrong-tier parsing that failed the sanity check, causing
+  // the entire stats write to be skipped.
+  describe('GH#33 — dust-vault markets with high raw totalOpenInterest still get stats written', () => {
+    it('should write stats when vault=1_000_000 and raw engine.totalOpenInterest is garbage', async () => {
+      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+
+      // Reproduce exact GH#33 scenario: empty newly-created admin-oracle market.
+      // vault=1_000_000 (creation seed, hits inclusive dust-vault guard ≤ 1_000_000).
+      // engine.totalOpenInterest=9_007_199_254_740_992 (~9e15) — garbage from wrong
+      // slab-tier detection; old guard would reject this and skip the entire upsert.
+      vi.mocked(core.parseEngine).mockReturnValue(
+        makeEngineState({
+          vault: 1_000_000n,
+          numUsedAccounts: 0,
+          totalOpenInterest: 9_007_199_254_740_992n, // ~9e15, exceeds MAX_SANE_VALUE=1e13
+          cTot: 0n,
+          lifetimeLiquidations: 0n,
+          lifetimeForceCloses: 0n,
+        })
+      );
+      vi.mocked(core.parseConfig).mockReturnValue(makeConfig());
+      vi.mocked(core.parseParams).mockReturnValue(makeParams());
+      vi.mocked(core.parseAllAccounts).mockReturnValue([] as any);
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      // Stats MUST be written — OI is zeroed by dust-vault guard, garbage totalOI ignored
+      expect(shared.upsertMarketStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          slab_address: SLAB1,
+          total_open_interest: 0,  // zeroed by dust-vault guard
+          open_interest_long: 0,
+          open_interest_short: 0,
+          vault_balance: 1_000_000, // vault still written for observability
+          c_tot: 0,
+        })
+      );
+    });
+  });
+
   // GH#1748: SKR/SEEKER slab Bk7XfKWs3Sr was silently skipped by syncMarkets when
   // initialMarginBps=0, causing FK violation on market_stats insert (stats never written).
   // Fix: use default max_leverage=10 instead of skipping; ensure market is registered.
