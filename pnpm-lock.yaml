@@ -437,8 +437,8 @@ packages:
     peerDependencies:
       '@opentelemetry/api': ^1.1.0
 
-  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/93c26150bdb7908753b2b65c02de3930f11dda77':
-    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/93c26150bdb7908753b2b65c02de3930f11dda77}
+  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/4678878885490348a63899470e117ed030a2d5db':
+    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/4678878885490348a63899470e117ed030a2d5db}
     version: 0.1.0
 
   '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/b6daec0de445e252bb28eb80891212d7c2a31659':
@@ -1665,7 +1665,7 @@ snapshots:
       '@opentelemetry/api': 1.9.0
       '@opentelemetry/core': 2.5.1(@opentelemetry/api@1.9.0)
 
-  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/93c26150bdb7908753b2b65c02de3930f11dda77(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)':
+  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/4678878885490348a63899470e117ed030a2d5db(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
@@ -1689,7 +1689,7 @@ snapshots:
 
   '@percolator/shared@https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/a265270ec848eb8f869655a92816757f7c442356(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)':
     dependencies:
-      '@percolator/sdk': https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/93c26150bdb7908753b2b65c02de3930f11dda77(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)
+      '@percolator/sdk': https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/4678878885490348a63899470e117ed030a2d5db(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)
       '@sentry/node': 10.40.0
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
       '@supabase/supabase-js': 2.97.0(bufferutil@4.1.0)(utf-8-validate@5.0.10)
