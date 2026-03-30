@@ -50,7 +50,13 @@ export class MarketDiscovery {
         const conn = attempt === HELIUS_429_BACKOFF_MS.length ? fallbackConn : primaryConn;
         const connLabel = conn === fallbackConn ? "fallback" : "primary";
         try {
-          const found = await discoverMarkets(conn, new PublicKey(id));
+          const found = await discoverMarkets(conn, new PublicKey(id), {
+            // PERC-8235: sequential=true to avoid firing all ~14 tier queries in parallel
+            // on startup — parallel burst immediately 429s Helius and locks out discovery.
+            sequential: true,
+            interTierDelayMs: 150,
+            rateLimitBackoffMs: [1_000, 3_000, 9_000, 27_000],
+          });
           all.push(...found);
           discovered = true;
           if (conn === fallbackConn) {

@@ -97,6 +97,23 @@ async function start() {
     throw new Error(`Invalid NODE_ENV: ${process.env.NODE_ENV}. Must be one of: ${validNodeEnvs.join(", ")}`);
   }
 
+  // PERC-8235: Verify Supabase connection before starting services — Railway logs show
+  // vague "Market sync failed" / "Backfill failed" because DB wasn't reachable at startup.
+  try {
+    await getSupabase().from("markets").select("id", { count: "exact", head: true });
+    logger.info("Supabase connectivity verified");
+  } catch (err) {
+    // Log clearly but don't crash — services will retry and the DB monitor will re-alert.
+    logger.error("Supabase connectivity check FAILED at startup — market sync and backfill may fail", {
+      error: err instanceof Error ? err.message : String(err),
+      hint: "Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables",
+    });
+    await sendCriticalAlert("Indexer startup: Supabase connectivity FAILED", [
+      { name: "Error", value: (err instanceof Error ? err.message : String(err)).slice(0, 200), inline: false },
+      { name: "Action", value: "Check SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in Railway env vars", inline: false },
+    ]).catch(() => {});
+  }
+
   await discovery.start();
   statsCollector.start();
   tradeIndexer.start();

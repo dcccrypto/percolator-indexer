@@ -33,7 +33,9 @@ export class HeliusWebhookManager {
       return;
     }
     if (!config.webhookUrl) {
-      logger.warn("No WEBHOOK_URL, skipping webhook registration");
+      // PERC-8235: Log clearly so Railway logs show why webhook is inactive.
+      // Trade indexing will fall back to polling mode (TradeIndexerPolling).
+      logger.warn("WEBHOOK_URL not set — Helius webhook registration skipped. Trade indexer will run in polling-only mode.");
       return;
     }
 
