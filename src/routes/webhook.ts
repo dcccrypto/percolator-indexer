@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout } from "@percolator/sdk";
-import { config, insertTrade, eventBus, decodeBase58, readU128LE, parseTradeSize, createLogger } from "@percolator/shared";
+import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolator/shared";
 
 const logger = createLogger("indexer:webhook");
 
@@ -61,11 +61,15 @@ export function webhookRoutes(): Hono {
     // Process synchronously — Helius has a 15s timeout, and we need to confirm
     // processing before returning 200. If we return early, Helius may retry
     // and we'd get duplicates (insertTrade handles 23505 but still wastes work).
+    // GH#42: Return 500 if persistent DB failures occurred so Helius retries the webhook.
+    // insertTrade is idempotent (unique constraint on tx_signature), so retries are safe.
     try {
       await processTransactions(transactions);
     } catch (err) {
-      logger.error("Webhook processing error", { error: err instanceof Error ? err.message : err });
-      // Still return 200 to prevent Helius retries — we logged the error
+      logger.error("Webhook processing error — returning 500 for Helius retry", {
+        error: err instanceof Error ? err.message : err,
+      });
+      return c.json({ error: "Processing failed, please retry" }, 500);
     }
 
     return c.json({ received: transactions.length }, 200);
@@ -118,15 +122,31 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authBytes, secretBytes);
 }
 
+/** Supabase duplicate constraint — not retriable */
+function isDuplicateError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  // Postgres unique constraint violation code 23505
+  return msg.includes("23505") || msg.toLowerCase().includes("duplicate");
+}
+
 async function processTransactions(transactions: any[]): Promise<void> {
   let indexed = 0;
+  let insertFailures = 0;
 
   for (const tx of transactions) {
     try {
       const trades = extractTradesFromEnhancedTx(tx);
       for (const trade of trades) {
         try {
-          await insertTrade(trade);
+          // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
+          // lose trades. Duplicate constraint (23505) is not retriable — skip immediately.
+          // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
+          await withRetry(() => insertTrade(trade), {
+            maxRetries: 2,
+            baseDelayMs: 100,
+            label: `insertTrade(${trade.tx_signature.slice(0, 12)})`,
+          });
           eventBus.publish("trade.executed", trade.slab_address, {
             signature: trade.tx_signature,
             trader: trade.trader,
@@ -137,8 +157,22 @@ async function processTransactions(transactions: any[]): Promise<void> {
           });
           indexed++;
         } catch (err) {
-          // insertTrade already handles duplicate constraint (23505)
-          logger.warn("Trade insert error", { error: err instanceof Error ? err.message : err });
+          if (isDuplicateError(err)) {
+            // Duplicate insert — expected, not an error
+            logger.debug("Duplicate trade insert skipped", { signature: trade.tx_signature.slice(0, 12) });
+          } else {
+            // All retries exhausted — capture to Sentry so we know this happened
+            insertFailures++;
+            logger.error("Trade insert failed after retries", {
+              signature: trade.tx_signature.slice(0, 12),
+              slabAddress: trade.slab_address.slice(0, 8),
+              error: err instanceof Error ? err.message : err,
+            });
+            captureException(err instanceof Error ? err : new Error(String(err)), {
+              tags: { context: "webhook-insert-failure" },
+              extra: { signature: trade.tx_signature, slabAddress: trade.slab_address },
+            });
+          }
         }
       }
     } catch (err) {
@@ -148,6 +182,11 @@ async function processTransactions(transactions: any[]): Promise<void> {
 
   if (indexed > 0) {
     logger.info("Trades indexed", { count: indexed });
+  }
+
+  // Surface persistent DB failures to the caller so Helius can retry
+  if (insertFailures > 0) {
+    throw new Error(`${insertFailures} trade insert(s) failed after retries`);
   }
 }
 

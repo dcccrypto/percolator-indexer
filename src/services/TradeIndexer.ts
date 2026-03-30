@@ -1,6 +1,6 @@
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolator/sdk";
-import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, readU128LE, parseTradeSize, withRetry, createLogger, captureException, addBreadcrumb } from "@percolator/shared";
+import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolator/shared";
 
 const logger = createLogger("indexer:trade-indexer");
 

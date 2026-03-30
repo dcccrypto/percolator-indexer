@@ -1,4 +1,4 @@
-import { getSupabase, getNetwork, config, getConnection, createLogger } from "@percolator/shared";
+import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolator/shared";
 import { deriveInsuranceLpMint } from "@percolator/sdk";
 import type { DiscoveredMarket } from "@percolator/sdk";
 import { PublicKey } from "@solana/web3.js";
@@ -81,10 +81,31 @@ export class InsuranceLPService {
         
         let lpSupply = 0;
         try {
-          const mintInfo = await connection.getTokenSupply(lpMint);
+          // GH#44: Wrap with retry to survive transient RPC failures.
+          // "Account not found" from Solana returns null value (not an exception),
+          // so lpSupply = 0 is correct for uninitialised LP mints.
+          const mintInfo = await withRetry(
+            () => connection.getTokenSupply(lpMint),
+            { maxRetries: 2, baseDelayMs: 500, label: `getTokenSupply(${slab.slice(0, 8)})` },
+          );
           lpSupply = Number(mintInfo.value.amount);
-        } catch {
-          // LP mint doesn't exist yet — no LPs have deposited. Expected for most devnet markets.
+        } catch (err) {
+          // After retries: could be "invalid param" (mint not yet created) or a persistent RPC issue.
+          // Don't write a snapshot with lpSupply=0 if this is a retriable RPC error — skip instead.
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const isAccountNotFound = errMsg.includes("Invalid param") || errMsg.includes("could not find account");
+          if (!isAccountNotFound) {
+            logger.warn("getTokenSupply failed after retries — skipping snapshot", {
+              slab: slab.slice(0, 8),
+              error: errMsg,
+            });
+            captureException(err instanceof Error ? err : new Error(errMsg), {
+              tags: { context: "insurance-lp-token-supply" },
+              extra: { slab },
+            });
+            continue;
+          }
+          // Account not found = LP mint not yet created — expected for new markets, lpSupply = 0 is correct
         }
 
         const redemptionRateE6 =
