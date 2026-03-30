@@ -97,6 +97,26 @@ async function start() {
     throw new Error(`Invalid NODE_ENV: ${process.env.NODE_ENV}. Must be one of: ${validNodeEnvs.join(", ")}`);
   }
 
+  // PERC-8235: Verify Supabase connectivity at startup — surface DB issues early
+  // instead of letting every sync operation fail silently with "Market sync failed".
+  try {
+    const { data, error } = await getSupabase().from("markets").select("slab_address").limit(1);
+    if (error) {
+      logger.error("Supabase connection test FAILED — DB operations will fail", {
+        error: error.message,
+        code: error.code,
+        hint: error.hint,
+        details: error.details,
+      });
+    } else {
+      logger.info("Supabase connection test passed", { rowCount: data?.length ?? 0 });
+    }
+  } catch (dbErr) {
+    logger.error("Supabase connection test threw — check DATABASE_URL / SUPABASE_URL", {
+      error: dbErr instanceof Error ? dbErr.message : String(dbErr),
+    });
+  }
+
   await discovery.start();
   statsCollector.start();
   tradeIndexer.start();
