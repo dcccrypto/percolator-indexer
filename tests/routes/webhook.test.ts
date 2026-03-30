@@ -41,6 +41,10 @@ vi.mock('@percolator/shared', () => ({
     side: 'long' as const,
   })),
   readU128LE: vi.fn(() => 0n),
+  // GH#42: withRetry added in PERC-8265 — pass-through so insertTrade mock is called directly
+  withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  // captureException: no-op in tests
+  captureException: vi.fn(),
 }));
 
 import * as shared from '@percolator/shared';
@@ -271,7 +275,10 @@ describe('POST /webhook/trades — price extraction', () => {
     expect(prices).toContain(2.0);
   });
 
-  it('returns 200 even when insertTrade throws', async () => {
+  it('returns 500 when insertTrade throws (non-duplicate) — GH#42: Helius retry', async () => {
+    // GH#42: PERC-8265 changed behavior — insertTrade failures now propagate as 500
+    // so Helius will retry the webhook. insertTrade is idempotent (unique constraint),
+    // so retries are safe. withRetry mock passes through, insertTrade throws → 500.
     vi.mocked(shared.insertTrade).mockRejectedValueOnce(new Error('DB error'));
     const tx = {
       signature: SIG,
@@ -281,7 +288,7 @@ describe('POST /webhook/trades — price extraction', () => {
       logs: ['Program log: 1500000, 2000000, 3000000, 4000000, 5000000'],
     };
     const res = await app.fetch(makeRequest([tx]));
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(500);
   });
 
   it('indexes TradeCpiV2 (tag=35, 22-byte layout) — GH#1171 regression', async () => {
