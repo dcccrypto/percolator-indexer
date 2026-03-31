@@ -575,6 +575,7 @@ export class StatsCollector {
             trading_fee_bps: 10,
             lp_collateral: null,
             matcher_context: null,
+            status: "active",
           });
 
           logger.info("Market registered", { slabAddress, symbol, name });
