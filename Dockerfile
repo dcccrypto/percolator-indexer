@@ -1,5 +1,6 @@
 # Builder stage — rebuilt 20260401-0808
 FROM node:22-alpine AS builder
+RUN apk add --no-cache python3 make g++ && rm -rf /var/cache/apk/*
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
 ADD vendor.tar.gz .
