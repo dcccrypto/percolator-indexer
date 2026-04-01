@@ -600,7 +600,12 @@ export class StatsCollector {
       await this.syncMarkets();
 
       const markets = this.marketProvider.getMarkets();
-      if (markets.size === 0) return;
+      if (markets.size === 0) {
+        logger.warn("StatsCollector.collect: marketProvider has 0 markets, skipping");
+        return;
+      }
+
+      logger.info("StatsCollector.collect started", { marketCount: markets.size });
 
       // GH#1218: load indexer_excluded flags from DB to skip corrupt slabs.
       // These are slabs where on-chain state is permanently corrupt and re-syncing
@@ -925,13 +930,13 @@ export class StatsCollector {
               updated++;
             } catch (err) {
               errors++;
-              console.warn(`[StatsCollector] Failed for ${slabAddress}:`, err instanceof Error ? err.message : err);
+              logger.warn("StatsCollector: market update failed", { slabAddress: slabAddress.slice(0, 12), error: err instanceof Error ? err.message : err });
             }
           }));
         } catch (batchErr) {
           // If batch fetch fails, log all markets in batch as errors
           errors += batch.length;
-          console.error(`[StatsCollector] Batch fetch failed:`, batchErr instanceof Error ? batchErr.message : batchErr);
+          logger.error("StatsCollector: batch RPC fetch failed", { error: batchErr instanceof Error ? batchErr.message : batchErr });
         }
 
         // Small delay between batches
@@ -940,18 +945,16 @@ export class StatsCollector {
         }
       }
 
-      if (updated > 0 || errors > 0) {
-        console.log(`[StatsCollector] Updated ${updated}/${markets.size} markets (${errors} errors)`);
-        if (errors > 0) {
-          addBreadcrumb("StatsCollector completed with errors", {
-            updated,
-            errors,
-            totalMarkets: markets.size,
-          });
-        }
+      logger.info("StatsCollector.collect complete", { updated, errors, totalMarkets: markets.size });
+      if (errors > 0) {
+        addBreadcrumb("StatsCollector completed with errors", {
+          updated,
+          errors,
+          totalMarkets: markets.size,
+        });
       }
     } catch (err) {
-      console.error("[StatsCollector] Collection failed:", err);
+      logger.error("StatsCollector.collect failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
       captureException(err, {
         tags: { context: "stats-collector-error" },
         extra: {
