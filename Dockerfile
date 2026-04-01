@@ -1,8 +1,8 @@
-# Builder stage — cache bust 20260401T0803
+# Builder stage — rebuilt 20260401-0808
 FROM node:22-alpine AS builder
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
-COPY vendor ./vendor
+ADD vendor.tar.gz .
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN ls -la vendor/percolator-sdk/ && pnpm install --frozen-lockfile
 COPY tsconfig.json ./
