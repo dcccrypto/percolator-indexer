@@ -5,6 +5,9 @@ import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry,
 
 const logger = createLogger("indexer:webhook");
 
+/** Context key: raw body bytes only after HMAC/static-token verification (defense in depth). */
+type WebhookVariables = { verifiedWebhookBody: Buffer };
+
 const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
 const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -24,10 +27,20 @@ if (!config.webhookSecret) {
   }
 }
 
-export function webhookRoutes(): Hono {
-  const app = new Hono();
+export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
+  const app = new Hono<{ Variables: WebhookVariables }>();
 
-  app.post("/webhook/trades", async (c) => {
+  /**
+   * Auth gate for `/webhook/trades`: read body once, verify signature, stash bytes for the POST handler.
+   * New routes on this app that mutate data must either use this middleware or a dedicated verifier —
+   * never call `insertTrade` from an HTTP handler that skips this layer.
+   */
+  app.use("/webhook/trades", async (c, next) => {
+    if (c.req.method !== "POST") {
+      c.header("Allow", "POST");
+      return c.json({ error: "Method not allowed" }, 405);
+    }
+
     // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
     let rawBody: Buffer;
     try {
@@ -47,6 +60,17 @@ export function webhookRoutes(): Hono {
     if (!verifyWebhookSignature(rawBody, authHeader, config.webhookSecret, hmacHeader || undefined)) {
       logger.warn("Webhook signature verification failed", { hasHeader: !!authHeader, hasHmac: !!hmacHeader });
       return c.json({ error: "Unauthorized" }, 401);
+    }
+
+    c.set("verifiedWebhookBody", rawBody);
+    return next();
+  });
+
+  app.post("/webhook/trades", async (c) => {
+    const rawBody = c.get("verifiedWebhookBody");
+    if (!rawBody) {
+      logger.error("POST /webhook/trades reached without verified body — check middleware order");
+      return c.json({ error: "Internal server error" }, 500);
     }
 
     // Parse body from the already-read buffer (avoids consuming the stream twice).

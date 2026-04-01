@@ -25,6 +25,8 @@ const webhookManager = new HeliusWebhookManager();
 const app = new Hono();
 
 // Health endpoint with connectivity checks
+// HTTP write path for trades: only POST /webhook/trades (mounted below), after signature verification
+// in routes/webhook.ts. Backup indexing uses TradeIndexerPolling (RPC), not this server.
 app.get("/health", async (c) => {
   const checks: { db: boolean; rpc: boolean } = { db: false, rpc: false };
   let status: "ok" | "degraded" | "down" = "ok";

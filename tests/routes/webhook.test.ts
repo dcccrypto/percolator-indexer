@@ -353,6 +353,27 @@ describe('POST /webhook/trades — price extraction', () => {
     const res = await app.fetch(req);
     expect(res.status).toBe(401);
   });
+
+  it('returns 405 for GET /webhook/trades — no trade processing without POST + verified body', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/webhook/trades', { method: 'GET', headers: { authorization: TEST_WEBHOOK_SECRET } }),
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get('Allow')).toBe('POST');
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('returns 405 for PUT /webhook/trades even with valid auth body', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/webhook/trades', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', authorization: TEST_WEBHOOK_SECRET },
+        body: JSON.stringify([]),
+      }),
+    );
+    expect(res.status).toBe(405);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
