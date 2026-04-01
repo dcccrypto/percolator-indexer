@@ -16,7 +16,6 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/vendor ./vendor
-RUN corepack enable && corepack prepare pnpm@10 --activate && pnpm prune --prod && corepack disable
 RUN chown -R node:node /app
 USER node
 ENV NODE_ENV=production
