@@ -59,7 +59,7 @@ export class HeliusWebhookManager {
   }
 
   async stop(): Promise<void> {
-    // Don't delete webhook on shutdown — it persists across deploys
+    // Don't delete webhook on shutdown â it persists across deploys
     this.webhookId = null;
   }
 
@@ -78,9 +78,9 @@ export class HeliusWebhookManager {
   async listWebhooks(): Promise<any[] | null> {
     if (!config.heliusApiKey) return null;
     try {
-      const res = await fetch(`${getHeliusWebhooksUrl()}?api-key=${config.heliusApiKey}`, {
+      const res = await fetch(getHeliusWebhooksUrl(), {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers: heliusHeaders(),
       });
       if (!res.ok) return null;
       return await res.json();
@@ -103,18 +103,18 @@ export class HeliusWebhookManager {
   }
 
   private async findExistingWebhook(): Promise<any | null> {
-    const url = `${getHeliusWebhooksUrl()}?api-key=${config.heliusApiKey}`;
-    logger.debug("Fetching Helius API", { url: url.replace(config.heliusApiKey, "***") });
+    const url = getHeliusWebhooksUrl();
+    logger.debug("Fetching Helius API", { url });
     let res: Response;
     try {
       res = await fetch(url, {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers: heliusHeaders(),
       });
     } catch (fetchErr) {
       const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
       const cause = fetchErr instanceof Error && fetchErr.cause instanceof Error ? fetchErr.cause : undefined;
-      logger.error("Fetch to api.helius.dev failed", { message: msg, cause: cause?.message });
+      logger.error("Fetch to Helius API failed", { message: msg, cause: cause?.message });
       return null;
     }
 
@@ -132,9 +132,9 @@ export class HeliusWebhookManager {
   }
 
   private async createWebhook(): Promise<string> {
-    const res = await fetch(`${getHeliusWebhooksUrl()}?api-key=${config.heliusApiKey}`, {
+    const res = await fetch(getHeliusWebhooksUrl(), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: heliusHeaders(),
       body: JSON.stringify(this.webhookPayload),
     });
 
@@ -148,9 +148,9 @@ export class HeliusWebhookManager {
   }
 
   private async updateWebhook(webhookId: string): Promise<void> {
-    const res = await fetch(`${getHeliusWebhooksUrl()}/${webhookId}?api-key=${config.heliusApiKey}`, {
+    const res = await fetch(`${getHeliusWebhooksUrl()}/${webhookId}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: heliusHeaders(),
       body: JSON.stringify(this.webhookPayload),
     });
 
