@@ -409,6 +409,10 @@ describe('verifyWebhookSignature — unit tests', () => {
     expect(verifyWebhookSignature(BODY, 'totally-wrong', SECRET, validHmac)).toBe(true);
   });
 
+  it('rejects when HMAC header is present but wrong even if Authorization matches secret', () => {
+    expect(verifyWebhookSignature(BODY, SECRET, SECRET, 'deadbeef'.repeat(8))).toBe(false);
+  });
+
   it('HMAC verifies body integrity — fails when body is different from what was signed', () => {
     const signedOverDifferentBody = nodeCrypto.createHmac('sha256', SECRET).update('tampered').digest('hex');
     expect(verifyWebhookSignature(BODY, '', SECRET, signedOverDifferentBody)).toBe(false);
@@ -447,6 +451,22 @@ describe('POST /webhook/trades — HMAC-SHA256 mode (PERC-750)', () => {
     });
     const res = await app.fetch(req);
     expect(res.status).toBe(401);
+  });
+
+  it('rejects wrong HMAC even when Authorization matches secret (no downgrade to static token)', async () => {
+    const raw = JSON.stringify([]);
+    const req = new Request('http://localhost/webhook/trades', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        authorization: TEST_WEBHOOK_SECRET,
+        'x-helius-hmac-sha256': 'badhash'.padEnd(64, '0'),
+      },
+      body: raw,
+    });
+    const res = await app.fetch(req);
+    expect(res.status).toBe(401);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
   });
 
   it('rejects a tampered body even when HMAC was computed over original body', async () => {
