@@ -92,7 +92,13 @@ app.get("/health", async (c) => {
 
 app.route("/", webhookRoutes());
 
-const port = Number(process.env.INDEXER_PORT ?? 3002);
+// SEC: Validate and sanitize port number at startup to prevent binding to
+// unexpected ports or crashing on NaN.
+const rawPort = Number(process.env.INDEXER_PORT ?? 3002);
+const port = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 3002;
+if (port !== rawPort) {
+  logger.warn("Invalid INDEXER_PORT, falling back to default", { raw: process.env.INDEXER_PORT, fallback: port });
+}
 
 // DB connection monitoring
 let dbConnectionLost = false;
@@ -123,6 +129,34 @@ async function start() {
       validOptions: validNodeEnvs.join(", ")
     });
     throw new Error(`Invalid NODE_ENV: ${process.env.NODE_ENV}. Must be one of: ${validNodeEnvs.join(", ")}`);
+  }
+
+  // SEC: Validate WEBHOOK_URL to prevent webhook hijacking via misconfigured env var.
+  if (config.webhookUrl) {
+    try {
+      const parsed = new URL(config.webhookUrl);
+      if (parsed.protocol !== "https:") {
+        logger.warn("WEBHOOK_URL uses non-HTTPS protocol — trades will be sent over insecure connection", {
+          protocol: parsed.protocol,
+        });
+      }
+    } catch {
+      logger.error("WEBHOOK_URL is not a valid URL — webhook registration will fail", {
+        webhookUrl: config.webhookUrl?.slice(0, 50),
+      });
+    }
+  }
+
+  // SEC: Validate SOLANA_RPC_URL to ensure it's a valid HTTPS endpoint.
+  if (config.rpcUrl) {
+    try {
+      const parsed = new URL(config.rpcUrl);
+      if (parsed.protocol !== "https:") {
+        logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol — RPC calls will be unencrypted");
+      }
+    } catch {
+      logger.error("SOLANA_RPC_URL is not a valid URL — RPC calls will fail");
+    }
   }
 
   // PERC-8235: Verify Supabase connectivity at startup â surface DB issues early
