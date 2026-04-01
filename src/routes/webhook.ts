@@ -17,10 +17,10 @@ const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 if (!config.webhookSecret) {
   if (IS_PRODUCTION) {
-    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production — webhook auth would be bypassed");
+    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production â webhook auth would be bypassed");
     process.exit(1);
   } else {
-    logger.warn("HELIUS_WEBHOOK_SECRET not set — webhook auth disabled (dev only)");
+    logger.warn("HELIUS_WEBHOOK_SECRET not set â webhook auth disabled (dev only)");
   }
 }
 
@@ -28,24 +28,42 @@ export function webhookRoutes(): Hono {
   const app = new Hono();
 
   app.post("/webhook/trades", async (c) => {
-    // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
+    // SEC: Capture request metadata for audit logging. This provides a forensic
+    // trail for investigating suspicious webhook activity (replay attacks, auth
+    // probing, payload manipulation). No secrets are logged.
+    const requestMeta = {
+      contentLength: c.req.header("content-length"),
+      contentType: c.req.header("content-type"),
+      userAgent: c.req.header("user-agent"),
+      hasAuth: !!c.req.header("authorization"),
+      hasHmac: !!c.req.header("x-helius-hmac-sha256"),
+    };
+
+    // PERC-750: Read raw body first â required for HMAC-SHA256 body signature verification.
     let rawBody: Buffer;
     try {
       rawBody = Buffer.from(await c.req.arrayBuffer());
     } catch {
+      logger.warn("Webhook request failed: could not read body", requestMeta);
       return c.json({ error: "Failed to read request body" }, 400);
     }
 
-    // PERC-1063 / PERC-750: Fail-closed — 503 if secret not configured, 401 if verification fails.
+    // PERC-1063 / PERC-750: Fail-closed â 503 if secret not configured, 401 if verification fails.
     if (!config.webhookSecret) {
-      logger.error("Webhook request rejected: HELIUS_WEBHOOK_SECRET not configured");
+      logger.error("Webhook request rejected: HELIUS_WEBHOOK_SECRET not configured", requestMeta);
       return c.json({ error: "Webhook auth not configured" }, 503);
     }
 
     const authHeader = c.req.header("authorization") ?? "";
     const hmacHeader = c.req.header("x-helius-hmac-sha256") ?? "";
     if (!verifyWebhookSignature(rawBody, authHeader, config.webhookSecret, hmacHeader || undefined)) {
-      logger.warn("Webhook signature verification failed", { hasHeader: !!authHeader, hasHmac: !!hmacHeader });
+      // SEC: Log failed auth attempts with request metadata for intrusion detection.
+      // Do NOT log the auth header value itself \u2014 it could be a valid secret from a
+      // misconfigured client.
+      logger.warn("Webhook signature verification failed", {
+        ...requestMeta,
+        bodyLength: rawBody.length,
+      });
       return c.json({ error: "Unauthorized" }, 401);
     }
 
@@ -55,10 +73,18 @@ export function webhookRoutes(): Hono {
       const parsed = JSON.parse(rawBody.toString("utf-8"));
       transactions = Array.isArray(parsed) ? parsed : [parsed];
     } catch {
+      logger.warn("Webhook request failed: invalid JSON", { ...requestMeta, bodyLength: rawBody.length });
       return c.json({ error: "Invalid JSON" }, 400);
     }
 
-    // Process synchronously — Helius has a 15s timeout, and we need to confirm
+    // SEC: Log successful webhook receipt for audit trail
+    logger.info("Webhook received", {
+      transactionCount: transactions.length,
+      bodyLength: rawBody.length,
+      ...requestMeta,
+    });
+
+    // Process synchronously â Helius has a 15s timeout, and we need to confirm
     // processing before returning 200. If we return early, Helius may retry
     // and we'd get duplicates (insertTrade handles 23505 but still wastes work).
     // GH#42: Return 500 if persistent DB failures occurred so Helius retries the webhook.
@@ -66,8 +92,9 @@ export function webhookRoutes(): Hono {
     try {
       await processTransactions(transactions);
     } catch (err) {
-      logger.error("Webhook processing error — returning 500 for Helius retry", {
+      logger.error("Webhook processing error â returning 500 for Helius retry", {
         error: err instanceof Error ? err.message : err,
+        transactionCount: transactions.length,
       });
       return c.json({ error: "Processing failed, please retry" }, 500);
     }
@@ -83,7 +110,7 @@ export function webhookRoutes(): Hono {
  *
  * Supports two modes, checked in priority order:
  *
- * 1. **HMAC-SHA256 body signature** (preferred — body-bound, prevents payload tampering):
+ * 1. **HMAC-SHA256 body signature** (preferred â body-bound, prevents payload tampering):
  *    The `x-helius-hmac-sha256` header contains hex(HMAC-SHA256(rawBody, secret)).
  *    Used when Helius or an intermediary proxy signs the payload.
  *
@@ -114,7 +141,7 @@ export function verifyWebhookSignature(
     return timingSafeEqual(hmacBytes, expectedBytes);
   }
 
-  // Mode 2: Static token — timing-safe comparison (current Helius authHeader behavior).
+  // Mode 2: Static token â timing-safe comparison (current Helius authHeader behavior).
   if (!authHeader) return false;
   const authBytes = Buffer.from(authHeader, "utf8");
   const secretBytes = Buffer.from(secret, "utf8");
@@ -122,7 +149,7 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authBytes, secretBytes);
 }
 
-/** Supabase duplicate constraint — not retriable */
+/** Supabase duplicate constraint â not retriable */
 function isDuplicateError(err: unknown): boolean {
   if (!err) return false;
   const msg = err instanceof Error ? err.message : String(err);
@@ -140,7 +167,7 @@ async function processTransactions(transactions: any[]): Promise<void> {
       for (const trade of trades) {
         try {
           // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
-          // lose trades. Duplicate constraint (23505) is not retriable — skip immediately.
+          // lose trades. Duplicate constraint (23505) is not retriable â skip immediately.
           // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
           await withRetry(() => insertTrade(trade), {
             maxRetries: 2,
@@ -158,10 +185,10 @@ async function processTransactions(transactions: any[]): Promise<void> {
           indexed++;
         } catch (err) {
           if (isDuplicateError(err)) {
-            // Duplicate insert — expected, not an error
+            // Duplicate insert â expected, not an error
             logger.debug("Duplicate trade insert skipped", { signature: trade.tx_signature.slice(0, 12) });
           } else {
-            // All retries exhausted — capture to Sentry so we know this happened
+            // All retries exhausted â capture to Sentry so we know this happened
             insertFailures++;
             logger.error("Trade insert failed after retries", {
               signature: trade.tx_signature.slice(0, 12),
@@ -219,7 +246,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     if (!TRADE_TAGS.has(tag)) continue;
 
     // Parse: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16)
-    // TradeCpiV2 adds an extra bump(u8) at byte 21 — same size offset, different total length (22 vs 21)
+    // TradeCpiV2 adds an extra bump(u8) at byte 21 â same size offset, different total length (22 vs 21)
     const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
 
     // Account layout (from core/abi/accounts.ts):
@@ -302,7 +329,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
  * 1. Read mark_price_e6 from the slab account's post-state data (Helius
  *    enhanced txs include `accountData` with base64-encoded post-state).
  * 2. Parse program logs for comma-separated numeric values and pick the
- *    first value in a plausible price_e6 range ($0.001–$1M).
+ *    first value in a plausible price_e6 range ($0.001â$1M).
  * 3. Return 0 if neither strategy yields a result.
  */
 function extractPrice(tx: any, slabAddress: string): number {
@@ -352,7 +379,7 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
 
 /**
  * Parse program logs for comma-separated numeric values (hex or decimal).
- * Matches 2–8 comma-separated values on a single "Program log:" line.
+ * Matches 2â8 comma-separated values on a single "Program log:" line.
  */
 function extractPriceFromLogs(tx: any): number {
   const logs: string[] = tx.logs ?? tx.logMessages ?? [];
