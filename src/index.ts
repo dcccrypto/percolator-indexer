@@ -104,18 +104,16 @@ async function start() {
   }
 
   // SEC: Validate WEBHOOK_URL to prevent webhook hijacking via misconfigured env var.
-  // An attacker who controls WEBHOOK_URL could redirect Helius to send transactions
-  // to their server, causing data loss (we never receive the trades).
   if (config.webhookUrl) {
     try {
       const parsed = new URL(config.webhookUrl);
       if (parsed.protocol !== "https:") {
-        logger.warn("WEBHOOK_URL uses non-HTTPS protocol — trades will be sent over insecure connection", {
+        logger.warn("WEBHOOK_URL uses non-HTTPS protocol \u2014 trades will be sent over insecure connection", {
           protocol: parsed.protocol,
         });
       }
     } catch {
-      logger.error("WEBHOOK_URL is not a valid URL — webhook registration will fail", {
+      logger.error("WEBHOOK_URL is not a valid URL \u2014 webhook registration will fail", {
         webhookUrl: config.webhookUrl?.slice(0, 50),
       });
     }
@@ -126,19 +124,49 @@ async function start() {
     try {
       const parsed = new URL(config.rpcUrl);
       if (parsed.protocol !== "https:") {
-        logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol — RPC calls will be unencrypted");
+        logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol \u2014 RPC calls will be unencrypted");
       }
     } catch {
-      logger.error("SOLANA_RPC_URL is not a valid URL — RPC calls will fail");
+      logger.error("SOLANA_RPC_URL is not a valid URL \u2014 RPC calls will fail");
     }
   }
 
-  // PERC-8235: Verify Supabase connectivity at startup â surface DB issues early
+  // SEC: Validate WEBHOOK_URL to prevent webhook hijacking via misconfigured env var.
+  // An attacker who controls WEBHOOK_URL could redirect Helius to send transactions
+  // to their server, causing data loss (we never receive the trades).
+  if (config.webhookUrl) {
+    try {
+      const parsed = new URL(config.webhookUrl);
+      if (parsed.protocol !== "https:") {
+        logger.warn("WEBHOOK_URL uses non-HTTPS protocol â trades will be sent over insecure connection", {
+          protocol: parsed.protocol,
+        });
+      }
+    } catch {
+      logger.error("WEBHOOK_URL is not a valid URL â webhook registration will fail", {
+        webhookUrl: config.webhookUrl?.slice(0, 50),
+      });
+    }
+  }
+
+  // SEC: Validate SOLANA_RPC_URL to ensure it's a valid HTTPS endpoint.
+  if (config.rpcUrl) {
+    try {
+      const parsed = new URL(config.rpcUrl);
+      if (parsed.protocol !== "https:") {
+        logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol â RPC calls will be unencrypted");
+      }
+    } catch {
+      logger.error("SOLANA_RPC_URL is not a valid URL â RPC calls will fail");
+    }
+  }
+
+  // PERC-8235: Verify Supabase connectivity at startup Ã¢ÂÂ surface DB issues early
   // instead of letting every sync operation fail silently with "Market sync failed".
   try {
     const { data, error } = await getSupabase().from("markets").select("slab_address").limit(1);
     if (error) {
-      logger.error("Supabase connection test FAILED â DB operations will fail", {
+      logger.error("Supabase connection test FAILED Ã¢ÂÂ DB operations will fail", {
         error: error.message,
         code: error.code,
         hint: error.hint,
@@ -148,7 +176,7 @@ async function start() {
       logger.info("Supabase connection test passed", { rowCount: data?.length ?? 0 });
     }
   } catch (dbErr) {
-    logger.error("Supabase connection test threw â check DATABASE_URL / SUPABASE_URL", {
+    logger.error("Supabase connection test threw Ã¢ÂÂ check DATABASE_URL / SUPABASE_URL", {
       error: dbErr instanceof Error ? dbErr.message : String(dbErr),
     });
   }
@@ -170,11 +198,11 @@ async function start() {
 }
 
 start().catch((err) => {
-  logger.error("Failed to start indexer â staying alive for healthcheck + retry", {
+  logger.error("Failed to start indexer Ã¢ÂÂ staying alive for healthcheck + retry", {
     error: err instanceof Error ? err.message : String(err),
   });
   captureException(err, { tags: { context: "indexer-startup" } });
-  // Don't exit â keep process alive so Railway healthcheck passes
+  // Don't exit Ã¢ÂÂ keep process alive so Railway healthcheck passes
   // Discovery will retry on its interval and pick up markets when they exist
 });
 
