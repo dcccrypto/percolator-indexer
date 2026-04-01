@@ -9,7 +9,11 @@ const logger = createLogger("indexer:webhook-manager");
 function getHeliusWebhooksUrl(): string {
   const isDevnet = config.rpcUrl.includes("devnet");
   const host = isDevnet ? "api-devnet.helius-rpc.com" : "api-mainnet.helius-rpc.com";
-  return `https://${host}/v0/webhooks`;
+  return `https://${host}/v0/webhooks?api-key=${config.heliusApiKey}`;
+}
+
+function heliusHeaders(): Record<string, string> {
+  return { "Content-Type": "application/json" };
 }
 
 /**
