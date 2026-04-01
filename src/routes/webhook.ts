@@ -13,6 +13,26 @@ const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 /**
+ * Maximum allowed webhook request body size (10 MB).
+ *
+ * Helius enhanced transaction payloads are typically 10–50 KB per transaction.
+ * Even a batch of 100 transactions rarely exceeds 5 MB. A 10 MB cap prevents
+ * memory-exhaustion DoS attacks while leaving ample headroom for legitimate
+ * Helius payloads.
+ */
+const MAX_BODY_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/**
+ * Maximum number of transactions allowed per single webhook invocation.
+ *
+ * Helius typically sends 1–10 transactions per webhook call. Capping at 500
+ * prevents an attacker (who has obtained the webhook secret) from sending a
+ * single request that triggers thousands of DB inserts and exceeds the 15-second
+ * Helius timeout window.
+ */
+const MAX_TRANSACTIONS_PER_REQUEST = 500;
+
+/**
  * Helius Enhanced Transaction webhook receiver.
  * Parses trade instructions from enhanced tx data and stores them.
  */
@@ -41,24 +61,56 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
       return c.json({ error: "Method not allowed" }, 405);
     }
 
+    // SEC: Capture request metadata for audit logging. This provides a forensic
+    // trail for investigating suspicious webhook activity (replay attacks, auth
+    // probing, payload manipulation). No secrets are logged.
+    const requestMeta = {
+      contentLength: c.req.header("content-length"),
+      contentType: c.req.header("content-type"),
+      userAgent: c.req.header("user-agent"),
+      hasAuth: !!c.req.header("authorization"),
+      hasHmac: !!c.req.header("x-helius-hmac-sha256"),
+    };
+
+    // SEC: Reject oversized payloads early to prevent OOM DoS.
+    // Check Content-Length header before reading the body into memory.
+    const contentLength = parseInt(c.req.header("content-length") ?? "0", 10);
+    if (contentLength > MAX_BODY_SIZE_BYTES) {
+      logger.warn("Webhook request rejected: body too large", { contentLength, maxAllowed: MAX_BODY_SIZE_BYTES });
+      return c.json({ error: "Payload too large" }, 413);
+    }
+
     // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
     let rawBody: Buffer;
     try {
       rawBody = Buffer.from(await c.req.arrayBuffer());
     } catch {
+      logger.warn("Webhook request failed: could not read body", requestMeta);
       return c.json({ error: "Failed to read request body" }, 400);
+    }
+
+    // Secondary body size check (Content-Length may be absent or spoofed)
+    if (rawBody.length > MAX_BODY_SIZE_BYTES) {
+      logger.warn("Webhook request rejected: actual body too large", { actualLength: rawBody.length, maxAllowed: MAX_BODY_SIZE_BYTES });
+      return c.json({ error: "Payload too large" }, 413);
     }
 
     // PERC-1063 / PERC-750: Fail-closed — 503 if secret not configured, 401 if verification fails.
     if (!config.webhookSecret) {
-      logger.error("Webhook request rejected: HELIUS_WEBHOOK_SECRET not configured");
+      logger.error("Webhook request rejected: HELIUS_WEBHOOK_SECRET not configured", requestMeta);
       return c.json({ error: "Webhook auth not configured" }, 503);
     }
 
     const authHeader = c.req.header("authorization") ?? "";
     const hmacHeader = c.req.header("x-helius-hmac-sha256") ?? "";
     if (!verifyWebhookSignature(rawBody, authHeader, config.webhookSecret, hmacHeader || undefined)) {
-      logger.warn("Webhook signature verification failed", { hasHeader: !!authHeader, hasHmac: !!hmacHeader });
+      // SEC: Log failed auth attempts with request metadata for intrusion detection.
+      // Do NOT log the auth header value itself — it could be a valid secret from a
+      // misconfigured client.
+      logger.warn("Webhook signature verification failed", {
+        ...requestMeta,
+        bodyLength: rawBody.length,
+      });
       return c.json({ error: "Unauthorized" }, 401);
     }
 
@@ -79,8 +131,24 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
       const parsed = JSON.parse(rawBody.toString("utf-8"));
       transactions = Array.isArray(parsed) ? parsed : [parsed];
     } catch {
+      logger.warn("Webhook request failed: invalid JSON", { bodyLength: rawBody.length });
       return c.json({ error: "Invalid JSON" }, 400);
     }
+
+    // SEC: Reject batches that exceed the transaction cap to prevent DB overload.
+    if (transactions.length > MAX_TRANSACTIONS_PER_REQUEST) {
+      logger.warn("Webhook request rejected: too many transactions", {
+        count: transactions.length,
+        maxAllowed: MAX_TRANSACTIONS_PER_REQUEST,
+      });
+      return c.json({ error: "Too many transactions in request" }, 400);
+    }
+
+    // SEC: Log successful webhook receipt for audit trail
+    logger.info("Webhook received", {
+      transactionCount: transactions.length,
+      bodyLength: rawBody.length,
+    });
 
     // Process synchronously — Helius has a 15s timeout, and we need to confirm
     // processing before returning 200. If we return early, Helius may retry
@@ -92,6 +160,7 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
     } catch (err) {
       logger.error("Webhook processing error — returning 500 for Helius retry", {
         error: err instanceof Error ? err.message : err,
+        transactionCount: transactions.length,
       });
       return c.json({ error: "Processing failed, please retry" }, 500);
     }
