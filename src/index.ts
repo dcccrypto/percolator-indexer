@@ -24,6 +24,32 @@ const webhookManager = new HeliusWebhookManager();
 
 const app = new Hono();
 
+// SEC: Security headers middleware — applied to all responses.
+// Hardens the HTTP surface against common attack vectors.
+app.use("*", async (c, next) => {
+  await next();
+
+  // Prevent MIME-type sniffing (reduces XSS risk from misinterpreted content).
+  c.header("X-Content-Type-Options", "nosniff");
+
+  // Prevent clickjacking — this is an API, never meant to be framed.
+  c.header("X-Frame-Options", "DENY");
+
+  // Disable browser-side caching of responses (trade data, health status).
+  c.header("Cache-Control", "no-store");
+
+  // Remove the default Server header to reduce fingerprinting surface.
+  c.header("Server", "");
+});
+
+// SEC: Reject non-POST methods on webhook path early (defense in depth).
+app.all("/webhook/trades", async (c, next) => {
+  if (c.req.method !== "POST") {
+    return c.json({ error: "Method not allowed" }, 405);
+  }
+  return next();
+});
+
 // Health endpoint with connectivity checks
 // HTTP write path for trades: only POST /webhook/trades (mounted below), after signature verification
 // in routes/webhook.ts. Backup indexing uses TradeIndexerPolling (RPC), not this server.
@@ -99,12 +125,12 @@ async function start() {
     throw new Error(`Invalid NODE_ENV: ${process.env.NODE_ENV}. Must be one of: ${validNodeEnvs.join(", ")}`);
   }
 
-  // PERC-8235: Verify Supabase connectivity at startup — surface DB issues early
+  // PERC-8235: Verify Supabase connectivity at startup â surface DB issues early
   // instead of letting every sync operation fail silently with "Market sync failed".
   try {
     const { data, error } = await getSupabase().from("markets").select("slab_address").limit(1);
     if (error) {
-      logger.error("Supabase connection test FAILED — DB operations will fail", {
+      logger.error("Supabase connection test FAILED â DB operations will fail", {
         error: error.message,
         code: error.code,
         hint: error.hint,
@@ -114,7 +140,7 @@ async function start() {
       logger.info("Supabase connection test passed", { rowCount: data?.length ?? 0 });
     }
   } catch (dbErr) {
-    logger.error("Supabase connection test threw — check DATABASE_URL / SUPABASE_URL", {
+    logger.error("Supabase connection test threw â check DATABASE_URL / SUPABASE_URL", {
       error: dbErr instanceof Error ? dbErr.message : String(dbErr),
     });
   }
@@ -136,11 +162,11 @@ async function start() {
 }
 
 start().catch((err) => {
-  logger.error("Failed to start indexer — staying alive for healthcheck + retry", {
+  logger.error("Failed to start indexer â staying alive for healthcheck + retry", {
     error: err instanceof Error ? err.message : String(err),
   });
   captureException(err, { tags: { context: "indexer-startup" } });
-  // Don't exit — keep process alive so Railway healthcheck passes
+  // Don't exit â keep process alive so Railway healthcheck passes
   // Discovery will retry on its interval and pick up markets when they exist
 });
 
