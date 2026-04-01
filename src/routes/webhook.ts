@@ -105,17 +105,19 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
 /**
  * Verify Helius webhook request authenticity. (PERC-750)
  *
- * Supports two modes, checked in priority order:
+ * Two mutually exclusive modes:
  *
- * 1. **HMAC-SHA256 body signature** (preferred — body-bound, prevents payload tampering):
- *    The `x-helius-hmac-sha256` header contains hex(HMAC-SHA256(rawBody, secret)).
- *    Used when Helius or an intermediary proxy signs the payload.
+ * 1. **HMAC-SHA256 body signature** (stronger — body-bound):
+ *    When `hmacHeader` is non-empty, only this path runs. The value must equal
+ *    hex(HMAC-SHA256(rawBody, secret)). If verification fails, the request is
+ *    rejected — **`Authorization` is not used as a fallback**, so a client cannot
+ *    satisfy an invalid HMAC by also sending a valid static token.
  *
- * 2. **Static token** (current Helius `authHeader` behavior):
- *    The `Authorization` header is compared timing-safely to the configured secret.
- *    Timing-safe comparison prevents oracle attacks on the static token.
+ * 2. **Static token** (Helius `authHeader` when no HMAC header is sent):
+ *    Used only when `hmacHeader` is empty/omitted. `Authorization` is compared
+ *    timing-safely to the configured secret.
  *
- * All comparisons use `crypto.timingSafeEqual` to prevent timing side-channels.
+ * All comparisons use `crypto.timingSafeEqual` to reduce timing side-channels.
  *
  * @param rawBody    Raw request body bytes (must be read before JSON.parse).
  * @param authHeader Value of the `Authorization` request header.
@@ -128,7 +130,7 @@ export function verifyWebhookSignature(
   secret: string,
   hmacHeader?: string,
 ): boolean {
-  // Mode 1: HMAC-SHA256 body signature (preferred)
+  // Mode 1: HMAC-SHA256 — exclusive; never fall through to static token on failure.
   if (hmacHeader) {
     const expectedHmac = createHmac("sha256", secret).update(rawBody).digest("hex");
     const hmacBytes = Buffer.from(hmacHeader, "utf8");
