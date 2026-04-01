@@ -10,6 +10,26 @@ const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 /**
+ * Maximum allowed webhook request body size (10 MB).
+ *
+ * Helius enhanced transaction payloads are typically 10–50 KB per transaction.
+ * Even a batch of 100 transactions rarely exceeds 5 MB. A 10 MB cap prevents
+ * memory-exhaustion DoS attacks while leaving ample headroom for legitimate
+ * Helius payloads.
+ */
+const MAX_BODY_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/**
+ * Maximum number of transactions allowed per single webhook invocation.
+ *
+ * Helius typically sends 1–10 transactions per webhook call. Capping at 500
+ * prevents an attacker (who has obtained the webhook secret) from sending a
+ * single request that triggers thousands of DB inserts and exceeds the 15-second
+ * Helius timeout window.
+ */
+const MAX_TRANSACTIONS_PER_REQUEST = 500;
+
+/**
  * Helius Enhanced Transaction webhook receiver.
  * Parses trade instructions from enhanced tx data and stores them.
  */
@@ -17,10 +37,10 @@ const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 if (!config.webhookSecret) {
   if (IS_PRODUCTION) {
-    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production — webhook auth would be bypassed");
+    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production â webhook auth would be bypassed");
     process.exit(1);
   } else {
-    logger.warn("HELIUS_WEBHOOK_SECRET not set — webhook auth disabled (dev only)");
+    logger.warn("HELIUS_WEBHOOK_SECRET not set â webhook auth disabled (dev only)");
   }
 }
 
@@ -28,7 +48,15 @@ export function webhookRoutes(): Hono {
   const app = new Hono();
 
   app.post("/webhook/trades", async (c) => {
-    // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
+    // SEC: Reject oversized payloads early to prevent OOM DoS.
+    // Check Content-Length header before reading the body into memory.
+    const contentLength = parseInt(c.req.header("content-length") ?? "0", 10);
+    if (contentLength > MAX_BODY_SIZE_BYTES) {
+      logger.warn("Webhook request rejected: body too large", { contentLength, maxAllowed: MAX_BODY_SIZE_BYTES });
+      return c.json({ error: "Payload too large" }, 413);
+    }
+
+    // PERC-750: Read raw body first â required for HMAC-SHA256 body signature verification.
     let rawBody: Buffer;
     try {
       rawBody = Buffer.from(await c.req.arrayBuffer());
@@ -36,7 +64,13 @@ export function webhookRoutes(): Hono {
       return c.json({ error: "Failed to read request body" }, 400);
     }
 
-    // PERC-1063 / PERC-750: Fail-closed — 503 if secret not configured, 401 if verification fails.
+    // SEC: Double-check actual body size (Content-Length can be spoofed or absent).
+    if (rawBody.length > MAX_BODY_SIZE_BYTES) {
+      logger.warn("Webhook request rejected: actual body exceeds limit", { bodyLength: rawBody.length, maxAllowed: MAX_BODY_SIZE_BYTES });
+      return c.json({ error: "Payload too large" }, 413);
+    }
+
+    // PERC-1063 / PERC-750: Fail-closed â 503 if secret not configured, 401 if verification fails.
     if (!config.webhookSecret) {
       logger.error("Webhook request rejected: HELIUS_WEBHOOK_SECRET not configured");
       return c.json({ error: "Webhook auth not configured" }, 503);
@@ -58,7 +92,16 @@ export function webhookRoutes(): Hono {
       return c.json({ error: "Invalid JSON" }, 400);
     }
 
-    // Process synchronously — Helius has a 15s timeout, and we need to confirm
+    // SEC: Cap transaction count to prevent unbounded processing within the 15s window.
+    if (transactions.length > MAX_TRANSACTIONS_PER_REQUEST) {
+      logger.warn("Webhook request rejected: too many transactions", {
+        count: transactions.length,
+        maxAllowed: MAX_TRANSACTIONS_PER_REQUEST,
+      });
+      return c.json({ error: `Too many transactions (max ${MAX_TRANSACTIONS_PER_REQUEST})` }, 400);
+    }
+
+    // Process synchronously â Helius has a 15s timeout, and we need to confirm
     // processing before returning 200. If we return early, Helius may retry
     // and we'd get duplicates (insertTrade handles 23505 but still wastes work).
     // GH#42: Return 500 if persistent DB failures occurred so Helius retries the webhook.
@@ -66,7 +109,7 @@ export function webhookRoutes(): Hono {
     try {
       await processTransactions(transactions);
     } catch (err) {
-      logger.error("Webhook processing error — returning 500 for Helius retry", {
+      logger.error("Webhook processing error â returning 500 for Helius retry", {
         error: err instanceof Error ? err.message : err,
       });
       return c.json({ error: "Processing failed, please retry" }, 500);
@@ -83,7 +126,7 @@ export function webhookRoutes(): Hono {
  *
  * Supports two modes, checked in priority order:
  *
- * 1. **HMAC-SHA256 body signature** (preferred — body-bound, prevents payload tampering):
+ * 1. **HMAC-SHA256 body signature** (preferred â body-bound, prevents payload tampering):
  *    The `x-helius-hmac-sha256` header contains hex(HMAC-SHA256(rawBody, secret)).
  *    Used when Helius or an intermediary proxy signs the payload.
  *
@@ -114,7 +157,7 @@ export function verifyWebhookSignature(
     return timingSafeEqual(hmacBytes, expectedBytes);
   }
 
-  // Mode 2: Static token — timing-safe comparison (current Helius authHeader behavior).
+  // Mode 2: Static token â timing-safe comparison (current Helius authHeader behavior).
   if (!authHeader) return false;
   const authBytes = Buffer.from(authHeader, "utf8");
   const secretBytes = Buffer.from(secret, "utf8");
@@ -122,7 +165,7 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authBytes, secretBytes);
 }
 
-/** Supabase duplicate constraint — not retriable */
+/** Supabase duplicate constraint â not retriable */
 function isDuplicateError(err: unknown): boolean {
   if (!err) return false;
   const msg = err instanceof Error ? err.message : String(err);
@@ -140,7 +183,7 @@ async function processTransactions(transactions: any[]): Promise<void> {
       for (const trade of trades) {
         try {
           // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
-          // lose trades. Duplicate constraint (23505) is not retriable — skip immediately.
+          // lose trades. Duplicate constraint (23505) is not retriable â skip immediately.
           // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
           await withRetry(() => insertTrade(trade), {
             maxRetries: 2,
@@ -158,10 +201,10 @@ async function processTransactions(transactions: any[]): Promise<void> {
           indexed++;
         } catch (err) {
           if (isDuplicateError(err)) {
-            // Duplicate insert — expected, not an error
+            // Duplicate insert â expected, not an error
             logger.debug("Duplicate trade insert skipped", { signature: trade.tx_signature.slice(0, 12) });
           } else {
-            // All retries exhausted — capture to Sentry so we know this happened
+            // All retries exhausted â capture to Sentry so we know this happened
             insertFailures++;
             logger.error("Trade insert failed after retries", {
               signature: trade.tx_signature.slice(0, 12),
@@ -219,7 +262,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     if (!TRADE_TAGS.has(tag)) continue;
 
     // Parse: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16)
-    // TradeCpiV2 adds an extra bump(u8) at byte 21 — same size offset, different total length (22 vs 21)
+    // TradeCpiV2 adds an extra bump(u8) at byte 21 â same size offset, different total length (22 vs 21)
     const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
 
     // Account layout (from core/abi/accounts.ts):
@@ -302,7 +345,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
  * 1. Read mark_price_e6 from the slab account's post-state data (Helius
  *    enhanced txs include `accountData` with base64-encoded post-state).
  * 2. Parse program logs for comma-separated numeric values and pick the
- *    first value in a plausible price_e6 range ($0.001–$1M).
+ *    first value in a plausible price_e6 range ($0.001â$1M).
  * 3. Return 0 if neither strategy yields a result.
  */
 function extractPrice(tx: any, slabAddress: string): number {
@@ -352,7 +395,7 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
 
 /**
  * Parse program logs for comma-separated numeric values (hex or decimal).
- * Matches 2–8 comma-separated values on a single "Program log:" line.
+ * Matches 2â8 comma-separated values on a single "Program log:" line.
  */
 function extractPriceFromLogs(tx: any): number {
   const logs: string[] = tx.logs ?? tx.logMessages ?? [];
