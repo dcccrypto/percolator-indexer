@@ -1,9 +1,10 @@
 # Builder stage
 FROM node:22-alpine AS builder
+ARG CACHE_BUST=1
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY vendor ./vendor
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
