@@ -11,6 +11,10 @@ type WebhookVariables = { verifiedWebhookBody: Buffer };
 const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
 const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+/** Solana signatures are base58-encoded 64-byte values (87–88 chars). */
+const BASE58_SIGNATURE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+/** Maximum valid trade size: signed i128 max */
+const I128_MAX = (1n << 127n) - 1n;
 
 /**
  * Maximum allowed webhook request body size (10 MB).
@@ -300,6 +304,11 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
   const signature = tx.signature ?? "";
   if (!signature) return trades;
 
+  // Validate signature format (base58, 64-byte = 87–88 chars).
+  // TradeIndexer validates this (line 293) but webhook didn't — garbage
+  // signatures would pollute the DB and bypass duplicate detection.
+  if (!BASE58_SIGNATURE.test(signature)) return trades;
+
   const instructions = tx.instructions ?? [];
 
   for (const ix of instructions) {
@@ -316,6 +325,10 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     // Parse: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16)
     // TradeCpiV2 adds an extra bump(u8) at byte 21 — same size offset, different total length (22 vs 21)
     const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+
+    // Validate size is within i128 range — TradeIndexer checks this (line 298)
+    // but webhook didn't, allowing oversized values to corrupt downstream calcs.
+    if (sizeValue > I128_MAX) continue;
 
     // Account layout (from core/abi/accounts.ts):
     // PERC-199: clock sysvar removed from trade instructions
@@ -360,6 +373,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
       if (!TRADE_TAGS.has(tag)) continue;
 
       const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+      if (sizeValue > I128_MAX) continue;
 
       // Same account layout: [0]=user, [2]=slab
       const accounts: string[] = ix.accounts ?? [];
