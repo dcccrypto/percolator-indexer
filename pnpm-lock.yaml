@@ -12,8 +12,8 @@ importers:
         specifier: ^1.19.11
         version: 1.19.11(hono@4.12.9)
       '@percolator/sdk':
-        specifier: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb42
-        version: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb42(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: npm:@percolatorct/sdk@^0.4.0
+        version: '@percolatorct/sdk@0.4.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)'
       '@percolator/shared':
         specifier: github:dcccrypto/percolator-shared#c88a5b8031676ae1b1d7b4848c8633f8df94db73
         version: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/c88a5b8031676ae1b1d7b4848c8633f8df94db73(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -455,11 +455,6 @@ packages:
   '@oxc-project/types@0.122.0':
     resolution: {integrity: sha512-oLAl5kBpV4w69UtFZ9xqcmTi+GENWOcPF7FCrczTiBbmC0ibXxCwyvZGbO39rCVEuLGAZM84DH0pUIyyv/YJzA==}
 
-  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb42':
-    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb42}
-    version: 1.0.0-rc.1
-    engines: {node: '>=20.0.0'}
-
   '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb429b3f98081c89312f03d9c420bf0d83bcd':
     resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb429b3f98081c89312f03d9c420bf0d83bcd}
     version: 1.0.0-rc.1
@@ -468,6 +463,10 @@ packages:
   '@percolator/shared@https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/c88a5b8031676ae1b1d7b4848c8633f8df94db73':
     resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/c88a5b8031676ae1b1d7b4848c8633f8df94db73}
     version: 0.1.0
+
+  '@percolatorct/sdk@0.4.0':
+    resolution: {integrity: sha512-7YfWDhxiJC9G7MlQLQDGW83X8qshVqni8chPTyAkTKYsNj0/618XttPXexJHpCAD8WLC7qPKCVO8uk6ysSP15A==}
+    engines: {node: '>=20.0.0'}
 
   '@prisma/instrumentation@7.4.2':
     resolution: {integrity: sha512-r9JfchJF1Ae6yAxcaLu/V1TGqBhAuSDe3mRNOssBfx1rMzfZ4fdNvrgUBwyb/TNTGXFxlH9AZix5P257x07nrg==}
@@ -1766,17 +1765,6 @@ snapshots:
 
   '@oxc-project/types@0.122.0': {}
 
-  '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb42(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
-    dependencies:
-      '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
-      '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
-    transitivePeerDependencies:
-      - bufferutil
-      - encoding
-      - fastestsmallesttextencoderdecoder
-      - typescript
-      - utf-8-validate
-
   '@percolator/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/c4fdb429b3f98081c89312f03d9c420bf0d83bcd(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -1803,6 +1791,17 @@ snapshots:
       - encoding
       - fastestsmallesttextencoderdecoder
       - supports-color
+      - typescript
+      - utf-8-validate
+
+  '@percolatorct/sdk@0.4.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+    dependencies:
+      '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+    transitivePeerDependencies:
+      - bufferutil
+      - encoding
+      - fastestsmallesttextencoderdecoder
       - typescript
       - utf-8-validate
 
