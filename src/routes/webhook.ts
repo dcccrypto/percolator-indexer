@@ -210,11 +210,13 @@ export function verifyWebhookSignature(
   }
 
   // Mode 2: Static token — timing-safe comparison (current Helius authHeader behavior).
+  // HMAC both values to produce equal-length digests, preventing a timing
+  // side-channel that would leak the secret's length via early return on
+  // length mismatch (the old `authBytes.length !== secretBytes.length` guard).
   if (!authHeader) return false;
-  const authBytes = Buffer.from(authHeader, "utf8");
-  const secretBytes = Buffer.from(secret, "utf8");
-  if (authBytes.length !== secretBytes.length) return false;
-  return timingSafeEqual(authBytes, secretBytes);
+  const authDigest = createHmac("sha256", "static-token-compare").update(authHeader).digest();
+  const secretDigest = createHmac("sha256", "static-token-compare").update(secret).digest();
+  return timingSafeEqual(authDigest, secretDigest);
 }
 
 /** Supabase duplicate constraint — not retriable */
