@@ -202,18 +202,41 @@ export class StatsCollector {
           const abs = raw < 0n ? -raw : raw;
           volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
         } catch {
-          const abs = BigInt(Math.abs(Number(trade.size)));
-          volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
+          // Fallback: size string isn't a valid BigInt literal. Parse via BigInt()
+          // instead of Math.abs(Number()) to avoid precision loss on large values.
+          try {
+            const numVal = Number(trade.size);
+            if (!Number.isFinite(numVal)) continue; // skip Infinity/NaN
+            const abs = BigInt(Math.trunc(Math.abs(numVal)));
+            volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
+          } catch {
+            // Completely unparseable size — skip this trade
+            logger.warn("syncVolumeForAllDBMarkets: unparseable trade size, skipping", {
+              slabAddress: trade.slab_address?.slice(0, 8),
+              size: String(trade.size).slice(0, 30),
+            });
+          }
         }
       }
 
-      // Upsert volume stats for each market that has trades
+      // Upsert volume stats for each market that has trades.
+      // volume_24h is NUMERIC in PostgreSQL so it can hold arbitrary precision,
+      // but MarketStatsRow types it as number|null. Use Number() with a warning
+      // when precision would be lost (> MAX_SAFE_INTEGER = ~9e15).
       let updated = 0;
       for (const [slabAddress, { volume, count }] of volumeMap.entries()) {
         try {
+          const volumeNum = Number(volume);
+          if (volume > BigInt(Number.MAX_SAFE_INTEGER)) {
+            logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, precision loss", {
+              slabAddress: slabAddress.slice(0, 8),
+              volumeBigInt: volume.toString(),
+              volumeNumber: volumeNum,
+            });
+          }
           await upsertMarketStats({
             slab_address: slabAddress,
-            volume_24h: Number(volume),
+            volume_24h: volumeNum,
             trade_count_24h: count,
           });
           updated++;
