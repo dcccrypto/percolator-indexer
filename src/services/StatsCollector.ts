@@ -94,6 +94,8 @@ export class StatsCollector {
   private lastOiHistoryTime = new Map<string, number>();
   private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
+  /** Tracks slabs already marked as closed this session to avoid repeated DB writes */
+  private closedSlabs = new Set<string>();
 
   constructor(
     private readonly marketProvider: MarketProvider,
@@ -409,6 +411,22 @@ export class StatsCollector {
                 liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps),
                 updated_at: new Date().toISOString(),
               });
+
+              // Auto-close orphan markets with dust vault + no accounts
+              if (hasDustVault && hasNoAccounts && !this.closedSlabs.has(dbMarket.slab_address)) {
+                try {
+                  await getSupabase()
+                    .from("markets")
+                    .update({ status: "closed", indexer_excluded: true })
+                    .eq("slab_address", dbMarket.slab_address)
+                    .eq("network", getNetwork())
+                    .neq("status", "closed");
+                  this.closedSlabs.add(dbMarket.slab_address);
+                  logger.info("Auto-closed orphan market", { slabAddress: dbMarket.slab_address.slice(0, 8) });
+                } catch (e) {
+                  // Non-fatal
+                }
+              }
 
               updated++;
             } catch (err) {
@@ -834,6 +852,27 @@ export class StatsCollector {
               liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps), // BIGINT
               updated_at: new Date().toISOString(),
             });
+
+            // Auto-close detection: if vault is dust and no accounts, mark market as closed.
+            // This hides stale/abandoned slabs from the frontend without manual DB edits.
+            if (hasDustVault && hasNoAccounts && !this.closedSlabs.has(slabAddress)) {
+              try {
+                const { error: closeErr } = await getSupabase()
+                  .from("markets")
+                  .update({ status: "closed", indexer_excluded: true })
+                  .eq("slab_address", slabAddress)
+                  .eq("network", getNetwork())
+                  .neq("status", "closed"); // only update if not already closed
+                if (closeErr) {
+                  logger.warn("Auto-close market failed", { slabAddress, error: closeErr.message });
+                } else {
+                  this.closedSlabs.add(slabAddress);
+                  logger.info("Auto-closed stale market", { slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
+                }
+              } catch (e) {
+                logger.warn("Auto-close market error", { slabAddress, error: e instanceof Error ? e.message : e });
+              }
+            }
 
             // Log oracle price to DB (rate-limited per market)
             if (priceE6 > 0n) {
