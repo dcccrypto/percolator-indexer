@@ -12,7 +12,7 @@ importers:
         specifier: ^1.19.11
         version: 1.19.11(hono@4.12.9)
       '@percolator/sdk':
-        specifier: npm:@percolatorct/sdk@^0.5.1
+        specifier: npm:@percolatorct/sdk@0.5.1
         version: '@percolatorct/sdk@0.5.1(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)'
       '@percolator/shared':
         specifier: github:dcccrypto/percolator-shared#c88a5b8031676ae1b1d7b4848c8633f8df94db73
