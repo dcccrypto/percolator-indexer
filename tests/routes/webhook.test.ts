@@ -319,6 +319,36 @@ describe('POST /webhook/trades — price extraction', () => {
     );
   });
 
+  it('rejects transactions with invalid signature format', async () => {
+    const tx = {
+      signature: 'not-a-valid-solana-signature!!!',
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: ['Program log: 1500000, 2000000'],
+    };
+    await app.fetch(makeRequest([tx]));
+    // Invalid signature → trade extraction returns empty → no insert
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects trades with oversized i128 size values', async () => {
+    // Mock parseTradeSize to return a value exceeding i128 max
+    const mockParseTradeSize = vi.mocked(shared.parseTradeSize);
+    const i128Max = (1n << 127n) - 1n;
+    mockParseTradeSize.mockReturnValueOnce({ sizeValue: i128Max + 1n, side: 'long' as const });
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: ['Program log: 1500000, 2000000'],
+    };
+    await app.fetch(makeRequest([tx]));
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
   it('returns 400 for invalid JSON body', async () => {
     const req = new Request('http://localhost/webhook/trades', {
       method: 'POST',
