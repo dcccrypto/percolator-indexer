@@ -176,28 +176,49 @@ export class StatsCollector {
     try {
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-      // Single bulk fetch: all trades in last 24h (capped at 10k rows to avoid OOM)
-      const { data: trades, error } = await getSupabase()
-        .from("trades")
-        .select("slab_address, size")
-        .gte("created_at", since)
-        .limit(10_000);
+      // Paginated fetch: read all trades in last 24h in pages of PAGE_SIZE.
+      // Previously capped at 10k rows — if >10k trades occurred in 24h,
+      // volume was silently under-reported. Now fetches all pages with a
+      // safety cap (MAX_PAGES) to prevent runaway memory usage.
+      const PAGE_SIZE = 5_000;
+      const MAX_PAGES = 20; // 100k trades max — far beyond expected 24h volume
+      const allTrades: Array<{ slab_address: string; size: string }> = [];
+      let page = 0;
+      let hasMore = true;
 
-      if (error) {
-        logger.warn("syncVolumeForAllDBMarkets: trade fetch failed", { error: error.message });
-        return;
+      while (hasMore && page < MAX_PAGES) {
+        const from = page * PAGE_SIZE;
+        const to = from + PAGE_SIZE - 1;
+        const { data: batch, error } = await getSupabase()
+          .from("trades")
+          .select("slab_address, size")
+          .gte("created_at", since)
+          .range(from, to);
+
+        if (error) {
+          logger.warn("syncVolumeForAllDBMarkets: trade fetch failed", { error: error.message, page });
+          return;
+        }
+
+        if (!batch || batch.length === 0) break;
+        allTrades.push(...batch);
+        hasMore = batch.length === PAGE_SIZE;
+        page++;
       }
 
-      if (!trades || trades.length === 0) return;
-
-      // Warn if we hit the row cap — volume will be under-reported for that window
-      if (trades.length === 10_000) {
-        logger.warn("syncVolumeForAllDBMarkets: trade fetch hit 10k row limit — volume may be under-reported", { since, limit: 10_000 });
+      if (page >= MAX_PAGES) {
+        logger.warn("syncVolumeForAllDBMarkets: hit max page limit — volume may be under-reported", {
+          totalFetched: allTrades.length,
+          maxPages: MAX_PAGES,
+          pageSize: PAGE_SIZE,
+        });
       }
+
+      if (allTrades.length === 0) return;
 
       // Aggregate volume + trade count by slab_address in memory
       const volumeMap = new Map<string, { volume: bigint; count: number }>();
-      for (const trade of trades) {
+      for (const trade of allTrades) {
         const current = volumeMap.get(trade.slab_address) ?? { volume: 0n, count: 0 };
         try {
           const raw = BigInt(trade.size);
@@ -228,7 +249,7 @@ export class StatsCollector {
       }
 
       if (updated > 0) {
-        logger.info("Volume sync complete", { marketsUpdated: updated, totalTrades: trades.length });
+        logger.info("Volume sync complete", { marketsUpdated: updated, totalTrades: allTrades.length, pages: page });
       }
     } catch (err) {
       logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
