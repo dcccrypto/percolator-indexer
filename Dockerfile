@@ -1,5 +1,6 @@
 # Builder stage
 FROM node:22-alpine AS builder
+ARG CACHE_BUST=1
 RUN apk add --no-cache python3 make g++ && rm -rf /var/cache/apk/*
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
