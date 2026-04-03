@@ -289,7 +289,13 @@ export class StatsCollector {
           await Promise.all(batch.map(async (dbMarket, batchIdx) => {
             try {
               const accountInfo = accountInfos[batchIdx];
-              if (!accountInfo?.data) return;
+              if (!accountInfo?.data) {
+                // Account doesn't exist on-chain — mark as closed + excluded
+                const db = getSupabase();
+                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", dbMarket.slab_address);
+                logger.info("Auto-closed non-existent orphan market", { slab: dbMarket.slab_address.slice(0, 8) });
+                return;
+              }
 
               const data = new Uint8Array(accountInfo.data);
 
@@ -668,7 +674,13 @@ export class StatsCollector {
           await Promise.all(batch.map(async ([slabAddress, state], batchIndex) => {
             try {
               const accountInfo = accountInfos[batchIndex];
-              if (!accountInfo?.data) return;
+              if (!accountInfo?.data) {
+                // Account doesn't exist on-chain — mark as closed + excluded
+                const db = getSupabase();
+                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", slabAddress);
+                logger.info("Auto-closed non-existent market", { slab: slabAddress.slice(0, 8) });
+                return;
+              }
 
             const data = new Uint8Array(accountInfo.data);
 
