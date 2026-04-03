@@ -180,8 +180,10 @@ export class TradeIndexerPolling {
         }
       );
     } catch (err) {
-      console.warn(`[TradeIndexer] Failed to get signatures for ${slabAddress.slice(0, 8)}... after retries:`,
-        err instanceof Error ? err.message : err);
+      logger.warn("Failed to get signatures after retries", {
+        slabAddress: slabAddress.slice(0, 8),
+        error: err instanceof Error ? err.message : err,
+      });
       return;
     }
 
@@ -222,13 +224,16 @@ export class TradeIndexerPolling {
           if (didIndex) indexed++;
         } catch (err) {
           // Non-fatal: skip this tx, continue with others
-          console.warn(`[TradeIndexer] Failed to process tx ${sig.slice(0, 12)}...:`, err instanceof Error ? err.message : err);
+          logger.warn("Failed to process transaction", {
+            signature: sig.slice(0, 12),
+            error: err instanceof Error ? err.message : err,
+          });
         }
       }
     }
 
     if (indexed > 0) {
-      console.log(`[TradeIndexer] Indexed ${indexed} trade(s) for ${slabAddress.slice(0, 8)}...`);
+      logger.info("Trades indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
     }
   }
 
@@ -286,19 +291,19 @@ export class TradeIndexerPolling {
       const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
       
       if (!base58PubkeyRegex.test(trader)) {
-        console.warn(`[TradeIndexer] Invalid trader pubkey format: ${trader.slice(0, 12)}... - skipping`);
+        logger.warn("Invalid trader pubkey format", { trader: trader.slice(0, 12) });
         return false;
       }
       
       if (!base58SigRegex.test(signature)) {
-        console.warn(`[TradeIndexer] Invalid signature format: ${signature.slice(0, 12)}... - skipping`);
+        logger.warn("Invalid signature format", { signature: signature.slice(0, 12) });
         return false;
       }
       
       // Validate size is within i128 range
       const i128Max = (1n << 127n) - 1n;
       if (sizeValue > i128Max) {
-        console.warn(`[TradeIndexer] Size out of range: ${sizeValue} - skipping`);
+        logger.warn("Trade size out of i128 range", { sizeValue: sizeValue.toString().slice(0, 30) });
         return false;
       }
 
