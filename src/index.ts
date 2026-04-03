@@ -15,6 +15,7 @@ import { webhookRoutes } from "./routes/webhook.js";
 initSentry("indexer");
 
 const logger = createLogger("indexer");
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 logger.info("Indexer service starting");
 
@@ -134,15 +135,21 @@ async function start() {
   }
 
   // SEC: Validate WEBHOOK_URL to prevent webhook hijacking via misconfigured env var.
+  // In production, reject non-HTTPS URLs — an attacker on the network path could
+  // intercept webhook payloads containing trade data and authentication headers.
   if (config.webhookUrl) {
     try {
       const parsed = new URL(config.webhookUrl);
       if (parsed.protocol !== "https:") {
+        if (IS_PRODUCTION) {
+          throw new Error("WEBHOOK_URL must use HTTPS in production — HTTP exposes webhook auth headers to network eavesdropping");
+        }
         logger.warn("WEBHOOK_URL uses non-HTTPS protocol — trades will be sent over insecure connection", {
           protocol: parsed.protocol,
         });
       }
-    } catch {
+    } catch (urlErr) {
+      if (urlErr instanceof Error && urlErr.message.includes("must use HTTPS")) throw urlErr;
       logger.error("WEBHOOK_URL is not a valid URL — webhook registration will fail", {
         webhookUrl: config.webhookUrl?.slice(0, 50),
       });
@@ -150,13 +157,19 @@ async function start() {
   }
 
   // SEC: Validate SOLANA_RPC_URL to ensure it's a valid HTTPS endpoint.
+  // In production, reject non-HTTPS URLs — MITM on the RPC connection could
+  // manipulate account state, prices, and trade data returned to the indexer.
   if (config.rpcUrl) {
     try {
       const parsed = new URL(config.rpcUrl);
       if (parsed.protocol !== "https:") {
+        if (IS_PRODUCTION) {
+          throw new Error("SOLANA_RPC_URL must use HTTPS in production — HTTP exposes RPC traffic to interception and manipulation");
+        }
         logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol — RPC calls will be unencrypted");
       }
-    } catch {
+    } catch (urlErr) {
+      if (urlErr instanceof Error && urlErr.message.includes("must use HTTPS")) throw urlErr;
       logger.error("SOLANA_RPC_URL is not a valid URL — RPC calls will fail");
     }
   }
