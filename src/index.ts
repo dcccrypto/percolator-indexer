@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { readFileSync } from "node:fs";
+try { const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")); console.log(`[BOOT] indexer build=20260403a sdk=${pkg.dependencies?.["@percolator/sdk"] ?? "?"}`); } catch {}
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert } from "@percolator/shared";
