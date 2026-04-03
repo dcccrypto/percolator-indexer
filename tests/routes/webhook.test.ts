@@ -456,6 +456,15 @@ describe('verifyWebhookSignature — unit tests', () => {
     expect(verifyWebhookSignature(BODY, '', SECRET)).toBe(false);
   });
 
+  it('rejects a static token of different length without leaking length via timing', () => {
+    // Pre-fix: early return on length mismatch leaked the secret length.
+    // Post-fix: HMAC-based comparison always runs constant-time regardless of input length.
+    expect(verifyWebhookSignature(BODY, 'x', SECRET)).toBe(false);
+    expect(verifyWebhookSignature(BODY, 'x'.repeat(200), SECRET)).toBe(false);
+    expect(verifyWebhookSignature(BODY, SECRET + '-extra', SECRET)).toBe(false);
+    expect(verifyWebhookSignature(BODY, SECRET.slice(0, -1), SECRET)).toBe(false);
+  });
+
   it('prefers HMAC header over static auth header (HMAC correct, auth wrong)', () => {
     expect(verifyWebhookSignature(BODY, 'totally-wrong', SECRET, validHmac)).toBe(true);
   });
