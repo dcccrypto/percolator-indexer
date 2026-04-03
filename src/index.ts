@@ -1,4 +1,3 @@
-try { const pkg = require("@percolator/sdk/package.json"); console.log("[SDK_VERSION]", pkg.version); } catch(e) { console.log("[SDK_VERSION] unknown:", e.message); }
 import "dotenv/config";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
@@ -244,4 +243,3 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 // Trigger rebuild 20260401053418
-// cache bust 1775186759
