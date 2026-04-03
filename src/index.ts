@@ -1,3 +1,4 @@
+try { const pkg = require("@percolator/sdk/package.json"); console.log("[SDK_VERSION]", pkg.version); } catch(e) { console.log("[SDK_VERSION] unknown:", e.message); }
 import "dotenv/config";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
