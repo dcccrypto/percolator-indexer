@@ -5,11 +5,21 @@ const logger = createLogger("indexer:webhook-manager");
 /**
  * Helius migrated from api.helius.dev to api-{network}.helius-rpc.com.
  * We build the URL dynamically based on the RPC URL (devnet vs mainnet).
+ *
+ * Note: Helius webhook management API requires the API key as a query
+ * parameter (`?api-key=`). We cannot move it to an Authorization header.
+ * To prevent the key from leaking into logs, Sentry breadcrumbs, or
+ * error stack traces, use `redactedHeliusUrl()` for all logging.
  */
 function getHeliusWebhooksUrl(): string {
   const isDevnet = config.rpcUrl.includes("devnet");
   const host = isDevnet ? "api-devnet.helius-rpc.com" : "api-mainnet.helius-rpc.com";
   return `https://${host}/v0/webhooks?api-key=${config.heliusApiKey}`;
+}
+
+/** Return the Helius URL with the API key redacted for safe logging. */
+function redactedHeliusUrl(url: string): string {
+  return url.replace(/api-key=[^&]+/, "api-key=REDACTED");
 }
 
 function heliusHeaders(): Record<string, string> {
@@ -108,7 +118,7 @@ export class HeliusWebhookManager {
 
   private async findExistingWebhook(): Promise<any | null> {
     const url = getHeliusWebhooksUrl();
-    logger.debug("Fetching Helius API", { url });
+    logger.debug("Fetching Helius API", { url: redactedHeliusUrl(url) });
     let res: Response;
     try {
       res = await fetch(url, {
@@ -116,7 +126,9 @@ export class HeliusWebhookManager {
         headers: heliusHeaders(),
       });
     } catch (fetchErr) {
-      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      // Redact potential API key from error messages (Node fetch can include the URL)
+      const rawMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      const msg = rawMsg.replace(/api-key=[^&\s]+/g, "api-key=REDACTED");
       const cause = fetchErr instanceof Error && fetchErr.cause instanceof Error ? fetchErr.cause : undefined;
       logger.error("Fetch to Helius API failed", { message: msg, cause: cause?.message });
       return null;
