@@ -95,7 +95,10 @@ app.get("/health", async (c) => {
     status = "degraded";
   }
   
-  const statusCode = status === "down" ? 503 : 200;
+  // Return 503 for both "down" and "degraded" so Docker healthcheck and
+  // load balancers detect partial failures (e.g., DB down but RPC up).
+  // Previously degraded returned 200, masking single-component outages.
+  const statusCode = status === "ok" ? 200 : 503;
   
   return c.json({ status, checks, service: "indexer" }, statusCode);
 });
