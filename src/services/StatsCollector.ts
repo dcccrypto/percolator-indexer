@@ -354,7 +354,7 @@ export class StatsCollector {
                 // Slab too small or unrecognized layout — skip
                 return;
               }
-              logger.info("VAULT_DBG", { slab: dbMarket.slab_address.slice(0, 8), vault: engine.vault.toString(), ins: engine.insuranceFund.balance.toString() });
+
 
               // Oracle-mode-aware price resolution (mirrors collect())
               const zeroKeyBytes = new Uint8Array(32);
