@@ -145,10 +145,14 @@ export class InsuranceLPService {
       const db = getSupabase();
       const since = new Date(Date.now() - days * MS_PER_DAY).toISOString();
 
+      // PERC-8192: Filter by network to prevent devnet snapshots from
+      // contaminating mainnet APY calculations (insert at line 122 stamps
+      // network, but this query was missing the filter).
       const { data, error } = await db
         .from("insurance_snapshots")
         .select("redemption_rate_e6, created_at")
         .eq("slab", slab)
+        .eq("network", getNetwork())
         .gte("created_at", since)
         .order("created_at", { ascending: true })
         .limit(1);
