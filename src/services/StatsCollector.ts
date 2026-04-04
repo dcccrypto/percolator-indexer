@@ -611,8 +611,15 @@ export class StatsCollector {
                 const dasSym = metadata?.symbol || tokenInfo?.symbol;
                 const dasName = metadata?.name;
                 const dasDecimals = tokenInfo?.decimals;
-                if (dasSym) symbol = dasSym;
-                if (dasName) name = dasName;
+                // Sanitize external metadata: truncate length and strip control
+                // characters / HTML to prevent DB bloat and stored XSS vectors
+                // (defense-in-depth — frontend must also escape).
+                if (typeof dasSym === "string" && dasSym.length > 0) {
+                  symbol = dasSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
+                }
+                if (typeof dasName === "string" && dasName.length > 0) {
+                  name = dasName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
+                }
                 if (dasDecimals != null) decimals = dasDecimals;
               }
             }
