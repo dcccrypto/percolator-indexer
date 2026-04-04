@@ -686,12 +686,43 @@ export class StatsCollector {
       // GH#1218: load indexer_excluded flags from DB to skip corrupt slabs.
       // These are slabs where on-chain state is permanently corrupt and re-syncing
       // would overwrite the zeroed DB values with garbage data.
+      //
+      // Recovery path: if an excluded market reappears in the on-chain discovery
+      // map (meaning it has live accounts or vault > dust), re-enable it so stats
+      // resume. This prevents the auto-close mechanism from permanently hiding
+      // markets that recover after being abandoned.
       let excludedSlabs: Set<string> = new Set();
       try {
         const dbMarkets = await getMarkets();
-        excludedSlabs = new Set(
-          dbMarkets.filter((m) => m.indexer_excluded === true).map((m) => m.slab_address),
-        );
+        const excludedDbMarkets = dbMarkets.filter((m) => m.indexer_excluded === true);
+
+        for (const m of excludedDbMarkets) {
+          // If the market is back in the live discovery map, it may have recovered.
+          // Re-enable it so collect() processes it this cycle.
+          if (markets.has(m.slab_address)) {
+            try {
+              await getSupabase()
+                .from("markets")
+                .update({ indexer_excluded: false, status: "active" })
+                .eq("slab_address", m.slab_address)
+                .eq("network", getNetwork());
+              this.closedSlabs.delete(m.slab_address);
+              logger.info("Re-enabled previously excluded market (back in discovery)", {
+                slabAddress: m.slab_address.slice(0, 8),
+              });
+            } catch (e) {
+              // Non-fatal — will retry next cycle
+              logger.warn("Failed to re-enable excluded market", {
+                slabAddress: m.slab_address.slice(0, 8),
+                error: e instanceof Error ? e.message : e,
+              });
+              excludedSlabs.add(m.slab_address);
+            }
+          } else {
+            excludedSlabs.add(m.slab_address);
+          }
+        }
+
         if (excludedSlabs.size > 0) {
           logger.info("StatsCollector: skipping indexer_excluded slabs", { count: excludedSlabs.size, slabs: Array.from(excludedSlabs) });
         }
