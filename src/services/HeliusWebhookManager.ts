@@ -22,6 +22,9 @@ function redactedHeliusUrl(url: string): string {
   return url.replace(/api-key=[^&]+/, "api-key=REDACTED");
 }
 
+/** Timeout for all Helius API calls. Prevents indefinite hangs if Helius is unresponsive. */
+const HELIUS_API_TIMEOUT_MS = 15_000;
+
 function heliusHeaders(): Record<string, string> {
   return { "Content-Type": "application/json" };
 }
@@ -95,6 +98,7 @@ export class HeliusWebhookManager {
       const res = await fetch(getHeliusWebhooksUrl(), {
         method: "GET",
         headers: heliusHeaders(),
+        signal: AbortSignal.timeout(HELIUS_API_TIMEOUT_MS),
       });
       if (!res.ok) return null;
       return await res.json();
@@ -124,6 +128,7 @@ export class HeliusWebhookManager {
       res = await fetch(url, {
         method: "GET",
         headers: heliusHeaders(),
+        signal: AbortSignal.timeout(HELIUS_API_TIMEOUT_MS),
       });
     } catch (fetchErr) {
       // Redact potential API key from error messages (Node fetch can include the URL)
@@ -152,6 +157,7 @@ export class HeliusWebhookManager {
       method: "POST",
       headers: heliusHeaders(),
       body: JSON.stringify(this.webhookPayload),
+      signal: AbortSignal.timeout(HELIUS_API_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -168,6 +174,7 @@ export class HeliusWebhookManager {
       method: "PUT",
       headers: heliusHeaders(),
       body: JSON.stringify(this.webhookPayload),
+      signal: AbortSignal.timeout(HELIUS_API_TIMEOUT_MS),
     });
 
     if (!res.ok) {
