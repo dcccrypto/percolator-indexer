@@ -226,33 +226,40 @@ start().catch((err) => {
   // Discovery will retry on its interval and pick up markets when they exist
 });
 
+/** Grace period for in-flight DB operations to complete after stopping services. */
+const SHUTDOWN_DRAIN_MS = 3_000;
+
 async function shutdown(signal: string): Promise<void> {
   logger.info("Shutdown initiated", { signal });
-  
+
   try {
     // Send shutdown alert
     await sendInfoAlert("Indexer service shutting down", [
       { name: "Signal", value: signal, inline: true },
     ]);
-    
-    // Stop all services (clears timers and intervals)
+
+    // Stop all services (clears timers and intervals — no new work starts)
     logger.info("Stopping market discovery");
     discovery.stop();
-    
+
     logger.info("Stopping stats collector");
     statsCollector.stop();
-    
+
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
-    
+
     logger.info("Stopping insurance LP service");
     insuranceService.stop();
-    
+
     logger.info("Stopping webhook manager");
     webhookManager.stop();
-    
-    // Note: Solana connection and Supabase client don't need explicit cleanup
-    
+
+    // Drain: give in-flight DB writes (webhook trade inserts, stats upserts)
+    // time to complete before exiting. Without this, process.exit() kills
+    // pending Supabase HTTP requests mid-flight.
+    logger.info("Draining in-flight operations", { drainMs: SHUTDOWN_DRAIN_MS });
+    await new Promise((r) => setTimeout(r, SHUTDOWN_DRAIN_MS));
+
     logger.info("Shutdown complete");
     process.exit(0);
   } catch (err) {
