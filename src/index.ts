@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
-try { const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")); console.log(`[BOOT] indexer build=20260403a sdk=${pkg.dependencies?.["@percolator/sdk"] ?? "?"}`); } catch {}
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert } from "@percolator/shared";
@@ -17,7 +16,15 @@ initSentry("indexer");
 const logger = createLogger("indexer");
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
-logger.info("Indexer service starting");
+// Log build info via structured logger (previously used console.log which bypassed Sentry/log pipeline)
+try {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  logger.info("Indexer service starting", {
+    sdk: pkg.dependencies?.["@percolator/sdk"] ?? "unknown",
+  });
+} catch {
+  logger.info("Indexer service starting");
+}
 
 const discovery = new MarketDiscovery();
 const statsCollector = new StatsCollector(discovery);
