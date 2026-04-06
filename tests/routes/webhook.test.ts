@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as nodeCrypto from 'node:crypto';
 
-vi.mock('@percolator/sdk', () => ({
+vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
   // detectSlabLayout: returns a V1-style layout so engineOff + engineMarkPriceOff = 1040,
   // matching the mock slab buffers built in tests below.
@@ -85,7 +85,7 @@ describe('POST /webhook/trades — price extraction', () => {
   it('falls back to log parsing when slab is V0 layout (engineMarkPriceOff < 0)', async () => {
     // Arrange: make detectSlabLayout return a V0 layout for a 512-byte buffer.
     // V0 slabs have engineMarkPriceOff=-1 — no mark_price field.
-    const { detectSlabLayout } = await import('@percolator/sdk');
+    const { detectSlabLayout } = await import('@percolatorct/sdk');
     vi.mocked(detectSlabLayout).mockImplementationOnce((dataLen: number) => {
       if (dataLen === 512) return { version: 0, engineOff: 480, engineMarkPriceOff: -1, engineBitmapOff: 496 } as any;
       if (dataLen < 8) return null;

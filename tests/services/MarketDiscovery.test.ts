@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock external dependencies
-vi.mock('@percolator/sdk', () => ({
+vi.mock('@percolatorct/sdk', () => ({
   discoverMarkets: vi.fn(),
 }));
 
@@ -31,7 +31,7 @@ vi.mock('@percolator/shared', () => ({
 }));
 
 import { MarketDiscovery } from '../../src/services/MarketDiscovery.js';
-import * as core from '@percolator/sdk';
+import * as core from '@percolatorct/sdk';
 
 describe('MarketDiscovery', () => {
   let marketDiscovery: MarketDiscovery;

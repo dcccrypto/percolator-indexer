@@ -20,7 +20,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 try {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   logger.info("Indexer service starting", {
-    sdk: pkg.dependencies?.["@percolator/sdk"] ?? "unknown",
+    sdk: pkg.dependencies?.["@percolatorct/sdk"] ?? "unknown",
   });
 } catch {
   logger.info("Indexer service starting");

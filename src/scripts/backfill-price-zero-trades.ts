@@ -23,7 +23,7 @@
 
 import { getSupabase } from "@percolator/shared";
 import { config } from "@percolator/shared";
-import { detectSlabLayout } from "@percolator/sdk";
+import { detectSlabLayout } from "@percolatorct/sdk";
 
 // Helius Parse Transactions batch limit
 const HELIUS_BATCH_SIZE = 100;
