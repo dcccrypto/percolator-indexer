@@ -31,8 +31,22 @@ export class MarketDiscovery {
   private markets = new Map<string, { market: DiscoveredMarket }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private consecutiveFailures = 0;
-  
+  private _discovering = false;
+
   async discover(): Promise<DiscoveredMarket[]> {
+    if (this._discovering) {
+      logger.warn("discover() already in progress — skipping overlapping invocation");
+      return [];
+    }
+    this._discovering = true;
+    try {
+      return await this._doDiscover();
+    } finally {
+      this._discovering = false;
+    }
+  }
+
+  private async _doDiscover(): Promise<DiscoveredMarket[]> {
     const programIds = config.allProgramIds;
     // Use Helius primary RPC (primaryConn) for all discovery attempts.
     // fallbackConn is tried exactly once — only after all HELIUS_429_BACKOFF_MS retries are
@@ -102,11 +116,14 @@ export class MarketDiscovery {
     
     // Only update the map when we actually found markets
     if (all.length > 0) {
-      // Rebuild map to drop stale entries
-      this.markets.clear();
+      // Atomic swap: build new map first, then replace reference in one step.
+      // This ensures concurrent readers via getMarkets() never see a partially
+      // populated or empty map during the rebuild.
+      const newMarkets = new Map<string, { market: DiscoveredMarket }>();
       for (const market of all) {
-        this.markets.set(market.slabAddress.toBase58(), { market });
+        newMarkets.set(market.slabAddress.toBase58(), { market });
       }
+      this.markets = newMarkets;
       this.consecutiveFailures = 0;
     }
     
