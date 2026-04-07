@@ -16,6 +16,20 @@ initSentry("indexer");
 const logger = createLogger("indexer");
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
+/** Maximum time for each health check probe (RPC / DB). Prevents a hung
+ *  upstream from holding the HTTP response open indefinitely. */
+const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 // Log build info via structured logger (previously used console.log which bypassed Sentry/log pipeline)
 try {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -69,19 +83,23 @@ app.get("/health", async (c) => {
   
   // Check RPC connectivity
   try {
-    await getConnection().getSlot();
+    await withTimeout(getConnection().getSlot(), HEALTH_CHECK_TIMEOUT_MS, "RPC health check");
     checks.rpc = true;
   } catch (err) {
-    logger.error("RPC check failed", { error: err instanceof Error ? err.message : err });
+    logger.warn("RPC health check failed", { error: err instanceof Error ? err.message : err });
     checks.rpc = false;
   }
-  
+
   // Check Supabase connectivity
   try {
-    await getSupabase().from("markets").select("id", { count: "exact", head: true });
+    await withTimeout(
+      getSupabase().from("markets").select("id", { count: "exact", head: true }),
+      HEALTH_CHECK_TIMEOUT_MS,
+      "DB health check",
+    );
     checks.db = true;
   } catch (err) {
-    logger.error("DB check failed", { error: err instanceof Error ? err.message : err });
+    logger.warn("DB health check failed", { error: err instanceof Error ? err.message : err });
     checks.db = false;
   }
   
