@@ -1,7 +1,5 @@
-import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolator/shared";
-import { deriveInsuranceLpMint } from "@percolatorct/sdk";
+import { getSupabase, getNetwork, config, createLogger } from "@percolator/shared";
 import type { DiscoveredMarket } from "@percolatorct/sdk";
-import { PublicKey } from "@solana/web3.js";
 
 const logger = createLogger("indexer:insurance-lp");
 
@@ -66,7 +64,6 @@ export class InsuranceLPService {
 
   private async poll(): Promise<void> {
     const markets = this.marketProvider.getMarkets();
-    const connection = getConnection();
 
     for (const [slab, state] of markets.entries()) {
       try {
@@ -75,38 +72,9 @@ export class InsuranceLPService {
         // Get real insurance balance from on-chain engine state
         const insuranceBalance = Number(engine.insuranceFund.balance);
 
-        // Derive LP mint PDA and fetch supply (use per-market programId for multi-program support)
-        const slabPubkey = new PublicKey(slab);
-        const [lpMint] = deriveInsuranceLpMint(state.market.programId, slabPubkey);
-        
-        let lpSupply = 0;
-        try {
-          // First attempt without retry to detect permanent "account not found" errors
-          // which mean LP mint doesn't exist yet (expected for new markets).
-          const mintInfo = await connection.getTokenSupply(lpMint);
-          lpSupply = Number(mintInfo.value.amount);
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const isAccountNotFound = errMsg.includes("Invalid param") || errMsg.includes("could not find account");
-          if (isAccountNotFound) {
-            // LP mint not yet created — expected, lpSupply = 0 is correct. No retry needed.
-          } else {
-            // Transient RPC error — retry once then skip
-            try {
-              const mintInfo = await withRetry(
-                () => connection.getTokenSupply(lpMint),
-                { maxRetries: 1, baseDelayMs: 500, label: `getTokenSupply(${slab.slice(0, 8)})` },
-              );
-              lpSupply = Number(mintInfo.value.amount);
-            } catch (retryErr) {
-              logger.warn("getTokenSupply failed after retries — skipping snapshot", {
-                slab: slab.slice(0, 8),
-                error: retryErr instanceof Error ? retryErr.message : String(retryErr),
-              });
-              continue;
-            }
-          }
-        }
+        // Insurance LP program removed in @percolatorct/sdk@1.0.0-beta.4.
+        // deriveInsuranceLpMint no longer exists; LP supply is always 0.
+        const lpSupply = 0;
 
         const redemptionRateE6 =
           lpSupply > 0 ? Math.floor((insuranceBalance * 1_000_000) / lpSupply) : REDEMPTION_RATE_E6_DEFAULT;
