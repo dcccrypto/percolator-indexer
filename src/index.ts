@@ -166,7 +166,7 @@ async function start() {
     }
   }
 
-  // SEC: Validate SOLANA_RPC_URL to ensure it's a valid HTTPS endpoint.
+  // SEC: Validate RPC_URL to ensure it's a valid HTTPS endpoint.
   // In production, reject non-HTTPS URLs — MITM on the RPC connection could
   // manipulate account state, prices, and trade data returned to the indexer.
   if (config.rpcUrl) {
@@ -174,13 +174,13 @@ async function start() {
       const parsed = new URL(config.rpcUrl);
       if (parsed.protocol !== "https:") {
         if (IS_PRODUCTION) {
-          throw new Error("SOLANA_RPC_URL must use HTTPS in production — HTTP exposes RPC traffic to interception and manipulation");
+          throw new Error("RPC_URL must use HTTPS in production — HTTP exposes RPC traffic to interception and manipulation");
         }
-        logger.warn("SOLANA_RPC_URL uses non-HTTPS protocol — RPC calls will be unencrypted");
+        logger.warn("RPC_URL uses non-HTTPS protocol — RPC calls will be unencrypted");
       }
     } catch (urlErr) {
       if (urlErr instanceof Error && urlErr.message.includes("must use HTTPS")) throw urlErr;
-      logger.error("SOLANA_RPC_URL is not a valid URL — RPC calls will fail");
+      logger.error("RPC_URL is not a valid URL — RPC calls will fail");
     }
   }
 
