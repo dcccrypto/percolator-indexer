@@ -115,19 +115,27 @@ if (port !== rawPort) {
 
 // DB connection monitoring
 let dbConnectionLost = false;
-setInterval(async () => {
+const dbMonitorInterval = setInterval(async () => {
   try {
     await getSupabase().from("markets").select("id", { count: "exact", head: true });
     if (dbConnectionLost) {
+      try {
+        await sendInfoAlert("Indexer database connection restored");
+      } catch (alertErr) {
+        logger.error("Failed to send DB restored alert", { error: alertErr });
+      }
       dbConnectionLost = false;
-      await sendInfoAlert("Indexer database connection restored");
     }
   } catch (err) {
     if (!dbConnectionLost) {
+      try {
+        await sendCriticalAlert("Indexer database connection lost", [
+          { name: "Error", value: (err instanceof Error ? err.message : String(err)).slice(0, 200), inline: false },
+        ]);
+      } catch (alertErr) {
+        logger.error("Failed to send DB connection lost alert", { error: alertErr });
+      }
       dbConnectionLost = true;
-      await sendCriticalAlert("Indexer database connection lost", [
-        { name: "Error", value: (err instanceof Error ? err.message : String(err)).slice(0, 200), inline: false },
-      ]);
     }
     logger.error("DB connection check failed", { error: err });
   }
@@ -256,6 +264,9 @@ async function shutdown(signal: string): Promise<void> {
 
     logger.info("Stopping webhook manager");
     webhookManager.stop();
+
+    logger.info("Stopping DB connection monitor");
+    clearInterval(dbMonitorInterval);
 
     // Drain: give in-flight DB writes (webhook trade inserts, stats upserts)
     // time to complete before exiting. Without this, process.exit() kills
