@@ -15,6 +15,8 @@ import {
   parseConfig,
   parseParams,
   parseAllAccounts,
+  detectDexType,
+  parseDexPool,
   type EngineState,
   type MarketConfig,
   type RiskParams,
@@ -625,6 +627,94 @@ export class StatsCollector {
             }
           } catch (metaErr) {
             logger.debug("Token metadata resolution failed, using fallback", { mintAddress, error: metaErr instanceof Error ? metaErr.message : metaErr });
+          }
+
+          // Hyperp markets: override symbol/name with the index asset, not the collateral.
+          //
+          // A hyperp market uses an on-chain DEX pool as its price oracle instead of Pyth.
+          // The collateral is typically USDC, but the market tracks a different base asset
+          // (e.g. SOL for a SOL/USDC Perp). Without this override, auto-discovery stores
+          // symbol="USDC" / name="USD Coin" which is misleading in the UI.
+          //
+          // Detection: indexFeedId == [0;32] identifies a hyperp market.
+          // Resolution path:
+          //   1. Read the dexPool address from MarketConfig (set via SetDexPool instruction).
+          //   2. Fetch and parse the pool account to extract baseMint.
+          //   3. Look up baseMint metadata via DAS API → use as symbol/name.
+          //   4. Construct the market name as "{baseSymbol}/USDC Perpetual".
+          //   5. Fall back to "SOL" / "SOL/USDC Perpetual" on any failure (only one hyperp
+          //      market type exists today; this should be generalised when more are added).
+          const zeroKeyBytesHyperp = new Uint8Array(32);
+          const isHyperpMarket = market.config.indexFeedId.equals(new PublicKey(zeroKeyBytesHyperp));
+          if (isHyperpMarket) {
+            let baseSymbol = "SOL";  // safe default: SOL/USDC is the only hyperp type today
+            let baseName = "Solana"; // safe default
+            let resolvedFromChain = false;
+            try {
+              const dexPool = market.config.dexPool;
+              if (dexPool != null) {
+                const poolAccountInfo = await connection.getAccountInfo(dexPool);
+                if (poolAccountInfo) {
+                  const dexType = detectDexType(poolAccountInfo.owner);
+                  if (dexType != null) {
+                    const poolInfo = parseDexPool(dexType, dexPool, new Uint8Array(poolAccountInfo.data));
+                    const baseMintAddress = poolInfo.baseMint.toBase58();
+                    // Resolve base mint metadata via DAS (same pattern as collateral above)
+                    const endpoint = connection.rpcEndpoint;
+                    if (endpoint.includes("helius-rpc.com")) {
+                      const baseDasRes = await fetch(endpoint, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          jsonrpc: "2.0",
+                          id: `das-base-${baseMintAddress}`,
+                          method: "getAsset",
+                          params: { id: baseMintAddress, options: { showFungible: true } },
+                        }),
+                        signal: AbortSignal.timeout(5000),
+                      });
+                      if (baseDasRes.ok) {
+                        const baseDasJson = await baseDasRes.json();
+                        const baseMeta = baseDasJson?.result?.content?.metadata;
+                        const baseTokenInfo = baseDasJson?.result?.token_info;
+                        const rawSym = baseMeta?.symbol || baseTokenInfo?.symbol;
+                        const rawName = baseMeta?.name;
+                        if (typeof rawSym === "string" && rawSym.length > 0) {
+                          baseSymbol = rawSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
+                          resolvedFromChain = true;
+                        }
+                        if (typeof rawName === "string" && rawName.length > 0) {
+                          baseName = rawName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
+                        }
+                      }
+                    } else {
+                      // Non-Helius endpoint: resolve via parsed account info for decimals only;
+                      // symbol stays at default "SOL" until a DAS-capable endpoint is available.
+                      resolvedFromChain = false;
+                    }
+                  }
+                }
+              }
+            } catch (hyperpErr) {
+              logger.debug("Hyperp base asset resolution failed, using SOL fallback", {
+                slabAddress,
+                error: hyperpErr instanceof Error ? hyperpErr.message : hyperpErr,
+              });
+            }
+            // Build market symbol/name from base asset.
+            // Collateral symbol is already in `symbol` from the DAS lookup above (e.g. "USDC").
+            // If collateral lookup also failed, fall back gracefully.
+            const collateralLabel = symbol === mintAddress.substring(0, 8) ? "USDC" : symbol;
+            symbol = baseSymbol;
+            name = `${baseSymbol}/${collateralLabel} Perpetual`;
+            logger.info("Hyperp market metadata resolved", {
+              slabAddress,
+              baseSymbol,
+              baseName,
+              collateralLabel,
+              resolvedFromChain,
+              dexPool: market.config.dexPool?.toBase58() ?? null,
+            });
           }
 
           // Validate decimals: SPL tokens use 0-18. Values outside this range
