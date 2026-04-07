@@ -588,7 +588,7 @@ describe('StatsCollector', () => {
       expect(shared.upsertMarketStats).toHaveBeenCalledWith(
         expect.objectContaining({
           slab_address: SLAB1,
-          c_tot: 1_100_012_321_792_688_500,
+          c_tot: "1100012321792688500",
         })
       );
     });
