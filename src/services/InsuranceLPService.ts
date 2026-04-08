@@ -1,5 +1,6 @@
 import { getSupabase, getNetwork, config, createLogger } from "@percolator/shared";
 import type { DiscoveredMarket } from "@percolatorct/sdk";
+import type { MarketProvider } from "./StatsCollector.js";
 
 const logger = createLogger("indexer:insurance-lp");
 
@@ -23,10 +24,6 @@ interface InsuranceStats {
   redemptionRate: number;
   apy7d: number | null;
   apy30d: number | null;
-}
-
-interface MarketProvider {
-  getMarkets(): Map<string, { market: DiscoveredMarket }>;
 }
 
 export class InsuranceLPService {
