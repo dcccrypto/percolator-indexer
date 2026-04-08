@@ -92,7 +92,6 @@ export class StatsCollector {
   private _syncingVolume = false;
   private _syncingOrphanStats = false;
   private lastOracleLogTime = new Map<string, number>();
-  private lastFundingLogSlot = new Map<string, number>();
   private lastOiHistoryTime = new Map<string, number>();
   private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
@@ -1176,6 +1175,24 @@ export class StatsCollector {
           errors,
           totalMarkets: markets.size,
         });
+      }
+
+      // Prune rate-limit maps: remove entries for slabs no longer in discovery.
+      // Prevents unbounded growth if markets are delisted over time.
+      for (const key of this.lastOracleLogTime.keys()) {
+        if (!markets.has(key)) this.lastOracleLogTime.delete(key);
+      }
+      for (const key of this.lastOiHistoryTime.keys()) {
+        if (!markets.has(key)) this.lastOiHistoryTime.delete(key);
+      }
+      for (const key of this.lastInsHistoryTime.keys()) {
+        if (!markets.has(key)) this.lastInsHistoryTime.delete(key);
+      }
+      for (const key of this.lastFundingHistoryTime.keys()) {
+        if (!markets.has(key)) this.lastFundingHistoryTime.delete(key);
+      }
+      for (const key of this.closedSlabs) {
+        if (!markets.has(key)) this.closedSlabs.delete(key);
       }
     } catch (err) {
       logger.error("StatsCollector.collect failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
