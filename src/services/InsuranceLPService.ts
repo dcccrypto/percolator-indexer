@@ -112,6 +112,11 @@ export class InsuranceLPService {
         captureException(err, { tags: { context: "insurance-lp-market", slab } });
       }
     }
+
+    // Evict cache entries for slabs no longer in the active market set
+    for (const key of this.cache.keys()) {
+      if (!markets.has(key)) this.cache.delete(key);
+    }
   }
 
   private async computeTrailingAPY(slab: string, days: number): Promise<number | null> {
