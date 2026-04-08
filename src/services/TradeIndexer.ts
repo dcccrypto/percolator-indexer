@@ -368,7 +368,14 @@ export class TradeIndexerPolling {
    */
   private async readMarkPriceFromSlab(connection: Connection, slabAddress: string): Promise<number> {
     try {
-      const info = await connection.getAccountInfo(new PublicKey(slabAddress));
+      const info = await withRetry(
+        () => connection.getAccountInfo(new PublicKey(slabAddress)),
+        {
+          maxRetries: 3,
+          baseDelayMs: 1000,
+          label: `getAccountInfo(${slabAddress.slice(0, 8)})`,
+        }
+      );
       if (!info?.data) return 0;
 
       // Auto-detect V0 vs V1 layout from the actual slab data length.
