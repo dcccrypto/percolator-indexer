@@ -127,7 +127,7 @@ export class InsuranceLPService {
 
       if (error || !data || data.length === 0) return null;
 
-      const oldest = data[0] as InsuranceSnapshot;
+      const oldest = data[0] as Pick<InsuranceSnapshot, "redemption_rate_e6" | "created_at">;
       const oldRate = oldest.redemption_rate_e6;
 
       const current = this.cache.get(slab);
