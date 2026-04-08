@@ -193,6 +193,7 @@ export class StatsCollector {
         const { data: batch, error } = await getSupabase()
           .from("trades")
           .select("slab_address, size")
+          .eq("network", getNetwork())
           .gte("created_at", since)
           .range(from, to);
 
@@ -337,7 +338,7 @@ export class StatsCollector {
               if (!accountInfo?.data) {
                 // Account doesn't exist on-chain — mark as closed + excluded
                 const db = getSupabase();
-                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", dbMarket.slab_address);
+                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", dbMarket.slab_address).eq("network", getNetwork());
                 logger.info("Auto-closed non-existent orphan market", { slab: dbMarket.slab_address.slice(0, 8) });
                 return;
               }
@@ -850,7 +851,7 @@ export class StatsCollector {
               if (!accountInfo?.data) {
                 // Account doesn't exist on-chain — mark as closed + excluded
                 const db = getSupabase();
-                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", slabAddress);
+                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", slabAddress).eq("network", getNetwork());
                 logger.info("Auto-closed non-existent market", { slab: slabAddress.slice(0, 8) });
                 return;
               }
