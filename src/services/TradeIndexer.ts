@@ -250,7 +250,7 @@ export class TradeIndexerPolling {
       if (price === 0) {
         price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
       }
-      const fee = 0;
+      const fee = this.extractFeeFromBalances(tx, trader);
 
       // Check for duplicate
       const exists = await tradeExistsBySignature(signature);
@@ -363,6 +363,21 @@ export class TradeIndexerPolling {
         error: err instanceof Error ? err.message : err,
       });
     }
+    return 0;
+  }
+
+  /** Extract protocol fee from pre/post balance changes (same heuristic as webhook path). */
+  private extractFeeFromBalances(tx: ParsedTransactionWithMeta, trader: string): number {
+    if (!tx.meta?.preBalances || !tx.meta?.postBalances) return 0;
+    const accountKeys = tx.transaction.message.accountKeys;
+    const index = accountKeys.findIndex(
+      (k) => (typeof k === "string" ? k : k.pubkey.toBase58()) === trader,
+    );
+    if (index === -1) return 0;
+    const change = Math.abs(tx.meta.postBalances[index] - tx.meta.preBalances[index]);
+    // Same filter as webhook.ts extractFeeFromTransfers: skip Solana tx fees (<10k lamports),
+    // cap at 1 SOL to avoid false positives from margin/collateral movements.
+    if (change > 10_000 && change < 1_000_000_000) return change / 1e9;
     return 0;
   }
 }
