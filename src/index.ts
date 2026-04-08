@@ -46,6 +46,10 @@ const tradeIndexer = new TradeIndexerPolling();
 const insuranceService = new InsuranceLPService(discovery);
 const webhookManager = new HeliusWebhookManager();
 
+/** HTTP server handle — assigned in start(), closed in shutdown(). */
+let httpServer: ReturnType<typeof serve> | undefined;
+let isShuttingDown = false;
+
 const app = new Hono();
 
 // SEC: Security headers middleware — applied to all responses.
@@ -236,7 +240,7 @@ async function start() {
   insuranceService.start();
   await webhookManager.start();
   
-  serve({ fetch: app.fetch, port }, (info) => {
+  httpServer = serve({ fetch: app.fetch, port }, (info) => {
     logger.info("Indexer service started", { port: info.port });
   });
   
@@ -259,6 +263,12 @@ start().catch((err) => {
 const SHUTDOWN_DRAIN_MS = 3_000;
 
 async function shutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    logger.warn("Shutdown already in progress, ignoring duplicate signal", { signal });
+    return;
+  }
+  isShuttingDown = true;
+
   logger.info("Shutdown initiated", { signal });
 
   try {
@@ -266,6 +276,13 @@ async function shutdown(signal: string): Promise<void> {
     await sendInfoAlert("Indexer service shutting down", [
       { name: "Signal", value: signal, inline: true },
     ]);
+
+    // Close HTTP server first — stop accepting new webhook/health requests
+    // while in-flight requests finish normally.
+    if (httpServer) {
+      httpServer.close();
+      logger.info("HTTP server closed");
+    }
 
     // Stop all services (clears timers and intervals — no new work starts)
     logger.info("Stopping market discovery");
@@ -301,6 +318,6 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
 // Trigger rebuild 20260401053418
