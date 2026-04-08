@@ -30,6 +30,7 @@ export class TradeIndexerPolling {
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private hasBackfilled = false;
+  private backfillAttempts = 0;
 
   start(): void {
     if (this._running) return;
@@ -58,12 +59,12 @@ export class TradeIndexerPolling {
    */
   private async backfill(): Promise<void> {
     if (this.hasBackfilled || !this._running) return;
-    this.hasBackfilled = true;
 
     try {
       const markets = await getMarkets();
       if (markets.length === 0) {
         logger.info("No markets found for backfill");
+        this.hasBackfilled = true;
         return;
       }
 
@@ -73,7 +74,7 @@ export class TradeIndexerPolling {
         try {
           await this.indexTradesForSlab(market.slab_address, BACKFILL_SIGNATURES);
         } catch (err) {
-          logger.error("Backfill error", { 
+          logger.error("Backfill error", {
             slabAddress: market.slab_address.slice(0, 8),
             error: err instanceof Error ? err.message : err
           });
@@ -87,12 +88,23 @@ export class TradeIndexerPolling {
         // Small delay between markets to avoid rate limits
         await sleep(1_000);
       }
+      this.hasBackfilled = true;
       logger.info("Trade backfill complete");
     } catch (err) {
       logger.error("Backfill failed", { error: err instanceof Error ? err.message : err });
       captureException(err, {
         tags: { context: "trade-indexer-backfill" },
       });
+      // Retry with backoff, up to 3 attempts
+      this.backfillAttempts++;
+      if (this.backfillAttempts < 3 && this._running) {
+        const delayMs = 10_000 * Math.pow(2, this.backfillAttempts); // 20s, 40s
+        logger.info("Scheduling backfill retry", { attempt: this.backfillAttempts, delayMs });
+        setTimeout(() => this.backfill(), delayMs);
+      } else {
+        this.hasBackfilled = true;
+        logger.error("Backfill exhausted retries — pollAllMarkets will cover the gap");
+      }
     }
   }
 
