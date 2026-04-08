@@ -110,6 +110,9 @@ export class TradeIndexerPolling {
       logger.info("Trade backfill complete");
     } catch (err) {
       logger.error("Backfill failed", { error: err instanceof Error ? err.message : err });
+      captureException(err, {
+        tags: { context: "trade-indexer-backfill" },
+      });
     }
   }
 
@@ -136,6 +139,9 @@ export class TradeIndexerPolling {
       }
     } catch (err) {
       logger.error("Poll failed", { error: err instanceof Error ? err.message : err });
+      captureException(err, {
+        tags: { context: "trade-indexer-poll" },
+      });
     }
   }
 
