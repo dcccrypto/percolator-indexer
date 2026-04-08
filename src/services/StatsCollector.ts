@@ -393,13 +393,15 @@ export class StatsCollector {
 
               const U64_MAX = 18446744073709551615n;
               const PG_BIGINT_MAX = 9223372036854775807n;
-              const safeBigNum = (v: bigint): number => {
+              const safeBigNum = (v: bigint): number | string => {
                 if (v >= U64_MAX || v < 0n) return 0;
+                if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
                 return Number(v);
               };
-              const safePgBigint = (v: bigint): number => {
+              const safePgBigint = (v: bigint): number | string => {
                 if (v >= U64_MAX || v < 0n) return 0;
-                if (v > PG_BIGINT_MAX) return Number(PG_BIGINT_MAX);
+                if (v > PG_BIGINT_MAX) return PG_BIGINT_MAX.toString();
+                if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
                 return Number(v);
               };
 
@@ -942,16 +944,18 @@ export class StatsCollector {
             const U64_MAX = 18446744073709551615n;
             const PG_BIGINT_MAX = 9223372036854775807n;
 
-            /** For NUMERIC columns: convert to number, capping at u64::MAX sentinel */
-            const safeBigNum = (v: bigint): number => {
+            /** For NUMERIC columns: convert to number, or string if precision would be lost */
+            const safeBigNum = (v: bigint): number | string => {
               if (v >= U64_MAX || v < 0n) return 0;
+              if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
               return Number(v);
             };
 
             /** For BIGINT columns: cap at PG signed bigint max to prevent overflow */
-            const safePgBigint = (v: bigint): number => {
+            const safePgBigint = (v: bigint): number | string => {
               if (v >= U64_MAX || v < 0n) return 0;
-              if (v > PG_BIGINT_MAX) return Number(PG_BIGINT_MAX);
+              if (v > PG_BIGINT_MAX) return PG_BIGINT_MAX.toString();
+              if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
               return Number(v);
             };
 
