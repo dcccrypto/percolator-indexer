@@ -6,6 +6,8 @@ import { config, createLogger, initSentry, captureException, getSupabase, getCon
 import { MarketDiscovery } from "./services/MarketDiscovery.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
+import { NftIndexerPolling } from "./services/NftIndexer.js";
+import { AdlIndexerPolling } from "./services/AdlIndexer.js";
 import { InsuranceLPService } from "./services/InsuranceLPService.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { webhookRoutes } from "./routes/webhook.js";
@@ -43,6 +45,8 @@ try {
 const discovery = new MarketDiscovery();
 const statsCollector = new StatsCollector(discovery);
 const tradeIndexer = new TradeIndexerPolling();
+const nftIndexer = new NftIndexerPolling();
+const adlIndexer = new AdlIndexerPolling();
 const insuranceService = new InsuranceLPService(discovery);
 const webhookManager = new HeliusWebhookManager();
 
@@ -237,6 +241,8 @@ async function start() {
   await discovery.start();
   statsCollector.start();
   tradeIndexer.start();
+  nftIndexer.start();
+  adlIndexer.start();
   insuranceService.start();
   await webhookManager.start();
   
@@ -293,6 +299,12 @@ async function shutdown(signal: string): Promise<void> {
 
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
+
+    logger.info("Stopping NFT indexer");
+    nftIndexer.stop();
+
+    logger.info("Stopping ADL indexer");
+    adlIndexer.stop();
 
     logger.info("Stopping insurance LP service");
     insuranceService.stop();
