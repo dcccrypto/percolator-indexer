@@ -22,35 +22,23 @@ const BACKFILL_SIGNATURES = 100;
  * Primary indexing is now webhook-driven (see HeliusWebhookManager + webhook routes).
  * This poller runs on startup for backfill, then every 5 minutes as a catchall.
  *
- * Two modes:
- * 1. Reactive: listens for crank.success events for immediate indexing
- * 2. Proactive: polls all active markets periodically to catch any missed trades
+ * Polls all active markets periodically to catch any missed trades.
  */
 export class TradeIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
   private lastSignature = new Map<string, string>();
   private _running = false;
-  private pendingSlabs = new Set<string>();
-  private processTimer: ReturnType<typeof setTimeout> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private crankListener: ((payload: { slabAddress: string }) => void) | null = null;
   private hasBackfilled = false;
 
   start(): void {
     if (this._running) return;
     this._running = true;
 
-    // Listen for successful cranks (reactive mode)
-    this.crankListener = (payload) => {
-      this.pendingSlabs.add(payload.slabAddress);
-      this.scheduleProcess();
-    };
-    eventBus.on("crank.success", this.crankListener);
-
     // Initial backfill after short delay to let discovery finish
     setTimeout(() => this.backfill(), 5_000);
 
-    // Start periodic polling (proactive mode)
+    // Start periodic polling
     this.pollTimer = setInterval(() => this.pollAllMarkets(), POLL_INTERVAL_MS);
 
     logger.info("TradeIndexerPolling started (backup mode)", { intervalMs: POLL_INTERVAL_MS });
@@ -58,14 +46,6 @@ export class TradeIndexerPolling {
 
   stop(): void {
     this._running = false;
-    if (this.crankListener) {
-      eventBus.off("crank.success", this.crankListener);
-      this.crankListener = null;
-    }
-    if (this.processTimer) {
-      clearTimeout(this.processTimer);
-      this.processTimer = null;
-    }
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
@@ -149,22 +129,6 @@ export class TradeIndexerPolling {
    * Debounce processing — cranks happen in batches, wait a bit
    * to collect all slabs before processing
    */
-  private scheduleProcess(): void {
-    if (this.processTimer) return;
-    this.processTimer = setTimeout(async () => {
-      this.processTimer = null;
-      const slabs = [...this.pendingSlabs];
-      this.pendingSlabs.clear();
-      for (const slab of slabs) {
-        try {
-          await this.indexTradesForSlab(slab);
-        } catch (err) {
-          logger.error("Error indexing trade", { slabAddress: slab, error: err instanceof Error ? err.message : err });
-        }
-      }
-    }, 3_000); // 3s debounce after crank
-  }
-
   private async indexTradesForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
     const connection = getConnection();
     const slabPk = new PublicKey(slabAddress);
