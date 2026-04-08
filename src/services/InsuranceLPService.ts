@@ -1,4 +1,4 @@
-import { getSupabase, getNetwork, config, createLogger } from "@percolator/shared";
+import { getSupabase, getNetwork, config, createLogger, captureException } from "@percolator/shared";
 import type { DiscoveredMarket } from "@percolatorct/sdk";
 
 const logger = createLogger("indexer:insurance-lp");
@@ -44,9 +44,15 @@ export class InsuranceLPService {
       logger.warn("SUPABASE_URL/KEY not set, service disabled");
       return;
     }
-    this.poll().catch((e) => logger.error("Failed to run initial poll", { error: e }));
+    this.poll().catch((e) => {
+      logger.error("Failed to run initial poll", { error: e instanceof Error ? e.message : e });
+      captureException(e, { tags: { context: "insurance-lp-initial-poll" } });
+    });
     this.timer = setInterval(() => {
-      this.poll().catch((e) => logger.error("Failed to poll insurance data", { error: e }));
+      this.poll().catch((e) => {
+        logger.error("Failed to poll insurance data", { error: e instanceof Error ? e.message : e });
+        captureException(e, { tags: { context: "insurance-lp-poll" } });
+      });
     }, POLL_INTERVAL_MS);
     logger.info("InsuranceLPService started", { intervalMs: POLL_INTERVAL_MS });
   }
@@ -102,7 +108,8 @@ export class InsuranceLPService {
           apy30d,
         });
       } catch (err) {
-        logger.error("Error polling market", { slab, error: err });
+        logger.error("Error polling market", { slab, error: err instanceof Error ? err.message : err });
+        captureException(err, { tags: { context: "insurance-lp-market", slab } });
       }
     }
   }
@@ -146,7 +153,8 @@ export class InsuranceLPService {
       
       return Math.round(annualized * 10_000) / 10_000; // 4 decimal places
     } catch (err) {
-      logger.error("APY calculation error", { slab, error: err });
+      logger.error("APY calculation error", { slab, error: err instanceof Error ? err.message : err });
+      captureException(err, { tags: { context: "insurance-lp-apy", slab } });
       return null;
     }
   }
