@@ -25,6 +25,8 @@ vi.stubGlobal("fetch", mockFetch);
 vi.mock("@percolator/shared", () => ({
   get config() { return sharedMock.config; },
   createLogger: vi.fn(() => sharedMock.logger),
+  captureException: vi.fn(),
+  sendCriticalAlert: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { HeliusWebhookManager } from "../../src/services/HeliusWebhookManager.js";
