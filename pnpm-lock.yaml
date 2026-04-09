@@ -15,8 +15,8 @@ importers:
         specifier: github:dcccrypto/percolator-shared#3dfbb7eeb689c8800c6324b89f4104f98b95b699
         version: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/3dfbb7eeb689c8800c6324b89f4104f98b95b699(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/sdk':
-        specifier: 1.0.0-beta.6
-        version: 1.0.0-beta.6(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.8
+        version: 1.0.0-beta.8(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -459,13 +459,13 @@ packages:
     resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/3dfbb7eeb689c8800c6324b89f4104f98b95b699}
     version: 0.1.0
 
-  '@percolatorct/sdk@1.0.0-beta.6':
-    resolution: {integrity: sha512-2zNR1JGt0K9AJmFUD4hyzUfrFoHY+9Dj/ZYrYxAqr1ha/rnQyeMK3HmZht9dmixE4X8txP+DMOF5RUxgYIuMeA==}
+  '@percolatorct/sdk@1.0.0-beta.8':
+    resolution: {integrity: sha512-VrJTao1kfkDh/cZcnptay4OL6c+v8JS911k3FcmZRVed68S4/z6iCucDV6+KOrx0CXJgnPWvRDQLp/DwSa0zyA==}
     engines: {node: '>=20.0.0'}
 
-  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/89fc3ea00c32ed20fbc3d1d2b5f61e9818530d1b':
-    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/89fc3ea00c32ed20fbc3d1d2b5f61e9818530d1b}
-    version: 1.0.0-beta.6
+  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/04649041468d9ed3e9ccef3c8d3a453ba6defdb6':
+    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/04649041468d9ed3e9ccef3c8d3a453ba6defdb6}
+    version: 1.0.0-beta.8
     engines: {node: '>=20.0.0'}
 
   '@prisma/instrumentation@7.4.2':
@@ -1767,7 +1767,7 @@ snapshots:
 
   '@percolator/shared@https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/3dfbb7eeb689c8800c6324b89f4104f98b95b699(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
-      '@percolator/sdk': '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/89fc3ea00c32ed20fbc3d1d2b5f61e9818530d1b(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)'
+      '@percolator/sdk': '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/04649041468d9ed3e9ccef3c8d3a453ba6defdb6(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)'
       '@sentry/node': 10.46.0
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@supabase/supabase-js': 2.100.1(bufferutil@4.1.0)(utf-8-validate@6.0.6)
@@ -1783,7 +1783,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/sdk@1.0.0-beta.6(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@1.0.0-beta.8(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -1794,7 +1794,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/89fc3ea00c32ed20fbc3d1d2b5f61e9818530d1b(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/04649041468d9ed3e9ccef3c8d3a453ba6defdb6(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
