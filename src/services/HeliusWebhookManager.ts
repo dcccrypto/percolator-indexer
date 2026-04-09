@@ -1,4 +1,4 @@
-import { config, createLogger } from "@percolator/shared";
+import { config, createLogger, captureException, sendCriticalAlert } from "@percolator/shared";
 
 const logger = createLogger("indexer:webhook-manager");
 
@@ -72,6 +72,16 @@ export class HeliusWebhookManager {
       this._status = "failed";
       logger.error("Failed to register webhook", { error: this._startError });
       logger.warn("Falling back to polling-only mode");
+      captureException(err, {
+        tags: { context: "helius-webhook-registration" },
+      });
+      try {
+        await sendCriticalAlert("Helius webhook registration failed — polling-only mode", [
+          { name: "Error", value: this._startError.slice(0, 200), inline: false },
+        ]);
+      } catch (alertErr) {
+        logger.error("Failed to send webhook registration alert", { error: alertErr });
+      }
     }
   }
 
