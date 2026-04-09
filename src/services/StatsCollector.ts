@@ -1029,16 +1029,16 @@ export class StatsCollector {
               // Complete RiskEngine state fields (migration 010)
               vault_balance: safeBigNum(engine.vault),         // NUMERIC
               lifetime_liquidations: safeBigNum(engine.lifetimeLiquidations), // NUMERIC (migration 024)
-              lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses),  // NUMERIC (migration 024)
-              c_tot: safeBigNum(engine.cTot),                  // NUMERIC
-              pnl_pos_tot: safeBigNum(engine.pnlPosTot),       // NUMERIC
-              last_crank_slot: safePgBigint(engine.lastCrankSlot), // BIGINT
-              max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots), // BIGINT
+              lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses) as number,  // NUMERIC (migration 024)
+              c_tot: safeBigNum(engine.cTot) as number,                  // NUMERIC
+              pnl_pos_tot: safeBigNum(engine.pnlPosTot) as number,       // NUMERIC
+              last_crank_slot: safePgBigint(engine.lastCrankSlot) as number, // BIGINT
+              max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots) as number, // BIGINT
               // RiskParams fields (migration 010)
               maintenance_fee_per_slot: params.maintenanceFeePerSlot.toString(), // TEXT
-              liquidation_fee_bps: safePgBigint(params.liquidationFeeBps), // BIGINT
+              liquidation_fee_bps: safePgBigint(params.liquidationFeeBps) as number, // BIGINT
               liquidation_fee_cap: params.liquidationFeeCap.toString(),    // TEXT
-              liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps), // BIGINT
+              liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps) as number, // BIGINT
               updated_at: new Date().toISOString(),
             });
 
