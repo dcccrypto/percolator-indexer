@@ -166,6 +166,12 @@ export class NftIndexerPolling {
             slabAddress: market.slab_address.slice(0, 8),
             error: err instanceof Error ? err.message : err,
           });
+          captureException(err, {
+            tags: {
+              context: "nft-indexer-poll",
+              slabAddress: market.slab_address,
+            },
+          });
         }
         await sleep(500);
       }
