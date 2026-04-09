@@ -21,7 +21,7 @@
  * Dry-run mode prints what would be updated without writing to DB.
  */
 
-import { getSupabase } from "@percolator/shared";
+import { getSupabase, getNetwork } from "@percolator/shared";
 import { config } from "@percolator/shared";
 import { detectSlabLayout } from "@percolatorct/sdk";
 
@@ -156,6 +156,7 @@ async function main() {
   const { data: zeroPricedTrades, error: fetchErr } = await supabase
     .from("trades")
     .select("id, slab_address, tx_signature, price")
+    .eq("network", getNetwork())
     .eq("price", 0)
     .not("tx_signature", "is", null)
     .order("created_at", { ascending: true });
@@ -271,6 +272,7 @@ async function main() {
           .from("trades")
           .update({ price })
           .eq("id", id)
+          .eq("network", getNetwork())
           .eq("price", 0) // guard: only overwrite if still 0
       )
     );
@@ -291,6 +293,7 @@ async function main() {
   const { count: remaining, error: countErr } = await supabase
     .from("trades")
     .select("id", { count: "exact", head: true })
+    .eq("network", getNetwork())
     .eq("price", 0);
 
   if (countErr) {
