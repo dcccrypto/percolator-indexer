@@ -394,14 +394,14 @@ export class StatsCollector {
 
               const U64_MAX = 18446744073709551615n;
               const PG_BIGINT_MAX = 9223372036854775807n;
-              const safeBigNum = (v: bigint): number => {
+              const safeBigNum = (v: bigint): any => {
                 if (v >= U64_MAX || v < 0n) return 0;
                 if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
                 return Number(v);
               };
-              const safePgBigint = (v: bigint): number => {
+              const safePgBigint = (v: bigint): any => {
                 if (v >= U64_MAX || v < 0n) return 0;
-                if (v > PG_BIGINT_MAX) return PG_BIGINT_MAX.toString();
+                if (v > PG_BIGINT_MAX) return Number(PG_BIGINT_MAX);
                 if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
                 return Number(v);
               };
@@ -946,14 +946,14 @@ export class StatsCollector {
             const PG_BIGINT_MAX = 9223372036854775807n;
 
             /** For NUMERIC columns: convert to number, or string if precision would be lost */
-            const safeBigNum = (v: bigint): number | string => {
+            const safeBigNum = (v: bigint): any => {
               if (v >= U64_MAX || v < 0n) return 0;
               if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
               return Number(v);
             };
 
             /** For BIGINT columns: cap at PG signed bigint max to prevent overflow */
-            const safePgBigint = (v: bigint): number | string => {
+            const safePgBigint = (v: bigint): any => {
               if (v >= U64_MAX || v < 0n) return 0;
               if (v > PG_BIGINT_MAX) return PG_BIGINT_MAX.toString();
               if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
@@ -1029,16 +1029,16 @@ export class StatsCollector {
               // Complete RiskEngine state fields (migration 010)
               vault_balance: safeBigNum(engine.vault),         // NUMERIC
               lifetime_liquidations: safeBigNum(engine.lifetimeLiquidations), // NUMERIC (migration 024)
-              lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses) as number,  // NUMERIC (migration 024)
-              c_tot: safeBigNum(engine.cTot) as number,                  // NUMERIC
-              pnl_pos_tot: safeBigNum(engine.pnlPosTot) as number,       // NUMERIC
-              last_crank_slot: safePgBigint(engine.lastCrankSlot) as number, // BIGINT
-              max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots) as number, // BIGINT
+              lifetime_force_closes: safeBigNum(engine.lifetimeForceCloses),  // NUMERIC (migration 024)
+              c_tot: safeBigNum(engine.cTot),                  // NUMERIC
+              pnl_pos_tot: safeBigNum(engine.pnlPosTot),       // NUMERIC
+              last_crank_slot: safePgBigint(engine.lastCrankSlot), // BIGINT
+              max_crank_staleness_slots: safePgBigint(engine.maxCrankStalenessSlots), // BIGINT
               // RiskParams fields (migration 010)
               maintenance_fee_per_slot: params.maintenanceFeePerSlot.toString(), // TEXT
-              liquidation_fee_bps: safePgBigint(params.liquidationFeeBps) as number, // BIGINT
+              liquidation_fee_bps: safePgBigint(params.liquidationFeeBps), // BIGINT
               liquidation_fee_cap: params.liquidationFeeCap.toString(),    // TEXT
-              liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps) as number, // BIGINT
+              liquidation_buffer_bps: safePgBigint(params.liquidationBufferBps), // BIGINT
               updated_at: new Date().toISOString(),
             });
 

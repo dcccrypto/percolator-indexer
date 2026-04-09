@@ -101,7 +101,7 @@ app.get("/health", async (c) => {
   // Check Supabase connectivity
   try {
     await withTimeout(
-      getSupabase().from("markets").select("id", { count: "exact", head: true }),
+      Promise.resolve(getSupabase().from("markets").select("id", { count: "exact", head: true })),
       HEALTH_CHECK_TIMEOUT_MS,
       "DB health check",
     );
