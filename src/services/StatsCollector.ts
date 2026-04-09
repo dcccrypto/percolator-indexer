@@ -394,12 +394,12 @@ export class StatsCollector {
 
               const U64_MAX = 18446744073709551615n;
               const PG_BIGINT_MAX = 9223372036854775807n;
-              const safeBigNum = (v: bigint): number | string => {
+              const safeBigNum = (v: bigint): number => {
                 if (v >= U64_MAX || v < 0n) return 0;
                 if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
                 return Number(v);
               };
-              const safePgBigint = (v: bigint): number | string => {
+              const safePgBigint = (v: bigint): number => {
                 if (v >= U64_MAX || v < 0n) return 0;
                 if (v > PG_BIGINT_MAX) return PG_BIGINT_MAX.toString();
                 if (v > BigInt(Number.MAX_SAFE_INTEGER)) return v.toString();
