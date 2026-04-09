@@ -1,6 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
 import { discoverMarkets, type DiscoveredMarket } from "@percolatorct/sdk";
-import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException } from "@percolator/shared";
+import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException, sendCriticalAlert } from "@percolator/shared";
 
 const logger = createLogger("indexer:market-discovery");
 
@@ -102,6 +102,13 @@ export class MarketDiscovery {
         staleMarkets: this.markets.size,
       });
       captureException(err, { tags: { context: "market-discovery-total-failure" } });
+      // Alert operators after 3 consecutive total failures (avoid noise on transient blips)
+      if (this.consecutiveFailures >= 3) {
+        sendCriticalAlert("Market discovery failed for all programs — RPC may be down", [
+          { name: "Consecutive failures", value: String(this.consecutiveFailures), inline: true },
+          { name: "Stale markets", value: String(this.markets.size), inline: true },
+        ]).catch((alertErr) => logger.error("Failed to send discovery alert", { error: alertErr }));
+      }
       // Preserve stale markets — do NOT clear the map
       return [];
     }
