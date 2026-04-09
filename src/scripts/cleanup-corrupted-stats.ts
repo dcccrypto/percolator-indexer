@@ -12,7 +12,7 @@
  *
  * Run: npx tsx packages/indexer/src/scripts/cleanup-corrupted-stats.ts
  */
-import { getSupabase } from "@percolator/shared";
+import { getSupabase, getNetwork } from "@percolator/shared";
 
 // GH#1208: Use 5e17 instead of 1e18 — values like 7.997e17 are clearly corrupt
 // but slip through the original 1e18 threshold.
@@ -26,6 +26,7 @@ async function main() {
   const { data: markets, error: marketsErr } = await supabase
     .from("markets")
     .select("slab_address, decimals, mint_address")
+    .eq("network", getNetwork())
     .or(`decimals.gt.${MAX_VALID_DECIMALS},decimals.lt.0`);
   
   if (marketsErr) throw marketsErr;
@@ -37,7 +38,8 @@ async function main() {
     const { error } = await supabase
       .from("markets")
       .update({ decimals: 6 })
-      .eq("slab_address", m.slab_address);
+      .eq("slab_address", m.slab_address)
+      .eq("network", getNetwork());
     if (error) console.error(`  ERROR: ${error.message}`);
   }
 
@@ -46,6 +48,7 @@ async function main() {
   const { data: corruptedStats, error: statsErr } = await supabase
     .from("markets")
     .select("slab_address, total_open_interest, insurance_balance, c_tot")
+    .eq("network", getNetwork())
     .or(`total_open_interest.gt.${MAX_SANE_VALUE},insurance_balance.gt.${MAX_SANE_VALUE},c_tot.gt.${MAX_SANE_VALUE}`);
 
   if (statsErr) throw statsErr;
@@ -73,7 +76,8 @@ async function main() {
         lifetime_liquidations: 0,
         lifetime_force_closes: 0,
       })
-      .eq("slab_address", s.slab_address);
+      .eq("slab_address", s.slab_address)
+      .eq("network", getNetwork());
     if (error) console.error(`  ERROR: ${error.message}`);
   }
 
