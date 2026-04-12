@@ -1,6 +1,14 @@
-import { getSupabase, getNetwork, config, createLogger, captureException } from "@percolator/shared";
+import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolator/shared";
 import type { DiscoveredMarket } from "@percolatorct/sdk";
-import type { MarketProvider } from "./StatsCollector.js";
+import { PublicKey } from "@solana/web3.js";
+
+// Inline PDA derivation — deriveInsuranceLpMint was removed from SDK in v1.0.0-beta.16
+function deriveInsuranceLpMint(programId: PublicKey, slab: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("insurance_lp_mint"), slab.toBuffer()],
+    programId,
+  );
+}
 
 const logger = createLogger("indexer:insurance-lp");
 
@@ -26,6 +34,10 @@ interface InsuranceStats {
   apy30d: number | null;
 }
 
+interface MarketProvider {
+  getMarkets(): Map<string, { market: DiscoveredMarket }>;
+}
+
 export class InsuranceLPService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly marketProvider: MarketProvider;
@@ -41,15 +53,9 @@ export class InsuranceLPService {
       logger.warn("SUPABASE_URL/KEY not set, service disabled");
       return;
     }
-    this.poll().catch((e) => {
-      logger.error("Failed to run initial poll", { error: e instanceof Error ? e.message : e });
-      captureException(e, { tags: { context: "insurance-lp-initial-poll" } });
-    });
+    this.poll().catch((e) => logger.error("Failed to run initial poll", { error: e }));
     this.timer = setInterval(() => {
-      this.poll().catch((e) => {
-        logger.error("Failed to poll insurance data", { error: e instanceof Error ? e.message : e });
-        captureException(e, { tags: { context: "insurance-lp-poll" } });
-      });
+      this.poll().catch((e) => logger.error("Failed to poll insurance data", { error: e }));
     }, POLL_INTERVAL_MS);
     logger.info("InsuranceLPService started", { intervalMs: POLL_INTERVAL_MS });
   }
@@ -67,6 +73,7 @@ export class InsuranceLPService {
 
   private async poll(): Promise<void> {
     const markets = this.marketProvider.getMarkets();
+    const connection = getConnection();
 
     for (const [slab, state] of markets.entries()) {
       try {
@@ -75,9 +82,38 @@ export class InsuranceLPService {
         // Get real insurance balance from on-chain engine state
         const insuranceBalance = Number(engine.insuranceFund.balance);
 
-        // Insurance LP program removed in @percolatorct/sdk@1.0.0-beta.4.
-        // deriveInsuranceLpMint no longer exists; LP supply is always 0.
-        const lpSupply = 0;
+        // Derive LP mint PDA and fetch supply (use per-market programId for multi-program support)
+        const slabPubkey = new PublicKey(slab);
+        const [lpMint] = deriveInsuranceLpMint(state.market.programId, slabPubkey);
+        
+        let lpSupply = 0;
+        try {
+          // GH#44: Wrap with retry to survive transient RPC failures.
+          // "Account not found" from Solana returns null value (not an exception),
+          // so lpSupply = 0 is correct for uninitialised LP mints.
+          const mintInfo = await withRetry(
+            () => connection.getTokenSupply(lpMint),
+            { maxRetries: 2, baseDelayMs: 500, label: `getTokenSupply(${slab.slice(0, 8)})` },
+          );
+          lpSupply = Number(mintInfo.value.amount);
+        } catch (err) {
+          // After retries: could be "invalid param" (mint not yet created) or a persistent RPC issue.
+          // Don't write a snapshot with lpSupply=0 if this is a retriable RPC error — skip instead.
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const isAccountNotFound = errMsg.includes("Invalid param") || errMsg.includes("could not find account");
+          if (!isAccountNotFound) {
+            logger.warn("getTokenSupply failed after retries — skipping snapshot", {
+              slab: slab.slice(0, 8),
+              error: errMsg,
+            });
+            captureException(err instanceof Error ? err : new Error(errMsg), {
+              tags: { context: "insurance-lp-token-supply" },
+              extra: { slab },
+            });
+            continue;
+          }
+          // Account not found = LP mint not yet created — expected for new markets, lpSupply = 0 is correct
+        }
 
         const redemptionRateE6 =
           lpSupply > 0 ? Math.floor((insuranceBalance * 1_000_000) / lpSupply) : REDEMPTION_RATE_E6_DEFAULT;
@@ -105,14 +141,8 @@ export class InsuranceLPService {
           apy30d,
         });
       } catch (err) {
-        logger.error("Error polling market", { slab, error: err instanceof Error ? err.message : err });
-        captureException(err, { tags: { context: "insurance-lp-market", slab } });
+        logger.error("Error polling market", { slab, error: err });
       }
-    }
-
-    // Evict cache entries for slabs no longer in the active market set
-    for (const key of this.cache.keys()) {
-      if (!markets.has(key)) this.cache.delete(key);
     }
   }
 
@@ -122,21 +152,17 @@ export class InsuranceLPService {
       const db = getSupabase();
       const since = new Date(Date.now() - days * MS_PER_DAY).toISOString();
 
-      // PERC-8192: Filter by network to prevent devnet snapshots from
-      // contaminating mainnet APY calculations (insert at line 122 stamps
-      // network, but this query was missing the filter).
       const { data, error } = await db
         .from("insurance_snapshots")
         .select("redemption_rate_e6, created_at")
         .eq("slab", slab)
-        .eq("network", getNetwork())
         .gte("created_at", since)
         .order("created_at", { ascending: true })
         .limit(1);
 
       if (error || !data || data.length === 0) return null;
 
-      const oldest = data[0] as Pick<InsuranceSnapshot, "redemption_rate_e6" | "created_at">;
+      const oldest = data[0] as InsuranceSnapshot;
       const oldRate = oldest.redemption_rate_e6;
 
       const current = this.cache.get(slab);
@@ -155,8 +181,7 @@ export class InsuranceLPService {
       
       return Math.round(annualized * 10_000) / 10_000; // 4 decimal places
     } catch (err) {
-      logger.error("APY calculation error", { slab, error: err instanceof Error ? err.message : err });
-      captureException(err, { tags: { context: "insurance-lp-apy", slab } });
+      logger.error("APY calculation error", { slab, error: err });
       return null;
     }
   }
