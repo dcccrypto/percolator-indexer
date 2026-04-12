@@ -15,8 +15,8 @@ importers:
         specifier: github:dcccrypto/percolator-shared#3dfbb7eeb689c8800c6324b89f4104f98b95b699
         version: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/3dfbb7eeb689c8800c6324b89f4104f98b95b699(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/sdk':
-        specifier: 1.0.0-beta.16
-        version: 1.0.0-beta.16(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.17
+        version: 1.0.0-beta.17(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -459,8 +459,8 @@ packages:
     resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/3dfbb7eeb689c8800c6324b89f4104f98b95b699}
     version: 0.1.0
 
-  '@percolatorct/sdk@1.0.0-beta.16':
-    resolution: {integrity: sha512-iCGL6jU0ckL8AAMgWWCTDTeNSPoLYg47H8OVRO1hddHBpVyhhsnoH6kMNm7/z9SnM4ug+ghN5Zs5E1EXjz1hfA==}
+  '@percolatorct/sdk@1.0.0-beta.17':
+    resolution: {integrity: sha512-IQvUAxPuYKAHnIRw5tkhH+lJXiv5/EkSHAzhuT4sdB4CMAuTSMoxTV/+uaaCh5pMZGjp8d2gOjsAO+I5sojuag==}
     engines: {node: '>=20.0.0'}
 
   '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/2f80d798e314d132bf92066cf841eb9ce2888dfd':
@@ -1783,7 +1783,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/sdk@1.0.0-beta.16(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@1.0.0-beta.17(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
