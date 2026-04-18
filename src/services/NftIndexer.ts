@@ -30,7 +30,7 @@ import {
   decodeBase58,
   createLogger,
   captureException,
-} from "@percolator/shared";
+} from "@percolatorct/shared";
 
 const logger = createLogger("indexer:nft-indexer");
 

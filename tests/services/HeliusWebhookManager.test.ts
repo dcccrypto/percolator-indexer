@@ -22,7 +22,7 @@ const { mockFetch, sharedMock } = vi.hoisted(() => ({
 
 vi.stubGlobal("fetch", mockFetch);
 
-vi.mock("@percolator/shared", () => ({
+vi.mock("@percolatorct/shared", () => ({
   get config() { return sharedMock.config; },
   createLogger: vi.fn(() => sharedMock.logger),
 }));

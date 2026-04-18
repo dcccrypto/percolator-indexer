@@ -35,7 +35,7 @@ import {
   createLogger,
   captureException,
   addBreadcrumb,
-} from "@percolator/shared";
+} from "@percolatorct/shared";
 
 /**
  * How often to sync volume/trade_count for ALL DB markets, including those not

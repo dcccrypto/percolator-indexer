@@ -1,4 +1,4 @@
-import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolator/shared";
+import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolatorct/shared";
 import type { DiscoveredMarket } from "@percolatorct/sdk";
 import { PublicKey } from "@solana/web3.js";
 
