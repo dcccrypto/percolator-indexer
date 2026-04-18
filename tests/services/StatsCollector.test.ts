@@ -12,7 +12,7 @@ vi.mock('@percolatorct/sdk', () => ({
   parseAllAccounts: vi.fn(() => []),
 }));
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   createLogger: vi.fn(() => ({
     info: vi.fn(),
     warn: vi.fn(),
@@ -43,7 +43,7 @@ vi.mock('@percolator/shared', () => ({
 import { StatsCollector } from '../../src/services/StatsCollector.js';
 import type { MarketProvider } from '../../src/services/StatsCollector.js';
 import * as core from '@percolatorct/sdk';
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 
 const SLAB1 = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
 const SLAB2 = 'FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn';

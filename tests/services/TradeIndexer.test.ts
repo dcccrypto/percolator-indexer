@@ -8,7 +8,7 @@ vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
 }));
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD'],
   },
@@ -58,7 +58,7 @@ vi.mock('@percolator/shared', () => ({
 }));
 
 import { TradeIndexerPolling } from '../../src/services/TradeIndexer.js';
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 
 const SLAB = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';

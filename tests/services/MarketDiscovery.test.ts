@@ -14,7 +14,7 @@ const mockFallbackConnection = {
   getProgramAccounts: vi.fn(),
 };
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['11111111111111111111111111111111', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'],
   },
@@ -171,7 +171,7 @@ describe('MarketDiscovery', () => {
     });
 
     it('should fall back to fallbackConn after exhausting all primary 429 retries', async () => {
-      const { getPrimaryConnection, getFallbackConnection } = await import('@percolator/shared');
+      const { getPrimaryConnection, getFallbackConnection } = await import('@percolatorct/shared');
       const primaryConn = getPrimaryConnection();
       const fallbackConn = getFallbackConnection();
 

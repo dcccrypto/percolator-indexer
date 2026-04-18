@@ -15,7 +15,7 @@ vi.mock('@percolatorct/sdk', () => ({
 // The string 'test-secret-token' is duplicated intentionally — do not replace with a variable reference.
 const TEST_WEBHOOK_SECRET = 'test-secret-token';
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD'],
     webhookSecret: 'test-secret-token', // must be a literal — vi.mock is hoisted
@@ -47,7 +47,7 @@ vi.mock('@percolator/shared', () => ({
   captureException: vi.fn(),
 }));
 
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 import { webhookRoutes, verifyWebhookSignature } from '../../src/routes/webhook.js';
 
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';

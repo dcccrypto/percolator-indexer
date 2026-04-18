@@ -12,7 +12,7 @@
  *
  * Run: npx tsx packages/indexer/src/scripts/cleanup-corrupted-stats.ts
  */
-import { getSupabase } from "@percolator/shared";
+import { getSupabase } from "@percolatorct/shared";
 
 // GH#1208: Use 5e17 instead of 1e18 — values like 7.997e17 are clearly corrupt
 // but slip through the original 1e18 threshold.

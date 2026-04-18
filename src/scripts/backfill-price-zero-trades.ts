@@ -21,8 +21,8 @@
  * Dry-run mode prints what would be updated without writing to DB.
  */
 
-import { getSupabase } from "@percolator/shared";
-import { config } from "@percolator/shared";
+import { getSupabase } from "@percolatorct/shared";
+import { config } from "@percolatorct/shared";
 import { detectSlabLayout } from "@percolatorct/sdk";
 
 // Helius Parse Transactions batch limit

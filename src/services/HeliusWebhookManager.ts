@@ -1,4 +1,4 @@
-import { config, createLogger } from "@percolator/shared";
+import { config, createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:webhook-manager");
 

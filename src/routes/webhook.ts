@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
-import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolator/shared";
+import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:webhook");
 
