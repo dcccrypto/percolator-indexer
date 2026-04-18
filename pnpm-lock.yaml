@@ -12,8 +12,8 @@ importers:
         specifier: ^1.19.11
         version: 1.19.11(hono@4.12.9)
       '@percolatorct/sdk':
-        specifier: 1.0.0-beta.31
-        version: 1.0.0-beta.31(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.32
+        version: 1.0.0-beta.32(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
         specifier: 1.0.0-beta.1
         version: 1.0.0-beta.1(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -455,8 +455,8 @@ packages:
   '@oxc-project/types@0.122.0':
     resolution: {integrity: sha512-oLAl5kBpV4w69UtFZ9xqcmTi+GENWOcPF7FCrczTiBbmC0ibXxCwyvZGbO39rCVEuLGAZM84DH0pUIyyv/YJzA==}
 
-  '@percolatorct/sdk@1.0.0-beta.31':
-    resolution: {integrity: sha512-3Cpqm+FaR7IlKzv+4SOgnkgvtdu9kzt4xwHtOuXJc6VF5eNI+8cLWb8KPaKGXt3XPUS68EUq5WuhvaFClc3nLw==}
+  '@percolatorct/sdk@1.0.0-beta.32':
+    resolution: {integrity: sha512-tS+08OeyXK1InEH2vL7p8/5H5emRjXL1OF+oLnTCS6JatPppETc6OSP74p+sWHGPZ66zYPFiu+4UtV47WwO/gA==}
     engines: {node: '>=20.0.0'}
 
   '@percolatorct/shared@1.0.0-beta.1':
@@ -1759,7 +1759,7 @@ snapshots:
 
   '@oxc-project/types@0.122.0': {}
 
-  '@percolatorct/sdk@1.0.0-beta.31(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@1.0.0-beta.32(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -1772,7 +1772,7 @@ snapshots:
 
   '@percolatorct/shared@1.0.0-beta.1(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
-      '@percolatorct/sdk': 1.0.0-beta.31(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@percolatorct/sdk': 1.0.0-beta.32(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@sentry/node': 10.46.0
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@supabase/supabase-js': 2.100.1(bufferutil@4.1.0)(utf-8-validate@6.0.6)
