@@ -1,0 +1,105 @@
+name: SDK publish smoke
+
+# Runs nightly and on demand to catch publish-time regressions in
+# @percolatorct/sdk that are invisible when pnpm resolves the workspace link.
+#
+# The job installs the *pinned npm version* of the SDK (not workspace:*) into a
+# temporary directory, then runs only the sdk-smoke test file.  The rest of the
+# percolator-indexer test suite is NOT executed here — it runs in ci.yml on every PR.
+#
+# To update the pinned version after a new SDK publish:
+#   1. Change SDK_VERSION below.
+#   2. Commit the change so nightly runs validate the new version.
+
+on:
+  schedule:
+    # 06:00 UTC every day
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: "SDK version to smoke-test (overrides pinned default)"
+        required: false
+        default: ""
+  repository_dispatch:
+    # Triggered by percolator-sdk post-publish workflow via:
+    #   gh api repos/dcccrypto/percolator-indexer/dispatches \
+    #     --field event_type=sdk-published \
+    #     --field client_payload[version]=1.0.0-beta.33
+    types: [sdk-published]
+
+env:
+  # Update this string when the SDK bumps.  Deliberate — that is the point.
+  SDK_VERSION: "1.0.0-beta.33"
+
+concurrency:
+  group: sdk-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: smoke @percolatorct/sdk@${{ github.event.client_payload.version || inputs.sdk_version || '1.0.0-beta.33' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          # No cache: we are testing a fresh install, not a lockfile reproduction.
+
+      # Resolve the version to test: repository_dispatch payload > workflow_dispatch
+      # input > pinned default.
+      - name: Resolve SDK version
+        id: sdk_ver
+        run: |
+          VERSION="${{ github.event.client_payload.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ inputs.sdk_version }}"
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ env.SDK_VERSION }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Testing @percolatorct/sdk@$VERSION"
+
+      # Install dependencies from the *existing* lockfile first so all other
+      # packages (hono, vitest, @solana/web3.js, @supabase/supabase-js …) are
+      # present, then override only the SDK dep to the target npm version.
+      # --no-frozen-lockfile is intentional: we are mutating one dep, not
+      # reproducing a build.
+      - name: Install dependencies (frozen lockfile for non-SDK packages)
+        run: pnpm install --frozen-lockfile
+
+      - name: Override SDK dep with published npm version
+        run: |
+          pnpm add "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }}" \
+            --no-frozen-lockfile
+
+      - name: Verify installed SDK version
+        run: |
+          INSTALLED=$(node -e "console.log(require('./node_modules/@percolatorct/sdk/package.json').version)")
+          echo "Installed: $INSTALLED"
+          if [ "$INSTALLED" != "${{ steps.sdk_ver.outputs.version }}" ]; then
+            echo "Version mismatch: expected ${{ steps.sdk_ver.outputs.version }}, got $INSTALLED"
+            exit 1
+          fi
+
+      - name: Run SDK smoke tests
+        run: pnpm vitest run tests/sdk-smoke.test.ts
+
+      - name: Report result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }} smoke PASSED"
+          else
+            echo "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }} smoke FAILED"
+            exit 1
+          fi
