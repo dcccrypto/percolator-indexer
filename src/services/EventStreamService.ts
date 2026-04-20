@@ -1,5 +1,5 @@
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
-import { createLogger, insertTrade } from "@percolatorct/shared";
+import { createLogger, insertTrade, eventBus } from "@percolatorct/shared";
 import { parsePercolatorFills } from "../parsers/percolatorTxParser.js";
 
 const log = createLogger("indexer:event-stream");
@@ -86,18 +86,37 @@ export class EventStreamService {
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
     for (const fill of fills) {
+      const price = fill.priceE6 ?? 0;
       try {
         await insertTrade({
           slab_address: slab,
           trader: fill.trader,
           side: fill.side,
           size: fill.sizeAbs.toString(),
-          price: fill.priceE6 ?? 0,
+          price,
           fee: 0,
           tx_signature: signature,
         });
       } catch (err) {
         log.warn("insertTrade failed", { sig: signature, err: String(err) });
+        continue;
+      }
+      // Fan out to percolator-api WS subscribers of trades:<slab>.
+      // The ws.ts handler picks this up and pushes to live chart clients.
+      try {
+        eventBus.emit("trade.executed", {
+          slabAddress: slab,
+          timestamp: Date.now(),
+          data: {
+            side: fill.side,
+            size: fill.sizeAbs.toString(),
+            price,
+            trader: fill.trader,
+            signature,
+          },
+        });
+      } catch (err) {
+        log.warn("eventBus emit failed", { err: String(err) });
       }
     }
   }
