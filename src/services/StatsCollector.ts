@@ -75,8 +75,20 @@ export interface MarketProvider {
   getMarkets(): Map<string, { market: DiscoveredMarket }>;
 }
 
-/** How often to collect stats (every 30s — runs after crank cycles) */
-export const COLLECT_INTERVAL_MS = 300_000;
+/**
+ * How often to collect stats. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
+ *
+ * Default: 60_000 (1 min). The old hardcoded 5 min left `oracle_prices` with long
+ * gaps — frontend price charts need denser samples for smooth backfill. Keep the
+ * env override so we can crank it down further if the RPC budget allows, or up
+ * if we need to back off.
+ */
+export const COLLECT_INTERVAL_MS: number = (() => {
+  const raw = process.env.STATS_COLLECT_INTERVAL_MS;
+  if (!raw) return 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+})();
 
 /** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
 const ORACLE_LOG_INTERVAL_MS = 60_000;

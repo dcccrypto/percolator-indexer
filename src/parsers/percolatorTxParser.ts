@@ -16,7 +16,15 @@ export interface ParsedFill {
   sizeAbs: bigint;
   /** "long" = positive i128 size, "short" = negative — matches SDK parseTradeSize. */
   side: "long" | "short";
-  /** Mark price in the slab-native integer representation (from logs, undefined if absent). */
+  /**
+   * Mark price from program logs — intentionally always `undefined` post-refactor.
+   *
+   * The old log-derived parser read the `sol_log_64(idx, price, 0, 0, 0)` output
+   * and picked the WRONG number on non-liquidation txs, writing bogus prices like
+   * $13.15 for real $84 SOL trades. The caller is now responsible for resolving
+   * price via slab state (see `readMarkPriceE6`). Kept in the shape for BC with
+   * existing callers that branch on `priceE6 ?? 0`.
+   */
   priceE6?: number;
 }
 
@@ -27,8 +35,9 @@ export interface ParsedFill {
  * `transactionSubscribe` notifications — both produce ParsedTransactionWithMeta-shaped objects.
  *
  * Mirrors the trade-parsing logic of TradeIndexerPolling.processTransaction but is pure:
- * no DB writes, no RPC calls, no price fallback to the slab account. The caller is responsible
- * for persistence (Task 2.4) and for any additional price resolution.
+ * no DB writes, no RPC calls. After the 2026-04-20 parser overhaul, this function no
+ * longer attempts to extract price from logs — callers MUST resolve price from the slab
+ * state at the tx slot via `readMarkPriceE6`.
  */
 export function parsePercolatorFills(
   tx: {
@@ -44,7 +53,6 @@ export function parsePercolatorFills(
   if (ixs.length === 0) return [];
 
   const programIdSet = new Set(programIds);
-  const priceE6 = extractPriceFromLogs(tx.meta.logMessages ?? []);
   const fills: ParsedFill[] = [];
 
   for (const ix of ixs) {
@@ -74,20 +82,14 @@ export function parsePercolatorFills(
       programId,
       sizeAbs: sizeValue, // parseTradeSize already returns absolute value
       side,
-      priceE6,
+      // priceE6 intentionally omitted — caller resolves via slab (readMarkPriceE6).
+      // See the field docstring for the why; the old `mark_price=<n>` regex never
+      // matched anything the program actually emitted.
+      priceE6: undefined,
     });
   }
 
   return fills;
-}
-
-/** Extract mark price in e6 units from `Program log: mark_price=<n>` style lines. */
-function extractPriceFromLogs(logs: string[]): number | undefined {
-  for (const line of logs) {
-    const m = line.match(/mark_price=(\d+)/);
-    if (m) return Number(m[1]);
-  }
-  return undefined;
 }
 
 function pubkeyToBase58(key: unknown): string | undefined {

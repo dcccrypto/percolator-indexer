@@ -307,34 +307,19 @@ export class TradeIndexerPolling {
   }
 
   /**
-   * Try to extract execution price from transaction logs.
-   * Matches comma-separated numeric values (2–8 values, hex or decimal).
+   * Deliberately neutered: always returns 0 so the caller falls through to
+   * `readMarkPriceFromSlab()`.
+   *
+   * The previous fuzzy regex scraped ANY integer in [1_000, 1e12] from `Program log:`
+   * lines and treated it as `price_e6`. Percolator emits log lines via
+   * `sol_log_64(idx, price, 0, 0, 0)` — a format that carries MULTIPLE hex numbers —
+   * and on most non-liquidation txs the parser picked the wrong one, writing e.g.
+   * $13.15 as the price of real SOL trades at ~$84. See 2026-04-20 parser overhaul.
+   *
+   * The correct source of truth for a Hyperp fill is the slab's `mark_price_e6`
+   * at the tx slot; we route every price request through `readMarkPriceFromSlab`.
    */
-  private extractPriceFromLogs(tx: ParsedTransactionWithMeta): number {
-    if (!tx.meta?.logMessages) return 0;
-
-    const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
-
-    for (const log of tx.meta.logMessages) {
-      if (!log.startsWith("Program log: ")) continue;
-      const payload = log.slice("Program log: ".length).trim();
-      if (!/^[\d, a-fA-Fx]+$/.test(payload)) continue;
-
-      const matches = payload.match(valuePattern);
-      if (!matches || matches.length < 2) continue;
-
-      const values = matches.map((v) =>
-        v.startsWith("0x") ? parseInt(v, 16) : Number(v),
-      );
-
-      for (const v of values) {
-        // Reasonable price_e6 range: $0.001 to $1,000,000
-        if (v >= 1_000 && v <= 1_000_000_000_000) {
-          return v / 1_000_000;
-        }
-      }
-    }
-
+  private extractPriceFromLogs(_tx: ParsedTransactionWithMeta): number {
     return 0;
   }
 

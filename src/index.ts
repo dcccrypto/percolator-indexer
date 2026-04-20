@@ -258,6 +258,7 @@ async function start() {
       eventStream = new EventStreamService({
         ws: atlasWs,
         programId: config.programId,
+        connection: getConnection(),
         autoIndex: true,
         knownSlabs,
       });

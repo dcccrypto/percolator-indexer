@@ -79,7 +79,39 @@ describe("parsePercolatorFills", () => {
       sizeAbs: 1_000_000n,
       side: expect.stringMatching(/long|short/),
     });
-    expect(fills[0].priceE6).toBe(42_000_000_000);
+    // Post-refactor (2026-04-20): parser NEVER pulls price from logs — the old
+    // `mark_price=<n>` regex was bogus on real program output. Callers must
+    // resolve price via slab state (see readMarkPriceE6).
+    expect(fills[0].priceE6).toBeUndefined();
+  });
+
+  it("ignores log-derived prices completely (even when logs include a valid mark_price line)", () => {
+    // Real program logs contain sol_log_64-style lines like `Program log: 1, 84123456, 0, 0, 0`
+    // which the old fuzzy parser would grab — producing the wrong price. Verify the new
+    // parser ignores logs entirely.
+    const tx: any = {
+      transaction: {
+        message: {
+          instructions: [
+            {
+              programId: new PublicKey(PERC),
+              accounts: [new PublicKey(TRADER)],
+              data: makeTradeIxData(IX_TAG.TradeCpi, 1_000_000n),
+            },
+          ],
+        },
+      },
+      meta: {
+        err: null,
+        logMessages: [
+          "Program log: mark_price=84000000",
+          "Program log: 1, 13153290, 0, 0, 0",
+        ],
+      },
+    };
+    const fills = parsePercolatorFills(tx, "sig", [PERC]);
+    expect(fills).toHaveLength(1);
+    expect(fills[0].priceE6).toBeUndefined();
   });
 
   it("returns empty array when tx.meta.err is set", () => {
