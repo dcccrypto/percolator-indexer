@@ -47,7 +47,7 @@ import {
  * because it issues a single bulk trade fetch + N upserts (cheap), but still
  * infrequent enough to avoid hammering the DB under high trade volume.
  */
-const VOLUME_SYNC_INTERVAL_MS = 5 * 60_000;
+const VOLUME_SYNC_INTERVAL_MS = 10 * 60_000;
 
 /**
  * How often to sync full stats (OI, vault, price, insurance) for DB-registered
@@ -76,7 +76,7 @@ export interface MarketProvider {
 }
 
 /** How often to collect stats (every 30s — runs after crank cycles) */
-const COLLECT_INTERVAL_MS = 120_000;
+export const COLLECT_INTERVAL_MS = 300_000;
 
 /** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
 const ORACLE_LOG_INTERVAL_MS = 60_000;

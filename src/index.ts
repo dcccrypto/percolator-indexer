@@ -2,7 +2,7 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert } from "@percolatorct/shared";
+import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert, createAtlasWs, type AtlasWs } from "@percolatorct/shared";
 import { MarketDiscovery } from "./services/MarketDiscovery.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
@@ -10,6 +10,7 @@ import { NftIndexerPolling } from "./services/NftIndexer.js";
 import { AdlIndexerPolling } from "./services/AdlIndexer.js";
 import { InsuranceLPService } from "./services/InsuranceLPService.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
+import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 
 // Initialize Sentry first
@@ -49,6 +50,9 @@ const nftIndexer = new NftIndexerPolling();
 const adlIndexer = new AdlIndexerPolling();
 const insuranceService = new InsuranceLPService(discovery);
 const webhookManager = new HeliusWebhookManager();
+
+let atlasWs: AtlasWs | null = null;
+let eventStream: EventStreamService | null = null;
 
 /** HTTP server handle — assigned in start(), closed in shutdown(). */
 let httpServer: ReturnType<typeof serve> | undefined;
@@ -245,6 +249,37 @@ async function start() {
   adlIndexer.start();
   insuranceService.start();
   await webhookManager.start();
+
+  // Phase 2: Atlas WebSocket event stream (opt-in; real-time complement to webhooks + polling).
+  if (process.env.HELIUS_ATLAS_WS_URL) {
+    try {
+      atlasWs = createAtlasWs();
+      const knownSlabs = Array.from(discovery.getMarkets().keys());
+      eventStream = new EventStreamService({
+        ws: atlasWs,
+        programId: config.programId,
+        autoIndex: true,
+        knownSlabs,
+      });
+      await eventStream.start();
+      logger.info("Atlas WS event-stream started", { slabCount: knownSlabs.length });
+
+      // Pick up new slabs as discovery finds them (MarketDiscovery polls on interval).
+      setInterval(() => {
+        if (!eventStream) return;
+        for (const slab of discovery.getMarkets().keys()) {
+          eventStream.addKnownSlab(slab);
+        }
+      }, 60_000);
+    } catch (err) {
+      logger.error("Atlas WS failed to start — continuing with webhook + polling only", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      captureException(err, { tags: { context: "atlas-ws-start" } });
+    }
+  } else {
+    logger.info("Atlas WS event-stream disabled (HELIUS_ATLAS_WS_URL not set)");
+  }
   
   httpServer = serve({ fetch: app.fetch, port }, (info) => {
     logger.info("Indexer service started", { port: info.port });
