@@ -194,8 +194,8 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
       const callsAfterInitial = vi.mocked(shared.upsertMarketStats).mock.calls.length;
 
-      // Advance by exactly one more interval (120s)
-      await vi.advanceTimersByTimeAsync(120_000);
+      // Advance by exactly one more interval (COLLECT_INTERVAL_MS = 5 min)
+      await vi.advanceTimersByTimeAsync(300_000);
       const callsAfterOneInterval = vi.mocked(shared.upsertMarketStats).mock.calls.length;
 
       // With double-started timers we'd get 2 extra calls; with single timer we get 1
@@ -264,10 +264,9 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
       expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBe(1);
 
-      // Second collect at ~130s — should NOT log again (< 60s since first? Actually it's >60s so it WILL log)
-      // With 120s interval, next collect fires at ~130.5s. 130.5 - 10.5 = 120s > 60s dedup, so it WILL log.
-      vi.setSystemTime(baseTime + 130_500);
-      await vi.advanceTimersByTimeAsync(120_000);
+      // Second collect fires one interval after first. COLLECT_INTERVAL_MS=5min > 60s dedup, so it WILL log.
+      vi.setSystemTime(baseTime + 310_500);
+      await vi.advanceTimersByTimeAsync(300_000);
       expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBe(2);
     });
 
