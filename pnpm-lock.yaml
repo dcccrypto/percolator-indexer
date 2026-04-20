@@ -15,8 +15,8 @@ importers:
         specifier: 1.0.0-beta.36
         version: 1.0.0-beta.36(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
-        specifier: 1.0.0-beta.3
-        version: 1.0.0-beta.3(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.4
+        version: 1.0.0-beta.4(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -463,8 +463,8 @@ packages:
     resolution: {integrity: sha512-woH7vn3UhAogQsoeCg8sEAZmr/nIsQ3IPQUERnRgcPhE1VqreRmY5Gh2DJbcTzxs5I6XuU3eSRBGjvPpVwQC3g==}
     engines: {node: '>=20.0.0'}
 
-  '@percolatorct/shared@1.0.0-beta.3':
-    resolution: {integrity: sha512-FQMIuHg1iR94QZJLQ3S5dPWE4vkXkCkRXyiNbr3FGp214tmrgo7Y2KXawqWgz/D6IIB5UP8QOh81SVNTOMCZXg==}
+  '@percolatorct/shared@1.0.0-beta.4':
+    resolution: {integrity: sha512-e14dnrckqlsZIh8+voRzKeVNlnLzxoigyDHs+f377p75nFvHfwgZ6ZIOaLVAIcPl98fs5K+9Q5NageUaiw3xDA==}
 
   '@prisma/instrumentation@7.4.2':
     resolution: {integrity: sha512-r9JfchJF1Ae6yAxcaLu/V1TGqBhAuSDe3mRNOssBfx1rMzfZ4fdNvrgUBwyb/TNTGXFxlH9AZix5P257x07nrg==}
@@ -1789,7 +1789,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/shared@1.0.0-beta.3(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/shared@1.0.0-beta.4(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@percolatorct/sdk': 1.0.0-beta.34(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@sentry/node': 10.46.0
