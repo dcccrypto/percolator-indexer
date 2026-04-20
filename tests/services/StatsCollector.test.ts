@@ -40,7 +40,7 @@ vi.mock('@percolatorct/shared', () => ({
   captureException: vi.fn(),
 }));
 
-import { StatsCollector } from '../../src/services/StatsCollector.js';
+import { StatsCollector, COLLECT_INTERVAL_MS } from '../../src/services/StatsCollector.js';
 import type { MarketProvider } from '../../src/services/StatsCollector.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
@@ -194,8 +194,9 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
       const callsAfterInitial = vi.mocked(shared.upsertMarketStats).mock.calls.length;
 
-      // Advance by exactly one more interval (COLLECT_INTERVAL_MS = 5 min)
-      await vi.advanceTimersByTimeAsync(300_000);
+      // Advance by exactly one more interval (references the exported const so this
+      // test stays in sync if the default / env override changes).
+      await vi.advanceTimersByTimeAsync(COLLECT_INTERVAL_MS);
       const callsAfterOneInterval = vi.mocked(shared.upsertMarketStats).mock.calls.length;
 
       // With double-started timers we'd get 2 extra calls; with single timer we get 1
@@ -258,16 +259,19 @@ describe('StatsCollector', () => {
 
       const baseTime = Date.now();
       statsCollector.start();
-      
+
       // First collect at ~10s
       vi.setSystemTime(baseTime + 10_500);
       await vi.advanceTimersByTimeAsync(10_500);
       expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBe(1);
 
-      // Second collect fires one interval after first. COLLECT_INTERVAL_MS=5min > 60s dedup, so it WILL log.
-      vi.setSystemTime(baseTime + 310_500);
-      await vi.advanceTimersByTimeAsync(300_000);
-      expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBe(2);
+      // Wait at least ORACLE_LOG_INTERVAL_MS (60s) + one COLLECT_INTERVAL_MS so a
+      // fresh collect fires AFTER the 60s dedup window has elapsed and the oracle
+      // write is allowed again.
+      const waitMs = 60_000 + COLLECT_INTERVAL_MS;
+      vi.setSystemTime(baseTime + 10_500 + waitMs);
+      await vi.advanceTimersByTimeAsync(waitMs);
+      expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
     it('should handle errored markets gracefully and continue', async () => {

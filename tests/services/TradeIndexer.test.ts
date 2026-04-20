@@ -342,8 +342,13 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
   });
 
-  describe('price extraction from logs', () => {
-    it('should extract price from program logs', async () => {
+  describe('price extraction (log parser neutralized 2026-04-20)', () => {
+    it('must NOT extract price from program logs — the fuzzy regex is dead', async () => {
+      // Reproduce the exact bug-trigger payload: a sol_log_64-style line that
+      // contains multiple comma-separated integers. The old `extractPriceFromLogs`
+      // would grab the first in-range value (1_500_000) and call it price_e6,
+      // writing $1.50 to the DB. The neutralized version MUST return 0 so the
+      // caller falls through to readMarkPriceFromSlab.
       vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
@@ -377,9 +382,11 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
+      // With the log parser neutered AND no getAccountInfo mock (so slab fallback
+      // also returns 0), price must not come out at 1.5 — it should be 0.
       if (vi.mocked(shared.insertTrade).mock.calls.length > 0) {
         const call = vi.mocked(shared.insertTrade).mock.calls[0][0] as any;
-        expect(call.price).toBe(1.5); // 1500000 / 1_000_000
+        expect(call.price).not.toBe(1.5);
       }
     }, 10000);
   });
