@@ -1,13 +1,18 @@
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
-import { createLogger } from "@percolatorct/shared";
+import { createLogger, insertTrade } from "@percolatorct/shared";
+import { parsePercolatorFills } from "../parsers/percolatorTxParser.js";
 
 const log = createLogger("indexer:event-stream");
 
 export interface EventStreamDeps {
   ws: AtlasWs;
   programId: string;
-  /** Optional callback fired for every transactionNotification matching the filter. */
+  /** Optional custom callback. When set, autoIndex is ignored. */
   onTx?: (tx: unknown) => Promise<void> | void;
+  /** When true, parse fills and insert into trades table automatically. */
+  autoIndex?: boolean;
+  /** Known slab addresses for this service — only fills touching these slabs are indexed. */
+  knownSlabs?: string[];
 }
 
 /**
@@ -18,11 +23,17 @@ export interface EventStreamDeps {
  *   - HeliusWebhookManager (primary, ~1-2s)
  *   - TradeIndexerPolling (backup, 5 min)
  *
- * Parser and Supabase insertion are wired in Task 2.3 / 2.4.
+ * Auto-indexing: when `autoIndex=true`, fills are parsed via `parsePercolatorFills` and
+ * inserted into the `trades` table via `insertTrade`. Duplicate inserts are safe thanks
+ * to the unique-constraint dedup inside `insertTrade` (swallows 23505).
  */
 export class EventStreamService {
   private started = false;
-  constructor(private deps: EventStreamDeps) {}
+  private slabSet: Set<string>;
+
+  constructor(private deps: EventStreamDeps) {
+    this.slabSet = new Set(deps.knownSlabs ?? []);
+  }
 
   async start(): Promise<void> {
     if (this.started) return;
@@ -43,15 +54,63 @@ export class EventStreamService {
       },
     ]);
 
-    log.info("event-stream started", { programId: this.deps.programId });
+    log.info("event-stream started", {
+      programId: this.deps.programId,
+      autoIndex: !!this.deps.autoIndex,
+      knownSlabs: this.slabSet.size,
+    });
+  }
+
+  /** Add a slab to the filter set at runtime (as new markets are discovered). */
+  addKnownSlab(slab: string): void {
+    this.slabSet.add(slab);
   }
 
   private async handle(msg: AtlasNotification): Promise<void> {
     if (msg.method !== "transactionNotification") return;
     const tx = (msg.params as any)?.result;
     if (!tx) return;
+
     if (this.deps.onTx) {
       await this.deps.onTx(tx);
+      return;
     }
+
+    if (!this.deps.autoIndex) return;
+
+    const signature = tx.signature ?? tx.transaction?.signatures?.[0];
+    if (!signature) return;
+
+    const slab = this.resolveSlab(tx);
+    if (!slab) return;
+
+    const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
+    for (const fill of fills) {
+      try {
+        await insertTrade({
+          slab_address: slab,
+          trader: fill.trader,
+          side: fill.side,
+          size: fill.sizeAbs.toString(),
+          price: fill.priceE6 ?? 0,
+          fee: 0,
+          tx_signature: signature,
+        });
+      } catch (err) {
+        log.warn("insertTrade failed", { sig: signature, err: String(err) });
+      }
+    }
+  }
+
+  /** Walk tx accountKeys and return the first key that matches our known slabs. */
+  private resolveSlab(tx: any): string | null {
+    const keys: any[] = tx.transaction?.message?.accountKeys ?? [];
+    for (const k of keys) {
+      const addr = typeof k === "string"
+        ? k
+        : k?.pubkey?.toBase58?.() ?? k?.toBase58?.();
+      if (addr && this.slabSet.has(addr)) return addr;
+    }
+    return null;
   }
 }

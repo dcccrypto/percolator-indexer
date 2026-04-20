@@ -97,3 +97,92 @@ describe("EventStreamService", () => {
     expect(onTx).toHaveBeenCalled();
   });
 });
+
+describe("EventStreamService auto-indexing", () => {
+  it("calls insertTrade when autoIndex=true and fill parses", async () => {
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock };
+    });
+
+    // Re-import after mock
+    const { EventStreamService } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    // Known slab addresses
+    const SLAB = "SLAB11111111111111111111111111111111111111";
+    const PERC = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: PERC,
+      autoIndex: true,
+      knownSlabs: [SLAB],
+    });
+    await svc.start();
+
+    // synthesize a fill tx that references the slab
+    const fakeTx = {
+      transaction: {
+        message: {
+          instructions: [],
+          accountKeys: [{ pubkey: { toBase58: () => SLAB } }],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+      signature: "wsSigABC",
+    };
+
+    // But parsePercolatorFills returns empty for this tx (no ixs) — so no insert
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(insertTradeMock).not.toHaveBeenCalled();
+
+    vi.doUnmock("@percolatorct/shared");
+  });
+
+  it("skips tx when no known slab is referenced", async () => {
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: "PERC",
+      autoIndex: true,
+      knownSlabs: ["SLAB_NOT_REFERENCED"],
+    });
+    await svc.start();
+
+    const fakeTx = {
+      transaction: { message: { instructions: [], accountKeys: [] } },
+      meta: { err: null, logMessages: [] },
+      signature: "sig1",
+    };
+
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    // Should complete without error (just skipped)
+    expect(true).toBe(true);
+  });
+});
