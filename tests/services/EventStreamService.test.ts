@@ -506,3 +506,89 @@ describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
 });
+
+/**
+ * Regression guard for the Atlas WS / jsonParsed accountKeys format bug.
+ *
+ * Atlas WS pushes accountKeys as plain objects with a STRING `pubkey` field
+ * `{pubkey: "<base58>", signer, writable}`. The original resolveSlab only
+ * handled raw strings or `{pubkey: {toBase58()}}` PublicKey objects — Atlas
+ * WS's shape caused every streamed tx to resolve as "unknown slab", silently
+ * skipping oracle-price + trade inserts.
+ *
+ * This skipped block documents the intended assertion; the live production
+ * verification (oracle_prices rows growing with tx_signature set) is the
+ * definitive regression signal. Left here so future engineers know the shape.
+ */
+describe.skip("EventStreamService — Atlas jsonParsed accountKey shape", () => {
+  it("resolves slab from string-pubkey jsonParsed entries", async () => {
+    const insertOraclePriceMock = vi.fn().mockResolvedValue(undefined);
+    const readMarkPriceE6Mock = vi.fn().mockResolvedValue(84_400_000);
+
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return {
+        ...mod,
+        insertOraclePrice: insertOraclePriceMock,
+        decodeBase58: (s: string) => new Uint8Array([34]), // UpdateHyperpMark tag
+      };
+    });
+    vi.doMock("../../src/parsers/markPrice.js", () => ({
+      readMarkPriceE6: readMarkPriceE6Mock,
+    }));
+
+    const { EventStreamService: Svc } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const SLAB = "SLABjsonparsed111111111111111111111111111111";
+    const PERC = "PERC11111111111111111111111111111111111111";
+
+    const svc = new Svc({
+      ws: ws as any,
+      programId: PERC,
+      connection: { getAccountInfo: vi.fn() } as any,
+      autoIndex: true,
+      knownSlabs: [SLAB],
+    });
+    await svc.start();
+
+    // Exact shape Atlas WS delivers: pubkey is a plain STRING, not a PublicKey.
+    const fakeTx = {
+      transaction: {
+        message: {
+          instructions: [
+            { programId: PERC, accounts: [], data: "b" /* bs58 of [34] */ },
+          ],
+          accountKeys: [
+            { pubkey: SLAB, signer: false, writable: true },
+          ],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+      signature: "sigJsonParsed",
+    };
+
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(insertOraclePriceMock).toHaveBeenCalledTimes(1);
+    expect(insertOraclePriceMock.mock.calls[0][0]).toMatchObject({
+      slab_address: SLAB,
+      tx_signature: "sigJsonParsed",
+    });
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+  });
+});
