@@ -443,19 +443,38 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
     }
     if (!raw) continue;
 
-    // Auto-detect V0 vs V1 layout from the actual slab data length.
-    // V0 (deployed devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
-    // V1 (future upgrade): ENGINE_OFF=640, mark_price at +400.
+    // Auto-detect layout version from the actual slab data length.
+    // V0 (legacy devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
+    // V1: ENGINE_OFF=640, mark_price at +400.
+    // v12.17: no stored engine.mark_price; fall back to config.mark_ewma_e6
+    //         (configMarkEwmaOff, absolute offset inside the slab).
     const layout = detectSlabLayout(raw.length);
-    if (!layout || layout.engineMarkPriceOff < 0) continue; // V0 has no mark_price
-
-    const off = layout.engineOff + layout.engineMarkPriceOff;
-    if (raw.length < off + 8) continue;
+    if (!layout) continue;
 
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    const markPriceE6 = dv.getBigUint64(off, true);
-    if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
-      return Number(markPriceE6) / 1_000_000;
+
+    // Primary: engine.mark_price for layouts that have it.
+    if (layout.engineMarkPriceOff >= 0) {
+      const off = layout.engineOff + layout.engineMarkPriceOff;
+      if (raw.length >= off + 8) {
+        const markPriceE6 = dv.getBigUint64(off, true);
+        if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
+          return Number(markPriceE6) / 1_000_000;
+        }
+      }
+    }
+
+    // Fallback for v12.17+: config.mark_ewma_e6. The Passive matcher quotes
+    // fills against this value, so it is the correct "fill price" proxy when
+    // engine.mark_price is absent.
+    if (layout.configMarkEwmaOff != null && layout.configMarkEwmaOff >= 0) {
+      const off = layout.configMarkEwmaOff;
+      if (raw.length >= off + 8) {
+        const markEwmaE6 = dv.getBigUint64(off, true);
+        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+          return Number(markEwmaE6) / 1_000_000;
+        }
+      }
     }
   }
   return 0;

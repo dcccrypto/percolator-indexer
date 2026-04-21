@@ -89,21 +89,34 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
     }
     if (!raw) continue;
 
-    // Auto-detect V0 vs V1 layout from the actual slab data length.
-    // V0 (deployed devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
-    // V1 (future upgrade): ENGINE_OFF=640, mark_price at ENGINE_OFF+400=1040.
+    // Auto-detect layout version from the actual slab data length.
+    // V0: no mark_price field (engineMarkPriceOff=-1) → fall through to logs.
+    // V1: mark_price at ENGINE_OFF + 400.
+    // v12.17: no engine.mark_price; fall back to config.mark_ewma_e6 via
+    //         configMarkEwmaOff (absolute offset into the slab).
     const layout = detectSlabLayout(raw.length);
-    if (!layout || layout.engineMarkPriceOff < 0) continue; // V0 has no mark_price; fall through to logs
-
-    const markPriceOffset = layout.engineOff + layout.engineMarkPriceOff;
-    if (raw.length < markPriceOffset + 8) continue;
+    if (!layout) continue;
 
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    const markPriceE6 = dv.getBigUint64(markPriceOffset, true);
 
-    // Sanity range: $0.001 → $1 000 000 (in e6 units)
-    if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
-      return Number(markPriceE6) / 1_000_000;
+    if (layout.engineMarkPriceOff >= 0) {
+      const off = layout.engineOff + layout.engineMarkPriceOff;
+      if (raw.length >= off + 8) {
+        const markPriceE6 = dv.getBigUint64(off, true);
+        if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
+          return Number(markPriceE6) / 1_000_000;
+        }
+      }
+    }
+
+    if (layout.configMarkEwmaOff != null && layout.configMarkEwmaOff >= 0) {
+      const off = layout.configMarkEwmaOff;
+      if (raw.length >= off + 8) {
+        const markEwmaE6 = dv.getBigUint64(off, true);
+        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+          return Number(markEwmaE6) / 1_000_000;
+        }
+      }
     }
   }
   return 0;

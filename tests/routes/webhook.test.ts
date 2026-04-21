@@ -82,6 +82,50 @@ describe('POST /webhook/trades — price extraction', () => {
     app = webhookRoutes();
   });
 
+  it('extracts price from config.mark_ewma_e6 when engineMarkPriceOff < 0 (v12.17)', async () => {
+    // Regression for v12.17 on mainnet: the Engine struct no longer stores
+    // mark_price. Without a config-level fallback, every v12.17 TradeCpi was
+    // landing in the trades table with price=0 and the chart rendered as a
+    // flat line. configMarkEwmaOff is the absolute slab offset of
+    // MarketConfig.mark_ewma_e6 (= headerLen + 304 = 376 in the real layout).
+    const { detectSlabLayout } = await import('@percolatorct/sdk');
+    // Pick a bogus size so the mock path fires. configMarkEwmaOff is 376 so
+    // we only need 384 bytes of backing buffer.
+    vi.mocked(detectSlabLayout).mockImplementationOnce((dataLen: number) => {
+      if (dataLen === 600) {
+        return {
+          version: 2,
+          engineOff: 999,       // unused — engineMarkPriceOff is -1
+          engineMarkPriceOff: -1,
+          engineBitmapOff: 0,
+          configMarkEwmaOff: 376,
+        } as any;
+      }
+      if (dataLen < 8) return null;
+      return { version: 1, engineOff: 640, engineMarkPriceOff: 400, engineBitmapOff: 656 } as any;
+    });
+
+    const slabData = new Uint8Array(600);
+    const dv = new DataView(slabData.buffer);
+    dv.setBigUint64(376, 85_599_093n, true); // $85.599093 — matches live mainnet SOL/USDC
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [{
+        account: SLAB,
+        data: Buffer.from(slabData).toString('base64'),
+      }],
+      logs: [], // no logs — must come from account data via the new fallback
+    };
+    await app.fetch(makeRequest([tx]));
+
+    expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect.objectContaining({ price: 85.599093 })
+    );
+  });
+
   it('falls back to log parsing when slab is V0 layout (engineMarkPriceOff < 0)', async () => {
     // Arrange: make detectSlabLayout return a V0 layout for a 512-byte buffer.
     // V0 slabs have engineMarkPriceOff=-1 — no mark_price field.
