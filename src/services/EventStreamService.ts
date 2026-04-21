@@ -195,11 +195,37 @@ export class EventStreamService {
   private resolveSlab(tx: any): string | null {
     const keys: any[] = tx.transaction?.message?.accountKeys ?? [];
     for (const k of keys) {
-      const addr = typeof k === "string"
-        ? k
-        : k?.pubkey?.toBase58?.() ?? k?.toBase58?.();
+      const addr = pubkeyToString(k);
       if (addr && this.slabSet.has(addr)) return addr;
     }
     return null;
   }
+}
+
+/**
+ * Coerce an accountKeys entry to its base58 string form.
+ *
+ * Across the RPC formats we see, an accountKeys element can be any of:
+ *   - a raw base58 string                                     (getTransaction with encoding="base58")
+ *   - `{pubkey: "<base58>", signer, writable}`                (jsonParsed — what Atlas WS returns)
+ *   - `{pubkey: PublicKey, signer, writable}`                 (some web3.js helpers)
+ *   - a `PublicKey` instance                                  (direct SDK usage)
+ *
+ * `resolveSlab` was only handling the 1st, 3rd, and 4th shapes. Atlas WS uses
+ * the 2nd — a plain object with a string-typed `pubkey`. Without this coercion
+ * every streamed tx resolved as "unknown slab" and both oracle_prices inserts
+ * and trade inserts were silently skipped.
+ */
+function pubkeyToString(k: unknown): string | null {
+  if (!k) return null;
+  if (typeof k === "string") return k;
+  if (typeof k === "object") {
+    const obj = k as { pubkey?: unknown; toBase58?: () => string };
+    if (typeof obj.pubkey === "string") return obj.pubkey;
+    if (obj.pubkey && typeof (obj.pubkey as { toBase58?: () => string }).toBase58 === "function") {
+      return (obj.pubkey as { toBase58: () => string }).toBase58();
+    }
+    if (typeof obj.toBase58 === "function") return obj.toBase58();
+  }
+  return null;
 }
