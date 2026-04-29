@@ -25,12 +25,12 @@ on:
     # Triggered by percolator-sdk post-publish workflow via:
     #   gh api repos/dcccrypto/percolator-indexer/dispatches \
     #     --field event_type=sdk-published \
-    #     --field client_payload[version]=1.0.0-beta.33
+    #     --field client_payload[version]=2.0.4
     types: [sdk-published]
 
 env:
   # Update this string when the SDK bumps.  Deliberate — that is the point.
-  SDK_VERSION: "1.0.0-beta.33"
+  SDK_VERSION: "2.0.4"
 
 concurrency:
   group: sdk-smoke-${{ github.ref }}
@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   smoke:
-    name: smoke @percolatorct/sdk@${{ github.event.client_payload.version || inputs.sdk_version || '1.0.0-beta.33' }}
+    name: smoke @percolatorct/sdk@${{ github.event.client_payload.version || inputs.sdk_version || '2.0.4' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
