@@ -15,8 +15,8 @@ importers:
         specifier: ^2.0.5
         version: 2.0.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
-        specifier: ^1.0.0-beta.5
-        version: 1.0.0-beta.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.6
+        version: 1.0.0-beta.6(@percolatorct/sdk@2.0.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -455,16 +455,14 @@ packages:
   '@oxc-project/types@0.122.0':
     resolution: {integrity: sha512-oLAl5kBpV4w69UtFZ9xqcmTi+GENWOcPF7FCrczTiBbmC0ibXxCwyvZGbO39rCVEuLGAZM84DH0pUIyyv/YJzA==}
 
-  '@percolatorct/sdk@1.0.0-beta.34':
-    resolution: {integrity: sha512-2okHLamCJLqyBoNtAiYHiE7hEOHOyszKTZODdG++io5XV3MMWOwORUeb1bcsVGKmEpYOMODvq6qkSXtdu5thHw==}
-    engines: {node: '>=20.0.0'}
-
   '@percolatorct/sdk@2.0.5':
     resolution: {integrity: sha512-JSc02Wu2jh/3I0PJQVRiBXvYGccRy6nFFX76xeh3R5Og7aip4ss8fWqDvskLQz0v2yAoKRPD/PR2dXYVREF75A==}
     engines: {node: '>=20.0.0'}
 
-  '@percolatorct/shared@1.0.0-beta.5':
-    resolution: {integrity: sha512-M5VzI/UCzK/5LABsTJWfw9eYytbkqpJDpkxKfrnX6ZwtXhNz9Z+UMHVk8unmTTAHd4vMo1GhodeDr4C/vjlLwA==}
+  '@percolatorct/shared@1.0.0-beta.6':
+    resolution: {integrity: sha512-1WcbsDFAuGmdrIpRMQY5HZTett+s9QP/1CwfnhHX+AA2wRO6sb8RtaTBvDHuhviuquRhDP8Si2orQIS/jlVQ6A==}
+    peerDependencies:
+      '@percolatorct/sdk': '>=2.0.5'
 
   '@prisma/instrumentation@7.4.2':
     resolution: {integrity: sha512-r9JfchJF1Ae6yAxcaLu/V1TGqBhAuSDe3mRNOssBfx1rMzfZ4fdNvrgUBwyb/TNTGXFxlH9AZix5P257x07nrg==}
@@ -1767,17 +1765,6 @@ snapshots:
 
   '@oxc-project/types@0.122.0': {}
 
-  '@percolatorct/sdk@1.0.0-beta.34(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
-    dependencies:
-      '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
-      '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
-    transitivePeerDependencies:
-      - bufferutil
-      - encoding
-      - fastestsmallesttextencoderdecoder
-      - typescript
-      - utf-8-validate
-
   '@percolatorct/sdk@2.0.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -1789,9 +1776,9 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/shared@1.0.0-beta.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/shared@1.0.0-beta.6(@percolatorct/sdk@2.0.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
-      '@percolatorct/sdk': 1.0.0-beta.34(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@percolatorct/sdk': 2.0.5(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@sentry/node': 10.46.0
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@supabase/supabase-js': 2.100.1(bufferutil@4.1.0)(utf-8-validate@6.0.6)
@@ -1803,7 +1790,6 @@ snapshots:
     transitivePeerDependencies:
       - bufferutil
       - encoding
-      - fastestsmallesttextencoderdecoder
       - supports-color
       - typescript
       - utf-8-validate
