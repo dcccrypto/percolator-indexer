@@ -7,7 +7,7 @@
  * This test does NOT make RPC calls or DB connections. Everything is pure in-process
  * computation so it runs reliably in CI without any environment secrets.
  *
- * Pinned version: @percolatorct/sdk@1.0.0-beta.33
+ * Pinned version: @percolatorct/sdk@2.0.4 (v12.19 mainnet alignment)
  * Update this comment when the workflow pins a new version.
  */
 
@@ -91,6 +91,16 @@ describe("@percolatorct/sdk exports — detectSlabLayout (indexer)", () => {
 
   it("returns null for length 0", () => {
     expect(detectSlabLayout(0)).toBeNull();
+  });
+
+  it("returns a V12_19 small layout for 96760 bytes (mainnet 2026-04-28 upgrade)", () => {
+    // v12.19 small slab — what live mainnet program produces under --features small.
+    // Wrapper anchor: percolator-prog post v12.19 upgrade.
+    const layout = detectSlabLayout(96760);
+    expect(layout).not.toBeNull();
+    if (layout !== null) {
+      expect(layout.maxAccounts).toBe(256);
+    }
   });
 
   it("returns a SlabLayout object for a known tier length if any tier is registered", () => {
