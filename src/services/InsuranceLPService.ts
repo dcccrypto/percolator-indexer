@@ -1,14 +1,10 @@
 import { getSupabase, getNetwork, config, getConnection, withRetry, captureException, createLogger } from "@percolatorct/shared";
-import type { DiscoveredMarket } from "@percolatorct/sdk";
+import { deriveInsuranceLpMint, type DiscoveredMarket } from "@percolatorct/sdk";
 import { PublicKey } from "@solana/web3.js";
 
-// Inline PDA derivation — deriveInsuranceLpMint was removed from SDK in v1.0.0-beta.16
-function deriveInsuranceLpMint(programId: PublicKey, slab: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("insurance_lp_mint"), slab.toBuffer()],
-    programId,
-  );
-}
+// CORRECTNESS FIX 2026-04-29: previous inline copy used seed "insurance_lp_mint",
+// but the wrapper at percolator-prog/src/percolator.rs:2545 derives with seed "lp_vault_mint".
+// SDK 2.0.4 re-exports the helper with the correct seed; switch back to the SDK source.
 
 const logger = createLogger("indexer:insurance-lp");
 
