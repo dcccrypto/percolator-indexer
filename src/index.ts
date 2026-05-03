@@ -244,9 +244,16 @@ async function start() {
 
   await discovery.start(config.discoveryIntervalMs);
   statsCollector.start();
-  tradeIndexer.start();
-  nftIndexer.start();
-  adlIndexer.start();
+  const rpcPollingEnabled = process.env.INDEXER_RPC_POLLING_ENABLED !== "false";
+  if (rpcPollingEnabled) {
+    tradeIndexer.start();
+    nftIndexer.start();
+    adlIndexer.start();
+  } else {
+    logger.info("RPC fallback pollers disabled", {
+      reason: "INDEXER_RPC_POLLING_ENABLED=false",
+    });
+  }
   insuranceService.start();
   await webhookManager.start();
 
