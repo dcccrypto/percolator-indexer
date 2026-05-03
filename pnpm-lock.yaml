@@ -15,8 +15,8 @@ importers:
         specifier: ^2.0.9
         version: 2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
-        specifier: 1.0.0-beta.6
-        version: 1.0.0-beta.6(@percolatorct/sdk@2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: 1.0.0-beta.8
+        version: 1.0.0-beta.8(@percolatorct/sdk@2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -459,8 +459,8 @@ packages:
     resolution: {integrity: sha512-WKvQInxm+6FgL98tRFUake3+k3C4KLLK35BpAjsoGr16Kb271IUy00rEI3xFeaSgNS+XRwWM84cjFWsP5uckGg==}
     engines: {node: '>=20.0.0'}
 
-  '@percolatorct/shared@1.0.0-beta.6':
-    resolution: {integrity: sha512-1WcbsDFAuGmdrIpRMQY5HZTett+s9QP/1CwfnhHX+AA2wRO6sb8RtaTBvDHuhviuquRhDP8Si2orQIS/jlVQ6A==}
+  '@percolatorct/shared@1.0.0-beta.8':
+    resolution: {integrity: sha512-o8h5mL3oqzivUUbgmJ9jQc0nVsMerJf/2vQarZ1lETadNhYj8cPvvhYVbZKCKKw/SqkYn7MDHOYd6oqEw07gEg==}
     peerDependencies:
       '@percolatorct/sdk': '>=2.0.5'
 
@@ -1776,7 +1776,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/shared@1.0.0-beta.6(@percolatorct/sdk@2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/shared@1.0.0-beta.8(@percolatorct/sdk@2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@percolatorct/sdk': 2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@sentry/node': 10.46.0
