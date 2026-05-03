@@ -13,6 +13,11 @@ const POLL_INTERVAL_MS = 120_000;
 const MS_PER_DAY = 86_400_000;
 const REDEMPTION_RATE_E6_DEFAULT = 1_000_000; // 1:1 ratio when no LPs
 
+function isTokenAccountNotFound(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("Invalid param") || msg.includes("could not find account");
+}
+
 interface InsuranceSnapshot {
   slab: string;
   insurance_balance: number;
@@ -85,30 +90,35 @@ export class InsuranceLPService {
         let lpSupply = 0;
         try {
           // GH#44: Wrap with retry to survive transient RPC failures.
-          // "Account not found" from Solana returns null value (not an exception),
-          // so lpSupply = 0 is correct for uninitialised LP mints.
+          // Helius returns "Invalid param: could not find account" for an
+          // uninitialized LP mint. That is a client/state condition, not a
+          // transient RPC error, so convert it to null inside the retry wrapper
+          // instead of retrying it every poll.
           const mintInfo = await withRetry(
-            () => connection.getTokenSupply(lpMint),
+            async () => {
+              try {
+                return await connection.getTokenSupply(lpMint);
+              } catch (err) {
+                if (isTokenAccountNotFound(err)) return null;
+                throw err;
+              }
+            },
             { maxRetries: 2, baseDelayMs: 500, label: `getTokenSupply(${slab.slice(0, 8)})` },
           );
-          lpSupply = Number(mintInfo.value.amount);
+          lpSupply = mintInfo ? Number(mintInfo.value.amount) : 0;
         } catch (err) {
-          // After retries: could be "invalid param" (mint not yet created) or a persistent RPC issue.
-          // Don't write a snapshot with lpSupply=0 if this is a retriable RPC error — skip instead.
+          // After retries this is a persistent RPC/transient-service issue. Do
+          // not write a zero-supply snapshot for that case.
           const errMsg = err instanceof Error ? err.message : String(err);
-          const isAccountNotFound = errMsg.includes("Invalid param") || errMsg.includes("could not find account");
-          if (!isAccountNotFound) {
-            logger.warn("getTokenSupply failed after retries — skipping snapshot", {
-              slab: slab.slice(0, 8),
-              error: errMsg,
-            });
-            captureException(err instanceof Error ? err : new Error(errMsg), {
-              tags: { context: "insurance-lp-token-supply" },
-              extra: { slab },
-            });
-            continue;
-          }
-          // Account not found = LP mint not yet created — expected for new markets, lpSupply = 0 is correct
+          logger.warn("getTokenSupply failed after retries — skipping snapshot", {
+            slab: slab.slice(0, 8),
+            error: errMsg,
+          });
+          captureException(err instanceof Error ? err : new Error(errMsg), {
+            tags: { context: "insurance-lp-token-supply" },
+            extra: { slab },
+          });
+          continue;
         }
 
         const redemptionRateE6 =

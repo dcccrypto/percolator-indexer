@@ -3,6 +3,9 @@ import { PublicKey } from '@solana/web3.js';
 
 const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
+const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
+  Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
+);
 
 vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
@@ -21,6 +24,7 @@ vi.mock('@percolatorct/shared', () => ({
   getConnection: vi.fn(() => ({
     getSignaturesForAddress: mockGetSignaturesForAddress,
     getParsedTransaction: mockGetParsedTransaction,
+    getParsedTransactions: mockGetParsedTransactions,
   })),
   insertTrade: vi.fn(),
   tradeExistsBySignature: vi.fn(async () => false),

@@ -7,14 +7,27 @@ const logger = createLogger("indexer:trade-indexer");
 /** Trade instruction tags we want to index */
 const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
 
+function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return max ? Math.min(parsed, max) : parsed;
+}
+
 /** How many recent signatures to fetch per slab per cycle */
-const MAX_SIGNATURES = 50;
+const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
 
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
-const POLL_INTERVAL_MS = 5 * 60_000;
+const POLL_INTERVAL_MS = readPositiveIntEnv("TRADE_POLL_INTERVAL_MS", 5 * 60_000);
 
 /** Initial backfill: fetch more signatures on first run */
-const BACKFILL_SIGNATURES = 100;
+const BACKFILL_SIGNATURES = readPositiveIntEnv("TRADE_BACKFILL_SIGNATURES", 100, 100);
+
+/** Helius historical-data batch cap is 100. Keep ours lower to avoid bursty catches. */
+const TX_BATCH_SIZE = readPositiveIntEnv("INDEXER_TX_BATCH_SIZE", 10, 100);
+const TX_FETCH_RETRIES = readPositiveIntEnv("INDEXER_TX_FETCH_RETRIES", 2, 5);
+const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !== "false";
 
 /**
  * TradeIndexerPolling — backup/backfill trade indexer using on-chain polling.
@@ -36,13 +49,22 @@ export class TradeIndexerPolling {
     if (this._running) return;
     this._running = true;
 
-    // Initial backfill after short delay to let discovery finish
-    setTimeout(() => this.backfill(), 5_000);
+    // Initial backfill after short delay to let discovery finish.
+    if (STARTUP_BACKFILL_ENABLED) {
+      setTimeout(() => this.backfill(), 5_000);
+    } else {
+      this.hasBackfilled = true;
+    }
 
     // Start periodic polling
     this.pollTimer = setInterval(() => this.pollAllMarkets(), POLL_INTERVAL_MS);
 
-    logger.info("TradeIndexerPolling started (backup mode)", { intervalMs: POLL_INTERVAL_MS });
+    logger.info("TradeIndexerPolling started (backup mode)", {
+      intervalMs: POLL_INTERVAL_MS,
+      startupBackfillEnabled: STARTUP_BACKFILL_ENABLED,
+      maxSignatures: MAX_SIGNATURES,
+      txBatchSize: TX_BATCH_SIZE,
+    });
   }
 
   stop(): void {
@@ -180,25 +202,22 @@ export class TradeIndexerPolling {
 
     let indexed = 0;
 
-    // Fetch transactions in batches of 5
-    for (let i = 0; i < validSigs.length; i += 5) {
-      const batch = validSigs.slice(i, i + 5);
-      const txResults = await Promise.allSettled(
-        batch.map(sig => withRetry(
-          () => connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 }),
-          { 
-            maxRetries: 3, 
-            baseDelayMs: 1000, 
-            label: `getParsedTransaction(${sig.slice(0, 12)})` 
-          }
-        ))
+    // Fetch transactions in Helius-supported historical batches instead of
+    // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
+    for (let i = 0; i < validSigs.length; i += TX_BATCH_SIZE) {
+      const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
+      const txs = await withRetry(
+        () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 0 }),
+        {
+          maxRetries: TX_FETCH_RETRIES,
+          baseDelayMs: 1000,
+          label: `getParsedTransactions(${batch.length})`,
+        },
       );
 
-      for (let j = 0; j < txResults.length; j++) {
-        const result = txResults[j];
-        if (result.status !== "fulfilled" || !result.value) continue;
-
-        const tx = result.value;
+      for (let j = 0; j < txs.length; j++) {
+        const tx = txs[j];
+        if (!tx) continue;
         const sig = batch[j];
 
         try {

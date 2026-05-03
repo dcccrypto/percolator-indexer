@@ -242,7 +242,7 @@ async function start() {
     });
   }
 
-  await discovery.start();
+  await discovery.start(config.discoveryIntervalMs);
   statsCollector.start();
   tradeIndexer.start();
   nftIndexer.start();
