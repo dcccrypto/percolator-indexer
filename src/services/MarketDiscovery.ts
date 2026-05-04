@@ -1,5 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
-import { discoverMarkets, type DiscoveredMarket } from "@percolatorct/sdk";
+import { discoverMarkets, getMarketsByAddress, type DiscoveredMarket } from "@percolatorct/sdk";
 import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:market-discovery");
@@ -56,6 +56,58 @@ export class MarketDiscovery {
     const fallbackConn = getFallbackConnection();
     const all: DiscoveredMarket[] = [];
     let failedPrograms = 0;
+
+    const marketsFilter = (process.env.MARKETS_FILTER ?? "").trim();
+    if (marketsFilter) {
+      const slabAddresses = marketsFilter
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(s => new PublicKey(s));
+
+      logger.info("Using MARKETS_FILTER — skipping getProgramAccounts discovery", {
+        count: slabAddresses.length,
+      });
+
+      for (const id of programIds) {
+        try {
+          const found = await getMarketsByAddress(
+            primaryConn,
+            new PublicKey(id),
+            slabAddresses,
+            { batchSize: 25, interBatchDelayMs: 250 },
+          );
+          all.push(...found);
+        } catch (e) {
+          failedPrograms++;
+          logger.warn("MARKETS_FILTER discovery failed on program", {
+            programId: id,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+
+      if (all.length > 0) {
+        const newMarkets = new Map<string, { market: DiscoveredMarket }>();
+        for (const market of all) {
+          newMarkets.set(market.slabAddress.toBase58(), { market });
+        }
+        this.markets = newMarkets;
+        this.consecutiveFailures = 0;
+      } else {
+        logger.warn("MARKETS_FILTER discovery found 0 markets", {
+          count: slabAddresses.length,
+          failedPrograms,
+        });
+      }
+
+      logger.info("Market discovery complete", {
+        totalMarkets: all.length,
+        failedPrograms,
+        consecutiveFailures: this.consecutiveFailures,
+      });
+      return all;
+    }
     
     for (const id of programIds) {
       let discovered = false;
