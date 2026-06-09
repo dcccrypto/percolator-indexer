@@ -355,6 +355,9 @@ export class TradeIndexerPolling {
         return false;
       }
 
+      // v17 TODO (blocked on @percolatorct/shared regen): pass asset_index to insertTrade
+      // once TradeRow gains an asset_index column. The v17 wire gives us asset_index at
+      // data[1:3] — extracted above — but TradeRow in shared@beta.8 doesn't accept it yet.
       await insertTrade({
         slab_address: slabAddress,
         trader,
