@@ -40,10 +40,16 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
 }
 
 /**
- * Percolator-prog tag for ADL execution.
- * Tag 50 = ExecuteAdl (PERC-305).
+ * v17 TOMBSTONE: ExecuteAdl was tag 50 in v12/v16. In v17 the wrapper no longer
+ * exposes a standalone ADL instruction at tag 50 — ADL is handled inside the
+ * engine via the crank path. The SDK aliases IX_TAG.ExecuteAdl → tag 101
+ * (deprecated) and IX_TAG.ExecuteAdl_v12 → 50. Neither tag appears in v17
+ * wrapper transactions, so this set is intentionally empty.
+ *
+ * To re-enable once a v17 ADL instruction is defined, add the new tag here.
+ * The poll/backfill infrastructure is kept intact for that future use.
  */
-const ADL_TAGS = new Set<number>([IX_TAG.ExecuteAdl]);
+const ADL_TAGS = new Set<number>(); // Empty: no v17 ADL instruction to index
 
 /** How many recent signatures to fetch per slab per cycle */
 const MAX_SIGNATURES = readPositiveIntEnv("ADL_MAX_SIGNATURES", 50, 100);

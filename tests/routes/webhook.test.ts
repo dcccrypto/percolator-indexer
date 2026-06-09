@@ -2,7 +2,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as nodeCrypto from 'node:crypto';
 
 vi.mock('@percolatorct/sdk', () => ({
-  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
+  // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
+  IX_TAG: {
+    TradeNoCpi: 10,
+    TradeCpi: 11,
+    // TradeCpiV2 deliberately omitted — deprecated in v17, tag 35 no longer exists.
+    BatchTradeNoCpi: 66,
+    BatchTradeCpi: 67,
+  },
   // detectSlabLayout: returns a V1-style layout so engineOff + engineMarkPriceOff = 1040,
   // matching the mock slab buffers built in tests below.
   detectSlabLayout: vi.fn((dataLen: number) => {
@@ -335,15 +342,15 @@ describe('POST /webhook/trades — price extraction', () => {
     expect(res.status).toBe(500);
   });
 
-  it('indexes TradeCpiV2 (tag=35, 22-byte layout) — GH#1171 regression', async () => {
-    // TradeCpiV2 adds a bump byte at position 21, total 22 bytes.
-    // The TRADE_TAGS set must include IX_TAG.TradeCpiV2 or all such trades are silently dropped.
+  it('v17: TradeCpiV2 (tag=35) is NOT indexed — removed from decoder', async () => {
+    // v17 BREAKING: TradeCpiV2 was removed from the wrapper decoder.
+    // Tag 35 no longer appears in v17 instruction streams. The old GH#1171
+    // regression test (which asserted tag=35 WAS indexed) is now inverted.
     const mockDecodeBase58 = vi.mocked(shared.decodeBase58);
     mockDecodeBase58.mockReturnValueOnce((() => {
-      const buf = new Uint8Array(22); // 22-byte TradeCpiV2
-      buf[0] = 35; // IX_TAG.TradeCpiV2
-      buf[5] = 0x40; buf[6] = 0x42; buf[7] = 0x0f; // size bytes
-      buf[21] = 0xfe; // bump byte
+      const buf = new Uint8Array(22);
+      buf[0] = 35; // tag 35 — NOT in v17 TRADE_TAGS
+      buf[3] = 0x40; buf[4] = 0x42; buf[5] = 0x0f; // size bytes
       return buf;
     })());
 
@@ -352,15 +359,40 @@ describe('POST /webhook/trades — price extraction', () => {
       instructions: makeBaseInstructions(),
       innerInstructions: [],
       accountData: [],
-      logs: ['Program log: 1500000, 2000000, 3000000, 4000000, 5000000'],
+      logs: [],
     };
     await app.fetch(makeRequest([tx]));
 
-    // Must have been indexed — not silently skipped
+    // Must NOT be indexed — TradeCpiV2 is dead in v17
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('v17: BatchTradeNoCpi (tag=66) — first-leg indexed as a trade', async () => {
+    // v17 BatchTrade: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*n
+    // Webhook extracts the first leg (size at [4:20]) and records it.
+    const mockDecodeBase58 = vi.mocked(shared.decodeBase58);
+    mockDecodeBase58.mockReturnValueOnce((() => {
+      const buf = new Uint8Array(2 + 26); // 1 leg, 28 bytes total
+      buf[0] = 66;  // BatchTradeNoCpi
+      buf[1] = 1;   // n_legs=1
+      buf[2] = 0;   // asset_index low byte
+      buf[3] = 0;   // asset_index high byte
+      // size_q at [4:20] — positive value = long
+      buf[4] = 0x40; buf[5] = 0x42; buf[6] = 0x0f; // ~1_000_000
+      return buf;
+    })());
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: [],
+    };
+    await app.fetch(makeRequest([tx]));
+
+    // Must have been indexed — batch trades are valid v17 fills
     expect(shared.insertTrade).toHaveBeenCalledOnce();
-    expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ side: 'long', size: '1000000' })
-    );
   });
 
   it('rejects transactions with invalid signature format', async () => {

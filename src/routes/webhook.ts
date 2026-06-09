@@ -8,7 +8,17 @@ const logger = createLogger("indexer:webhook");
 /** Context key: raw body bytes only after HMAC/static-token verification (defense in depth). */
 type WebhookVariables = { verifiedWebhookBody: Buffer };
 
-const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
+/**
+ * v17 trade tags for webhook parsing.
+ * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v17 wrapper instruction — removed.
+ * BatchTradeNoCpi (66) and BatchTradeCpi (67) are now included.
+ */
+const TRADE_TAGS = new Set<number>([
+  IX_TAG.TradeNoCpi,      // 6
+  IX_TAG.TradeCpi,        // 10
+  IX_TAG.BatchTradeNoCpi, // 66
+  IX_TAG.BatchTradeCpi,   // 67
+]);
 const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 /** Solana signatures are base58-encoded 64-byte values (87–88 chars). */
@@ -319,24 +329,40 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
 
     // Decode instruction data (base58)
     const data = ix.data ? decodeBase58(ix.data) : null;
-    if (!data || data.length < 21) continue;
+    if (!data || data.length < 2) continue;
 
     const tag = data[0];
     if (!TRADE_TAGS.has(tag)) continue;
 
-    // Parse: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16)
-    // TradeCpiV2 adds an extra bump(u8) at byte 21 — same size offset, different total length (22 vs 21)
-    const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+    // v17 wire format:
+    //   Single fill (TradeNoCpi=6, TradeCpi=10):
+    //     tag(1)+asset_index(u16=2)+size_q(i128=16)+... — min 19 bytes, size at [3:19]
+    //   Batch fill (BatchTradeNoCpi=66, BatchTradeCpi=67):
+    //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+8B]*n — min 2+26 bytes
+    //     Each leg is expanded separately; webhook records the first leg per slab.
+    const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
+    let sizeValue: bigint;
+    let side: "long" | "short";
+
+    if (isBatch) {
+      // Batch: leg[0] starts at offset 2; asset_index(2)+size_q(16) → size at [4:20]
+      if (data.length < 2 + 26) continue;
+      const nLegs = data[1];
+      if (nLegs === 0) continue;
+      ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
+    } else {
+      // Single fill: size_q at [3:19]
+      if (data.length < 19) continue;
+      ({ sizeValue, side } = parseTradeSize(data.slice(3, 19)));
+    }
 
     // Validate size is within i128 range — TradeIndexer checks this (line 298)
     // but webhook didn't, allowing oversized values to corrupt downstream calcs.
     if (sizeValue > I128_MAX) continue;
 
-    // Account layout (from core/abi/accounts.ts):
-    // PERC-199: clock sysvar removed from trade instructions
-    // TradeNoCpi:  [0]=user(signer), [1]=lp(signer), [2]=slab(writable), [3]=oracle
-    // TradeCpi:    [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=oracle, ...
-    // TradeCpiV2:  [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=oracle, ... (same layout, adds bump in data)
+    // Account layout (v17):
+    // TradeNoCpi/TradeCpi: [0]=user(signer), [1]=portfolio, [2]=slab(writable), ...
+    // BatchTrade: same first-3 shape
     const accounts: string[] = ix.accounts ?? [];
     const trader = accounts[0] ?? "";
     const slabAddress = accounts.length > 2 ? accounts[2] : "";
@@ -369,12 +395,25 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
       if (!PROGRAM_IDS.has(programId)) continue;
 
       const data = ix.data ? decodeBase58(ix.data) : null;
-      if (!data || data.length < 21) continue;
+      if (!data || data.length < 2) continue;
 
       const tag = data[0];
       if (!TRADE_TAGS.has(tag)) continue;
 
-      const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+      // v17: single fill size at [3:19]; batch leg[0] size at [4:20]
+      const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
+      let sizeValue: bigint;
+      let side: "long" | "short";
+
+      if (isBatchInner) {
+        if (data.length < 2 + 26) continue;
+        if (data[1] === 0) continue;
+        ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
+      } else {
+        if (data.length < 19) continue;
+        ({ sizeValue, side } = parseTradeSize(data.slice(3, 19)));
+      }
+
       if (sizeValue > I128_MAX) continue;
 
       // Same account layout: [0]=user, [2]=slab

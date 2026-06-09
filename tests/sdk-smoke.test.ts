@@ -65,8 +65,11 @@ describe("@percolatorct/sdk exports — IX_TAG (indexer)", () => {
     expect(IX_TAG.LiquidateAtOracle).toBe(7);
   });
 
-  it("IX_TAG.ExecuteAdl is 50", () => {
-    expect(IX_TAG.ExecuteAdl).toBe(50);
+  it("IX_TAG.ExecuteAdl is 101 in v17 (deprecated alias — removed from wrapper decoder)", () => {
+    // v17 rearchitected ADL: ExecuteAdl moved to deprecated tag 101.
+    // Tag 50 in v17 is ForceCloseExpiredPosition (different instruction).
+    // AdlIndexer.ts uses an empty ADL_TAGS set in v17 — no wrapper ADL instruction.
+    expect(IX_TAG.ExecuteAdl).toBe(101);
   });
 
   it("IX_TAG has at least 10 instruction tags", () => {

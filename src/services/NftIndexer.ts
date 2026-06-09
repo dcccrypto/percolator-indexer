@@ -1,10 +1,15 @@
 // SQL Schema:
 // -- position_nft_events: id, signature UNIQUE, event_type, slab, user_idx, owner, nft_mint, slot, timestamp, network
 //
+// v17 MIGRATION NOTE: Add 'transfer' to the CHECK constraint before deploying v17:
+//   ALTER TABLE position_nft_events DROP CONSTRAINT position_nft_events_event_type_check;
+//   ALTER TABLE position_nft_events ADD CONSTRAINT position_nft_events_event_type_check
+//     CHECK (event_type IN ('mint', 'burn', 'transfer'));
+//
 // CREATE TABLE position_nft_events (
 //   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 //   signature  TEXT NOT NULL UNIQUE,
-//   event_type TEXT NOT NULL CHECK (event_type IN ('mint', 'burn')),
+//   event_type TEXT NOT NULL CHECK (event_type IN ('mint', 'burn', 'transfer')),
 //   slab       TEXT NOT NULL,
 //   user_idx   INT  NOT NULL,
 //   owner      TEXT NOT NULL,
@@ -43,11 +48,21 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
 }
 
 /**
- * Percolator-prog tags for NFT operations.
- * Tag 64 = MintPositionNft, Tag 66 = BurnPositionNft.
- * These are main-program (percolator-prog) instructions, not NFT-program instructions.
+ * v17 wrapper tag for NFT B-3 ownership transfer.
+ * Tag 72 = TransferPortfolioOwnership (wrapper program).
+ *
+ * v17 tag collision audit:
+ *   IX_TAG.MintPositionNft = 64 (DEPRECATED) — collides with ForceCloseAbandonedAsset=64.
+ *     Indexing tag 64 in v17 would misclassify force-close txs as NFT mints. REMOVED.
+ *   IX_TAG.BurnPositionNft = 66 (DEPRECATED) — collides with BatchTradeNoCpi=66.
+ *     Indexing tag 66 in v17 would misclassify batch-trade fills as NFT burns. REMOVED.
+ *   IX_TAG.TransferPortfolioOwnership = 72 — the canonical v17 NFT B-3 ownership change.
+ *     This is issued by the wrapper program when portfolio ownership (= NFT holder) changes.
+ *
+ * event_type for TransferPortfolioOwnership is stored as "transfer" (schema allows
+ * 'mint'|'burn'|'transfer').  Existing v12 rows with 'mint'/'burn' are not migrated.
  */
-const NFT_TAGS = new Set<number>([IX_TAG.MintPositionNft, IX_TAG.BurnPositionNft]);
+const NFT_TAGS = new Set<number>([IX_TAG.TransferPortfolioOwnership]); // tag 72
 
 /** How many recent signatures to fetch per slab per cycle */
 const MAX_SIGNATURES = readPositiveIntEnv("NFT_MAX_SIGNATURES", 50, 100);
@@ -64,20 +79,25 @@ const TX_FETCH_RETRIES = readPositiveIntEnv("INDEXER_TX_FETCH_RETRIES", 2, 5);
 const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !== "false";
 
 /**
- * NftIndexerPolling — backup/backfill indexer for position NFT mint/burn events.
+ * NftIndexerPolling — backup/backfill indexer for position NFT B-3 ownership transfer events.
  *
- * Tracks IX_TAG.MintPositionNft (64) and IX_TAG.BurnPositionNft (66) on
- * percolator-prog. Polls all active market slabs and upserts events to the
- * `position_nft_events` table.
+ * Tracks IX_TAG.TransferPortfolioOwnership (72) on the WRAPPER program.
+ * Polls all active market slabs and upserts events to the `position_nft_events` table
+ * with event_type = 'transfer'.
  *
- * Account layout for both instructions (percolator-prog):
- *   [0] owner/signer (position owner for mint, NFT holder for burn)
- *   [1] slab (writable — the perp market slab account)
- *   [2+] additional accounts (NFT mint, ATAs, etc.)
+ * v17 tag collision context (DO NOT revert to 64/66):
+ *   Tag 64 = ForceCloseAbandonedAsset in v17 (was MintPositionNft in v12 — COLLISION)
+ *   Tag 66 = BatchTradeNoCpi in v17 (was BurnPositionNft in v12 — COLLISION)
+ *   Tag 72 = TransferPortfolioOwnership — the canonical v17 NFT B-3 path
+ *
+ * Account layout for TransferPortfolioOwnership (wrapper program):
+ *   [0] from_owner/signer (current NFT holder / portfolio owner)
+ *   [1] to_owner         (new owner)
+ *   [2] slab (writable)
+ *   [3+] additional accounts
  *
  * Data layout:
- *   MintPositionNft (tag 64): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
- *   BurnPositionNft (tag 66): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
+ *   TransferPortfolioOwnership (tag 72): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
  */
 export class NftIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
@@ -307,22 +327,23 @@ export class NftIndexerPolling {
       const tag = data[0];
       if (!NFT_TAGS.has(tag)) continue;
 
-      // Both MintPositionNft and BurnPositionNft carry user_idx as u16 LE at data[1..3]
+      // TransferPortfolioOwnership carries user_idx as u16 LE at data[1..3]
       if (data.length < 3) continue;
 
       const userIdx = data[1] | (data[2] << 8); // u16 little-endian
 
-      // Account layout: [0] = owner/signer, [1] = slab
-      const owner = ix.accounts[0]?.toBase58();
-      const accountSlab = ix.accounts[1]?.toBase58();
+      // Account layout (v17 wrapper TransferPortfolioOwnership):
+      //   [0] from_owner/signer, [1] to_owner, [2] slab (writable)
+      const owner = ix.accounts[0]?.toBase58();    // from_owner
+      const accountSlab = ix.accounts[2]?.toBase58();
 
       if (!owner || !accountSlab) continue;
 
       // accountSlab should match the slab we're polling — sanity-check
       if (accountSlab !== slabAddress) continue;
 
-      const eventType: "mint" | "burn" =
-        tag === IX_TAG.MintPositionNft ? "mint" : "burn";
+      // v17: all NFT events are portfolio ownership transfers
+      const eventType = "transfer" as const;
 
       await this.upsertNftEvent({
         signature,
@@ -342,7 +363,7 @@ export class NftIndexerPolling {
 
   private async upsertNftEvent(event: {
     signature: string;
-    event_type: "mint" | "burn";
+    event_type: "mint" | "burn" | "transfer"; // v17 adds "transfer" for TransferPortfolioOwnership
     slab: string;
     user_idx: number;
     owner: string;

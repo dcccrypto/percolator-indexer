@@ -8,11 +8,14 @@ import { readMarkPriceE6 } from "../parsers/markPrice.js";
 const log = createLogger("indexer:event-stream");
 
 /**
- * Fallback for environments where the SDK build in use predates the UpdateHyperpMark
- * instruction. The program source defines tag 34 in `percolator-prog/src/instruction.rs`.
+ * v17 note: IX_TAG.UpdateHyperpMark no longer exists as a named constant in the v17 SDK
+ * because the instruction was renamed to `ConfigureHybridOracle` (tag 34 — same numeric
+ * value). The fallback ?? 34 is the authoritative value and will always be used in v17.
+ *
+ * DO NOT change the numeric value: the program still emits tag 34 for oracle-price updates.
  */
 const TAG_UPDATE_HYPERP_MARK: number =
-  (IX_TAG as Record<string, number>).UpdateHyperpMark ?? 34;
+  (IX_TAG as Record<string, number>).UpdateHyperpMark ?? 34; // 34 = ConfigureHybridOracle in v17
 
 export interface EventStreamDeps {
   ws: AtlasWs;

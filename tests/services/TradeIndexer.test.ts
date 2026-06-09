@@ -8,7 +8,14 @@ const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
 );
 
 vi.mock('@percolatorct/sdk', () => ({
-  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, TradeCpiV2: 35 },
+  // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
+  IX_TAG: {
+    TradeNoCpi: 10,
+    TradeCpi: 11,
+    // TradeCpiV2 deliberately omitted — deprecated in v17, tag 35 no longer in decoder.
+    BatchTradeNoCpi: 66,
+    BatchTradeCpi: 67,
+  },
 }));
 
 vi.mock('@percolatorct/shared', () => ({
@@ -279,16 +286,50 @@ describe('TradeIndexerPolling', () => {
       expect(shared.insertTrade).not.toHaveBeenCalled();
     }, 10000);
 
-    it('should index TradeCpiV2 (tag=35, 22-byte layout) — GH#1171 regression', async () => {
-      // TradeCpiV2 was not in TRADE_TAGS, causing all post-PR#18 trades to be silently dropped.
+    it('v17: TradeCpiV2 (tag=35) NOT indexed — removed from decoder', async () => {
+      // v17 BREAKING: TradeCpiV2 removed from the v17 wrapper decoder.
+      // The old GH#1171 regression asserted tag=35 WAS indexed; in v17 it MUST NOT be.
       vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
-      vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: 5_000_000n, side: 'short' as const });
 
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
 
-      const ixData = new Uint8Array(22); // TradeCpiV2 is 22 bytes
-      ixData[0] = 35; // IX_TAG.TradeCpiV2
+      const ixData = new Uint8Array(22);
+      ixData[0] = 35; // tag 35 — NOT in v17 TRADE_TAGS
+      vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
+
+      mockGetParsedTransaction.mockResolvedValue({
+        meta: { err: null, logMessages: [] },
+        transaction: {
+          message: {
+            instructions: [{
+              programId: new PublicKey(PROGRAM_ID),
+              accounts: [new PublicKey(TRADER), new PublicKey(TRADER), new PublicKey(SLAB)],
+              data: 'somedata',
+            }],
+          },
+        },
+      });
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+
+      // Tag=35 is NOT a trade tag in v17 — must not be indexed
+      expect(shared.insertTrade).not.toHaveBeenCalled();
+    }, 10000);
+
+    it('v17: BatchTradeNoCpi (tag=66) IS indexed', async () => {
+      // v17 NEW: BatchTradeNoCpi=66 replaces the old BurnPositionNft=66 tag.
+      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: 7_000_000n, side: 'long' as const });
+
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
+
+      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*1 = 28 bytes
+      const ixData = new Uint8Array(28);
+      ixData[0] = 66;  // BatchTradeNoCpi
+      ixData[1] = 1;   // n_legs
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
 
       mockGetParsedTransaction.mockResolvedValue({
@@ -309,7 +350,7 @@ describe('TradeIndexerPolling', () => {
 
       expect(shared.insertTrade).toHaveBeenCalledOnce();
       expect(shared.insertTrade).toHaveBeenCalledWith(
-        expect.objectContaining({ side: 'short', size: '5000000', slab_address: SLAB })
+        expect.objectContaining({ side: 'long', size: '7000000', slab_address: SLAB })
       );
     }, 10000);
 

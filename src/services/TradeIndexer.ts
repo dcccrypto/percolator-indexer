@@ -4,8 +4,18 @@ import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets,
 
 const logger = createLogger("indexer:trade-indexer");
 
-/** Trade instruction tags we want to index */
-const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
+/**
+ * v17 trade tags to index.
+ *
+ * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v17 wrapper instruction — removed.
+ * BatchTradeNoCpi (66) and BatchTradeCpi (67) emit fills and are included.
+ */
+const TRADE_TAGS = new Set<number>([
+  IX_TAG.TradeNoCpi,      // 6
+  IX_TAG.TradeCpi,        // 10
+  IX_TAG.BatchTradeNoCpi, // 66
+  IX_TAG.BatchTradeCpi,   // 67
+]);
 
 function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
@@ -263,13 +273,50 @@ export class TradeIndexerPolling {
       const tag = data[0];
       if (!TRADE_TAGS.has(tag)) continue;
 
-      // This is a trade instruction! Parse it.
-      // Layout: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16) = 21 bytes
-      // TradeCpiV2 adds bump(u8) at byte 21, total 22 bytes — size offset unchanged.
-      if (data.length < 21) continue;
+      // v17 single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... = 19 bytes min
+      // v17 batch-fill: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+8B]*n
+      // The batch path is forwarded to parseBatchTradeSize helper below.
+      const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
 
-      // Parse size as signed i128 (little-endian)
-      const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+      if (isBatch) {
+        // Batch: tag(1)+n_legs(1)+legs; we only store the first leg for the slab-level record.
+        // Full multi-leg expansion happens in parsePercolatorFills (for webhook/stream paths).
+        if (data.length < 2) continue;
+        const nLegs = data[1];
+        if (nLegs === 0 || data.length < 2 + nLegs * 26) continue;
+        // Parse first leg: asset_index(2)+size_q(16)+8B starting at offset 2
+        const { sizeValue, side } = parseTradeSize(data.slice(4, 20)); // leg[0] size at 2+2=4
+        if (sizeValue === 0n) continue;
+
+        const traderKey = ix.accounts[0];
+        if (!traderKey) continue;
+        const trader = traderKey.toBase58();
+
+        let price = this.extractPriceFromLogs(tx);
+        if (price === 0) {
+          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+        }
+        const fee = this.extractFeeFromBalances(tx, trader);
+
+        const exists = await tradeExistsBySignature(signature);
+        if (exists) return false;
+
+        const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+        const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+        if (!base58PubkeyRegex.test(trader) || !base58SigRegex.test(signature)) return false;
+        const i128Max = (1n << 127n) - 1n;
+        if (sizeValue > i128Max) return false;
+
+        await insertTrade({ slab_address: slabAddress, trader, side, size: sizeValue.toString(), price, fee, tx_signature: signature });
+        eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
+        return true;
+      }
+
+      // Single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... = 19 bytes min
+      if (data.length < 19) continue;
+
+      // Parse size as signed i128 (little-endian) — size starts at byte 3 (after tag+asset_index)
+      const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
 
       // Determine trader from account keys
       const traderKey = ix.accounts[0];

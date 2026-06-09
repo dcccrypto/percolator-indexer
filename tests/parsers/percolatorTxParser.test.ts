@@ -35,23 +35,47 @@ function encodeBase58(bytes: Uint8Array): string {
 }
 
 /**
- * Build a synthetic tx.transaction.message.instructions entry for a trade tx.
- * Layout: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128 LE=16) = 21 bytes.
- * Only the low i64 of the size is populated — sufficient for sizes < 2^63.
+ * Build a synthetic v17 single-fill instruction data buffer.
+ * v17 layout: tag(1) + asset_index(u16 LE=2) + size_q(i128 LE=16) = 19 bytes min.
+ *
+ * BREAKING CHANGE vs v12: size is at bytes [3:19], not [5:21].
+ * The old v12 format was: tag(1)+lpIdx(2)+userIdx(2)+size(16) = 21 bytes.
  */
-function makeTradeIxData(tag: number, size: bigint): string {
-  const buf = new Uint8Array(21);
+function makeTradeIxData(tag: number, size: bigint, assetIndex = 0): string {
+  const buf = new Uint8Array(19);
   const dv = new DataView(buf.buffer);
   dv.setUint8(0, tag);
-  dv.setUint16(1, 0, true); // lpIdx
-  dv.setUint16(3, 0, true); // userIdx
-  // i128 LE — write low i64 at bytes 5..13; bytes 13..21 remain 0 (positive values only here).
-  dv.setBigInt64(5, size, true);
+  dv.setUint16(1, assetIndex, true); // asset_index (u16 LE) — was lpIdx in v12
+  // i128 LE — write low i64 at bytes 3..11; bytes 11..19 remain 0 (positive values only here).
+  dv.setBigInt64(3, size, true);     // size_q starts at byte 3 in v17 (was byte 5 in v12)
+  return encodeBase58(buf);
+}
+
+/**
+ * Build a synthetic v17 batch-fill instruction data buffer.
+ * v17 layout: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+padding(8)]*n
+ * Each leg = 26 bytes; total = 2 + n*26 bytes.
+ */
+function makeBatchTradeIxData(
+  tag: number,
+  legs: Array<{ assetIndex: number; size: bigint }>,
+): string {
+  const legLen = 26;
+  const buf = new Uint8Array(2 + legs.length * legLen);
+  const dv = new DataView(buf.buffer);
+  dv.setUint8(0, tag);
+  dv.setUint8(1, legs.length);
+  for (let i = 0; i < legs.length; i++) {
+    const off = 2 + i * legLen;
+    dv.setUint16(off, legs[i].assetIndex, true);     // asset_index
+    dv.setBigInt64(off + 2, legs[i].size, true);     // size_q low i64
+    // bytes off+10 .. off+25: high i64 of i128 + 8B padding — all zero
+  }
   return encodeBase58(buf);
 }
 
 describe("parsePercolatorFills", () => {
-  it("extracts a fill from TradeNoCpi", () => {
+  it("extracts a fill from TradeNoCpi with asset_index (v17 wire format)", () => {
     const tx: any = {
       transaction: {
         message: {
@@ -59,7 +83,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeTradeIxData(IX_TAG.TradeNoCpi, 1_000_000n),
+              data: makeTradeIxData(IX_TAG.TradeNoCpi, 1_000_000n, /* assetIndex */ 2),
             },
           ],
         },
@@ -76,6 +100,7 @@ describe("parsePercolatorFills", () => {
       signature: "signature123",
       trader: TRADER,
       programId: PERC,
+      assetIndex: 2,         // v17: asset_index from bytes [1:3] of instruction data
       sizeAbs: 1_000_000n,
       side: expect.stringMatching(/long|short/),
     });
@@ -83,6 +108,27 @@ describe("parsePercolatorFills", () => {
     // `mark_price=<n>` regex was bogus on real program output. Callers must
     // resolve price via slab state (see readMarkPriceE6).
     expect(fills[0].priceE6).toBeUndefined();
+  });
+
+  it("extracts a fill from TradeCpi with asset_index=0 (default)", () => {
+    const tx: any = {
+      transaction: {
+        message: {
+          instructions: [
+            {
+              programId: new PublicKey(PERC),
+              accounts: [new PublicKey(TRADER)],
+              data: makeTradeIxData(IX_TAG.TradeCpi, 500_000n, 0),
+            },
+          ],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+    };
+    const fills = parsePercolatorFills(tx, "sig2", [PERC]);
+    expect(fills).toHaveLength(1);
+    expect(fills[0].assetIndex).toBe(0);
+    expect(fills[0].sizeAbs).toBe(500_000n);
   });
 
   it("ignores log-derived prices completely (even when logs include a valid mark_price line)", () => {
@@ -112,6 +158,77 @@ describe("parsePercolatorFills", () => {
     const fills = parsePercolatorFills(tx, "sig", [PERC]);
     expect(fills).toHaveLength(1);
     expect(fills[0].priceE6).toBeUndefined();
+  });
+
+  it("expands BatchTradeNoCpi into per-leg fills with correct assetIndex", () => {
+    // Batch with 2 legs: asset 0 long 100, asset 1 long 200
+    const tx: any = {
+      transaction: {
+        message: {
+          instructions: [
+            {
+              programId: new PublicKey(PERC),
+              accounts: [new PublicKey(TRADER)],
+              data: makeBatchTradeIxData(IX_TAG.BatchTradeNoCpi, [
+                { assetIndex: 0, size: 100n },
+                { assetIndex: 1, size: 200n },
+              ]),
+            },
+          ],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+    };
+    const fills = parsePercolatorFills(tx, "batchsig", [PERC]);
+    expect(fills).toHaveLength(2);
+    expect(fills[0]).toMatchObject({ assetIndex: 0, sizeAbs: 100n });
+    expect(fills[1]).toMatchObject({ assetIndex: 1, sizeAbs: 200n });
+    // All fills share the same signature and trader
+    expect(fills[0].signature).toBe("batchsig");
+    expect(fills[1].signature).toBe("batchsig");
+    expect(fills[0].trader).toBe(TRADER);
+  });
+
+  it("expands BatchTradeCpi legs correctly", () => {
+    const tx: any = {
+      transaction: {
+        message: {
+          instructions: [
+            {
+              programId: new PublicKey(PERC),
+              accounts: [new PublicKey(TRADER)],
+              data: makeBatchTradeIxData(IX_TAG.BatchTradeCpi, [
+                { assetIndex: 3, size: 999n },
+              ]),
+            },
+          ],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+    };
+    const fills = parsePercolatorFills(tx, "batchcpisig", [PERC]);
+    expect(fills).toHaveLength(1);
+    expect(fills[0].assetIndex).toBe(3);
+    expect(fills[0].sizeAbs).toBe(999n);
+  });
+
+  it("skips batch instruction when n_legs=0", () => {
+    const tx: any = {
+      transaction: {
+        message: {
+          instructions: [
+            {
+              programId: new PublicKey(PERC),
+              accounts: [new PublicKey(TRADER)],
+              // Empty leg list
+              data: makeBatchTradeIxData(IX_TAG.BatchTradeNoCpi, []),
+            },
+          ],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+    };
+    expect(parsePercolatorFills(tx, "sig", [PERC])).toEqual([]);
   });
 
   it("returns empty array when tx.meta.err is set", () => {
