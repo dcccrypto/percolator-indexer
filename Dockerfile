@@ -19,6 +19,6 @@ COPY --from=builder /app/package.json ./
 RUN chown -R node:node /app
 USER node
 ENV NODE_ENV=production
-EXPOSE 4001
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -f http://localhost:4001/health || exit 1
+EXPOSE 3002
+HEALTHCHECK --interval=30s --timeout=15s --start-period=10s --retries=3 CMD curl -f http://localhost:3002/health || exit 1
 CMD ["node", "dist/index.js"]
