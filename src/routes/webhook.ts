@@ -306,6 +306,14 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
   const signature = tx.signature ?? "";
   if (!signature) return trades;
 
+  // Skip failed transactions — Helius enhanced format uses `transactionError`
+  // (non-null on failure). Without this guard, failed txs are parsed and
+  // indexed as phantom trades. Mirrors TradeIndexer.processTransaction check.
+  if (tx.transactionError != null) {
+    logger.debug("Skipping failed transaction", { signature: signature.slice(0, 12) });
+    return trades;
+  }
+
   // Validate signature format (base58, 64-byte = 87–88 chars).
   // TradeIndexer validates this (line 293) but webhook didn't — garbage
   // signatures would pollute the DB and bypass duplicate detection.
