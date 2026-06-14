@@ -90,14 +90,16 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
  *   Tag 66 = BatchTradeNoCpi in v17 (was BurnPositionNft in v12 — COLLISION)
  *   Tag 72 = TransferPortfolioOwnership — the canonical v17 NFT B-3 path
  *
- * Account layout for TransferPortfolioOwnership (wrapper program):
- *   [0] from_owner/signer (current NFT holder / portfolio owner)
- *   [1] to_owner         (new owner)
- *   [2] slab (writable)
+ * v17 account layout for TransferPortfolioOwnership (wrapper program) — desync fix 7:
+ *   [0] mint_auth (NFT program's mint-authority PDA, signer — NOT the user wallet)
+ *   [1] portfolio (writable)
+ *   [2] nft_registry (read-only PDA)
  *   [3+] additional accounts
  *
- * Data layout:
- *   TransferPortfolioOwnership (tag 72): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
+ * v17 wire data format — desync fix 7:
+ *   tag(1) + new_owner([u8;32]) + asset_index(u16 LE) = 35 bytes minimum
+ *   The new_owner pubkey at data[1:33] identifies who becomes the portfolio owner.
+ *   The 16-bit value at data[33:35] is asset_index (NOT user_idx as the old comment stated).
  */
 export class NftIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
@@ -327,20 +329,26 @@ export class NftIndexerPolling {
       const tag = data[0];
       if (!NFT_TAGS.has(tag)) continue;
 
-      // TransferPortfolioOwnership carries user_idx as u16 LE at data[1..3]
-      if (data.length < 3) continue;
+      // v17 wire decode — desync fix 7:
+      //   tag(1) + new_owner([u8;32]) + asset_index(u16 LE) = 35 bytes minimum
+      if (data.length < 35) continue;
 
-      const userIdx = data[1] | (data[2] << 8); // u16 little-endian
+      // new_owner is the recipient pubkey at data[1:33]
+      const newOwnerBytes = data.slice(1, 33);
+      const newOwnerPk = new PublicKey(newOwnerBytes).toBase58();
 
-      // Account layout (v17 wrapper TransferPortfolioOwnership):
-      //   [0] from_owner/signer, [1] to_owner, [2] slab (writable)
-      const owner = ix.accounts[0]?.toBase58();    // from_owner
-      const accountSlab = ix.accounts[2]?.toBase58();
+      // asset_index (u16 LE) at data[33:35]
+      const assetIndex = data[33] | (data[34] << 8);
 
-      if (!owner || !accountSlab) continue;
+      // v17 account layout (desync fix 7):
+      //   [0] mint_auth (PDA signer — NOT the user wallet)
+      //   [1] portfolio (writable)
+      //   [2] nft_registry (PDA)
+      // The portfolio's new owner comes from the wire data new_owner field, not accounts[].
+      // The nft_registry at accounts[2] is NOT the market slab — we match on portfolio at [1].
+      const portfolio = ix.accounts[1]?.toBase58();
 
-      // accountSlab should match the slab we're polling — sanity-check
-      if (accountSlab !== slabAddress) continue;
+      if (!newOwnerPk || !portfolio) continue;
 
       // v17: all NFT events are portfolio ownership transfers
       const eventType = "transfer" as const;
@@ -349,8 +357,8 @@ export class NftIndexerPolling {
         signature,
         event_type: eventType,
         slab: slabAddress,
-        user_idx: userIdx,
-        owner,
+        user_idx: assetIndex,   // v17: asset_index used in user_idx column (schema compatible)
+        owner: newOwnerPk,      // v17: new_owner from wire data
         slot,
         timestamp,
       });

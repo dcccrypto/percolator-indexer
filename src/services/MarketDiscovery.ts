@@ -1,6 +1,7 @@
 import { PublicKey } from "@solana/web3.js";
-import { discoverMarkets, getMarketsByAddress, type DiscoveredMarket } from "@percolatorct/sdk";
+import { discoverMarkets, getMarketsByAddress, isV17Account, type DiscoveredMarket } from "@percolatorct/sdk";
 import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException } from "@percolatorct/shared";
+import { discoverV17Markets } from "../v17/discovery.js";
 
 const logger = createLogger("indexer:market-discovery");
 
@@ -71,6 +72,14 @@ export class MarketDiscovery {
 
       for (const id of programIds) {
         try {
+          // v17 accounts: use v17-aware address-based discovery.
+          // The SDK's getMarketsByAddress checks v12 magic (TALOCREP) and will skip v17 accounts.
+          const v17Found = await discoverV17Markets(primaryConn, new PublicKey(id), slabAddresses);
+          if (v17Found.length > 0) {
+            all.push(...v17Found);
+            continue;
+          }
+          // Fall back to v12 SDK path for legacy markets
           const found = await getMarketsByAddress(
             primaryConn,
             new PublicKey(id),
@@ -116,6 +125,15 @@ export class MarketDiscovery {
         const conn = attempt === HELIUS_429_BACKOFF_MS.length ? fallbackConn : primaryConn;
         const connLabel = conn === fallbackConn ? "fallback" : "primary";
         try {
+          // v17 discovery: use v17-aware helper that checks PERCV16\0 magic.
+          // The SDK's discoverMarkets uses v12 TALOCREP magic and will return 0 v17 markets.
+          const v17Found = await discoverV17Markets(conn, new PublicKey(id));
+          if (v17Found.length > 0) {
+            all.push(...v17Found);
+            discovered = true;
+            break;
+          }
+          // Fall back to v12 discovery for legacy markets
           const found = await discoverMarkets(conn, new PublicKey(id));
           all.push(...found);
           discovered = true;

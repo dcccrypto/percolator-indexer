@@ -16,6 +16,10 @@ vi.mock('@percolatorct/sdk', () => ({
     if (dataLen < 8) return null; // too small
     return { version: 1, engineOff: 640, engineMarkPriceOff: 400, engineBitmapOff: 656 };
   }),
+  // v17 desync additions — default to false so existing v12 test paths pass through.
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  V17_HEADER_LEN: 16,
 }));
 
 // NOTE: This constant must be a literal string used inside vi.mock (which is hoisted before const declarations).

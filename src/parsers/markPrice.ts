@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { parseEngine, detectSlabLayout } from "@percolatorct/sdk";
+import { parseEngine, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { createLogger, withRetry } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:mark-price");
@@ -33,6 +33,21 @@ export async function readMarkPriceE6(
     if (!info?.data) return null;
 
     const data = new Uint8Array(info.data);
+
+    // Desync fix 9: v17 account — detectSlabLayout returns null for v17 account sizes
+    // (no v17 tier registered). Use parseWrapperConfigV17 to read mark_ewma_e6 directly.
+    if (isV17Account(data)) {
+      try {
+        const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
+        const markEwmaE6 = cfg.markEwmaE6;
+        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+          return Number(markEwmaE6);
+        }
+      } catch {
+        // parseWrapperConfigV17 failed — return null
+      }
+      return null;
+    }
 
     // Fast-path check before attempting parseEngine: the slab layout must have
     // a mark_price field (V0 does not). detectSlabLayout is cheap — avoids a

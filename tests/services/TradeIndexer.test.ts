@@ -16,6 +16,11 @@ vi.mock('@percolatorct/sdk', () => ({
     BatchTradeNoCpi: 66,
     BatchTradeCpi: 67,
   },
+  // v17 desync additions — default to false/null so existing v12 test paths pass through.
+  detectSlabLayout: vi.fn(() => null),
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  V17_HEADER_LEN: 16,
 }));
 
 vi.mock('@percolatorct/shared', () => ({

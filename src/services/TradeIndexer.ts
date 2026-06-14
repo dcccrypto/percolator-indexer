@@ -1,5 +1,5 @@
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
-import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
+import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:trade-indexer");
@@ -278,6 +278,16 @@ export class TradeIndexerPolling {
       // The batch path is forwarded to parseBatchTradeSize helper below.
       const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
 
+      // Desync fix 6: verify this instruction is for the slab we're polling.
+      // For TradeNoCpi/BatchTradeNoCpi: market is at accounts[2].
+      // For TradeCpi/BatchTradeCpi: market is at accounts[1].
+      // Without this guard, a batch tx touching multiple slabs would double-index
+      // fills under the wrong slab.
+      const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
+      const marketAccountIdx = isNoCpiTag ? 2 : 1;
+      const ixMarket = ix.accounts[marketAccountIdx]?.toBase58();
+      if (ixMarket && ixMarket !== slabAddress) continue;
+
       if (isBatch) {
         // Batch: tag(1)+n_legs(1)+legs; we only store the first leg for the slab-level record.
         // Full multi-leg expansion happens in parsePercolatorFills (for webhook/stream paths).
@@ -395,6 +405,10 @@ export class TradeIndexerPolling {
   /**
    * Fallback: read mark_price_e6 from the slab account's on-chain state.
    * This gives the current mark price (close to execution price for recent trades).
+   *
+   * Desync fix (finding 9 / TradeIndexer path): v17 accounts use parseWrapperConfigV17
+   * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
+   * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
   private async readMarkPriceFromSlab(connection: Connection, slabAddress: string): Promise<number> {
     try {
@@ -408,7 +422,23 @@ export class TradeIndexerPolling {
       );
       if (!info?.data) return 0;
 
-      // Auto-detect V0 vs V1 layout from the actual slab data length.
+      const rawData = new Uint8Array(info.data);
+
+      // v17 path: read mark_ewma_e6 from WrapperConfigV17
+      if (isV17Account(rawData)) {
+        try {
+          const cfg = parseWrapperConfigV17(rawData, V17_HEADER_LEN);
+          const markEwmaE6 = cfg.markEwmaE6;
+          if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+            return Number(markEwmaE6) / 1_000_000;
+          }
+        } catch {
+          // parseWrapperConfigV17 failed
+        }
+        return 0;
+      }
+
+      // v12 path: Auto-detect V0 vs V1 layout from the actual slab data length.
       // V0 (deployed devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
       // V1 (future upgrade): ENGINE_OFF=640, mark_price at +400.
       const layout = detectSlabLayout(info.data.length);

@@ -17,11 +17,196 @@ import {
   parseAllAccounts,
   detectDexType,
   parseDexPool,
+  isV17Account,
+  parseWrapperConfigV17,
+  parseAssetOracleProfileV17,
+  V17_HEADER_LEN,
+  V17_MARKET_GROUP_OFF,
+  V17_ASSET_ORACLE_PROFILE_LEN,
   type EngineState,
   type MarketConfig,
   type RiskParams,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
+
+/**
+ * v17 market group header layout (all offsets relative to V17_MARKET_GROUP_OFF=448).
+ * Desync fix 4: read vault and insurance from the v17 on-chain layout.
+ *   +0  market_group_id [u8;32]
+ *  +32  vault u128
+ *  +48  insurance u128
+ *  +64  c_tot u128
+ */
+const V17_MG_VAULT_OFF = 32;       // abs: V17_MARKET_GROUP_OFF + 32 = 480
+const V17_MG_INSURANCE_OFF = 48;   // abs: V17_MARKET_GROUP_OFF + 48 = 496
+const V17_MG_C_TOT_OFF = 64;       // abs: V17_MARKET_GROUP_OFF + 64 = 512
+const V17_MG_MIN_BYTES = 64;       // minimum bytes needed past MARKET_GROUP_OFF
+
+/**
+ * Market group header length between V17_MARKET_GROUP_OFF and the first
+ * AssetOracleProfileV17. From the desync doc: asset-0 oracle profile at
+ * abs offset 1206 = 448 + 758, so MARKET_GROUP_HDR_LEN = 758.
+ */
+const V17_MARKET_GROUP_HDR_LEN = 758;
+const V17_ASSET0_PROFILE_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_HDR_LEN; // 1206
+
+function readU128LESB(data: Uint8Array, offset: number): bigint {
+  const dv = new DataView(data.buffer, data.byteOffset + offset, 16);
+  const lo = dv.getBigUint64(0, true);
+  const hi = dv.getBigUint64(8, true);
+  return lo | (hi << 64n);
+}
+
+/**
+ * Parse a v17 account and return v12-compatible engine/config/params shapes.
+ *
+ * Desync fixes 2, 3, 4:
+ *   - Use parseWrapperConfigV17 for config fields (correct v17 offsets)
+ *   - Use parseAssetOracleProfileV17 for oracleAuthority / price
+ *   - Read vault and insurance from the v17 market group header
+ */
+function parseV17AccountStats(data: Uint8Array): {
+  engine: EngineState;
+  marketConfig: MarketConfig;
+  params: RiskParams;
+} {
+  const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
+
+  // Asset-0 oracle profile for oracleAuthority and authorityPriceE6
+  const zeroKey = new PublicKey(new Uint8Array(32));
+  let oracleAuthority = zeroKey;
+  let authorityPriceE6 = 0n;
+  if (data.length >= V17_ASSET0_PROFILE_OFF + V17_ASSET_ORACLE_PROFILE_LEN) {
+    try {
+      const op = parseAssetOracleProfileV17(data, V17_ASSET0_PROFILE_OFF);
+      oracleAuthority = op.oracleAuthority;
+      authorityPriceE6 = op.oracleTargetPriceE6;
+    } catch {
+      // Asset oracle profile unavailable — use zero authority (Pyth-pinned fallback)
+    }
+  }
+
+  // markEwmaE6 from WrapperConfigV17 (offset 232 within config block; absolute 16+232=248)
+  const lastEffectivePriceE6 = cfg.markEwmaE6;
+
+  const marketConfig: MarketConfig = {
+    collateralMint: cfg.collateralMint,
+    vaultPubkey: zeroKey,
+    indexFeedId: zeroKey,           // zeroed: v17 has no global Pyth indexFeedId
+    maxStalenessSlots: cfg.maxStalenessSecs,
+    confFilterBps: cfg.confFilterBps,
+    vaultAuthorityBump: 0,
+    invert: cfg.invert,
+    unitScale: cfg.unitScale,
+    fundingHorizonSlots: 0n,
+    fundingKBps: 0n,
+    fundingInvScaleNotionalE6: 0n,
+    fundingMaxPremiumBps: 0n,
+    fundingMaxBpsPerSlot: 0n,
+    threshFloor: 0n,
+    threshRiskBps: 0n,
+    threshUpdateIntervalSlots: 0n,
+    threshStepBps: 0n,
+    threshAlphaBps: 0n,
+    threshMin: 0n,
+    threshMax: 0n,
+    threshMinStep: 0n,
+    oracleAuthority,
+    authorityPriceE6,
+    authorityTimestamp: 0n,
+    oraclePriceCapE2bps: 0n,
+    lastEffectivePriceE6,
+    oiCapMultiplierBps: 0n,
+    maxPnlCap: 0n,
+    adaptiveFundingEnabled: false,
+    adaptiveScaleBps: 0,
+    adaptiveMaxFundingBps: 0n,
+    marketCreatedSlot: 0n,
+    oiRampSlots: 0n,
+    resolvedSlot: 0n,
+    insuranceIsolationBps: 0,
+    oraclePhase: 0,
+    cumulativeVolumeE6: 0n,
+    phase2DeltaSlots: 0,
+    dexPool: null,
+  };
+
+  // Read vault and insurance from v17 market group header (desync fix 4)
+  const mgOff = V17_MARKET_GROUP_OFF;
+  const hasGroupHeader = data.length >= mgOff + V17_MG_MIN_BYTES;
+  const vault = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_VAULT_OFF) : 0n;
+  const insurance = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_INSURANCE_OFF) : 0n;
+  const cTot = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_C_TOT_OFF) : 0n;
+
+  const engine: EngineState = {
+    vault,
+    insuranceFund: { balance: insurance, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
+    currentSlot: 0n,
+    fundingIndexQpbE6: 0n,
+    lastFundingSlot: 0n,
+    fundingRateBpsPerSlotLast: 0n,
+    fundingRateE9: 0n,
+    marketMode: null,
+    lastCrankSlot: 0n,
+    maxCrankStalenessSlots: 0n,
+    totalOpenInterest: 0n,
+    longOi: 0n,
+    shortOi: 0n,
+    cTot,
+    pnlPosTot: 0n,
+    pnlMaturedPosTot: 0n,
+    liqCursor: 0,
+    gcCursor: 0,
+    lastSweepStartSlot: 0n,
+    lastSweepCompleteSlot: 0n,
+    crankCursor: 0,
+    sweepStartIdx: 0,
+    lifetimeLiquidations: 0n,
+    lifetimeForceCloses: 0n,
+    netLpPos: 0n,
+    lpSumAbs: 0n,
+    lpMaxAbs: 0n,
+    lpMaxAbsSweep: 0n,
+    emergencyOiMode: false,
+    emergencyStartSlot: 0n,
+    lastBreakerSlot: 0n,
+    numUsedAccounts: 0,
+    nextAccountId: 0n,
+    markPriceE6: lastEffectivePriceE6,
+    oraclePriceE6: 0n,
+    fLongNum: 0n,
+    fShortNum: 0n,
+    negPnlAccountCount: 0n,
+    fundPxLast: 0n,
+    resolvedKLongTerminalDelta: 0n,
+    resolvedKShortTerminalDelta: 0n,
+    resolvedLivePrice: 0n,
+  };
+
+  const params: RiskParams = {
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 0n,
+    initialMarginBps: 500n,   // default 20x
+    tradingFeeBps: BigInt(cfg.tradeFeeBps),
+    maxAccounts: 0n,
+    newAccountFee: 0n,
+    riskReductionThreshold: 0n,
+    maintenanceFeePerSlot: cfg.maintenanceFeePerSlot,
+    maxCrankStalenessSlots: 0n,
+    liquidationFeeBps: 0n,
+    liquidationFeeCap: 0n,
+    liquidationBufferBps: 0n,
+    minLiquidationAbs: 0n,
+    minInitialDeposit: 0n,
+    minNonzeroMmReq: 0n,
+    minNonzeroImReq: 0n,
+    insuranceFloor: 0n,
+    hMin: 0n,
+    hMax: 0n,
+  };
+
+  return { engine, marketConfig, params };
+}
 import { 
   getConnection,
   upsertMarketStats, 
@@ -357,13 +542,21 @@ export class StatsCollector {
 
               const data = new Uint8Array(accountInfo.data);
 
-              let engine: ReturnType<typeof parseEngine>;
-              let marketConfig: ReturnType<typeof parseConfig>;
-              let params: ReturnType<typeof parseParams>;
+              let engine: EngineState;
+              let marketConfig: MarketConfig;
+              let params: RiskParams;
               try {
-                engine = parseEngine(data);
-                marketConfig = parseConfig(data);
-                params = parseParams(data);
+                if (isV17Account(data)) {
+                  // v17: use v17-correct parsers (desync fixes 2, 3, 4)
+                  const v17 = parseV17AccountStats(data);
+                  engine = v17.engine;
+                  marketConfig = v17.marketConfig;
+                  params = v17.params;
+                } else {
+                  engine = parseEngine(data);
+                  marketConfig = parseConfig(data);
+                  params = parseParams(data);
+                }
               } catch {
                 // Slab too small or unrecognized layout — skip
                 return;
@@ -870,14 +1063,23 @@ export class StatsCollector {
 
             const data = new Uint8Array(accountInfo.data);
 
-            // Parse engine state and risk params
+            // Parse engine state and risk params — v17 dispatch (desync fixes 2, 3, 4)
             let engine: EngineState;
             let marketConfig: MarketConfig;
             let params: RiskParams;
             try {
-              engine = parseEngine(data);
-              marketConfig = parseConfig(data);
-              params = parseParams(data);
+              if (isV17Account(data)) {
+                // v17: use v17-correct parsers (parseEngine/parseConfig/parseParams all throw
+                // "Unrecognized slab data length" for v17 account sizes — wrong magic + no registered tier)
+                const v17 = parseV17AccountStats(data);
+                engine = v17.engine;
+                marketConfig = v17.marketConfig;
+                params = v17.params;
+              } else {
+                engine = parseEngine(data);
+                marketConfig = parseConfig(data);
+                params = parseParams(data);
+              }
             } catch (parseErr) {
               // Slab too small or invalid — skip
               return;

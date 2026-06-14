@@ -1,8 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Mock external dependencies
+// Mock the v17 discovery helper so tests don't need a real RPC connection.
+// Default: return empty array (no v17 markets) so tests fall through to discoverMarkets().
+vi.mock('../../src/v17/discovery.js', () => ({
+  discoverV17Markets: vi.fn(async () => []),
+}));
+
+// Mock external dependencies — include all SDK exports used by MarketDiscovery and discoverV17Markets.
 vi.mock('@percolatorct/sdk', () => ({
   discoverMarkets: vi.fn(),
+  getMarketsByAddress: vi.fn(),
+  isV17Account: vi.fn(() => false),
 }));
 
 // Stable mock connection objects so tests can script and assert connection switching.

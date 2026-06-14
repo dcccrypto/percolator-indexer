@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
+import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:webhook");
@@ -360,12 +360,16 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     // but webhook didn't, allowing oversized values to corrupt downstream calcs.
     if (sizeValue > I128_MAX) continue;
 
-    // Account layout (v17):
-    // TradeNoCpi/TradeCpi: [0]=user(signer), [1]=portfolio, [2]=slab(writable), ...
-    // BatchTrade: same first-3 shape
+    // Account layout (v17) — desync fix 5: TradeCpi market is at accounts[1], not accounts[2].
+    //   TradeNoCpi (tag 6) / BatchTradeNoCpi (tag 66):
+    //     [0]=signer_a, [1]=signer_b, [2]=market (writable), [3]=account_a, [4]=account_b
+    //   TradeCpi (tag 10) / BatchTradeCpi (tag 67):
+    //     [0]=signer_a, [1]=market (writable), [2]=account_a (taker portfolio), [3]=account_b (LP), ...
     const accounts: string[] = ix.accounts ?? [];
     const trader = accounts[0] ?? "";
-    const slabAddress = accounts.length > 2 ? accounts[2] : "";
+    const isNoCpi = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
+    const marketIdx = isNoCpi ? 2 : 1;
+    const slabAddress = accounts.length > marketIdx ? accounts[marketIdx] : "";
     if (!trader || !slabAddress) continue;
 
     // Validate pubkey formats
@@ -416,10 +420,12 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
 
       if (sizeValue > I128_MAX) continue;
 
-      // Same account layout: [0]=user, [2]=slab
+      // Same v17 account layout with CPI dispatch fix (desync fix 5)
       const accounts: string[] = ix.accounts ?? [];
       const trader = accounts[0] ?? "";
-      const slabAddress = accounts.length > 2 ? accounts[2] : "";
+      const isNoCpiInner = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
+      const innerMarketIdx = isNoCpiInner ? 2 : 1;
+      const slabAddress = accounts.length > innerMarketIdx ? accounts[innerMarketIdx] : "";
       if (!trader || !slabAddress) continue;
 
       if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
@@ -481,6 +487,21 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
       try { raw = Uint8Array.from(Buffer.from(acc.data[0], "base64")); } catch { /* skip */ }
     }
     if (!raw) continue;
+
+    // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
+    // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
+    if (isV17Account(raw)) {
+      try {
+        const cfg = parseWrapperConfigV17(raw, V17_HEADER_LEN);
+        const markEwmaE6 = cfg.markEwmaE6;
+        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+          return Number(markEwmaE6) / 1_000_000;
+        }
+      } catch {
+        // parseWrapperConfigV17 failed — fall through to log-based extraction
+      }
+      continue;
+    }
 
     // Auto-detect layout version from the actual slab data length.
     // V0 (legacy devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).

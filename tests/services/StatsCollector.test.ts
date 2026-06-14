@@ -10,6 +10,15 @@ vi.mock('@percolatorct/sdk', () => ({
   parseConfig: vi.fn(),
   parseParams: vi.fn(),
   parseAllAccounts: vi.fn(() => []),
+  // v17 desync additions — default to false so existing v12 test paths pass through.
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  parseAssetOracleProfileV17: vi.fn(),
+  V17_HEADER_LEN: 16,
+  V17_MARKET_GROUP_OFF: 448,
+  V17_ASSET_ORACLE_PROFILE_LEN: 400,
+  detectDexType: vi.fn(() => null),
+  parseDexPool: vi.fn(),
 }));
 
 vi.mock('@percolatorct/shared', () => ({

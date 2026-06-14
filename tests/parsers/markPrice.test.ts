@@ -14,6 +14,10 @@ vi.mock("@percolatorct/sdk", () => ({
     return { engineOff: 0, engineMarkPriceOff: 400 };
   }),
   parseEngine: vi.fn(),
+  // v17 desync additions — default to false so existing v12 test paths pass through.
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  V17_HEADER_LEN: 16,
 }));
 
 vi.mock("@percolatorct/shared", () => ({
