@@ -305,7 +305,14 @@ function makeV17RiskParamsStub(): RiskParams {
 
 /**
  * Parse a single v17 market account into a DiscoveredMarket.
- * Returns null if the account is not a valid v17 market account.
+ * Returns null if the account is not a valid v17 market account OR is not
+ * a KIND_MARKET (kind=1) account.
+ *
+ * The program discriminates account kinds at byte[10] (check_header @v16_program.rs:986):
+ *   KIND_MARKET=1, KIND_PORTFOLIO=2, KIND_BACKING_DOMAIN_LEDGER=3, KIND_INSURANCE_LEDGER=4.
+ * Without this guard, 9347-byte PORTFOLIO accounts and other non-market v17 accounts
+ * (any >=448-byte account with the v17 magic) would pass isV17Account and be parsed as
+ * markets, producing bogus rows via StatsCollector.insertMarket.
  */
 function parseV17Account(
   pubkey: PublicKey,
@@ -313,6 +320,8 @@ function parseV17Account(
   data: Uint8Array,
 ): DiscoveredMarket | null {
   if (!isV17Account(data)) return null;
+  // KIND_MARKET = 1 at byte[10] (v16_program.rs:46, check_header @v16_program.rs:986)
+  if (data.length < 11 || data[10] !== 1) return null;
 
   try {
     const header = makeV17SlabHeader(data, programId);
@@ -372,13 +381,26 @@ export async function discoverV17Markets(
   try {
     // Convert v17 magic bytes to base58 for the RPC memcmp filter
     // [0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]
-    // The RPC accepts raw bytes or base58 — use raw bytes array form
+    // The RPC accepts raw bytes or base58 — use raw bytes array form.
+    //
+    // Also add a memcmp at offset 10 for KIND_MARKET=0x01 so only market-group
+    // accounts are returned. Portfolio (kind=2), backing-domain-ledger (kind=3),
+    // and insurance-ledger (kind=4) accounts share the same v17 magic and would
+    // otherwise be fetched and silently parsed as bogus market rows.
+    // This mirrors the keeper's discoverV17Markets KIND_MARKET memcmp (crank.ts).
+    // Reference: v16_program.rs:46 (KIND_MARKET=1), v16_program.rs:986 (check_header byte[10]).
     const results = await connection.getProgramAccounts(programId, {
       filters: [
         {
           memcmp: {
             offset: 0,
             bytes: "1347Wxtvn4w", // base58 of [0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50] (V17_MAGIC LE)
+          },
+        },
+        {
+          memcmp: {
+            offset: 10,
+            bytes: "2", // base58 of [0x01] = KIND_MARKET
           },
         },
       ],
