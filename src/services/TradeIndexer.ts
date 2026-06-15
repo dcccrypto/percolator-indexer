@@ -293,7 +293,7 @@ export class TradeIndexerPolling {
         // Full multi-leg expansion happens in parsePercolatorFills (for webhook/stream paths).
         if (data.length < 2) continue;
         const nLegs = data[1];
-        if (nLegs === 0 || data.length < 2 + nLegs * 26) continue;
+        if (nLegs === 0 || data.length < 2 + nLegs * 34) continue;
         // Parse first leg: asset_index(2)+size_q(16)+8B starting at offset 2
         const { sizeValue, side } = parseTradeSize(data.slice(4, 20)); // leg[0] size at 2+2=4
         if (sizeValue === 0n) continue;

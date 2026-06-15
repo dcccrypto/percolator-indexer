@@ -31,16 +31,19 @@ import {
 
 /**
  * v17 market group header layout (all offsets relative to V17_MARKET_GROUP_OFF=448).
- * Desync fix 4: read vault and insurance from the v17 on-chain layout.
- *   +0  market_group_id [u8;32]
- *  +32  vault u128
- *  +48  insurance u128
- *  +64  c_tot u128
+ * VERIFIED via percolator-prog `cargo run --example dump_layout` (MarketGroupV16HeaderAccount):
+ *   +0    market_group_id [u8;32]
+ *   +32   config V16ConfigAccount        (249 bytes — INLINE, precedes vault)
+ *   +281  asset_slot_capacity u32        (4 bytes)
+ *   +285  vault u128
+ *   +301  insurance u128
+ *   +317  c_tot u128
+ * (Earlier +32/48/64 was wrong — it read inside the 249-byte config block.)
  */
-const V17_MG_VAULT_OFF = 32;       // abs: V17_MARKET_GROUP_OFF + 32 = 480
-const V17_MG_INSURANCE_OFF = 48;   // abs: V17_MARKET_GROUP_OFF + 48 = 496
-const V17_MG_C_TOT_OFF = 64;       // abs: V17_MARKET_GROUP_OFF + 64 = 512
-const V17_MG_MIN_BYTES = 64;       // minimum bytes needed past MARKET_GROUP_OFF
+const V17_MG_VAULT_OFF = 285;      // abs: V17_MARKET_GROUP_OFF + 285 = 733
+const V17_MG_INSURANCE_OFF = 301;  // abs: V17_MARKET_GROUP_OFF + 301 = 749
+const V17_MG_C_TOT_OFF = 317;      // abs: V17_MARKET_GROUP_OFF + 317 = 765
+const V17_MG_MIN_BYTES = 333;      // must cover the c_tot read at +317 (317 + 16)
 
 /**
  * Market group header length between V17_MARKET_GROUP_OFF and the first

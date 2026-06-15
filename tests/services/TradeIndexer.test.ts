@@ -331,8 +331,8 @@ describe('TradeIndexerPolling', () => {
 
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
 
-      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*1 = 28 bytes
-      const ixData = new Uint8Array(28);
+      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*1 = 36 bytes
+      const ixData = new Uint8Array(36);
       ixData[0] = 66;  // BatchTradeNoCpi
       ixData[1] = 1;   // n_legs
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);

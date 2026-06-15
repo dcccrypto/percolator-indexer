@@ -372,11 +372,11 @@ describe('POST /webhook/trades — price extraction', () => {
   });
 
   it('v17: BatchTradeNoCpi (tag=66) — first-leg indexed as a trade', async () => {
-    // v17 BatchTrade: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*n
+    // v17 BatchTrade: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n
     // Webhook extracts the first leg (size at [4:20]) and records it.
     const mockDecodeBase58 = vi.mocked(shared.decodeBase58);
     mockDecodeBase58.mockReturnValueOnce((() => {
-      const buf = new Uint8Array(2 + 26); // 1 leg, 28 bytes total
+      const buf = new Uint8Array(2 + 34); // 1 leg, 36 bytes total
       buf[0] = 66;  // BatchTradeNoCpi
       buf[1] = 1;   // n_legs=1
       buf[2] = 0;   // asset_index low byte

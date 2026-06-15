@@ -46,26 +46,27 @@ const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45
  * MarketGroupV16HeaderAccount on-chain serialization (dense / zero-copy).
  * Full struct in v16_program.rs:MarketGroupV16HeaderAccount.
  *
- * Relevant offsets (all relative to V17_MARKET_GROUP_OFF = 448):
- *   +0   market_group_id [u8;32]     → 32 bytes
- *   +32  vault u128                  → 16 bytes  (abs offset 480)
- *   +48  insurance u128              → 16 bytes  (abs offset 496)
- *   +64  c_tot u128                  → 16 bytes  (abs offset 512)
- *   +80  pnl_pos_tot u128            → 16 bytes  (abs offset 528)
- * (remaining fields not needed here)
+ * Offsets (relative to V17_MARKET_GROUP_OFF = 448), VERIFIED against the program's own
+ * `cargo run --example dump_layout` for MarketGroupV16HeaderAccount (size=758, align=1):
+ *   +0    market_group_id [u8;32]       → 32 bytes
+ *   +32   config V16ConfigAccount       → 249 bytes (INLINE — engine config sits before vault)
+ *   +281  asset_slot_capacity u32       → 4 bytes
+ *   +285  vault u128                    → 16 bytes  (abs offset 733)
+ *   +301  insurance u128                → 16 bytes  (abs offset 749)
+ *   +317  c_tot u128                    → 16 bytes  (abs offset 765)
  *
- * The desync doc cited vault@285 / insurance@301 within the market group header —
- * those are offsets within a *different* serialization (the keeper wire format).
- * The on-chain zero-copy layout puts vault at +32 after market_group_id[32] within
- * the MarketGroupV16HeaderAccount block starting at V17_MARKET_GROUP_OFF.
+ * NOTE: an earlier version used +32/+48/+64 on the false assumption that vault followed
+ * market_group_id directly. That is wrong — the 249-byte V16ConfigAccount + 4-byte
+ * asset_slot_capacity precede vault, so +32/48/64 read INSIDE the config block (garbage).
+ * There is no separate "keeper wire format"; the program reads this same bytemuck cast.
  */
 const MG_MARKET_GROUP_ID_OFF = 0;   // [u8;32] market_group_id
-const MG_VAULT_OFF = 32;            // u128 vault
-const MG_INSURANCE_OFF = 48;        // u128 insurance
-const MG_C_TOT_OFF = 64;            // u128 c_tot
+const MG_VAULT_OFF = 285;           // u128 vault
+const MG_INSURANCE_OFF = 301;       // u128 insurance
+const MG_C_TOT_OFF = 317;           // u128 c_tot
 
-/** Minimum market group header length (just enough for vault + insurance). */
-const MG_MIN_HEADER_BYTES = 64;
+/** Minimum market group header length (must cover the c_tot read at +317). */
+const MG_MIN_HEADER_BYTES = 333;
 
 /** Zero pubkey sentinel. */
 const ZERO_PUBKEY = new PublicKey(new Uint8Array(32));

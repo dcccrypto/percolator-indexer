@@ -28,9 +28,10 @@ const V17_SINGLE_MIN_LEN = 19; // only need tag+asset_index+size_q to parse fill
 const V17_SINGLE_ASSET_IDX_OFF = 1; // u16 LE
 const V17_SINGLE_SIZE_OFF = 3;      // i128 LE, 16 bytes
 
-/** v17 BatchTrade leg wire: asset_index(2)+size_q(16)+exec_price_or_fee(8) = 26 bytes/leg. */
+/** v17 BatchTrade leg wire: asset_index(2)+size_q(16)+exec_price(8)+fee_bps_or_limit(8) = 34 bytes/leg.
+ *  (Matches v16_program.rs decode arms for tags 66/67 and the SDK encodeBatchTrade{NoCpi,Cpi}.) */
 const V17_BATCH_HEADER_LEN = 2;    // tag(1)+n_legs(1)
-const V17_BATCH_LEG_LEN = 26;      // matches MATCHER_BATCH_LEG_LEN in SDK
+const V17_BATCH_LEG_LEN = 34;      // asset_index(2)+size_q(16)+exec_price(8)+trailing u64(8)
 const V17_BATCH_LEG_ASSET_OFF = 0; // u16 LE within leg
 const V17_BATCH_LEG_SIZE_OFF = 2;  // i128 LE within leg
 

@@ -53,14 +53,14 @@ function makeTradeIxData(tag: number, size: bigint, assetIndex = 0): string {
 
 /**
  * Build a synthetic v17 batch-fill instruction data buffer.
- * v17 layout: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+padding(8)]*n
- * Each leg = 26 bytes; total = 2 + n*26 bytes.
+ * v17 layout: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(u64=8)+fee_bps_or_limit(u64=8)]*n
+ * Each leg = 34 bytes; total = 2 + n*34 bytes (matches v16_program.rs tags 66/67 and SDK encoders).
  */
 function makeBatchTradeIxData(
   tag: number,
   legs: Array<{ assetIndex: number; size: bigint }>,
 ): string {
-  const legLen = 26;
+  const legLen = 34;
   const buf = new Uint8Array(2 + legs.length * legLen);
   const dv = new DataView(buf.buffer);
   dv.setUint8(0, tag);
@@ -69,7 +69,7 @@ function makeBatchTradeIxData(
     const off = 2 + i * legLen;
     dv.setUint16(off, legs[i].assetIndex, true);     // asset_index
     dv.setBigInt64(off + 2, legs[i].size, true);     // size_q low i64
-    // bytes off+10 .. off+25: high i64 of i128 + 8B padding — all zero
+    // bytes off+10 .. off+33: high i64 of i128 + exec_price(8) + fee_bps/limit(8) — all zero
   }
   return encodeBase58(buf);
 }

@@ -346,7 +346,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     //   Single fill (TradeNoCpi=6, TradeCpi=10):
     //     tag(1)+asset_index(u16=2)+size_q(i128=16)+... — min 19 bytes, size at [3:19]
     //   Batch fill (BatchTradeNoCpi=66, BatchTradeCpi=67):
-    //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+8B]*n — min 2+26 bytes
+    //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(8)+8B]*n — min 2+34 bytes
     //     Each leg is expanded separately; webhook records the first leg per slab.
     const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
     let sizeValue: bigint;
@@ -354,7 +354,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
 
     if (isBatch) {
       // Batch: leg[0] starts at offset 2; asset_index(2)+size_q(16) → size at [4:20]
-      if (data.length < 2 + 26) continue;
+      if (data.length < 2 + 34) continue;
       const nLegs = data[1];
       if (nLegs === 0) continue;
       ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
@@ -418,7 +418,7 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
       let side: "long" | "short";
 
       if (isBatchInner) {
-        if (data.length < 2 + 26) continue;
+        if (data.length < 2 + 34) continue;
         if (data[1] === 0) continue;
         ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
       } else {
