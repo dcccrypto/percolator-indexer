@@ -95,8 +95,10 @@ export class TradeIndexerPolling {
     try {
       const markets = await getMarkets();
       if (markets.length === 0) {
-        logger.info("No markets found for backfill");
-        this.hasBackfilled = true;
+        // #111: do NOT mark backfill complete with no markets yet — discovery may still be
+        // running on cold start. Return WITHOUT the flag so pollAllMarkets re-triggers backfill
+        // once markets appear; otherwise pre-startup history is permanently missed.
+        logger.info("No markets found for backfill yet — will retry next cycle");
         return;
       }
 
@@ -145,6 +147,12 @@ export class TradeIndexerPolling {
    */
   private async pollAllMarkets(): Promise<void> {
     if (!this._running) return;
+
+    // #111: re-trigger the startup backfill if it hasn't completed (market discovery may not
+    // have populated markets when it first ran). backfill()'s own guard makes this a no-op once done.
+    if (!this.hasBackfilled) {
+      await this.backfill();
+    }
 
     try {
       const markets = await getMarkets();
