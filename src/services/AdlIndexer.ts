@@ -121,8 +121,9 @@ export class AdlIndexerPolling {
     try {
       const markets = await getMarkets();
       if (markets.length === 0) {
-        logger.info("No markets found for ADL backfill");
-        this.hasBackfilled = true;
+        // #111: don't mark backfill complete with no markets — discovery may still be
+        // running on cold start. Return without setting the flag so the next cycle retries.
+        logger.info("No markets found for ADL backfill yet — will retry next cycle");
         return;
       }
 
@@ -170,6 +171,12 @@ export class AdlIndexerPolling {
    */
   private async pollAllMarkets(): Promise<void> {
     if (!this._running) return;
+
+    // #111: re-trigger the startup backfill if it hasn't completed (discovery may not have
+    // populated markets yet when it first ran). backfill()'s guard makes this a no-op once done.
+    if (!this.hasBackfilled) {
+      await this.backfill();
+    }
 
     try {
       const markets = await getMarkets();

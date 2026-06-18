@@ -85,8 +85,10 @@ export class TradeIndexerPolling {
     try {
       const markets = await getMarkets();
       if (markets.length === 0) {
-        logger.info("No markets found for backfill");
-        this.hasBackfilled = true;
+        // #111: do NOT mark backfill complete when there are no markets yet — discovery
+        // may still be in progress on cold start. Return WITHOUT setting the flag so the
+        // next cycle retries once markets appear; otherwise pre-startup history is lost.
+        logger.info("No markets found for backfill yet — will retry next cycle");
         return;
       }
 
@@ -135,6 +137,13 @@ export class TradeIndexerPolling {
    */
   private async pollAllMarkets(): Promise<void> {
     if (!this._running) return;
+
+    // #111: re-trigger the startup backfill if it hasn't completed (e.g. market discovery
+    // hadn't populated any markets when it first ran). backfill()'s own guard makes this a
+    // no-op once done, so pre-startup history is captured as soon as markets appear.
+    if (!this.hasBackfilled) {
+      await this.backfill();
+    }
 
     try {
       const markets = await getMarkets();
@@ -265,7 +274,7 @@ export class TradeIndexerPolling {
 
       // This is a trade instruction! Parse it.
       // Layout: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16) = 21 bytes
-      // TradeCpiV2 adds bump(u8) at byte 21, total 22 bytes — size offset unchanged.
+      // TradeCpiV adds bump(u8) at byte 21, total 22 bytes — size offset unchanged.
       if (data.length < 21) continue;
 
       // Parse size as signed i128 (little-endian)
