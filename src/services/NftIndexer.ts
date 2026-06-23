@@ -43,8 +43,15 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
   const raw = process.env[name];
   if (!raw) return fallback;
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
-  return max ? Math.min(parsed, max) : parsed;
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    logger.warn(`Invalid env var ${name}: "${raw}". Falling back to default: ${fallback}`, { raw });
+    return fallback;
+  }
+  const val = max ? Math.min(parsed, max) : parsed;
+  if (max && parsed > max) {
+    logger.warn(`Env var ${name}: "${raw}" exceeds max limit ${max}. Clamped to ${val}`, { raw });
+  }
+  return val;
 }
 
 /**
@@ -263,12 +270,13 @@ export class NftIndexerPolling {
 
     if (sigInfos.length === 0) return;
 
-    // Update last signature (most recent first)
-    this.lastSignature.set(slabAddress, sigInfos[0].signature);
-
     // Filter out errored transactions; retain slot/blockTime for later
     const validSigInfos = sigInfos.filter(s => !s.err);
-    if (validSigInfos.length === 0) return;
+    if (validSigInfos.length === 0) {
+      // If there are no valid signatures, we can safely advance the cursor
+      this.lastSignature.set(slabAddress, sigInfos[0].signature);
+      return;
+    }
 
     let indexed = 0;
 
@@ -309,6 +317,9 @@ export class NftIndexerPolling {
         }
       }
     }
+
+    // Update last signature (most recent first) after successful processing (M-2)
+    this.lastSignature.set(slabAddress, sigInfos[0].signature);
 
     if (indexed > 0) {
       logger.info("NFT events indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
@@ -362,6 +373,25 @@ export class NftIndexerPolling {
       const portfolio = ix.accounts[1]?.toBase58();
 
       if (!newOwnerPk || !portfolio) continue;
+
+      // To prevent multi-slab attribution errors (L-3), fetch the portfolio account
+      // to derive the correct slab address from its on-chain state.
+      // v17 portfolio accounts store the market group (slab) address at offset 16.
+      let actualSlab = slabAddress;
+      try {
+        const connection = getConnection();
+        const portfolioInfo = await connection.getAccountInfo(new PublicKey(portfolio));
+        if (portfolioInfo?.data) {
+          const portfolioData = new Uint8Array(portfolioInfo.data);
+          if (portfolioData.length >= 48) {
+            actualSlab = new PublicKey(portfolioData.subarray(16, 48)).toBase58();
+          }
+        }
+      } catch (err) {
+        logger.warn("Failed to fetch portfolio account to verify slab", { portfolio, error: err });
+      }
+
+      if (actualSlab !== slabAddress) continue;
 
       // v17: all NFT events are portfolio ownership transfers
       const eventType = "transfer" as const;

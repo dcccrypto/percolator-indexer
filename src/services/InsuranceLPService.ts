@@ -136,15 +136,15 @@ export class InsuranceLPService {
         });
 
         // Compute APY from history
-        const apy7d = await this.computeTrailingAPY(slab, 7);
-        const apy30d = await this.computeTrailingAPY(slab, 30);
+        const apy7d = await this.computeTrailingAPY(slab, 7, redemptionRateE6);
+        const oapy30d = await this.computeTrailingAPY(slab, 30, redemptionRateE6);
 
         this.cache.set(slab, {
           balance: insuranceBalance,
           lpSupply,
           redemptionRate: redemptionRateE6,
           apy7d,
-          apy30d,
+          apy30d: oapy30d,
         });
       } catch (err) {
         logger.error("Error polling market", { slab, error: err });
@@ -152,7 +152,7 @@ export class InsuranceLPService {
     }
   }
 
-  private async computeTrailingAPY(slab: string, days: number): Promise<number | null> {
+  private async computeTrailingAPY(slab: string, days: number, currentRedemptionRate: number): Promise<number | null> {
     // BM5: Add error handling for APY calculation
     try {
       const db = getSupabase();
@@ -170,11 +170,9 @@ export class InsuranceLPService {
 
       const oldest = data[0] as InsuranceSnapshot;
       const oldRate = oldest.redemption_rate_e6;
+      if (oldRate === 0) return null;
 
-      const current = this.cache.get(slab);
-      if (!current || oldRate === 0) return null;
-
-      const growth = (current.redemptionRate - oldRate) / oldRate;
+      const growth = (currentRedemptionRate - oldRate) / oldRate;
       const elapsed = Date.now() - new Date(oldest.created_at).getTime();
       if (elapsed < MS_PER_DAY) return null; // need at least 1 day of data
 

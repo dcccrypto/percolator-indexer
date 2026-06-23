@@ -90,7 +90,13 @@ describe('POST /webhook/trades — price extraction', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    app = webhookRoutes();
+    const mockDiscovery = {
+      getMarkets: () => new Map([
+        ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', {}],
+        ['SomeOtherAccount', {}]
+      ])
+    };
+    app = webhookRoutes(mockDiscovery);
   });
 
   it('extracts price from config.mark_ewma_e6 when engineMarkPriceOff < 0 (v12.17)', async () => {
@@ -564,7 +570,12 @@ describe('POST /webhook/trades — HMAC-SHA256 mode (PERC-750)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    app = webhookRoutes();
+    const mockDiscovery = {
+      getMarkets: () => new Map([
+        ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', {}]
+      ])
+    };
+    app = webhookRoutes(mockDiscovery);
   });
 
   it('accepts a request with a valid x-helius-hmac-sha256 header', async () => {

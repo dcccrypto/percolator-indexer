@@ -297,18 +297,20 @@ export class TradeIndexerPolling {
       if (ixMarket && ixMarket !== slabAddress) continue;
 
       if (isBatch) {
-        // Batch: tag(1)+n_legs(1)+legs; we only store the first leg for the slab-level record.
-        // Full multi-leg expansion happens in parsePercolatorFills (for webhook/stream paths).
         if (data.length < 2) continue;
         const nLegs = data[1];
         if (nLegs === 0 || data.length < 2 + nLegs * 34) continue;
-        // Parse first leg: asset_index(2)+size_q(16)+8B starting at offset 2
-        const { sizeValue, side } = parseTradeSize(data.slice(4, 20)); // leg[0] size at 2+2=4
-        if (sizeValue === 0n) continue;
 
         const traderKey = ix.accounts[0];
         if (!traderKey) continue;
         const trader = traderKey.toBase58();
+
+        const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+        const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+        if (!base58PubkeyRegex.test(trader) || !base58SigRegex.test(signature)) return false;
+
+        const exists = await tradeExistsBySignature(signature);
+        if (exists) return false;
 
         let price = this.extractPriceFromLogs(tx);
         if (price === 0) {
@@ -316,18 +318,28 @@ export class TradeIndexerPolling {
         }
         const fee = this.extractFeeFromBalances(tx, trader);
 
-        const exists = await tradeExistsBySignature(signature);
-        if (exists) return false;
-
-        const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-        const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
-        if (!base58PubkeyRegex.test(trader) || !base58SigRegex.test(signature)) return false;
         const i128Max = (1n << 127n) - 1n;
-        if (sizeValue > i128Max) return false;
+        let insertedAny = false;
 
-        await insertTrade({ slab_address: slabAddress, trader, side, size: sizeValue.toString(), price, fee, tx_signature: signature });
-        eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
-        return true;
+        for (let i = 0; i < nLegs; i++) {
+          const legOff = 2 + i * 34;
+          if (legOff + 34 > data.length) break;
+          const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
+          if (sizeValue === 0n || sizeValue > i128Max) continue;
+
+          await insertTrade({
+            slab_address: slabAddress,
+            trader,
+            side,
+            size: sizeValue.toString(),
+            price,
+            fee,
+            tx_signature: signature,
+          });
+          eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
+          insertedAny = true;
+        }
+        return insertedAny;
       }
 
       // Single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... = 19 bytes min
@@ -335,6 +347,7 @@ export class TradeIndexerPolling {
 
       // Parse size as signed i128 (little-endian) — size starts at byte 3 (after tag+asset_index)
       const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
+      if (sizeValue === 0n) continue;
 
       // Determine trader from account keys
       const traderKey = ix.accounts[0];
