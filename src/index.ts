@@ -18,6 +18,11 @@ initSentry("indexer");
 
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+// Restored: the HTTPS-enforcement guards in start() (WEBHOOK_URL / RPC_URL) reference this.
+// It was dropped during the H-1 fix while two usages remained — a runtime ReferenceError
+// on any non-HTTPS URL. The webhook auth fix itself now keys off NETWORK (see webhook.ts),
+// so this constant only gates the production HTTPS-URL checks.
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 // M-5: IP-based rate limiter middleware for webhook endpoint
 const rateLimitWindowMs = 60_000; // 1 minute
