@@ -275,7 +275,12 @@ export const COLLECT_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_COLLECT_INTERVAL_MS;
   if (!raw) return 60_000;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : 60_000;
+  if (Number.isFinite(n) && n > 0) {
+    return n;
+  } else {
+    logger.warn("Invalid STATS_COLLECT_INTERVAL_MS env var, falling back to 60000ms", { raw });
+    return 60_000;
+  }
 })();
 
 /** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
@@ -451,8 +456,9 @@ export class StatsCollector {
       let updated = 0;
       for (const [slabAddress, { volume, count }] of volumeMap.entries()) {
         try {
+          const exceedsSafeInt = volume > BigInt(Number.MAX_SAFE_INTEGER);
           const volumeNum = Number(volume);
-          if (volume > BigInt(Number.MAX_SAFE_INTEGER)) {
+          if (exceedsSafeInt) {
             logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, precision loss", {
               slabAddress: slabAddress.slice(0, 8),
               volumeBigInt: volume.toString(),
@@ -461,7 +467,7 @@ export class StatsCollector {
           }
           await upsertMarketStats({
             slab_address: slabAddress,
-            volume_24h: volumeNum,
+            volume_24h: exceedsSafeInt ? (volume.toString() as any) : volumeNum,
             trade_count_24h: count,
           });
           updated++;
@@ -685,6 +691,10 @@ export class StatsCollector {
                     .eq("network", getNetwork())
                     .neq("status", "closed");
                   this.closedSlabs.add(dbMarket.slab_address);
+                  if (this.closedSlabs.size > 1000) {
+                    const oldest = this.closedSlabs.values().next().value;
+                    if (oldest !== undefined) this.closedSlabs.delete(oldest);
+                  }
                   logger.info("Auto-closed orphan market", { slabAddress: dbMarket.slab_address.slice(0, 8) });
                 } catch (e) {
                   // Non-fatal
@@ -1000,22 +1010,34 @@ export class StatsCollector {
           // If the market is back in the live discovery map, it may have recovered.
           // Re-enable it so collect() processes it this cycle.
           if (markets.has(m.slab_address)) {
-            try {
-              await getSupabase()
-                .from("markets")
-                .update({ indexer_excluded: false, status: "active" })
-                .eq("slab_address", m.slab_address)
-                .eq("network", getNetwork());
-              this.closedSlabs.delete(m.slab_address);
-              logger.info("Re-enabled previously excluded market (back in discovery)", {
-                slabAddress: m.slab_address.slice(0, 8),
-              });
-            } catch (e) {
-              // Non-fatal — will retry next cycle
-              logger.warn("Failed to re-enable excluded market", {
-                slabAddress: m.slab_address.slice(0, 8),
-                error: e instanceof Error ? e.message : e,
-              });
+            const state = markets.get(m.slab_address);
+            const engine = state?.market.engine;
+            const vault = engine ? BigInt(engine.vault) : 0n;
+            const numUsedAccounts = engine ? Number(engine.numUsedAccounts) : 0;
+            const isLive = vault > 1_000_000n || numUsedAccounts > 0;
+
+            if (isLive) {
+              try {
+                await getSupabase()
+                  .from("markets")
+                  .update({ indexer_excluded: false, status: "active" })
+                  .eq("slab_address", m.slab_address)
+                  .eq("network", getNetwork());
+                this.closedSlabs.delete(m.slab_address);
+                logger.info("Re-enabled previously excluded market (back in discovery and active)", {
+                  slabAddress: m.slab_address.slice(0, 8),
+                  vault: vault.toString(),
+                  numUsedAccounts,
+                });
+              } catch (e) {
+                // Non-fatal — will retry next cycle
+                logger.warn("Failed to re-enable excluded market", {
+                  slabAddress: m.slab_address.slice(0, 8),
+                  error: e instanceof Error ? e.message : e,
+                });
+                excludedSlabs.add(m.slab_address);
+              }
+            } else {
               excludedSlabs.add(m.slab_address);
             }
           } else {
@@ -1273,6 +1295,10 @@ export class StatsCollector {
                   logger.warn("Auto-close market failed", { slabAddress, error: closeErr.message });
                 } else {
                   this.closedSlabs.add(slabAddress);
+                  if (this.closedSlabs.size > 1000) {
+                    const oldest = this.closedSlabs.values().next().value;
+                    if (oldest !== undefined) this.closedSlabs.delete(oldest);
+                  }
                   logger.info("Auto-closed stale market", { slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
                 }
               } catch (e) {

@@ -1,7 +1,8 @@
 import { Hono } from "hono";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
 
@@ -50,18 +51,59 @@ const MAX_TRANSACTIONS_PER_REQUEST = 500;
  * Helius Enhanced Transaction webhook receiver.
  * Parses trade instructions from enhanced tx data and stores them.
  */
-// PERC-692: Fail fast if webhook secret is not configured in production
+// PERC-692: Fail fast if webhook secret is not configured in production or on mainnet
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const IS_MAINNET = CURRENT_NETWORK === "mainnet";
 if (!config.webhookSecret) {
-  if (IS_PRODUCTION) {
-    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production — webhook auth would be bypassed");
+  if (IS_PRODUCTION || IS_MAINNET) {
+    logger.error("FATAL: HELIUS_WEBHOOK_SECRET must be set in production or on mainnet — webhook auth would be bypassed");
     process.exit(1);
   } else {
     logger.warn("HELIUS_WEBHOOK_SECRET not set — webhook auth disabled (dev only)");
   }
 }
 
-export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
+function isValidTransactionArray(parsed: unknown): parsed is any[] {
+  if (!Array.isArray(parsed)) return false;
+  for (const tx of parsed) {
+    if (tx === null || typeof tx !== "object") return false;
+    if (tx.signature !== undefined && typeof tx.signature !== "string") return false;
+    if (tx.instructions !== undefined) {
+      if (!Array.isArray(tx.instructions)) return false;
+      for (const ix of tx.instructions) {
+        if (ix === null || typeof ix !== "object") return false;
+        if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
+        if (ix.data !== undefined && typeof ix.data !== "string") return false;
+        if (ix.accounts !== undefined && !Array.isArray(ix.accounts)) return false;
+      }
+    }
+    if (tx.innerInstructions !== undefined) {
+      if (!Array.isArray(tx.innerInstructions)) return false;
+      for (const inner of tx.innerInstructions) {
+        if (inner === null || typeof inner !== "object") return false;
+        if (inner.instructions !== undefined) {
+          if (!Array.isArray(inner.instructions)) return false;
+          for (const ix of inner.instructions) {
+            if (ix === null || typeof ix !== "object") return false;
+            if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
+            if (ix.data !== undefined && typeof ix.data !== "string") return false;
+            if (ix.accounts !== undefined && !Array.isArray(ix.accounts)) return false;
+          }
+        }
+      }
+    }
+    if (tx.accountData !== undefined) {
+      if (!Array.isArray(tx.accountData)) return false;
+      for (const ad of tx.accountData) {
+        if (ad === null || typeof ad !== "object") return false;
+        if (ad.account !== undefined && typeof ad.account !== "string") return false;
+      }
+    }
+  }
+  return true;
+}
+
+export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariables }> {
   const app = new Hono<{ Variables: WebhookVariables }>();
 
   /**
@@ -143,7 +185,12 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
     let transactions: any[];
     try {
       const parsed = JSON.parse(rawBody.toString("utf-8"));
-      transactions = Array.isArray(parsed) ? parsed : [parsed];
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      if (!isValidTransactionArray(arr)) {
+        logger.warn("Webhook request failed: invalid transaction format", { bodyLength: rawBody.length });
+        return c.json({ error: "Invalid transaction format" }, 400);
+      }
+      transactions = arr;
     } catch {
       logger.warn("Webhook request failed: invalid JSON", { bodyLength: rawBody.length });
       return c.json({ error: "Invalid JSON" }, 400);
@@ -170,7 +217,7 @@ export function webhookRoutes(): Hono<{ Variables: WebhookVariables }> {
     // GH#42: Return 500 if persistent DB failures occurred so Helius retries the webhook.
     // insertTrade is idempotent (unique constraint on tx_signature), so retries are safe.
     try {
-      await processTransactions(transactions);
+      await processTransactions(transactions, discovery);
     } catch (err) {
       logger.error("Webhook processing error — returning 500 for Helius retry", {
         error: err instanceof Error ? err.message : err,
@@ -228,8 +275,9 @@ export function verifyWebhookSignature(
   // side-channel that would leak the secret's length via early return on
   // length mismatch (the old `authBytes.length !== secretBytes.length` guard).
   if (!authHeader) return false;
-  const authDigest = createHmac("sha256", "static-token-compare").update(authHeader).digest();
-  const secretDigest = createHmac("sha256", "static-token-compare").update(secret).digest();
+  // HMAC is used only for equal-length output — the hash has no security role here.
+  const authDigest = createHash("sha256").update(authHeader).digest();
+  const secretDigest = createHash("sha256").update(secret).digest();
   return timingSafeEqual(authDigest, secretDigest);
 }
 
@@ -241,13 +289,13 @@ function isDuplicateError(err: unknown): boolean {
   return msg.includes("23505") || msg.toLowerCase().includes("duplicate");
 }
 
-async function processTransactions(transactions: any[]): Promise<void> {
+async function processTransactions(transactions: any[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
 
   for (const tx of transactions) {
     try {
-      const trades = extractTradesFromEnhancedTx(tx);
+      const trades = extractTradesFromEnhancedTx(tx, discovery);
       for (const trade of trades) {
         try {
           // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
@@ -281,7 +329,10 @@ async function processTransactions(transactions: any[]): Promise<void> {
             });
             captureException(err instanceof Error ? err : new Error(String(err)), {
               tags: { context: "webhook-insert-failure" },
-              extra: { signature: trade.tx_signature, slabAddress: trade.slab_address },
+              extra: {
+                signature: trade.tx_signature.slice(0, 16),
+                slabAddress: trade.slab_address.slice(0, 16),
+              },
             });
           }
         }
@@ -311,7 +362,7 @@ interface TradeData {
   tx_signature: string;
 }
 
-function extractTradesFromEnhancedTx(tx: any): TradeData[] {
+function extractTradesFromEnhancedTx(tx: any, discovery: any): TradeData[] {
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -347,26 +398,29 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     //     tag(1)+asset_index(u16=2)+size_q(i128=16)+... — min 19 bytes, size at [3:19]
     //   Batch fill (BatchTradeNoCpi=66, BatchTradeCpi=67):
     //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(8)+8B]*n — min 2+34 bytes
-    //     Each leg is expanded separately; webhook records the first leg per slab.
+    //     Each leg is expanded separately.
     const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-    let sizeValue: bigint;
-    let side: "long" | "short";
+    const legs: { sizeValue: bigint; side: "long" | "short" }[] = [];
 
     if (isBatch) {
-      // Batch: leg[0] starts at offset 2; asset_index(2)+size_q(16) → size at [4:20]
-      if (data.length < 2 + 34) continue;
+      if (data.length < 2) continue;
       const nLegs = data[1];
       if (nLegs === 0) continue;
-      ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
+      for (let i = 0; i < nLegs; i++) {
+        const legOff = 2 + i * 34;
+        if (legOff + 34 > data.length) break;
+        const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
+        if (sizeValue === 0n) continue;
+        legs.push({ sizeValue, side });
+      }
     } else {
-      // Single fill: size_q at [3:19]
       if (data.length < 19) continue;
-      ({ sizeValue, side } = parseTradeSize(data.slice(3, 19)));
+      const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
+      if (sizeValue === 0n) continue;
+      legs.push({ sizeValue, side });
     }
 
-    // Validate size is within i128 range — TradeIndexer checks this (line 298)
-    // but webhook didn't, allowing oversized values to corrupt downstream calcs.
-    if (sizeValue > I128_MAX) continue;
+    if (legs.length === 0) continue;
 
     // Account layout (v17) — desync fix 5: TradeCpi market is at accounts[1], not accounts[2].
     //   TradeNoCpi (tag 6) / BatchTradeNoCpi (tag 66):
@@ -383,19 +437,29 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     // Validate pubkey formats
     if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
 
+    // L-5: Validate slabAddress against live known-slab set
+    if (discovery && !discovery.getMarkets().has(slabAddress)) {
+      logger.warn("Skipping trade: slab address not in known-slab set", { slabAddress, signature });
+      continue;
+    }
+
     // Extract price from slab account data or program logs
     const price = extractPrice(tx, slabAddress);
     const fee = extractFeeFromTransfers(tx, trader);
 
-    trades.push({
-      slab_address: slabAddress,
-      trader,
-      side,
-      size: sizeValue.toString(),
-      price,
-      fee,
-      tx_signature: signature,
-    });
+    for (const leg of legs) {
+      if (leg.sizeValue > I128_MAX) continue;
+
+      trades.push({
+        slab_address: slabAddress,
+        trader,
+        side: leg.side,
+        size: leg.sizeValue.toString(),
+        price,
+        fee,
+        tx_signature: signature,
+      });
+    }
   }
 
   // Also check inner instructions (for TradeCpi routed through matcher)
@@ -412,21 +476,28 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
       const tag = data[0];
       if (!TRADE_TAGS.has(tag)) continue;
 
-      // v17: single fill size at [3:19]; batch leg[0] size at [4:20]
       const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      let sizeValue: bigint;
-      let side: "long" | "short";
+      const legs: { sizeValue: bigint; side: "long" | "short" }[] = [];
 
       if (isBatchInner) {
-        if (data.length < 2 + 34) continue;
-        if (data[1] === 0) continue;
-        ({ sizeValue, side } = parseTradeSize(data.slice(4, 20)));
+        if (data.length < 2) continue;
+        const nLegs = data[1];
+        if (nLegs === 0) continue;
+        for (let i = 0; i < nLegs; i++) {
+          const legOff = 2 + i * 34;
+          if (legOff + 34 > data.length) break;
+          const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
+          if (sizeValue === 0n) continue;
+          legs.push({ sizeValue, side });
+        }
       } else {
         if (data.length < 19) continue;
-        ({ sizeValue, side } = parseTradeSize(data.slice(3, 19)));
+        const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
+        if (sizeValue === 0n) continue;
+        legs.push({ sizeValue, side });
       }
 
-      if (sizeValue > I128_MAX) continue;
+      if (legs.length === 0) continue;
 
       // Same v17 account layout with CPI dispatch fix (desync fix 5)
       const accounts: string[] = ix.accounts ?? [];
@@ -438,21 +509,31 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
 
       if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
 
+      // L-5: Validate slabAddress against live known-slab set
+      if (discovery && !discovery.getMarkets().has(slabAddress)) {
+        logger.warn("Skipping inner trade: slab address not in known-slab set", { slabAddress, signature });
+        continue;
+      }
+
       const price = extractPrice(tx, slabAddress);
       const fee = extractFeeFromTransfers(tx, trader);
 
-      // Avoid duplicates within same tx (match on trader + side + size + slab)
-      if (trades.some((t) => t.tx_signature === signature && t.trader === trader && t.slab_address === slabAddress && t.side === side && t.size === sizeValue.toString())) continue;
+      for (const leg of legs) {
+        if (leg.sizeValue > I128_MAX) continue;
 
-      trades.push({
-        slab_address: slabAddress,
-        trader,
-        side,
-        size: sizeValue.toString(),
-        price,
-        fee,
-        tx_signature: signature,
-      });
+        // Avoid duplicates within same tx (match on trader + side + size + slab)
+        if (trades.some((t) => t.tx_signature === signature && t.trader === trader && t.slab_address === slabAddress && t.side === leg.side && t.size === leg.sizeValue.toString())) continue;
+
+        trades.push({
+          slab_address: slabAddress,
+          trader,
+          side: leg.side,
+          size: leg.sizeValue.toString(),
+          price,
+          fee,
+          tx_signature: signature,
+        });
+      }
     }
   }
 
@@ -556,9 +637,14 @@ function extractPriceFromLogs(tx: any): number {
   const logs: string[] = tx.logs ?? tx.logMessages ?? [];
   const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
 
-  for (const log of logs) {
+  // Cap logs length to prevent CPU amplification
+  const cappedLogs = logs.slice(0, 200);
+
+  for (const log of cappedLogs) {
     if (!log.startsWith("Program log: ")) continue;
     const payload = log.slice("Program log: ".length).trim();
+    // Cap payload length before regex tests to prevent CPU amplification
+    if (payload.length > 1024) continue;
     // Only consider lines that look like comma-separated numbers
     if (!/^[\d, a-fA-Fx]+$/.test(payload)) continue;
 
@@ -584,7 +670,24 @@ function extractPriceFromLogs(tx: any): number {
  * For coin-margined perps, look at SOL balance changes for the trader.
  */
 function extractFeeFromTransfers(tx: any, trader: string): number {
-  // Check accountData for balance changes (Helius enhanced provides this)
+  // 1. Try reading from raw pre/post balances if available
+  const preBalances: number[] = tx.meta?.preBalances;
+  const postBalances: number[] = tx.meta?.postBalances;
+  if (Array.isArray(preBalances) && Array.isArray(postBalances)) {
+    const accountKeys: any[] = tx.transaction?.message?.accountKeys ?? tx.accountKeys ?? [];
+    const index = accountKeys.findIndex((k) => {
+      const pubkey = typeof k === "string" ? k : k?.pubkey;
+      return pubkey === trader;
+    });
+    if (index !== -1 && index < preBalances.length && index < postBalances.length) {
+      const change = Math.abs(postBalances[index] - preBalances[index]);
+      if (change > 10_000 && change < 1_000_000_000) {
+        return change / 1e9;
+      }
+    }
+  }
+
+  // 2. Fallback to Helius enhanced accountData
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
     if (acc.account === trader && acc.nativeBalanceChange != null) {

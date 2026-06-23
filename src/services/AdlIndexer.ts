@@ -35,8 +35,15 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
   const raw = process.env[name];
   if (!raw) return fallback;
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
-  return max ? Math.min(parsed, max) : parsed;
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    logger.warn(`Invalid env var ${name}: "${raw}". Falling back to default: ${fallback}`, { raw });
+    return fallback;
+  }
+  const val = max ? Math.min(parsed, max) : parsed;
+  if (max && parsed > max) {
+    logger.warn(`Env var ${name}: "${raw}" exceeds max limit ${max}. Clamped to ${val}`, { raw });
+  }
+  return val;
 }
 
 /**
@@ -241,12 +248,13 @@ export class AdlIndexerPolling {
 
     if (sigInfos.length === 0) return;
 
-    // Update last signature (most recent first)
-    this.lastSignature.set(slabAddress, sigInfos[0].signature);
-
     // Filter out errored transactions; retain slot/blockTime for later
     const validSigInfos = sigInfos.filter(s => !s.err);
-    if (validSigInfos.length === 0) return;
+    if (validSigInfos.length === 0) {
+      // If there are no valid signatures, we can safely advance the cursor
+      this.lastSignature.set(slabAddress, sigInfos[0].signature);
+      return;
+    }
 
     let indexed = 0;
 
@@ -287,6 +295,9 @@ export class AdlIndexerPolling {
         }
       }
     }
+
+    // Update last signature (most recent first) after successful processing (M-2)
+    this.lastSignature.set(slabAddress, sigInfos[0].signature);
 
     if (indexed > 0) {
       logger.info("ADL events indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });

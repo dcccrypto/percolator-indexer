@@ -41,6 +41,38 @@ import {
  */
 const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
 
+/** Tiny base58 encoder to programmatically verify magic bytes at module load (M-1/I-1) */
+function encodeBase58(bytes: Uint8Array): string {
+  const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+
+  const digits: number[] = [];
+  for (let i = zeros; i < bytes.length; i++) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+
+  let out = "";
+  for (let i = 0; i < zeros; i++) out += "1";
+  for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]];
+  return out;
+}
+
+// Programmatic verification of the base58 magic string (M-1)
+const computedMagic = encodeBase58(V17_MAGIC_BYTES);
+if (computedMagic !== "1347Wxtvn4w") {
+  throw new Error(`v17 magic bytes base58 encoding mismatch: expected '1347Wxtvn4w', computed '${computedMagic}'`);
+}
+
 /**
  * V17 market group header layout at V17_MARKET_GROUP_OFF (448).
  * MarketGroupV16HeaderAccount on-chain serialization (dense / zero-copy).

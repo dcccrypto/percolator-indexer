@@ -17,11 +17,40 @@ import { webhookRoutes } from "./routes/webhook.js";
 initSentry("indexer");
 
 const logger = createLogger("indexer");
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
-
-/** Maximum time for each health check probe (RPC / DB). Prevents a hung
- *  upstream from holding the HTTP response open indefinitely. */
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+
+// M-5: IP-based rate limiter middleware for webhook endpoint
+const rateLimitWindowMs = 60_000; // 1 minute
+const rateLimitMaxRequests = 100;
+const ipRequestCounts = new Map<string, { count: number; resetTime: number }>();
+
+// Simple automatic memory pruning interval every 5 minutes to avoid memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of ipRequestCounts.entries()) {
+    if (now > data.resetTime) {
+      ipRequestCounts.delete(ip);
+    }
+  }
+}, 5 * 60_000);
+
+const rateLimiter = async (c: any, next: any) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || "unknown-ip";
+  const now = Date.now();
+  const data = ipRequestCounts.get(ip);
+
+  if (!data || now > data.resetTime) {
+    ipRequestCounts.set(ip, { count: 1, resetTime: now + rateLimitWindowMs });
+  } else {
+    data.count++;
+    if (data.count > rateLimitMaxRequests) {
+      logger.warn("Rate limit exceeded", { ip, count: data.count });
+      c.header("Retry-After", Math.ceil((data.resetTime - now) / 1000).toString());
+      return c.json({ error: "Too many requests, please try again later" }, 429);
+    }
+  }
+  await next();
+};
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -76,6 +105,12 @@ app.use("*", async (c, next) => {
 
   // Remove the default Server header to reduce fingerprinting surface.
   c.header("Server", "");
+
+  // M-6: Strict-Transport-Security (force HTTPS)
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+
+  // M-6: Content-Security-Policy (disable all resources for API safety)
+  c.header("Content-Security-Policy", "default-src 'none'");
 });
 
 // SEC: Reject non-POST methods on webhook path early (defense in depth).
@@ -85,6 +120,9 @@ app.all("/webhook/trades", async (c, next) => {
   }
   return next();
 });
+
+// Mount the rate limiter on /webhook/trades
+app.use("/webhook/trades", rateLimiter);
 
 // Health endpoint with connectivity checks
 // HTTP write path for trades: only POST /webhook/trades (mounted below), after signature verification
@@ -130,10 +168,11 @@ app.get("/health", async (c) => {
   // Previously degraded returned 200, masking single-component outages.
   const statusCode = status === "ok" ? 200 : 503;
   
-  return c.json({ status, checks, service: "indexer" }, statusCode);
+  // I-3: Mask checks and service name from unauthenticated callers
+  return c.json({ status }, statusCode);
 });
 
-app.route("/", webhookRoutes());
+app.route("/", webhookRoutes(discovery));
 
 // SEC: Validate and sanitize port number at startup to prevent binding to
 // unexpected ports or crashing on NaN.
