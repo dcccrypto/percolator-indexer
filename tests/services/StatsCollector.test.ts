@@ -746,4 +746,74 @@ describe('StatsCollector', () => {
       );
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // #132 (L-1) — closedSlabs LRU off-by-one
+  // The `recordClosedSlab` helper must keep size <= MAX_CLOSED_SLABS_CACHE (1000)
+  // at ALL times — including immediately after the add (no transient 1001 state).
+  // ---------------------------------------------------------------------------
+  describe('closedSlabs LRU bound at exactly 1000 (#132)', () => {
+    it('recordClosedSlab keeps Set size at exactly MAX_CLOSED_SLABS_CACHE after filling', async () => {
+      // Access the private method via a cast to any so we can unit-test it directly.
+      const collector = new StatsCollector({ getMarkets: vi.fn(() => new Map()) });
+      const c = collector as any;
+
+      // Fill the cache to exactly MAX_CLOSED_SLABS_CACHE
+      const MAX = 1000;
+      for (let i = 0; i < MAX; i++) {
+        c.recordClosedSlab(`Slab${String(i).padStart(8, '0')}111111111111111111111111111111`);
+      }
+      expect(c.closedSlabs.size).toBe(MAX);
+
+      // Add one more — should evict oldest FIRST, so size stays at MAX
+      c.recordClosedSlab(`SlabNew0000111111111111111111111111111111`);
+      expect(c.closedSlabs.size).toBe(MAX);
+    });
+
+    it('recordClosedSlab size never exceeds MAX_CLOSED_SLABS_CACHE under repeated additions', async () => {
+      const collector = new StatsCollector({ getMarkets: vi.fn(() => new Map()) });
+      const c = collector as any;
+      const MAX = 1000;
+
+      // Add 1100 unique slabs
+      for (let i = 0; i < MAX + 100; i++) {
+        c.recordClosedSlab(`Slab${String(i).padStart(8, '0')}111111111111111111111111111111`);
+        // Invariant: size must never exceed MAX at any point
+        expect(c.closedSlabs.size).toBeLessThanOrEqual(MAX);
+      }
+      // Final size is exactly MAX
+      expect(c.closedSlabs.size).toBe(MAX);
+    });
+
+    it('recordClosedSlab evicts oldest (insertion-order) entry first', async () => {
+      const collector = new StatsCollector({ getMarkets: vi.fn(() => new Map()) });
+      const c = collector as any;
+      const MAX = 1000;
+
+      // The first slab added is the "oldest"
+      const FIRST_SLAB = 'SlabOldest1111111111111111111111111111111';
+      c.recordClosedSlab(FIRST_SLAB);
+
+      // Fill the rest to capacity
+      for (let i = 1; i < MAX; i++) {
+        c.recordClosedSlab(`Slab${String(i).padStart(8, '0')}111111111111111111111111111111`);
+      }
+      expect(c.closedSlabs.has(FIRST_SLAB)).toBe(true); // still present at capacity
+
+      // Add one more — FIRST_SLAB should be evicted
+      c.recordClosedSlab(`SlabOverflow1111111111111111111111111111`);
+      expect(c.closedSlabs.has(FIRST_SLAB)).toBe(false);
+      expect(c.closedSlabs.size).toBe(MAX);
+    });
+
+    it('recordClosedSlab is idempotent: re-adding existing slab does not change size', async () => {
+      const collector = new StatsCollector({ getMarkets: vi.fn(() => new Map()) });
+      const c = collector as any;
+      const SLAB = 'SlabIdempotent11111111111111111111111111';
+      c.recordClosedSlab(SLAB);
+      c.recordClosedSlab(SLAB);
+      c.recordClosedSlab(SLAB);
+      expect(c.closedSlabs.size).toBe(1);
+    });
+  });
 });

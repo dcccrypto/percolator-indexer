@@ -300,8 +300,46 @@ export class StatsCollector {
   private lastOiHistoryTime = new Map<string, number>();
   private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
-  /** Tracks slabs already marked as closed this session to avoid repeated DB writes */
+  /**
+   * Tracks slabs already marked as closed this session to avoid repeated DB writes.
+   *
+   * Purpose: once we have written `status=closed` to the DB for a slab, we record
+   * it here so the next collect cycle doesn't issue the same UPDATE again (the DB
+   * `.neq("status","closed")` guard is the true fence; this is a cheap in-memory
+   * pre-check to skip the RPC round-trip entirely).
+   *
+   * Relationship to `excludedSlabs` (local var rebuilt from DB each cycle): a slab
+   * in `closedSlabs` will also appear in `excludedSlabs` on the next cycle once the
+   * DB write has committed, so the two sets are complementary — `closedSlabs` prevents
+   * re-issuing the write; `excludedSlabs` prevents re-processing the slab at all.
+   * We do NOT need to delete from `closedSlabs` when adding to `excludedSlabs` because
+   * the "already closed" guard on the DB update (`neq("status","closed")`) makes the
+   * write idempotent anyway. Entries are pruned at the bottom of collect() for slabs
+   * that leave the discovery map.
+   *
+   * LRU bound (#132): capped at MAX_CLOSED_SLABS_CACHE entries. We evict the oldest
+   * entry BEFORE adding the new one when the set is at capacity so the size never
+   * exceeds the limit even transiently.
+   */
   private closedSlabs = new Set<string>();
+  private static readonly MAX_CLOSED_SLABS_CACHE = 1000;
+
+  /**
+   * Add `slabAddress` to the closedSlabs LRU cache.
+   * Evicts the insertion-order-oldest entry first if the cache is already full,
+   * so the set size never exceeds MAX_CLOSED_SLABS_CACHE (#132 off-by-one fix).
+   */
+  private recordClosedSlab(slabAddress: string): void {
+    if (this.closedSlabs.has(slabAddress)) return; // already present — no-op
+    if (this.closedSlabs.size >= StatsCollector.MAX_CLOSED_SLABS_CACHE) {
+      // Evict before adding: Set iteration order is insertion order, so
+      // values().next().value is the oldest entry. Evict it first so the
+      // set size stays at MAX_CLOSED_SLABS_CACHE and never hits MAX+1.
+      const oldest = this.closedSlabs.values().next().value;
+      if (oldest !== undefined) this.closedSlabs.delete(oldest);
+    }
+    this.closedSlabs.add(slabAddress);
+  }
 
   constructor(
     private readonly marketProvider: MarketProvider,
@@ -690,11 +728,7 @@ export class StatsCollector {
                     .eq("slab_address", dbMarket.slab_address)
                     .eq("network", getNetwork())
                     .neq("status", "closed");
-                  this.closedSlabs.add(dbMarket.slab_address);
-                  if (this.closedSlabs.size > 1000) {
-                    const oldest = this.closedSlabs.values().next().value;
-                    if (oldest !== undefined) this.closedSlabs.delete(oldest);
-                  }
+                  this.recordClosedSlab(dbMarket.slab_address);
                   logger.info("Auto-closed orphan market", { slabAddress: dbMarket.slab_address.slice(0, 8) });
                 } catch (e) {
                   // Non-fatal
@@ -1294,11 +1328,7 @@ export class StatsCollector {
                 if (closeErr) {
                   logger.warn("Auto-close market failed", { slabAddress, error: closeErr.message });
                 } else {
-                  this.closedSlabs.add(slabAddress);
-                  if (this.closedSlabs.size > 1000) {
-                    const oldest = this.closedSlabs.values().next().value;
-                    if (oldest !== undefined) this.closedSlabs.delete(oldest);
-                  }
+                  this.recordClosedSlab(slabAddress);
                   logger.info("Auto-closed stale market", { slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
                 }
               } catch (e) {

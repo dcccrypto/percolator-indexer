@@ -374,10 +374,15 @@ export class NftIndexerPolling {
 
       if (!newOwnerPk || !portfolio) continue;
 
-      // To prevent multi-slab attribution errors (L-3), fetch the portfolio account
-      // to derive the correct slab address from its on-chain state.
+      // To prevent multi-slab attribution errors (L-3 / #134), fetch the portfolio
+      // account to derive the correct slab address from its on-chain state.
       // v17 portfolio accounts store the market group (slab) address at offset 16.
-      let actualSlab = slabAddress;
+      //
+      // SEC (#134): on null response or RPC error we MUST skip this record.
+      // The original code left `actualSlab = slabAddress` on error, so the
+      // event would be written attributed to the poll-loop slab even though we
+      // could not verify it. An unverified attribution is wrong attribution.
+      let actualSlab: string | null = null;
       try {
         const connection = getConnection();
         const portfolioInfo = await connection.getAccountInfo(new PublicKey(portfolio));
@@ -385,13 +390,27 @@ export class NftIndexerPolling {
           const portfolioData = new Uint8Array(portfolioInfo.data);
           if (portfolioData.length >= 48) {
             actualSlab = new PublicKey(portfolioData.subarray(16, 48)).toBase58();
+          } else {
+            logger.warn("Portfolio account data too short to read slab — skipping NFT event", {
+              portfolio,
+              dataLen: portfolioData.length,
+            });
           }
+        } else {
+          // Account returned null — slab cannot be verified; skip.
+          logger.warn("Portfolio account not found on-chain — skipping NFT event", { portfolio });
         }
       } catch (err) {
-        logger.warn("Failed to fetch portfolio account to verify slab", { portfolio, error: err });
+        // RPC error — slab cannot be verified; skip rather than mis-attribute.
+        logger.warn("Failed to fetch portfolio account — skipping NFT event to avoid wrong attribution", {
+          portfolio,
+          error: err instanceof Error ? err.message : err,
+        });
       }
 
-      if (actualSlab !== slabAddress) continue;
+      // Skip if we could not determine the actual slab OR if it doesn't match
+      // the slab we are currently polling (wrong-market guard).
+      if (actualSlab === null || actualSlab !== slabAddress) continue;
 
       // v17: all NFT events are portfolio ownership transfers
       const eventType = "transfer" as const;
