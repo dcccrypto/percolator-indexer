@@ -636,3 +636,105 @@ describe('POST /webhook/trades — HMAC-SHA256 mode (PERC-750)', () => {
     expect(res.status).toBe(401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #127 (M-4) — field-type validation and prototype-pollution guard
+// ---------------------------------------------------------------------------
+
+describe('POST /webhook/trades — field-type validation and prototype-pollution (#127)', () => {
+  let app: ReturnType<typeof webhookRoutes>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = webhookRoutes(undefined);
+  });
+
+  it('rejects payload where tx.signature is not a string', async () => {
+    const body = [{ signature: 12345, instructions: [] }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload where ix.programId is not a string', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [{ programId: { evil: true }, data: 'abc', accounts: [] }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload where ix.data is not a string', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [{ programId: PROGRAM_ID, data: 99, accounts: [] }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload where ix.accounts contains a non-string element', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [{ programId: PROGRAM_ID, data: 'abc', accounts: [{ pubkey: 'not-a-string' }] }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload where ad.account is not a string', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [],
+      accountData: [{ account: 42, data: '' }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload with __proto__ key at tx level (prototype-pollution guard)', async () => {
+    // JSON.parse with a literal "__proto__" key creates a plain enumerable property in
+    // modern V8 (does NOT pollute Object.prototype), but we still reject it defensively
+    // because the intent is adversarial.
+    const raw = '[{"__proto__":{"polluted":true},"signature":"' + SIG + '","instructions":[]}]';
+    const req = new Request('http://localhost/webhook/trades', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'authorization': TEST_WEBHOOK_SECRET },
+      body: raw,
+    });
+    const res = await app.fetch(req);
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload with constructor key at instruction level (prototype-pollution guard)', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [{
+        programId: PROGRAM_ID,
+        data: 'abc',
+        accounts: [],
+        constructor: { prototype: { evil: true } },
+      }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects payload with prototype key at accountData level (prototype-pollution guard)', async () => {
+    const body = [{
+      signature: SIG,
+      instructions: [],
+      accountData: [{ prototype: { evil: true }, account: TRADER }],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(400);
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+});

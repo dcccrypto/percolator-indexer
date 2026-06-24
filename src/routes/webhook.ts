@@ -63,31 +63,97 @@ if (!config.webhookSecret) {
   }
 }
 
-function isValidTransactionArray(parsed: unknown): parsed is any[] {
+/**
+ * SEC (#127): Prototype-pollution guard.
+ *
+ * Any user-supplied object parsed from JSON may carry `__proto__`, `constructor`,
+ * or `prototype` keys. Writing to those via object-spread or property assignment
+ * would pollute Object.prototype and affect every subsequent object in the process.
+ *
+ * We reject the ENTIRE webhook request if any object in the payload contains one
+ * of these keys rather than silently dropping the offending field. This is the
+ * correct policy: a legitimate Helius payload will never carry these keys, and a
+ * payload that does is either a probe or an adversarial input.
+ */
+const PROTO_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function hasPoisonKey(obj: object): boolean {
+  for (const key of Object.keys(obj)) {
+    if (PROTO_POISON_KEYS.has(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * Validated webhook transaction type — replaces `any[]` so downstream code
+ * cannot accidentally read unvalidated fields without a cast.
+ */
+interface ValidatedInstruction {
+  programId?: string;
+  data?: string;
+  accounts?: unknown[];
+}
+interface ValidatedInnerGroup {
+  instructions?: ValidatedInstruction[];
+}
+interface ValidatedAccountDatum {
+  account?: string;
+  data?: unknown;
+  nativeBalanceChange?: unknown;
+}
+export interface ValidatedTransaction {
+  signature?: string;
+  transactionError?: unknown;
+  instructions?: ValidatedInstruction[];
+  innerInstructions?: ValidatedInnerGroup[];
+  accountData?: ValidatedAccountDatum[];
+  logs?: unknown[];
+  logMessages?: unknown[];
+  // Allow extra top-level fields (Helius Enhanced Tx has many) but forbid poison keys.
+  [key: string]: unknown;
+}
+
+function isValidTransactionArray(parsed: unknown): parsed is ValidatedTransaction[] {
   if (!Array.isArray(parsed)) return false;
   for (const tx of parsed) {
     if (tx === null || typeof tx !== "object") return false;
+    // SEC (#127): reject prototype-pollution attempts at every nesting level.
+    if (hasPoisonKey(tx as object)) return false;
     if (tx.signature !== undefined && typeof tx.signature !== "string") return false;
     if (tx.instructions !== undefined) {
       if (!Array.isArray(tx.instructions)) return false;
       for (const ix of tx.instructions) {
         if (ix === null || typeof ix !== "object") return false;
+        if (hasPoisonKey(ix as object)) return false;
         if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
         if (ix.data !== undefined && typeof ix.data !== "string") return false;
-        if (ix.accounts !== undefined && !Array.isArray(ix.accounts)) return false;
+        if (ix.accounts !== undefined) {
+          if (!Array.isArray(ix.accounts)) return false;
+          // Each account entry must be a string (pubkey) in the Helius enhanced format.
+          for (const acc of ix.accounts) {
+            if (typeof acc !== "string") return false;
+          }
+        }
       }
     }
     if (tx.innerInstructions !== undefined) {
       if (!Array.isArray(tx.innerInstructions)) return false;
       for (const inner of tx.innerInstructions) {
         if (inner === null || typeof inner !== "object") return false;
+        if (hasPoisonKey(inner as object)) return false;
         if (inner.instructions !== undefined) {
           if (!Array.isArray(inner.instructions)) return false;
           for (const ix of inner.instructions) {
             if (ix === null || typeof ix !== "object") return false;
+            if (hasPoisonKey(ix as object)) return false;
             if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
             if (ix.data !== undefined && typeof ix.data !== "string") return false;
-            if (ix.accounts !== undefined && !Array.isArray(ix.accounts)) return false;
+            if (ix.accounts !== undefined) {
+              if (!Array.isArray(ix.accounts)) return false;
+              for (const acc of ix.accounts) {
+                if (typeof acc !== "string") return false;
+              }
+            }
           }
         }
       }
@@ -96,6 +162,7 @@ function isValidTransactionArray(parsed: unknown): parsed is any[] {
       if (!Array.isArray(tx.accountData)) return false;
       for (const ad of tx.accountData) {
         if (ad === null || typeof ad !== "object") return false;
+        if (hasPoisonKey(ad as object)) return false;
         if (ad.account !== undefined && typeof ad.account !== "string") return false;
       }
     }
@@ -182,7 +249,7 @@ export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariabl
     }
 
     // Parse body from the already-read buffer (avoids consuming the stream twice).
-    let transactions: any[];
+    let transactions: ValidatedTransaction[];
     try {
       const parsed = JSON.parse(rawBody.toString("utf-8"));
       const arr = Array.isArray(parsed) ? parsed : [parsed];
@@ -289,7 +356,7 @@ function isDuplicateError(err: unknown): boolean {
   return msg.includes("23505") || msg.toLowerCase().includes("duplicate");
 }
 
-async function processTransactions(transactions: any[], discovery: any): Promise<void> {
+async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
 
@@ -362,7 +429,7 @@ interface TradeData {
   tx_signature: string;
 }
 
-function extractTradesFromEnhancedTx(tx: any, discovery: any): TradeData[] {
+function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): TradeData[] {
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -550,7 +617,7 @@ function extractTradesFromEnhancedTx(tx: any, discovery: any): TradeData[] {
  *    first value in a plausible price_e6 range ($0.001–$1M).
  * 3. Return 0 if neither strategy yields a result.
  */
-function extractPrice(tx: any, slabAddress: string): number {
+function extractPrice(tx: ValidatedTransaction, slabAddress: string): number {
   // Strategy 1: read mark_price_e6 from slab post-state account data
   const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
   if (priceFromAccount > 0) return priceFromAccount;
@@ -564,7 +631,7 @@ function extractPrice(tx: any, slabAddress: string): number {
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
-function extractPriceFromAccountData(tx: any, slabAddress: string): number {
+function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
     if (acc.account !== slabAddress) continue;
@@ -633,7 +700,7 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
  * Parse program logs for comma-separated numeric values (hex or decimal).
  * Matches 2–8 comma-separated values on a single "Program log:" line.
  */
-function extractPriceFromLogs(tx: any): number {
+function extractPriceFromLogs(tx: ValidatedTransaction): number {
   const logs: string[] = tx.logs ?? tx.logMessages ?? [];
   const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
 
@@ -669,7 +736,7 @@ function extractPriceFromLogs(tx: any): number {
  * Extract fee from token/native transfers.
  * For coin-margined perps, look at SOL balance changes for the trader.
  */
-function extractFeeFromTransfers(tx: any, trader: string): number {
+function extractFeeFromTransfers(tx: ValidatedTransaction, trader: string): number {
   // 1. Try reading from raw pre/post balances if available
   const preBalances: number[] = tx.meta?.preBalances;
   const postBalances: number[] = tx.meta?.postBalances;
