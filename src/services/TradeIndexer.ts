@@ -508,18 +508,26 @@ export class TradeIndexerPolling {
     return 0;
   }
 
-  /** Extract protocol fee from pre/post balance changes (same heuristic as webhook path). */
-  private extractFeeFromBalances(tx: ParsedTransactionWithMeta, trader: string): number {
-    if (!tx.meta?.preBalances || !tx.meta?.postBalances) return 0;
-    const accountKeys = tx.transaction.message.accountKeys;
-    const index = accountKeys.findIndex(
-      (k) => (typeof k === "string" ? k : k.pubkey.toBase58()) === trader,
-    );
-    if (index === -1) return 0;
-    const change = Math.abs(tx.meta.postBalances[index] - tx.meta.preBalances[index]);
-    // Same filter as webhook.ts extractFeeFromTransfers: skip Solana tx fees (<10k lamports),
-    // cap at 1 SOL to avoid false positives from margin/collateral movements.
-    if (change > 10_000 && change < 1_000_000_000) return change / 1e9;
+  /**
+   * #153 — NEUTERED: always returns 0.
+   *
+   * The previous implementation derived `trades.fee` from the trader's net
+   * native-SOL balance delta (pre/post balances at the trader's account index).
+   * In a trade tx the trader's SOL delta is dominated by collateral/margin
+   * movement and the Solana network fee — not the protocol fee — so `trades.fee`
+   * was being populated with collateral movements for sub-1-SOL moves, and
+   * genuine protocol fees ≥ 1 SOL were silently dropped to `0`.
+   *
+   * Following the same precedent as webhook.ts #153 / extractFeeFromTransfers,
+   * we return `0` until the absolute fee can be sourced from the fee-vault
+   * balance delta or a verified program event.
+   *
+   * @param _tx     Parsed transaction (unused after neuter).
+   * @param _trader Trader public key (unused after neuter).
+   * @returns Always 0.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private extractFeeFromBalances(_tx: ParsedTransactionWithMeta, _trader: string): number {
     return 0;
   }
 }

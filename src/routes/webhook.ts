@@ -757,38 +757,32 @@ function extractPriceFromLogs(_tx: ValidatedTransaction): number {
 }
 
 /**
- * Extract fee from token/native transfers.
- * For coin-margined perps, look at SOL balance changes for the trader.
+ * #153 — NEUTERED: always returns 0.
+ *
+ * The previous implementation derived `trades.fee` from the trader's net
+ * native-SOL balance delta, accepting any value in the (10_000, 1_000_000_000)
+ * lamport range as "the fee". In a trade tx the trader's SOL delta is dominated
+ * by collateral/margin movement plus the network fee — not the protocol fee —
+ * so `trades.fee` was being populated with collateral movements for sub-1-SOL
+ * moves, and genuine fees ≥ 1 SOL were silently recorded as `0`.
+ *
+ * The correct source of truth for the absolute protocol fee is the fee-vault
+ * balance delta (the account that receives the fee) or an explicit fee field in
+ * the fill receipt event, neither of which is currently available in the Helius
+ * enhanced-transaction payload without knowing the protocol fee account address
+ * at parse time.
+ *
+ * Following the same precedent as #150 (extractPriceFromLogs neutered to avoid
+ * log-injection), we record `fee = 0` when the fee is not recoverable from a
+ * trusted source rather than misattributing collateral movements. A backfill
+ * script can populate the column retroactively once the fee-vault address is
+ * plumbed through.
+ *
+ * @param _tx      Enhanced transaction (unused after neuter).
+ * @param _trader  Trader public key (unused after neuter).
+ * @returns Always 0.
  */
-function extractFeeFromTransfers(tx: ValidatedTransaction, trader: string): number {
-  // 1. Try reading from raw pre/post balances if available
-  const preBalances: number[] = tx.meta?.preBalances;
-  const postBalances: number[] = tx.meta?.postBalances;
-  if (Array.isArray(preBalances) && Array.isArray(postBalances)) {
-    const accountKeys: any[] = tx.transaction?.message?.accountKeys ?? tx.accountKeys ?? [];
-    const index = accountKeys.findIndex((k) => {
-      const pubkey = typeof k === "string" ? k : k?.pubkey;
-      return pubkey === trader;
-    });
-    if (index !== -1 && index < preBalances.length && index < postBalances.length) {
-      const change = Math.abs(postBalances[index] - preBalances[index]);
-      if (change > 10_000 && change < 1_000_000_000) {
-        return change / 1e9;
-      }
-    }
-  }
-
-  // 2. Fallback to Helius enhanced accountData
-  const accountData: any[] = tx.accountData ?? [];
-  for (const acc of accountData) {
-    if (acc.account === trader && acc.nativeBalanceChange != null) {
-      const change = Math.abs(Number(acc.nativeBalanceChange));
-      // Transaction fee is typically 5000-10000 lamports, protocol fees are larger
-      // Skip tiny tx fees, look for protocol-level fees
-      if (change > 10_000 && change < 1_000_000_000) {
-        return change / 1e9;
-      }
-    }
-  }
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function extractFeeFromTransfers(_tx: ValidatedTransaction, _trader: string): number {
   return 0;
 }
