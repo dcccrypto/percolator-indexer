@@ -745,3 +745,87 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     expect(shared.insertTrade).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #153 [LOW] — fee must not be derived from trader SOL balance delta
+// ---------------------------------------------------------------------------
+
+describe('POST /webhook/trades — fee attribution (#153)', () => {
+  let app: ReturnType<typeof webhookRoutes>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const mockDiscovery = {
+      getMarkets: () => new Map([[SLAB, {}]]),
+    };
+    app = webhookRoutes(mockDiscovery);
+  });
+
+  it('records fee=0 when the trader has a large sub-1-SOL collateral movement (not misattributed as fee)', async () => {
+    // Previously extractFeeFromTransfers would return 0.5 SOL for this tx
+    // because the trader's nativeBalanceChange of -500_000_000 lamports passed
+    // the (10_000, 1_000_000_000) window filter. After the #153 fix the
+    // function always returns 0.
+    const body = [{
+      signature: SIG,
+      transactionError: null,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [
+        // 0.5 SOL collateral withdrawal — previously misread as "fee"
+        { account: TRADER, nativeBalanceChange: -500_000_000 },
+      ],
+      logs: [],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(200);
+    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
+    // Must NOT store the collateral movement as the protocol fee.
+    expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect.objectContaining({ fee: 0 }),
+    );
+  });
+
+  it('records fee=0 when the trader has a large sub-1-SOL balance change in raw pre/postBalances', async () => {
+    // The pre/post balances path (tx.meta.preBalances / tx.meta.postBalances) had the
+    // same flaw — any abs(post-pre) in (10_000, 1e9) lamports was stored as the fee.
+    const body = [{
+      signature: SIG2,
+      transactionError: null,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      meta: {
+        preBalances: [1_000_000_000, 200_000_000],
+        postBalances: [500_000_000, 200_000_000], // trader lost 0.5 SOL (collateral)
+      },
+      // accountKeys matching the account layout so index lookup succeeds
+      accountKeys: [TRADER, SLAB],
+      accountData: [],
+      logs: [],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(200);
+    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
+    expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect.objectContaining({ fee: 0 }),
+    );
+  });
+
+  it('records fee=0 even when no balance data at all is present', async () => {
+    // Baseline: if accountData and pre/postBalances are absent, fee must be 0.
+    const body = [{
+      signature: SIG,
+      transactionError: null,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: [],
+    }];
+    const res = await app.fetch(makeRequest(body));
+    expect(res.status).toBe(200);
+    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
+    expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect.objectContaining({ fee: 0 }),
+    );
+  });
+});
