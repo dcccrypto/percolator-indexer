@@ -219,6 +219,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
         programId: PERC,
         sizeAbs: 1_000_000n,
         side: "long" as const,
+        slabAddress: SLAB, // #148: fill.slabAddress required for per-fill attribution
         priceE6: undefined,
       },
     ]);
@@ -299,6 +300,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
         programId: PERC,
         sizeAbs: 42n,
         side: "short" as const,
+        slabAddress: SLAB, // #148: fill.slabAddress required for per-fill attribution
         priceE6: undefined,
       },
     ]);

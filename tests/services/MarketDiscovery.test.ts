@@ -472,17 +472,22 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
     const result = await marketDiscovery.discover();
 
     // Both scanners must have produced results that were merged.
+    // v17 scanner returns the same market for both programs (same slab addr = deduped to 1 in map).
+    // v12 scanner returns a v12 market for program 1 only.
+    // Final map: 2 unique slabs (V17 + V12).
     expect(core.discoverMarkets).toHaveBeenCalled();
     expect(result.some(m => m.slabAddress.toBase58() === 'V17MarketAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBe(true);
     expect(result.some(m => m.slabAddress.toBase58() === 'V12MarketBBBBBBBBBBBBBBBBBBBBBBBBBBBB')).toBe(true);
-    expect(marketDiscovery.getMarkets().size).toBe(4); // 2 unique slabs × 2 programs each
+    expect(marketDiscovery.getMarkets().size).toBe(2); // 2 unique slabs
   }, 15_000);
 
   it('MARKETS_FILTER path: v12 getMarketsByAddress still runs after v17 finds markets', async () => {
     // #145 regression: the original MARKETS_FILTER code `continue`d to the next program
     // after finding v17 markets, permanently skipping getMarketsByAddress (v12).
-    const slabV17 = 'V17FilterAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-    const slabV12 = 'V12FilterBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+    //
+    // Use valid base58 Solana pubkey addresses (32-byte keys encoded in base58).
+    const slabV17 = 'So11111111111111111111111111111111111111112'; // wrapped SOL mint
+    const slabV12 = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'; // USDC mint
 
     const v17Market = {
       slabAddress: { toBase58: () => slabV17 },
