@@ -143,9 +143,11 @@ describe('POST /webhook/trades — price extraction', () => {
     );
   });
 
-  it('falls back to log parsing when slab is V0 layout (engineMarkPriceOff < 0)', async () => {
-    // Arrange: make detectSlabLayout return a V0 layout for a 512-byte buffer.
-    // V0 slabs have engineMarkPriceOff=-1 — no mark_price field.
+  it('#150: V0 slab (engineMarkPriceOff < 0) with logs yields price=0 — log fallback is neutered', async () => {
+    // #150: extractPriceFromLogs is neutered — it always returns 0 regardless of
+    // log content. V0 slabs have no mark_price field in accountData, so when the
+    // slab's engineMarkPriceOff=-1 AND accountData has no usable mark_ewma field,
+    // the stored price MUST be 0 (backfill-price-zero-trades.ts covers this gap).
     const { detectSlabLayout } = await import('@percolatorct/sdk');
     vi.mocked(detectSlabLayout).mockImplementationOnce((dataLen: number) => {
       if (dataLen === 512) return { version: 0, engineOff: 480, engineMarkPriceOff: -1, engineBitmapOff: 496 } as any;
@@ -163,13 +165,13 @@ describe('POST /webhook/trades — price extraction', () => {
         account: SLAB,
         data: Buffer.from(v0SlabData).toString('base64'),
       }],
-      logs: ['Program log: 3750000, 4000000, 5000000, 6000000, 7000000'], // $3.75 in logs
+      logs: ['Program log: 3750000, 4000000, 5000000, 6000000, 7000000'], // ignored — log fallback neutered
     };
     await app.fetch(makeRequest([tx]));
 
-    // Should NOT read from slab (V0 has no mark_price), MUST fall back to logs
+    // Log fallback is neutered (#150): price MUST be 0, not 3.75
     expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 3.75 }) // 3_750_000 / 1_000_000
+      expect.objectContaining({ price: 0 })
     );
   });
 
@@ -220,7 +222,9 @@ describe('POST /webhook/trades — price extraction', () => {
     );
   });
 
-  it('falls back to logs when accountData has no slab entry', async () => {
+  it('#150: yields price=0 when accountData has no slab entry — log fallback is neutered', async () => {
+    // #150: extractPriceFromLogs is neutered. Without a usable slab in accountData,
+    // price MUST be 0 rather than a log-derived value from an arbitrary program.
     const tx = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -231,12 +235,13 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 1.5 }) // fell back to log extraction
+      expect.objectContaining({ price: 0 }) // log fallback neutered — backfill covers this
     );
   });
 
-  it('extracts price from tx.logs (Helius Enhanced Transaction format)', async () => {
-    // Helius Enhanced Transactions expose logs as tx.logs, NOT tx.logMessages
+  it('#150: tx.logs present but yields price=0 — log fallback is neutered', async () => {
+    // #150: extractPriceFromLogs is neutered — Program log: lines from any program
+    // could be adversarially crafted to poison the price. Rely on accountData only.
     const tx = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -247,12 +252,12 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 1.5 }) // 1_500_000 / 1_000_000
+      expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
 
-  it('falls back to tx.logMessages if tx.logs is absent', async () => {
-    // Fallback: some callers may pass logMessages (web3.js format)
+  it('#150: tx.logMessages present but yields price=0 — log fallback is neutered', async () => {
+    // #150: Same as above — logMessages from any program are not trusted.
     const tx = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -263,7 +268,7 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 2.5 }) // 2_500_000 / 1_000_000
+      expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
 
@@ -297,8 +302,9 @@ describe('POST /webhook/trades — price extraction', () => {
     );
   });
 
-  it('extracts price from hex-formatted log values', async () => {
-    // 0x16E360 = 1500000 → 1.5 USD at e6 precision
+  it('#150: hex-formatted log values yield price=0 — log fallback is neutered', async () => {
+    // #150: 0x16E360 = 1500000 would have been parsed as $1.50 before neutralization.
+    // Log-based price is now always 0; accountData is the only trusted source.
     const tx = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -309,11 +315,12 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     expect(shared.insertTrade).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 1.5 })
+      expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
 
-  it('processes an array of transactions and extracts prices independently', async () => {
+  it('#150: batch of transactions — log-derived prices not used, both store price=0', async () => {
+    // #150: Both txs have only log data, no slab accountData. Both must store price=0.
     const tx1 = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -332,8 +339,8 @@ describe('POST /webhook/trades — price extraction', () => {
 
     expect(shared.insertTrade).toHaveBeenCalledTimes(2);
     const prices = vi.mocked(shared.insertTrade).mock.calls.map((c) => (c[0] as any).price);
-    expect(prices).toContain(1.0);
-    expect(prices).toContain(2.0);
+    // Log fallback neutered (#150) — both prices are 0, not 1.0 / 2.0
+    expect(prices).toEqual([0, 0]);
   });
 
   it('returns 500 when insertTrade throws (non-duplicate) — GH#42: Helius retry', async () => {

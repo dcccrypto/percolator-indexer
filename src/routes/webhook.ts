@@ -649,9 +649,9 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
  * Strategy (in order):
  * 1. Read mark_price_e6 from the slab account's post-state data (Helius
  *    enhanced txs include `accountData` with base64-encoded post-state).
- * 2. Parse program logs for comma-separated numeric values and pick the
- *    first value in a plausible price_e6 range ($0.001–$1M).
- * 3. Return 0 if neither strategy yields a result.
+ * 2. Return 0 — log-based extraction is neutered (#150: trusting Program log:
+ *    lines from any CPI program enables price poisoning; the backfill script
+ *    covers fills that land with price=0).
  */
 function extractPrice(tx: ValidatedTransaction, slabAddress: string): number {
   // Strategy 1: read mark_price_e6 from slab post-state account data
@@ -733,38 +733,26 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
 }
 
 /**
- * Parse program logs for comma-separated numeric values (hex or decimal).
- * Matches 2–8 comma-separated values on a single "Program log:" line.
+ * #150 — NEUTERED: always returns 0.
+ *
+ * The previous implementation scraped ANY "Program log:" line from the tx's log
+ * array and treated the first integer in [1_000, 1e12] as price_e6. Because
+ * Percolator txs may include CPI calls to system programs, AMMs, or arbitrary
+ * third-party programs, log lines emitted by non-Percolator programs were
+ * silently trusted. An attacker who can craft a tx with an inner CPI to a
+ * program that emits a plausible-looking log line could poison every fill in
+ * that tx with an arbitrary price.
+ *
+ * The correct source of truth for a fill price is `extractPriceFromAccountData`,
+ * which reads `mark_price_e6` / `mark_ewma_e6` from the slab's post-state data
+ * included in the Helius enhanced payload. When that is absent (e.g. the slab
+ * account wasn't included in accountData), the price is stored as 0 and the
+ * backfill-price-zero-trades.ts script is used to retroactively populate it.
+ *
+ * This matches what TradeIndexer.ts already does (see extractPriceFromLogs
+ * there, which has been a no-op since the 2026-04-20 parser overhaul).
  */
-function extractPriceFromLogs(tx: ValidatedTransaction): number {
-  const logs: string[] = tx.logs ?? tx.logMessages ?? [];
-  const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
-
-  // Cap logs length to prevent CPU amplification
-  const cappedLogs = logs.slice(0, 200);
-
-  for (const log of cappedLogs) {
-    if (!log.startsWith("Program log: ")) continue;
-    const payload = log.slice("Program log: ".length).trim();
-    // Cap payload length before regex tests to prevent CPU amplification
-    if (payload.length > 1024) continue;
-    // Only consider lines that look like comma-separated numbers
-    if (!/^[\d, a-fA-Fx]+$/.test(payload)) continue;
-
-    const matches = payload.match(valuePattern);
-    if (!matches || matches.length < 2) continue;
-
-    const values = matches.map((v) =>
-      v.startsWith("0x") ? parseInt(v, 16) : Number(v),
-    );
-
-    for (const v of values) {
-      // Reasonable price_e6 range: $0.001 to $1,000,000
-      if (v >= 1_000 && v <= 1_000_000_000_000) {
-        return v / 1_000_000;
-      }
-    }
-  }
+function extractPriceFromLogs(_tx: ValidatedTransaction): number {
   return 0;
 }
 
