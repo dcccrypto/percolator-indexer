@@ -91,7 +91,7 @@ function hasPoisonKey(obj: object): boolean {
 interface ValidatedInstruction {
   programId?: string;
   data?: string;
-  accounts?: unknown[];
+  accounts?: string[];
 }
 interface ValidatedInnerGroup {
   instructions?: ValidatedInstruction[];
