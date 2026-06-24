@@ -203,20 +203,56 @@ export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariabl
       return c.json({ error: "Payload too large" }, 413);
     }
 
-    // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
+    // PERC-750 / #149: Read raw body with streaming size enforcement.
+    //
+    // The Content-Length pre-check above rejects obviously oversized requests, but
+    // Content-Length can be absent or spoofed (e.g. sent low to bypass the check while
+    // streaming a large body). We enforce the cap a second time by consuming the request
+    // stream chunk-by-chunk and aborting as soon as accumulated bytes exceed the limit —
+    // before any chunk after the limit is buffered in memory. This prevents OOM DoS
+    // regardless of what the Content-Length header says.
     let rawBody: Buffer;
     try {
-      rawBody = Buffer.from(await c.req.arrayBuffer());
+      const reader = c.req.raw.body?.getReader();
+      if (!reader) {
+        // No body stream — treat as empty body.
+        rawBody = Buffer.alloc(0);
+      } else {
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        let tooLarge = false;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            totalBytes += value.byteLength;
+            if (totalBytes > MAX_BODY_SIZE_BYTES) {
+              tooLarge = true;
+              // Cancel the remaining stream to release the underlying connection.
+              reader.cancel().catch(() => {});
+              break;
+            }
+            chunks.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        if (tooLarge) {
+          logger.warn("Webhook request rejected: streamed body too large", { totalBytes, maxAllowed: MAX_BODY_SIZE_BYTES });
+          return c.json({ error: "Payload too large" }, 413);
+        }
+
+        rawBody = Buffer.concat(chunks.map(c => Buffer.from(c)));
+      }
     } catch {
       logger.warn("Webhook request failed: could not read body", requestMeta);
       return c.json({ error: "Failed to read request body" }, 400);
     }
 
-    // Secondary body size check (Content-Length may be absent or spoofed)
-    if (rawBody.length > MAX_BODY_SIZE_BYTES) {
-      logger.warn("Webhook request rejected: actual body too large", { actualLength: rawBody.length, maxAllowed: MAX_BODY_SIZE_BYTES });
-      return c.json({ error: "Payload too large" }, 413);
-    }
+    // #149 secondary size check removed: streaming enforcement above already aborts and
+    // returns 413 before the full body is buffered, making this check redundant.
 
     // PERC-1063 / PERC-750: Fail-closed — 503 if secret not configured, 401 if verification fails.
     if (!config.webhookSecret) {

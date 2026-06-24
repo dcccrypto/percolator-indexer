@@ -40,6 +40,15 @@ setInterval(() => {
 }, 5 * 60_000);
 
 const rateLimiter = async (c: any, next: any) => {
+  // #149 (INFRA): x-forwarded-for is trusted as-is here.
+  // A client that directly accesses this service can spoof the XFF header and
+  // supply any IP, bypassing the per-IP rate limit. This is acceptable ONLY when
+  // the ingress proxy (Railway / Cloudflare) is configured to:
+  //   1. strip any client-supplied X-Forwarded-For header, AND
+  //   2. append the real client IP before forwarding.
+  // Verify this is enforced in the proxy configuration before relying on this
+  // limiter as a security control. The primary auth guard (HMAC secret) is the
+  // load-bearing protection; this limiter is a secondary DoS mitigation.
   const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || "unknown-ip";
   const now = Date.now();
   const data = ipRequestCounts.get(ip);
