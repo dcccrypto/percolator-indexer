@@ -106,29 +106,41 @@ export class EventStreamService {
     const signature = tx.signature ?? tx.transaction?.signatures?.[0];
     if (!signature) return;
 
-    const slab = this.resolveSlab(tx);
-    if (!slab) return;
-
-    // P2: oracle-update detection. Fire before fill processing so even a tx that
-    // contains ONLY an UpdateHyperpMark (no trade) still writes an oracle row.
+    // P2: oracle-update detection. Resolve slab for oracle updates tx-wide (only one
+    // oracle account per UpdateHyperpMark call), then fire before fill processing so
+    // even a tx that contains ONLY an UpdateHyperpMark (no trade) still writes an oracle row.
     if (this.hasUpdateHyperpMark(tx)) {
-      try {
-        const markE6 = await readMarkPriceE6(this.deps.connection, slab);
-        if (markE6 != null) {
-          await insertOraclePrice({
-            slab_address: slab,
-            price_e6: String(markE6),
-            timestamp: Math.floor(Date.now() / 1000),
-            tx_signature: signature,
-          });
+      const oracleSlab = this.resolveSlab(tx);
+      if (oracleSlab) {
+        try {
+          const markE6 = await readMarkPriceE6(this.deps.connection, oracleSlab);
+          if (markE6 != null) {
+            await insertOraclePrice({
+              slab_address: oracleSlab,
+              price_e6: String(markE6),
+              timestamp: Math.floor(Date.now() / 1000),
+              tx_signature: signature,
+            });
+          }
+        } catch (err) {
+          log.warn("insertOraclePrice failed", { sig: signature, err: String(err) });
         }
-      } catch (err) {
-        log.warn("insertOraclePrice failed", { sig: signature, err: String(err) });
       }
     }
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
     for (const fill of fills) {
+      // #148: Use the per-fill slab derived from instruction accounts (fill.slabAddress),
+      // not the tx-wide resolveSlab() result. resolveSlab returns the *first* known slab
+      // in accountKeys and applies it to every fill in the tx — mis-attributing fills in
+      // multi-slab transactions. The parser now populates fill.slabAddress from
+      // ix.accounts[marketAccountIdx] (same logic as TradeIndexer's per-instruction guard).
+      const slab = fill.slabAddress;
+      if (!slab || !this.slabSet.has(slab)) {
+        log.warn("skipping fill — slab not in known set", { sig: signature, slab });
+        continue;
+      }
+
       let price = fill.priceE6 ?? 0;
       if (!price) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
