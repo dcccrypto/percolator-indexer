@@ -219,6 +219,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
         programId: PERC,
         sizeAbs: 1_000_000n,
         side: "long" as const,
+        slabAddress: SLAB, // #148: fill.slabAddress required for per-fill attribution
         priceE6: undefined,
       },
     ]);
@@ -299,6 +300,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
         programId: PERC,
         sizeAbs: 42n,
         side: "short" as const,
+        slabAddress: SLAB, // #148: fill.slabAddress required for per-fill attribution
         priceE6: undefined,
       },
     ]);
@@ -500,6 +502,191 @@ describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
     await new Promise((r) => setTimeout(r, 20));
 
     expect(insertOraclePriceMock).not.toHaveBeenCalled();
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #148 focused regression — per-fill slab attribution from instruction accounts
+// ---------------------------------------------------------------------------
+
+describe("#148 — EventStreamService: per-fill slab derived from instruction accounts", () => {
+  it("attributes each fill to its own slab in a multi-slab tx", async () => {
+    // #148 regression: the original resolveSlab(tx) returned the first known slab
+    // in tx.accountKeys and applied it to every fill, mis-attributing fills in
+    // multi-slab transactions.
+    //
+    // Fix: parsePercolatorFills now populates fill.slabAddress from
+    // ix.accounts[marketAccountIdx] (NoCpi=accounts[2], Cpi=accounts[1]).
+    // EventStreamService.handle() uses that per-fill slab for insertTrade.
+    const SLAB_A = "SLABABABABABABABABABABABABABABABABABABABABAB";
+    const SLAB_B = "SLABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const PERC_148 = "PERC148AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    const readMarkMock = vi.fn().mockResolvedValue(100_000_000); // $100
+
+    // parseFillsMock returns two fills with different slabAddresses.
+    const parseFillsMock = vi.fn().mockReturnValue([
+      {
+        signature: "sig148",
+        trader: "trader1",
+        programId: PERC_148,
+        assetIndex: 0,
+        sizeAbs: 1_000n,
+        side: "long" as const,
+        slabAddress: SLAB_A,
+        priceE6: undefined,
+      },
+      {
+        signature: "sig148",
+        trader: "trader2",
+        programId: PERC_148,
+        assetIndex: 0,
+        sizeAbs: 2_000n,
+        side: "short" as const,
+        slabAddress: SLAB_B,
+        priceE6: undefined,
+      },
+    ]);
+
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
+    });
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+
+    const { EventStreamService } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: PERC_148,
+      connection: { getAccountInfo: vi.fn() } as any,
+      autoIndex: true,
+      knownSlabs: [SLAB_A, SLAB_B], // both slabs known
+    });
+    await svc.start();
+
+    const fakeTx = {
+      transaction: {
+        message: {
+          instructions: [],
+          accountKeys: [{ pubkey: { toBase58: () => SLAB_A } }],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+      signature: "sig148",
+    };
+
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Both fills must have been inserted with their OWN slab, not SLAB_A for both.
+    expect(insertTradeMock).toHaveBeenCalledTimes(2);
+    const slabs = insertTradeMock.mock.calls.map((c: any) => c[0].slab_address);
+    expect(slabs).toContain(SLAB_A);
+    expect(slabs).toContain(SLAB_B);
+
+    // Verify fill-to-slab attribution is correct (not swapped)
+    const fillA = insertTradeMock.mock.calls.find((c: any) => c[0].slab_address === SLAB_A)?.[0];
+    expect(fillA?.size).toBe("1000");
+    expect(fillA?.side).toBe("long");
+
+    const fillB = insertTradeMock.mock.calls.find((c: any) => c[0].slab_address === SLAB_B)?.[0];
+    expect(fillB?.size).toBe("2000");
+    expect(fillB?.side).toBe("short");
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
+  });
+
+  it("skips fills whose slabAddress is not in the known set", async () => {
+    // #148: A fill with slabAddress not in knownSlabs must be silently dropped.
+    const SLAB_KNOWN = "SLABKNOWN1111111111111111111111111111111111";
+    const SLAB_UNKNOWN = "SLABUNKNOWN11111111111111111111111111111111";
+    const PERC_148B = "PERC148BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    const readMarkMock = vi.fn().mockResolvedValue(50_000_000);
+
+    const parseFillsMock = vi.fn().mockReturnValue([
+      {
+        signature: "sig148b",
+        trader: "trader1",
+        programId: PERC_148B,
+        assetIndex: 0,
+        sizeAbs: 500n,
+        side: "long" as const,
+        slabAddress: SLAB_UNKNOWN, // not in knownSlabs
+        priceE6: undefined,
+      },
+    ]);
+
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
+    });
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+
+    const { EventStreamService } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: PERC_148B,
+      connection: { getAccountInfo: vi.fn() } as any,
+      autoIndex: true,
+      knownSlabs: [SLAB_KNOWN],
+    });
+    await svc.start();
+
+    const fakeTx = {
+      transaction: {
+        message: {
+          instructions: [],
+          accountKeys: [{ pubkey: { toBase58: () => SLAB_KNOWN } }],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+      signature: "sig148b",
+    };
+
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Fill for an unknown slab must be dropped
+    expect(insertTradeMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
     vi.doUnmock("../../src/parsers/markPrice.js");

@@ -40,6 +40,7 @@ vi.mock('@percolatorct/shared', () => ({
 
 import { MarketDiscovery } from '../../src/services/MarketDiscovery.js';
 import * as core from '@percolatorct/sdk';
+import * as v17disc from '../../src/v17/discovery.js';
 
 describe('MarketDiscovery', () => {
   let marketDiscovery: MarketDiscovery;
@@ -428,5 +429,92 @@ describe('MarketDiscovery', () => {
       const markets = marketDiscovery.getMarkets();
       expect(markets.size).toBe(1000);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #145 focused regression tests — both scanners always run and results merge
+// ---------------------------------------------------------------------------
+
+describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per program', () => {
+  let marketDiscovery: MarketDiscovery;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    marketDiscovery = new MarketDiscovery();
+  });
+
+  afterEach(() => {
+    marketDiscovery.stop();
+  });
+
+  it('normal path: v12 discoverMarkets still runs after v17 finds markets', async () => {
+    // #145 regression: the original code broke out of the retry loop after the first
+    // v17 hit, permanently skipping discoverMarkets (v12) for that program.
+    const v17Market = {
+      slabAddress: { toBase58: () => 'V17MarketAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+      programId: { toBase58: () => '11111111111111111111111111111111' },
+      config: {}, params: {}, header: {},
+    };
+    const v12Market = {
+      slabAddress: { toBase58: () => 'V12MarketBBBBBBBBBBBBBBBBBBBBBBBBBBBB' },
+      programId: { toBase58: () => '11111111111111111111111111111111' },
+      config: {}, params: {}, header: {},
+    };
+
+    // Program 1: v17 returns a market AND v12 also returns a market.
+    // Program 2: both return nothing.
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([v17Market] as any);
+    vi.mocked(core.discoverMarkets)
+      .mockResolvedValueOnce([v12Market] as any) // program 1
+      .mockResolvedValueOnce([]);                 // program 2
+
+    const result = await marketDiscovery.discover();
+
+    // Both scanners must have produced results that were merged.
+    // v17 scanner returns the same market for both programs (same slab addr = deduped to 1 in map).
+    // v12 scanner returns a v12 market for program 1 only.
+    // Final map: 2 unique slabs (V17 + V12).
+    expect(core.discoverMarkets).toHaveBeenCalled();
+    expect(result.some(m => m.slabAddress.toBase58() === 'V17MarketAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBe(true);
+    expect(result.some(m => m.slabAddress.toBase58() === 'V12MarketBBBBBBBBBBBBBBBBBBBBBBBBBBBB')).toBe(true);
+    expect(marketDiscovery.getMarkets().size).toBe(2); // 2 unique slabs
+  }, 15_000);
+
+  it('MARKETS_FILTER path: v12 getMarketsByAddress still runs after v17 finds markets', async () => {
+    // #145 regression: the original MARKETS_FILTER code `continue`d to the next program
+    // after finding v17 markets, permanently skipping getMarketsByAddress (v12).
+    //
+    // Use valid base58 Solana pubkey addresses (32-byte keys encoded in base58).
+    const slabV17 = 'So11111111111111111111111111111111111111112'; // wrapped SOL mint
+    const slabV12 = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'; // USDC mint
+
+    const v17Market = {
+      slabAddress: { toBase58: () => slabV17 },
+      programId: { toBase58: () => '11111111111111111111111111111111' },
+      config: {}, params: {}, header: {},
+    };
+    const v12Market = {
+      slabAddress: { toBase58: () => slabV12 },
+      programId: { toBase58: () => '11111111111111111111111111111111' },
+      config: {}, params: {}, header: {},
+    };
+
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([v17Market] as any);
+    vi.mocked(core.getMarketsByAddress).mockResolvedValue([v12Market] as any);
+
+    // Provide two slab addresses in MARKETS_FILTER env so the filter branch is taken.
+    const origFilter = process.env.MARKETS_FILTER;
+    process.env.MARKETS_FILTER = `${slabV17},${slabV12}`;
+    try {
+      const result = await marketDiscovery.discover();
+      // Both scanners must have run and merged results.
+      expect(core.getMarketsByAddress).toHaveBeenCalled();
+      const addrs = result.map(m => m.slabAddress.toBase58());
+      expect(addrs).toContain(slabV17);
+      expect(addrs).toContain(slabV12);
+    } finally {
+      process.env.MARKETS_FILTER = origFilter;
+    }
   });
 });

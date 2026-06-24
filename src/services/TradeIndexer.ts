@@ -211,27 +211,46 @@ export class TradeIndexerPolling {
 
     if (signatures.length === 0) return;
 
-    // Update last signature (most recent first)
-    this.lastSignature.set(slabAddress, signatures[0].signature);
+    // #147: Do NOT advance the cursor here. We commit lastSignature only after
+    // the entire batch is fetched and processed successfully. Advancing it before
+    // getParsedTransactions means an RPC failure permanently skips those trades
+    // (the cursor is already past them on the next poll).
 
     // Filter out errored transactions
     const validSigs = signatures.filter(s => !s.err).map(s => s.signature);
-    if (validSigs.length === 0) return;
+    if (validSigs.length === 0) {
+      // No valid txs in this window but signatures were fetched — safe to advance.
+      this.lastSignature.set(slabAddress, signatures[0].signature);
+      return;
+    }
 
     let indexed = 0;
+    let batchFailed = false;
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
     for (let i = 0; i < validSigs.length; i += TX_BATCH_SIZE) {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
-      const txs = await withRetry(
-        () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 0 }),
-        {
-          maxRetries: TX_FETCH_RETRIES,
-          baseDelayMs: 1000,
-          label: `getParsedTransactions(${batch.length})`,
-        },
-      );
+      let txs: (ParsedTransactionWithMeta | null)[];
+      try {
+        txs = await withRetry(
+          () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 0 }),
+          {
+            maxRetries: TX_FETCH_RETRIES,
+            baseDelayMs: 1000,
+            label: `getParsedTransactions(${batch.length})`,
+          },
+        );
+      } catch (err) {
+        // #147: RPC failure — stop processing and do NOT advance the cursor.
+        // The next poll will re-fetch from the same lastSignature and retry.
+        logger.warn("getParsedTransactions failed — cursor not advanced, will retry next poll", {
+          slabAddress: slabAddress.slice(0, 8),
+          error: err instanceof Error ? err.message : err,
+        });
+        batchFailed = true;
+        break;
+      }
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
@@ -249,6 +268,12 @@ export class TradeIndexerPolling {
           });
         }
       }
+    }
+
+    // #147: Only commit the cursor after the full batch is fetched and processed.
+    // If any batch fetch failed we leave the cursor in place so the next poll retries.
+    if (!batchFailed) {
+      this.lastSignature.set(slabAddress, signatures[0].signature);
     }
 
     if (indexed > 0) {

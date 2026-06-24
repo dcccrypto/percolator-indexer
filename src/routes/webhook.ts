@@ -203,20 +203,56 @@ export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariabl
       return c.json({ error: "Payload too large" }, 413);
     }
 
-    // PERC-750: Read raw body first — required for HMAC-SHA256 body signature verification.
+    // PERC-750 / #149: Read raw body with streaming size enforcement.
+    //
+    // The Content-Length pre-check above rejects obviously oversized requests, but
+    // Content-Length can be absent or spoofed (e.g. sent low to bypass the check while
+    // streaming a large body). We enforce the cap a second time by consuming the request
+    // stream chunk-by-chunk and aborting as soon as accumulated bytes exceed the limit —
+    // before any chunk after the limit is buffered in memory. This prevents OOM DoS
+    // regardless of what the Content-Length header says.
     let rawBody: Buffer;
     try {
-      rawBody = Buffer.from(await c.req.arrayBuffer());
+      const reader = c.req.raw.body?.getReader();
+      if (!reader) {
+        // No body stream — treat as empty body.
+        rawBody = Buffer.alloc(0);
+      } else {
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        let tooLarge = false;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            totalBytes += value.byteLength;
+            if (totalBytes > MAX_BODY_SIZE_BYTES) {
+              tooLarge = true;
+              // Cancel the remaining stream to release the underlying connection.
+              reader.cancel().catch(() => {});
+              break;
+            }
+            chunks.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        if (tooLarge) {
+          logger.warn("Webhook request rejected: streamed body too large", { totalBytes, maxAllowed: MAX_BODY_SIZE_BYTES });
+          return c.json({ error: "Payload too large" }, 413);
+        }
+
+        rawBody = Buffer.concat(chunks.map(c => Buffer.from(c)));
+      }
     } catch {
       logger.warn("Webhook request failed: could not read body", requestMeta);
       return c.json({ error: "Failed to read request body" }, 400);
     }
 
-    // Secondary body size check (Content-Length may be absent or spoofed)
-    if (rawBody.length > MAX_BODY_SIZE_BYTES) {
-      logger.warn("Webhook request rejected: actual body too large", { actualLength: rawBody.length, maxAllowed: MAX_BODY_SIZE_BYTES });
-      return c.json({ error: "Payload too large" }, 413);
-    }
+    // #149 secondary size check removed: streaming enforcement above already aborts and
+    // returns 413 before the full body is buffered, making this check redundant.
 
     // PERC-1063 / PERC-750: Fail-closed — 503 if secret not configured, 401 if verification fails.
     if (!config.webhookSecret) {
@@ -613,9 +649,9 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
  * Strategy (in order):
  * 1. Read mark_price_e6 from the slab account's post-state data (Helius
  *    enhanced txs include `accountData` with base64-encoded post-state).
- * 2. Parse program logs for comma-separated numeric values and pick the
- *    first value in a plausible price_e6 range ($0.001–$1M).
- * 3. Return 0 if neither strategy yields a result.
+ * 2. Return 0 — log-based extraction is neutered (#150: trusting Program log:
+ *    lines from any CPI program enables price poisoning; the backfill script
+ *    covers fills that land with price=0).
  */
 function extractPrice(tx: ValidatedTransaction, slabAddress: string): number {
   // Strategy 1: read mark_price_e6 from slab post-state account data
@@ -697,38 +733,26 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
 }
 
 /**
- * Parse program logs for comma-separated numeric values (hex or decimal).
- * Matches 2–8 comma-separated values on a single "Program log:" line.
+ * #150 — NEUTERED: always returns 0.
+ *
+ * The previous implementation scraped ANY "Program log:" line from the tx's log
+ * array and treated the first integer in [1_000, 1e12] as price_e6. Because
+ * Percolator txs may include CPI calls to system programs, AMMs, or arbitrary
+ * third-party programs, log lines emitted by non-Percolator programs were
+ * silently trusted. An attacker who can craft a tx with an inner CPI to a
+ * program that emits a plausible-looking log line could poison every fill in
+ * that tx with an arbitrary price.
+ *
+ * The correct source of truth for a fill price is `extractPriceFromAccountData`,
+ * which reads `mark_price_e6` / `mark_ewma_e6` from the slab's post-state data
+ * included in the Helius enhanced payload. When that is absent (e.g. the slab
+ * account wasn't included in accountData), the price is stored as 0 and the
+ * backfill-price-zero-trades.ts script is used to retroactively populate it.
+ *
+ * This matches what TradeIndexer.ts already does (see extractPriceFromLogs
+ * there, which has been a no-op since the 2026-04-20 parser overhaul).
  */
-function extractPriceFromLogs(tx: ValidatedTransaction): number {
-  const logs: string[] = tx.logs ?? tx.logMessages ?? [];
-  const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
-
-  // Cap logs length to prevent CPU amplification
-  const cappedLogs = logs.slice(0, 200);
-
-  for (const log of cappedLogs) {
-    if (!log.startsWith("Program log: ")) continue;
-    const payload = log.slice("Program log: ".length).trim();
-    // Cap payload length before regex tests to prevent CPU amplification
-    if (payload.length > 1024) continue;
-    // Only consider lines that look like comma-separated numbers
-    if (!/^[\d, a-fA-Fx]+$/.test(payload)) continue;
-
-    const matches = payload.match(valuePattern);
-    if (!matches || matches.length < 2) continue;
-
-    const values = matches.map((v) =>
-      v.startsWith("0x") ? parseInt(v, 16) : Number(v),
-    );
-
-    for (const v of values) {
-      // Reasonable price_e6 range: $0.001 to $1,000,000
-      if (v >= 1_000 && v <= 1_000_000_000_000) {
-        return v / 1_000_000;
-      }
-    }
-  }
+function extractPriceFromLogs(_tx: ValidatedTransaction): number {
   return 0;
 }
 

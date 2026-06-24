@@ -392,6 +392,56 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
   });
 
+  describe('#147 — cursor not advanced when getParsedTransactions fails', () => {
+    it('does not advance lastSignature when getParsedTransactions throws', async () => {
+      // #147 regression: the original code advanced this.lastSignature immediately after
+      // getSignaturesForAddress, before getParsedTransactions ran. An RPC failure in
+      // getParsedTransactions then permanently skipped those transactions.
+      //
+      // Verify: after a getParsedTransactions failure, the NEXT getSignaturesForAddress
+      // call for the same slab is issued WITHOUT an `until` option (cursor unchanged),
+      // meaning the slab will be re-scanned from the same point on the next poll.
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+
+      mockGetSignaturesForAddress.mockResolvedValue([
+        { signature: VALID_SIG, err: null },
+      ]);
+
+      // Make withRetry throw when called for getParsedTransactions (2-arg form).
+      // The getSignaturesForAddress path uses withRetry too — only fail the tx fetch.
+      let withRetryCalls = 0;
+      vi.mocked(shared.withRetry).mockImplementation(async (fn: any) => {
+        withRetryCalls++;
+        // First call = getSignaturesForAddress (pass through).
+        // Second call = getParsedTransactions (throw).
+        if (withRetryCalls % 2 === 0) {
+          throw new Error('RPC: failed to fetch transactions');
+        }
+        return fn();
+      });
+
+      indexer.start();
+      // Wait for backfill to run
+      await new Promise(r => setTimeout(r, 6500));
+
+      // insertTrade must NOT have been called — the tx batch failed
+      expect(shared.insertTrade).not.toHaveBeenCalled();
+
+      // The FIRST getSignaturesForAddress call had no `until` (fresh cursor).
+      // After the failure the cursor must still be unset, so if a second
+      // getSignaturesForAddress ran it should also have no `until`.
+      const calls = mockGetSignaturesForAddress.mock.calls;
+      if (calls.length > 0) {
+        // First call: always no `until` (initial state)
+        expect((calls[0][1] as any)?.until).toBeUndefined();
+        // If a second call happened: still no `until` (cursor not advanced)
+        if (calls.length > 1) {
+          expect((calls[1][1] as any)?.until).toBeUndefined();
+        }
+      }
+    }, 10_000);
+  });
+
   describe('price extraction (log parser neutralized 2026-04-20)', () => {
     it('must NOT extract price from program logs — the fuzzy regex is dead', async () => {
       // Reproduce the exact bug-trigger payload: a sol_log_64-style line that

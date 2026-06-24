@@ -49,6 +49,20 @@ export interface ParsedFill {
   /** "long" = positive i128 size, "short" = negative — matches SDK parseTradeSize. */
   side: "long" | "short";
   /**
+   * Slab (market) address derived from the instruction's account list.
+   *
+   * #148: Populated per-instruction (not per-tx) so that multi-slab transactions
+   * correctly attribute each fill to its own slab rather than the first known slab
+   * in the tx's accountKeys.
+   *
+   * Account layout (v17):
+   *   TradeNoCpi (6) / BatchTradeNoCpi (66): accounts[2] = market (writable)
+   *   TradeCpi  (10) / BatchTradeCpi  (67): accounts[1] = market (writable)
+   *
+   * May be undefined if the account list is shorter than expected (malformed ix).
+   */
+  slabAddress?: string;
+  /**
    * Mark price from program logs — intentionally always `undefined` post-refactor.
    *
    * The old log-derived parser read the `sol_log_64(idx, price, 0, 0, 0)` output
@@ -111,6 +125,15 @@ export function parsePercolatorFills(
     const trader = pubkeyToBase58(ix.accounts?.[0]);
     if (!trader) continue;
 
+    // #148: Derive slab per-instruction from the account list.
+    // TradeNoCpi (6) / BatchTradeNoCpi (66): market is at accounts[2].
+    // TradeCpi  (10) / BatchTradeCpi  (67): market is at accounts[1].
+    // This mirrors the TradeIndexer per-instruction guard so multi-slab txs
+    // correctly attribute each fill to its own slab, not the first known slab.
+    const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
+    const marketAccountIdx = isNoCpiTag ? 2 : 1;
+    const slabAddress = pubkeyToBase58(ix.accounts?.[marketAccountIdx]);
+
     if (SINGLE_TRADE_TAGS.has(tag)) {
       // v17 single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... min 19 bytes
       if (data.length < V17_SINGLE_MIN_LEN) continue;
@@ -129,6 +152,7 @@ export function parsePercolatorFills(
         assetIndex,
         sizeAbs: sizeValue,
         side,
+        slabAddress,
         priceE6: undefined,
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
@@ -159,6 +183,7 @@ export function parsePercolatorFills(
           assetIndex,
           sizeAbs: sizeValue,
           side,
+          slabAddress,
           priceE6: undefined,
         });
       }

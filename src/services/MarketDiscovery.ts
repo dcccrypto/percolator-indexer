@@ -72,14 +72,15 @@ export class MarketDiscovery {
 
       for (const id of programIds) {
         try {
-          // v17 accounts: use v17-aware address-based discovery.
-          // The SDK's getMarketsByAddress checks v12 magic (TALOCREP) and will skip v17 accounts.
+          // #145: Always run BOTH v17 and v12 scanners and merge results.
+          // A program may host a mix of v17 and v12 markets — skipping the v12
+          // scan whenever v17 finds anything silently drops all v12 markets under
+          // that program from the live map.
           const v17Found = await discoverV17Markets(primaryConn, new PublicKey(id), slabAddresses);
           if (v17Found.length > 0) {
             all.push(...v17Found);
-            continue;
           }
-          // Fall back to v12 SDK path for legacy markets
+          // Always also run v12 SDK path for legacy markets, regardless of v17 results.
           const found = await getMarketsByAddress(
             primaryConn,
             new PublicKey(id),
@@ -125,15 +126,15 @@ export class MarketDiscovery {
         const conn = attempt === HELIUS_429_BACKOFF_MS.length ? fallbackConn : primaryConn;
         const connLabel = conn === fallbackConn ? "fallback" : "primary";
         try {
-          // v17 discovery: use v17-aware helper that checks PERCV16\0 magic.
-          // The SDK's discoverMarkets uses v12 TALOCREP magic and will return 0 v17 markets.
+          // #145: Always run BOTH v17 and v12 scanners and merge results.
+          // A program may host a mix of v17 and v12 markets — breaking out of the
+          // retry loop on the first v17 hit silently drops all v12 markets under
+          // that program from the live map.
           const v17Found = await discoverV17Markets(conn, new PublicKey(id));
           if (v17Found.length > 0) {
             all.push(...v17Found);
-            discovered = true;
-            break;
           }
-          // Fall back to v12 discovery for legacy markets
+          // Always also run v12 discovery for legacy markets, regardless of v17 results.
           const found = await discoverMarkets(conn, new PublicKey(id));
           all.push(...found);
           discovered = true;
