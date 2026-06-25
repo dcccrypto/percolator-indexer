@@ -16,7 +16,6 @@
 // CREATE INDEX idx_adl_events_target    ON adl_events(target_idx);
 
 import { PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
-import { IX_TAG } from "@percolatorct/sdk";
 import {
   config,
   getConnection,
@@ -40,10 +39,19 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
 }
 
 /**
- * Percolator-prog tag for ADL execution.
- * Tag 50 = ExecuteAdl (PERC-305).
+ * v17: ExecuteAdl (v12.x tag 101) is NOT in the v17 wrapper decoder — it was removed.
+ *
+ * In v17:
+ *   - Tag 50 = WithdrawBackingBucket (a completely different instruction — NOT ADL)
+ *   - Tag 101 = CancelQueuedWithdrawal (also not ADL)
+ *
+ * ADL_TAGS is intentionally EMPTY to prevent mis-indexing any v17 instruction under
+ * a stale tag number. The indexer is effectively a no-op and will log a warning on
+ * startup. The adl_events table schema is preserved for historical data compatibility.
+ *
+ * When ADL is re-implemented in the v17 program, update ADL_TAGS with the new tag.
  */
-const ADL_TAGS = new Set<number>([IX_TAG.ExecuteAdl]);
+const ADL_TAGS = new Set<number>(); // DISABLED: ExecuteAdl removed in v17
 
 /** How many recent signatures to fetch per slab per cycle */
 const MAX_SIGNATURES = readPositiveIntEnv("ADL_MAX_SIGNATURES", 50, 100);
@@ -60,18 +68,13 @@ const TX_FETCH_RETRIES = readPositiveIntEnv("INDEXER_TX_FETCH_RETRIES", 2, 5);
 const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !== "false";
 
 /**
- * AdlIndexerPolling — backup/backfill indexer for Auto-Deleveraging (ADL) events.
+ * AdlIndexerPolling — NO-OP in v17. ExecuteAdl was removed from the v17 wrapper program.
  *
- * Tracks IX_TAG.ExecuteAdl (50) on percolator-prog. Polls all active market slabs
- * and upserts events to the `adl_events` table.
+ * ADL_TAGS is empty so no transactions will ever be indexed. The service starts,
+ * logs a warning, and then does nothing. The adl_events table and upsert logic are
+ * preserved for historical data compatibility and future re-enablement.
  *
- * Account layout for ExecuteAdl (percolator-prog):
- *   [0] caller/signer
- *   [1] slab (the perp market slab account)
- *   [2+] additional accounts
- *
- * Data layout:
- *   ExecuteAdl (tag 50): tag(1) + target_idx(u16 LE = 2) — min 3 bytes
+ * To re-enable: confirm the v17 ADL instruction tag and add it to ADL_TAGS above.
  */
 export class AdlIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
@@ -85,7 +88,16 @@ export class AdlIndexerPolling {
     if (this._running) return;
     this._running = true;
 
-    // Initial backfill after short delay to let discovery finish.
+    // v17: ADL removed from the v17 wrapper program. This indexer is a no-op.
+    // ADL_TAGS is empty so processTransaction will never match any instruction.
+    logger.warn(
+      "AdlIndexerPolling is DISABLED — ExecuteAdl was removed in v17. " +
+      "ADL_TAGS is empty; no ADL events will be indexed. " +
+      "Update ADL_TAGS when v17 re-introduces an ADL instruction.",
+    );
+
+    // Keep the poll infrastructure running so the service can be re-enabled
+    // without a code change — just update ADL_TAGS above.
     if (STARTUP_BACKFILL_ENABLED) {
       setTimeout(() => this.backfill(), 5_000);
     } else {

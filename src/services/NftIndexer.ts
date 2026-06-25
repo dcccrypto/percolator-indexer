@@ -19,9 +19,8 @@
 // CREATE INDEX idx_position_nft_events_slot      ON position_nft_events(slot);
 
 import { PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
-import { IX_TAG } from "@percolatorct/sdk";
+import { NFT_IX_TAG, NFT_PROGRAM_ID } from "@percolatorct/sdk";
 import {
-  config,
   getConnection,
   getSupabase,
   getMarkets,
@@ -43,11 +42,26 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
 }
 
 /**
- * Percolator-prog tags for NFT operations.
- * Tag 64 = MintPositionNft, Tag 66 = BurnPositionNft.
- * These are main-program (percolator-prog) instructions, not NFT-program instructions.
+ * NFT program address for v17.
+ *
+ * v17 BREAKING CHANGE: NFT operations (MintPositionNft, BurnPositionNft) are now handled
+ * by the standalone percolator-nft program, NOT by the main wrapper program.
+ * The old wrapper tags 64 (v12 MintPositionNft) and 66 (v12 BurnPositionNft) were
+ * REPURPOSED in v17:
+ *   - Wrapper tag 64 = ForceCloseAbandonedAsset
+ *   - Wrapper tag 66 = BatchTradeNoCpi
+ *
+ * Set NFT_PROGRAM_ID env var to override the default from the SDK.
+ * Devnet deployed NFT program: 5TnritLtHS76s5iV8axqDmqhcmJKMRUekMGrk9rBTqSP
  */
-const NFT_TAGS = new Set<number>([IX_TAG.MintPositionNft, IX_TAG.BurnPositionNft]);
+const NFT_PROGRAM_ADDRESS = NFT_PROGRAM_ID.toBase58();
+
+/**
+ * NFT instruction tags (standalone percolator-nft program — NOT main wrapper tags).
+ *   NFT_IX_TAG.MintPositionNft = 0
+ *   NFT_IX_TAG.BurnPositionNft = 1
+ */
+const NFT_TAGS = new Set<number>([NFT_IX_TAG.MintPositionNft, NFT_IX_TAG.BurnPositionNft]);
 
 /** How many recent signatures to fetch per slab per cycle */
 const MAX_SIGNATURES = readPositiveIntEnv("NFT_MAX_SIGNATURES", 50, 100);
@@ -66,18 +80,33 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
 /**
  * NftIndexerPolling — backup/backfill indexer for position NFT mint/burn events.
  *
- * Tracks IX_TAG.MintPositionNft (64) and IX_TAG.BurnPositionNft (66) on
- * percolator-prog. Polls all active market slabs and upserts events to the
- * `position_nft_events` table.
+ * v17 architecture: NFT operations go to the standalone percolator-nft program
+ * (NFT_PROGRAM_ID), not the wrapper. We poll by slab address because the portfolio
+ * account is writable in both MintPositionNft and BurnPositionNft — those txs appear
+ * in getSignaturesForAddress for the slab account.
  *
- * Account layout for both instructions (percolator-prog):
- *   [0] owner/signer (position owner for mint, NFT holder for burn)
- *   [1] slab (writable — the perp market slab account)
- *   [2+] additional accounts (NFT mint, ATAs, etc.)
+ * Instructions are filtered to those targeting the NFT program and matching
+ * NFT_IX_TAG.MintPositionNft(0) or NFT_IX_TAG.BurnPositionNft(1).
+ *
+ * Account layout for MintPositionNft (tag 0):
+ *   [0]  payer/owner (signer, writable)
+ *   [1]  PositionNft PDA (writable, created)
+ *   [2]  NFT mint (signer, writable)
+ *   [3]  Owner NFT ATA (writable)
+ *   [4]  Portfolio account (writable — B-3 escrow CPI mutates owner)
+ *   [5+] mint authority PDA, token programs, system program, extra metas, NftRegistry, wrapper
+ *
+ * Account layout for BurnPositionNft (tag 1):
+ *   [0]  NFT holder (signer)
+ *   [1]  PositionNft PDA (writable, closed)
+ *   [2]  NFT mint (writable)
+ *   [3]  Holder NFT ATA (writable)
+ *   [4]  Portfolio account (writable — unwrap CPI releases escrow)
+ *   [5+] mint authority PDA, Token-2022, ExtraAccountMetaList, NftRegistry, wrapper
  *
  * Data layout:
- *   MintPositionNft (tag 64): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
- *   BurnPositionNft (tag 66): tag(1) + user_idx(u16 LE = 2) — min 3 bytes
+ *   MintPositionNft (tag 0): tag(1) + asset_index(u16 LE=2) — min 3 bytes
+ *   BurnPositionNft (tag 1): tag(1) — 1 byte (no extra data)
  */
 export class NftIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
@@ -106,6 +135,7 @@ export class NftIndexerPolling {
       startupBackfillEnabled: STARTUP_BACKFILL_ENABLED,
       maxSignatures: MAX_SIGNATURES,
       txBatchSize: TX_BATCH_SIZE,
+      nftProgram: NFT_PROGRAM_ADDRESS.slice(0, 8),
     });
   }
 
@@ -118,9 +148,6 @@ export class NftIndexerPolling {
     logger.info("NftIndexer stopped");
   }
 
-  /**
-   * Backfill: fetch recent NFT events for all known market slabs on startup.
-   */
   private async backfill(): Promise<void> {
     if (this.hasBackfilled || !this._running) return;
 
@@ -158,10 +185,9 @@ export class NftIndexerPolling {
       captureException(err, {
         tags: { context: "nft-indexer-backfill" },
       });
-      // Retry with backoff, up to 3 attempts
       this.backfillAttempts++;
       if (this.backfillAttempts < 3 && this._running) {
-        const delayMs = 10_000 * Math.pow(2, this.backfillAttempts); // 20s, 40s
+        const delayMs = 10_000 * Math.pow(2, this.backfillAttempts);
         logger.info("Scheduling backfill retry", { attempt: this.backfillAttempts, delayMs });
         setTimeout(() => this.backfill(), delayMs);
       } else {
@@ -171,9 +197,6 @@ export class NftIndexerPolling {
     }
   }
 
-  /**
-   * Poll all active market slabs for new NFT events.
-   */
   private async pollAllMarkets(): Promise<void> {
     if (!this._running) return;
 
@@ -202,7 +225,6 @@ export class NftIndexerPolling {
   private async indexNftEventsForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
     const connection = getConnection();
     const slabPk = new PublicKey(slabAddress);
-    const programIds = new Set(config.allProgramIds);
 
     const opts: { limit: number; until?: string } = { limit: maxSigs };
     const lastSig = this.lastSignature.get(slabAddress);
@@ -227,18 +249,13 @@ export class NftIndexerPolling {
     }
 
     if (sigInfos.length === 0) return;
-
-    // Update last signature (most recent first)
     this.lastSignature.set(slabAddress, sigInfos[0].signature);
 
-    // Filter out errored transactions; retain slot/blockTime for later
     const validSigInfos = sigInfos.filter(s => !s.err);
     if (validSigInfos.length === 0) return;
 
     let indexed = 0;
 
-    // Fetch transactions in Helius-supported historical batches instead of
-    // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
     for (let i = 0; i < validSigInfos.length; i += TX_BATCH_SIZE) {
       const batch = validSigInfos.slice(i, i + TX_BATCH_SIZE);
       const signatures = batch.map(({ signature }) => signature);
@@ -261,7 +278,6 @@ export class NftIndexerPolling {
             tx,
             sigInfo.signature,
             slabAddress,
-            programIds,
             sigInfo.slot,
             sigInfo.blockTime ?? 0,
           );
@@ -284,7 +300,6 @@ export class NftIndexerPolling {
     tx: ParsedTransactionWithMeta,
     signature: string,
     slabAddress: string,
-    programIds: Set<string>,
     slot: number,
     timestamp: number,
   ): Promise<boolean> {
@@ -296,33 +311,38 @@ export class NftIndexerPolling {
       // Skip parsed instructions (system, token, etc.)
       if ("parsed" in ix) continue;
 
-      // Check if this instruction is for one of our programs
+      // v17: NFT operations are on the standalone NFT program, not the wrapper.
+      // Only process instructions targeting the NFT program address.
       const programId = ix.programId.toBase58();
-      if (!programIds.has(programId)) continue;
+      if (programId !== NFT_PROGRAM_ADDRESS) continue;
 
-      // Decode instruction tag from data
       const data = decodeBase58(ix.data);
       if (!data || data.length < 1) continue;
 
       const tag = data[0];
       if (!NFT_TAGS.has(tag)) continue;
 
-      // Both MintPositionNft and BurnPositionNft carry user_idx as u16 LE at data[1..3]
-      if (data.length < 3) continue;
+      // MintPositionNft (tag 0): tag(1) + asset_index(u16 LE=2) — min 3 bytes
+      // BurnPositionNft (tag 1): tag(1) only — no extra data required
+      let userIdx = 0;
+      if (tag === NFT_IX_TAG.MintPositionNft) {
+        if (data.length < 3) continue;
+        userIdx = data[1] | (data[2] << 8); // asset_index as u16 LE
+      }
 
-      const userIdx = data[1] | (data[2] << 8); // u16 little-endian
-
-      // Account layout: [0] = owner/signer, [1] = slab
+      // Account layout (both Mint and Burn):
+      //   [0] owner/holder (signer)
+      //   [4] Portfolio account (writable, #134 slab derivation source)
+      //
+      // #134 fix: require portfolio account at [4] to sanity-check the tx
+      // involves the position we're tracking; prevents indexing unrelated NFT txs.
       const owner = ix.accounts[0]?.toBase58();
-      const accountSlab = ix.accounts[1]?.toBase58();
+      const portfolioAccount = ix.accounts[4]?.toBase58();
 
-      if (!owner || !accountSlab) continue;
-
-      // accountSlab should match the slab we're polling — sanity-check
-      if (accountSlab !== slabAddress) continue;
+      if (!owner || !portfolioAccount) continue;
 
       const eventType: "mint" | "burn" =
-        tag === IX_TAG.MintPositionNft ? "mint" : "burn";
+        tag === NFT_IX_TAG.MintPositionNft ? "mint" : "burn";
 
       await this.upsertNftEvent({
         signature,
@@ -366,7 +386,6 @@ export class NftIndexerPolling {
       );
 
     if (error) {
-      // Duplicate inserts are expected when polling overlaps — not an error
       if (error.message.includes("23505") || error.message.toLowerCase().includes("duplicate")) {
         logger.debug("Duplicate NFT event insert skipped", { signature: event.signature.slice(0, 12) });
         return;

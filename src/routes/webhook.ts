@@ -8,7 +8,13 @@ const logger = createLogger("indexer:webhook");
 /** Context key: raw body bytes only after HMAC/static-token verification (defense in depth). */
 type WebhookVariables = { verifiedWebhookBody: Buffer };
 
-const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
+// v17 trade tags: TradeCpiV2(105) removed (not in v17 decoder); BatchTradeNoCpi(66)/BatchTradeCpi(67) added.
+const TRADE_TAGS = new Set<number>([
+  IX_TAG.TradeNoCpi,      // 6
+  IX_TAG.TradeCpi,        // 10
+  IX_TAG.BatchTradeNoCpi, // 66 — multi-leg NoCpi
+  IX_TAG.BatchTradeCpi,   // 67 — multi-leg Cpi
+]);
 const PROGRAM_IDS = new Set(config.allProgramIds);
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 /** Solana signatures are base58-encoded 64-byte values (87–88 chars). */
@@ -319,27 +325,34 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
 
     // Decode instruction data (base58)
     const data = ix.data ? decodeBase58(ix.data) : null;
-    if (!data || data.length < 21) continue;
 
-    const tag = data[0];
-    if (!TRADE_TAGS.has(tag)) continue;
+    const tag = data ? data[0] : -1;
+    if (!TRADE_TAGS.has(tag) || !data) continue;
 
-    // Parse: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16)
-    // TradeCpiV2 adds an extra bump(u8) at byte 21 — same size offset, different total length (22 vs 21)
-    const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+    // v17 wire layout for TradeNoCpi(6) and TradeCpi(10):
+    //   tag(1) + asset_index(u16=2) + size_q(i128=16) + ... = min 19 bytes
+    //   size_q at byte offset 3 (v12 was offset 5; lpIdx+userIdx removed in v17).
+    // For BatchTradeNoCpi(66) and BatchTradeCpi(67):
+    //   tag(1) + n_legs(u8=1) + [asset_index(u16=2) + size_q(i128=16) + ...]×n
+    //   first leg asset_index at [2], size_q at [4] — min 20 bytes for first leg.
+    const isBatch = tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi;
+    const legOffset = isBatch ? 1 : 0;
+    if (data.length < 1 + legOffset + 2 + 16) continue;
+    const sizeOffset = 1 + legOffset + 2; // skip tag + [n_legs] + asset_index
+    const { sizeValue, side } = parseTradeSize(data.slice(sizeOffset, sizeOffset + 16));
 
     // Validate size is within i128 range — TradeIndexer checks this (line 298)
     // but webhook didn't, allowing oversized values to corrupt downstream calcs.
     if (sizeValue > I128_MAX) continue;
 
-    // Account layout (from core/abi/accounts.ts):
-    // PERC-199: clock sysvar removed from trade instructions
-    // TradeNoCpi:  [0]=user(signer), [1]=lp(signer), [2]=slab(writable), [3]=oracle
-    // TradeCpi:    [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=oracle, ...
-    // TradeCpiV2:  [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=oracle, ... (same layout, adds bump in data)
+    // v17 account layout for TradeNoCpi/TradeCpi:
+    //   [0] taker/user (signer)
+    //   [1] slab/market-group (writable)
+    //   [2+] oracle, matcher context, etc.
     const accounts: string[] = ix.accounts ?? [];
     const trader = accounts[0] ?? "";
-    const slabAddress = accounts.length > 2 ? accounts[2] : "";
+    // v17: slab is at accounts[1] (accounts[2] was the v12 layout with an extra lp/owner account)
+    const slabAddress = accounts[1] ?? "";
     if (!trader || !slabAddress) continue;
 
     // Validate pubkey formats
@@ -368,19 +381,21 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
       const programId = ix.programId ?? "";
       if (!PROGRAM_IDS.has(programId)) continue;
 
-      const data = ix.data ? decodeBase58(ix.data) : null;
-      if (!data || data.length < 21) continue;
+      const innerData = ix.data ? decodeBase58(ix.data) : null;
+      const innerTag = innerData ? innerData[0] : -1;
+      if (!TRADE_TAGS.has(innerTag) || !innerData) continue;
 
-      const tag = data[0];
-      if (!TRADE_TAGS.has(tag)) continue;
-
-      const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+      const innerIsBatch = innerTag === IX_TAG.BatchTradeNoCpi || innerTag === IX_TAG.BatchTradeCpi;
+      const innerLegOffset = innerIsBatch ? 1 : 0;
+      if (innerData.length < 1 + innerLegOffset + 2 + 16) continue;
+      const innerSizeOffset = 1 + innerLegOffset + 2;
+      const { sizeValue, side } = parseTradeSize(innerData.slice(innerSizeOffset, innerSizeOffset + 16));
       if (sizeValue > I128_MAX) continue;
 
-      // Same account layout: [0]=user, [2]=slab
+      // v17 account layout: [0]=user, [1]=slab
       const accounts: string[] = ix.accounts ?? [];
       const trader = accounts[0] ?? "";
-      const slabAddress = accounts.length > 2 ? accounts[2] : "";
+      const slabAddress = accounts[1] ?? "";
       if (!trader || !slabAddress) continue;
 
       if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;

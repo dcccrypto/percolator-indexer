@@ -4,8 +4,25 @@ import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets,
 
 const logger = createLogger("indexer:trade-indexer");
 
-/** Trade instruction tags we want to index */
-const TRADE_TAGS = new Set<number>([IX_TAG.TradeNoCpi, IX_TAG.TradeCpi, IX_TAG.TradeCpiV2]);
+/**
+ * Trade instruction tags we want to index.
+ *
+ * v17 wire layout for TradeNoCpi(6) and TradeCpi(10):
+ *   tag(1) + asset_index(u16=2) + size_q(i128=16) + exec_price(u64=8) + fee_bps(u64=8) = 35 bytes
+ *   size_q is at byte offset 3 (NOT 5 — v12 had lpIdx+userIdx before size).
+ *
+ * v17 wire layout for BatchTradeNoCpi(66) and BatchTradeCpi(67):
+ *   tag(1) + n_legs(u8=1) + [asset_index(u16=2) + size_q(i128=16) + ...×2 u64]×n
+ *   We index only the first leg of each batch instruction (same per-leg layout).
+ *
+ * Removed: TradeCpiV2(105) — deprecated v12.x tag, not in the v17 decoder.
+ */
+const TRADE_TAGS = new Set<number>([
+  IX_TAG.TradeNoCpi,
+  IX_TAG.TradeCpi,
+  IX_TAG.BatchTradeNoCpi,
+  IX_TAG.BatchTradeCpi,
+]);
 
 function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
@@ -264,12 +281,23 @@ export class TradeIndexerPolling {
       if (!TRADE_TAGS.has(tag)) continue;
 
       // This is a trade instruction! Parse it.
-      // Layout: tag(1) + lpIdx(u16=2) + userIdx(u16=2) + size(i128=16) = 21 bytes
-      // TradeCpiV2 adds bump(u8) at byte 21, total 22 bytes — size offset unchanged.
-      if (data.length < 21) continue;
+      // v17 layout: tag(1) + asset_index(u16=2) + size_q(i128=16) + ... = 35 bytes minimum.
+      // For BatchTrade tags: tag(1) + n_legs(u8=1) + [asset_index(u16)+size_q(i128)+...]×n
+      //   — first leg starts at byte 2, so asset_index at [2..4] and size_q at [4..20].
+      // For single-trade tags (6, 10): asset_index at [1..3], size_q at [3..19].
+      const isBatch = tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi;
+      const legOffset = isBatch ? 1 : 0; // BatchTrade has n_legs(u8) before first leg
+      // Minimum: tag(1) + [legOffset] + asset_index(2) + size_q(16) = 19 + legOffset bytes
+      if (data.length < 19 + legOffset) continue;
 
-      // Parse size as signed i128 (little-endian)
-      const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
+      const assetIndexOffset = 1 + legOffset;
+      const sizeOffset = assetIndexOffset + 2; // skip asset_index(u16)
+
+      // asset_index: u16 LE at assetIndexOffset
+      const assetIndex = data[assetIndexOffset] | (data[assetIndexOffset + 1] << 8);
+
+      // Parse size as signed i128 (little-endian), 16 bytes starting at sizeOffset
+      const { sizeValue, side } = parseTradeSize(data.slice(sizeOffset, sizeOffset + 16));
 
       // Determine trader from account keys
       const traderKey = ix.accounts[0];
@@ -308,6 +336,8 @@ export class TradeIndexerPolling {
         return false;
       }
 
+      // TODO(#143): pass asset_index to insertTrade once @percolatorct/shared adds the
+      // column to TradeRow and the migration adds it to the trades table.
       await insertTrade({
         slab_address: slabAddress,
         trader,
@@ -318,7 +348,7 @@ export class TradeIndexerPolling {
         tx_signature: signature,
       });
 
-      eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
+      eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString(), assetIndex });
       return true;
     }
 

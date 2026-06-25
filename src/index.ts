@@ -8,6 +8,7 @@ import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
 import { NftIndexerPolling } from "./services/NftIndexer.js";
 import { AdlIndexerPolling } from "./services/AdlIndexer.js";
+import { LiquidationIndexerPolling } from "./services/LiquidationIndexer.js";
 import { InsuranceLPService } from "./services/InsuranceLPService.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
@@ -48,6 +49,7 @@ const statsCollector = new StatsCollector(discovery);
 const tradeIndexer = new TradeIndexerPolling();
 const nftIndexer = new NftIndexerPolling();
 const adlIndexer = new AdlIndexerPolling();
+const liquidationIndexer = new LiquidationIndexerPolling();
 const insuranceService = new InsuranceLPService(discovery);
 const webhookManager = new HeliusWebhookManager();
 
@@ -249,6 +251,9 @@ async function start() {
     tradeIndexer.start();
     nftIndexer.start();
     adlIndexer.start();
+    // v17: liquidation indexer — watches PermissionlessCrank(5) action=1
+    await liquidationIndexer.initialize();
+    liquidationIndexer.start();
   } else {
     logger.info("RPC fallback pollers disabled", {
       reason: "INDEXER_RPC_POLLING_ENABLED=false",
@@ -348,6 +353,9 @@ async function shutdown(signal: string): Promise<void> {
 
     logger.info("Stopping ADL indexer");
     adlIndexer.stop();
+
+    logger.info("Stopping liquidation indexer");
+    liquidationIndexer.stop();
 
     logger.info("Stopping insurance LP service");
     insuranceService.stop();
