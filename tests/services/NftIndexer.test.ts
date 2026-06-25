@@ -154,12 +154,15 @@ describe('NftIndexerPolling — processTransaction (#134: skip-on-null portfolio
     expect(mockGetAccountInfo).toHaveBeenCalled();
     expect(didIndex).toBe(true);
     expect(mockUpsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        signature: SIG,
-        slab: SLAB,
-        event_type: 'transfer',
-      }),
-      expect.objectContaining({ onConflict: 'signature' }),
+      [
+        expect.objectContaining({
+          signature: SIG,
+          instruction_index: 0,
+          slab: SLAB,
+          event_type: 'transfer',
+        }),
+      ],
+      expect.objectContaining({ onConflict: 'signature,instruction_index' }),
     );
   });
 
