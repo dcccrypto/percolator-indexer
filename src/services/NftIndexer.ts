@@ -23,7 +23,6 @@ import { NFT_IX_TAG, NFT_PROGRAM_ID } from "@percolatorct/sdk";
 import {
   getConnection,
   getSupabase,
-  getMarkets,
   getNetwork,
   withRetry,
   decodeBase58,
@@ -148,43 +147,27 @@ export class NftIndexerPolling {
     logger.info("NftIndexer stopped");
   }
 
+  /**
+   * Backfill: poll the NFT program directly for all recent NFT events.
+   *
+   * The standalone percolator-nft program account accumulates every MintPositionNft
+   * and BurnPositionNft instruction. The slab/market address is NOT in the NFT
+   * program's account list — so polling slab addresses would miss these txs entirely.
+   * Instead we poll NFT_PROGRAM_ADDRESS for signatures and parse from there.
+   */
   private async backfill(): Promise<void> {
     if (this.hasBackfilled || !this._running) return;
 
     try {
-      const markets = await getMarkets();
-      if (markets.length === 0) {
-        logger.info("No markets found for NFT backfill");
-        this.hasBackfilled = true;
-        return;
-      }
-
-      logger.info("Starting NFT backfill", { marketCount: markets.length });
-      for (const market of markets) {
-        if (!this._running) break;
-        try {
-          await this.indexNftEventsForSlab(market.slab_address, BACKFILL_SIGNATURES);
-        } catch (err) {
-          logger.error("Backfill error", {
-            slabAddress: market.slab_address.slice(0, 8),
-            error: err instanceof Error ? err.message : err,
-          });
-          captureException(err, {
-            tags: {
-              context: "nft-indexer-backfill",
-              slabAddress: market.slab_address,
-            },
-          });
-        }
-        await sleep(1_000);
-      }
+      logger.info("Starting NFT backfill via NFT program polling", {
+        program: NFT_PROGRAM_ADDRESS.slice(0, 8),
+      });
+      await this.indexNftEventsFromProgram(BACKFILL_SIGNATURES);
       this.hasBackfilled = true;
       logger.info("NFT backfill complete");
     } catch (err) {
       logger.error("Backfill failed", { error: err instanceof Error ? err.message : err });
-      captureException(err, {
-        tags: { context: "nft-indexer-backfill" },
-      });
+      captureException(err, { tags: { context: "nft-indexer-backfill" } });
       this.backfillAttempts++;
       if (this.backfillAttempts < 3 && this._running) {
         const delayMs = 10_000 * Math.pow(2, this.backfillAttempts);
@@ -192,7 +175,7 @@ export class NftIndexerPolling {
         setTimeout(() => this.backfill(), delayMs);
       } else {
         this.hasBackfilled = true;
-        logger.error("Backfill exhausted retries — pollAllMarkets will cover the gap");
+        logger.error("Backfill exhausted retries — periodic poll will cover the gap");
       }
     }
   }
@@ -201,55 +184,50 @@ export class NftIndexerPolling {
     if (!this._running) return;
 
     try {
-      const markets = await getMarkets();
-      for (const market of markets) {
-        if (!this._running) break;
-        try {
-          await this.indexNftEventsForSlab(market.slab_address, MAX_SIGNATURES);
-        } catch (err) {
-          logger.error("Poll error", {
-            slabAddress: market.slab_address.slice(0, 8),
-            error: err instanceof Error ? err.message : err,
-          });
-        }
-        await sleep(500);
-      }
+      await this.indexNftEventsFromProgram(MAX_SIGNATURES);
     } catch (err) {
       logger.error("Poll failed", { error: err instanceof Error ? err.message : err });
-      captureException(err, {
-        tags: { context: "nft-indexer-poll" },
-      });
+      captureException(err, { tags: { context: "nft-indexer-poll" } });
     }
   }
 
-  private async indexNftEventsForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
+  /**
+   * Polls the standalone NFT program address for recent transactions.
+   *
+   * The NFT program's account is writable in every MintPositionNft/BurnPositionNft
+   * transaction, so getSignaturesForAddress(nftProgram) returns all NFT events.
+   *
+   * slab field in DB: stores the portfolio account (accounts[4]) which uniquely
+   * identifies the position. The market/slab address is not in the NFT ix account
+   * list and would require an extra RPC call to derive.
+   */
+  private async indexNftEventsFromProgram(maxSigs = MAX_SIGNATURES): Promise<void> {
     const connection = getConnection();
-    const slabPk = new PublicKey(slabAddress);
+    const nftProgramPk = new PublicKey(NFT_PROGRAM_ADDRESS);
+    const cacheKey = "nft-program";
 
-    const opts: { limit: number; until?: string } = { limit: maxSigs };
-    const lastSig = this.lastSignature.get(slabAddress);
-    if (lastSig) opts.until = lastSig;
+    const opts: { limit: number; before?: string } = { limit: maxSigs };
+    const lastSig = this.lastSignature.get(cacheKey);
+    // Walk backwards: use 'before' so we fetch older txs on each poll cycle.
+    // On backfill (first run) this fetches the most recent maxSigs txs.
+    if (lastSig) opts.before = lastSig;
 
     let sigInfos;
     try {
       sigInfos = await withRetry(
-        () => connection.getSignaturesForAddress(slabPk, opts),
-        {
-          maxRetries: 3,
-          baseDelayMs: 1000,
-          label: `getSignaturesForAddress(${slabAddress.slice(0, 8)})`,
-        }
+        () => connection.getSignaturesForAddress(nftProgramPk, opts),
+        { maxRetries: 3, baseDelayMs: 1000, label: `getSignaturesForAddress(nft-program)` }
       );
     } catch (err) {
-      logger.warn("Failed to get signatures after retries", {
-        slabAddress: slabAddress.slice(0, 8),
+      logger.warn("Failed to get NFT program signatures after retries", {
         error: err instanceof Error ? err.message : err,
       });
       return;
     }
 
     if (sigInfos.length === 0) return;
-    this.lastSignature.set(slabAddress, sigInfos[0].signature);
+    // Advance cursor to oldest sig in this batch (walk backwards historically)
+    this.lastSignature.set(cacheKey, sigInfos[sigInfos.length - 1].signature);
 
     const validSigInfos = sigInfos.filter(s => !s.err);
     if (validSigInfos.length === 0) return;
@@ -261,11 +239,7 @@ export class NftIndexerPolling {
       const signatures = batch.map(({ signature }) => signature);
       const txs = await withRetry(
         () => connection.getParsedTransactions(signatures, { maxSupportedTransactionVersion: 0 }),
-        {
-          maxRetries: TX_FETCH_RETRIES,
-          baseDelayMs: 1000,
-          label: `getParsedTransactions(${signatures.length})`,
-        },
+        { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label: `getParsedTransactions(${signatures.length})` },
       );
 
       for (let j = 0; j < txs.length; j++) {
@@ -277,13 +251,12 @@ export class NftIndexerPolling {
           const didIndex = await this.processTransaction(
             tx,
             sigInfo.signature,
-            slabAddress,
             sigInfo.slot,
             sigInfo.blockTime ?? 0,
           );
           if (didIndex) indexed++;
         } catch (err) {
-          logger.warn("Failed to process transaction", {
+          logger.warn("Failed to process NFT transaction", {
             signature: sigInfo.signature.slice(0, 12),
             error: err instanceof Error ? err.message : err,
           });
@@ -292,14 +265,13 @@ export class NftIndexerPolling {
     }
 
     if (indexed > 0) {
-      logger.info("NFT events indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
+      logger.info("NFT events indexed", { count: indexed });
     }
   }
 
   private async processTransaction(
     tx: ParsedTransactionWithMeta,
     signature: string,
-    slabAddress: string,
     slot: number,
     timestamp: number,
   ): Promise<boolean> {
@@ -311,8 +283,7 @@ export class NftIndexerPolling {
       // Skip parsed instructions (system, token, etc.)
       if ("parsed" in ix) continue;
 
-      // v17: NFT operations are on the standalone NFT program, not the wrapper.
-      // Only process instructions targeting the NFT program address.
+      // Only process instructions targeting the standalone NFT program
       const programId = ix.programId.toBase58();
       if (programId !== NFT_PROGRAM_ADDRESS) continue;
 
@@ -322,32 +293,38 @@ export class NftIndexerPolling {
       const tag = data[0];
       if (!NFT_TAGS.has(tag)) continue;
 
+      const isMint = tag === NFT_IX_TAG.MintPositionNft;
+
       // MintPositionNft (tag 0): tag(1) + asset_index(u16 LE=2) — min 3 bytes
-      // BurnPositionNft (tag 1): tag(1) only — no extra data required
+      // BurnPositionNft (tag 1): tag(1) only — no asset_index in payload
       let userIdx = 0;
-      if (tag === NFT_IX_TAG.MintPositionNft) {
+      if (isMint) {
         if (data.length < 3) continue;
-        userIdx = data[1] | (data[2] << 8); // asset_index as u16 LE
+        userIdx = data[1] | (data[2] << 8); // asset_index stored as user_idx for DB compat
       }
 
-      // Account layout (both Mint and Burn):
+      // Account layout for the devnet-deployed percolator-nft program:
       //   [0] owner/holder (signer)
-      //   [4] Portfolio account (writable, #134 slab derivation source)
+      //   [1] nftPda (PositionNft state PDA)
+      //   [2] nftMint
+      //   [3] owner ATA
+      //   [4] portfolio account (the position being wrapped — #134 source)
+      //   [5] mintAuthPda / wrapper program
+      //   ...
       //
-      // #134 fix: require portfolio account at [4] to sanity-check the tx
-      // involves the position we're tracking; prevents indexing unrelated NFT txs.
+      // The market-group/slab is NOT in the account list. We use the portfolio
+      // account (accounts[4]) as the slab field — it uniquely identifies the position.
       const owner = ix.accounts[0]?.toBase58();
       const portfolioAccount = ix.accounts[4]?.toBase58();
 
       if (!owner || !portfolioAccount) continue;
 
-      const eventType: "mint" | "burn" =
-        tag === NFT_IX_TAG.MintPositionNft ? "mint" : "burn";
+      const eventType: "mint" | "burn" = isMint ? "mint" : "burn";
 
       await this.upsertNftEvent({
         signature,
         event_type: eventType,
-        slab: slabAddress,
+        slab: portfolioAccount, // portfolio is the position identifier (#134)
         user_idx: userIdx,
         owner,
         slot,
