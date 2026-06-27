@@ -357,6 +357,93 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     vi.doUnmock("../../src/parsers/markPrice.js");
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
+
+  it("continues processing later fills when one slab fallback read throws", async () => {
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    const readMarkMock = vi.fn().mockRejectedValueOnce(new Error("rpc unavailable"));
+    const parseFillsMock = vi.fn().mockReturnValue([
+      {
+        signature: "sigFallbackThrow",
+        trader: "trader-fallback-fails",
+        programId: PERC,
+        sizeAbs: 1_000n,
+        side: "long" as const,
+        slabAddress: SLAB,
+        priceE6: undefined,
+      },
+      {
+        signature: "sigFallbackThrow",
+        trader: "trader-price-present",
+        programId: PERC,
+        sizeAbs: 2_000n,
+        side: "short" as const,
+        slabAddress: SLAB,
+        priceE6: 99_000_000,
+      },
+    ]);
+
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
+    });
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+
+    const { EventStreamService } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: PERC,
+      connection: mockConn(),
+      autoIndex: true,
+      knownSlabs: [SLAB],
+    });
+    await svc.start();
+
+    const fakeTx = {
+      transaction: {
+        message: {
+          instructions: [],
+          accountKeys: [{ pubkey: { toBase58: () => SLAB } }],
+        },
+      },
+      meta: { err: null, logMessages: [] },
+      signature: "sigFallbackThrow",
+    };
+
+    await listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: { result: fakeTx, subscription: 1 },
+    });
+
+    expect(readMarkMock).toHaveBeenCalledTimes(1);
+    expect(insertTradeMock).toHaveBeenCalledTimes(1);
+    expect(insertTradeMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        slab_address: SLAB,
+        trader: "trader-price-present",
+        side: "short",
+        size: "2000",
+        price: 99_000_000,
+        tx_signature: "sigFallbackThrow",
+      }),
+    );
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
+  });
+
 });
 
 describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
