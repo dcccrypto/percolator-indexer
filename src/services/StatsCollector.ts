@@ -30,7 +30,7 @@ import {
 } from "@percolatorct/sdk";
 
 /**
- * v17 market group header layout (all offsets relative to V17_MARKET_GROUP_OFF=448).
+ * v17 market group header layout (all offsets relative to V17_MARKET_GROUP_OFF).
  * VERIFIED via percolator-prog `cargo run --example dump_layout` (MarketGroupV16HeaderAccount):
  *   +0    market_group_id [u8;32]
  *   +32   config V16ConfigAccount        (249 bytes — INLINE, precedes vault)
@@ -39,19 +39,30 @@ import {
  *   +301  insurance u128
  *   +317  c_tot u128
  * (Earlier +32/48/64 was wrong — it read inside the 249-byte config block.)
+ *
+ * V17_MARKET_GROUP_OFF is imported from the SDK, NOT hardcoded here — it tracks
+ * WrapperConfigV16's length automatically (432B/offset 448 pre protocol-fee change;
+ * 496B/offset 512 as of the protocol-fee program change, VERSION 16 -> 17). The +N
+ * relative offsets below are unaffected by that growth (MarketGroupV16HeaderAccount
+ * sits entirely after the wrapper config block and its own internal layout didn't
+ * move); only the absolute addresses derived from V17_MARKET_GROUP_OFF do.
  */
-const V17_MG_VAULT_OFF = 285;      // abs: V17_MARKET_GROUP_OFF + 285 = 733
-const V17_MG_INSURANCE_OFF = 301;  // abs: V17_MARKET_GROUP_OFF + 301 = 749
-const V17_MG_C_TOT_OFF = 317;      // abs: V17_MARKET_GROUP_OFF + 317 = 765
+const V17_MG_VAULT_OFF = 285;      // abs: V17_MARKET_GROUP_OFF + 285 (797 post-change, was 733)
+const V17_MG_INSURANCE_OFF = 301;  // abs: V17_MARKET_GROUP_OFF + 301 (813 post-change, was 749)
+const V17_MG_C_TOT_OFF = 317;      // abs: V17_MARKET_GROUP_OFF + 317 (829 post-change, was 765)
 const V17_MG_MIN_BYTES = 333;      // must cover the c_tot read at +317 (317 + 16)
 
 /**
  * Market group header length between V17_MARKET_GROUP_OFF and the first
  * AssetOracleProfileV17. From the desync doc: asset-0 oracle profile at
- * abs offset 1206 = 448 + 758, so MARKET_GROUP_HDR_LEN = 758.
+ * V17_MARKET_GROUP_OFF + 758, so MARKET_GROUP_HDR_LEN = 758 (this 758 is the
+ * MarketGroupV16HeaderAccount struct's own fixed size — unaffected by the
+ * WrapperConfigV16 432->496B growth; only the V17_MARKET_GROUP_OFF base moves,
+ * from 448 pre-change to 512 post-change, so asset-0 profile lands at 1270
+ * post-change, was 1206).
  */
 const V17_MARKET_GROUP_HDR_LEN = 758;
-const V17_ASSET0_PROFILE_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_HDR_LEN; // 1206
+const V17_ASSET0_PROFILE_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_HDR_LEN;
 
 function readU128LESB(data: Uint8Array, offset: number): bigint {
   const dv = new DataView(data.buffer, data.byteOffset + offset, 16);

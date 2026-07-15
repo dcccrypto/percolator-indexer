@@ -42,18 +42,32 @@ import {
 const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
 
 /**
- * V17 market group header layout at V17_MARKET_GROUP_OFF (448).
+ * V17 market group header layout at V17_MARKET_GROUP_OFF.
  * MarketGroupV16HeaderAccount on-chain serialization (dense / zero-copy).
  * Full struct in v16_program.rs:MarketGroupV16HeaderAccount.
  *
- * Offsets (relative to V17_MARKET_GROUP_OFF = 448), VERIFIED against the program's own
+ * V17_MARKET_GROUP_OFF is imported from the SDK (`V17_HEADER_LEN +
+ * V17_WRAPPER_CONFIG_LEN`), NOT hardcoded here — so it tracks the SDK's
+ * WrapperConfigV16 length automatically (432B/offset 448 pre protocol-fee
+ * change; 496B/offset 512 as of the protocol-fee program change, VERSION
+ * 16 -> 17). Every offset below is relative to that constant, so nothing in
+ * this file needs to change when the wrapper config grows — only the SDK's
+ * V17_WRAPPER_CONFIG_LEN does. The absolute numbers in the comments below
+ * are illustrative for the CURRENT SDK-pinned length; do not treat them as
+ * a second source of truth.
+ *
+ * Offsets (relative to V17_MARKET_GROUP_OFF), VERIFIED against the program's own
  * `cargo run --example dump_layout` for MarketGroupV16HeaderAccount (size=758, align=1):
  *   +0    market_group_id [u8;32]       → 32 bytes
  *   +32   config V16ConfigAccount       → 249 bytes (INLINE — engine config sits before vault)
  *   +281  asset_slot_capacity u32       → 4 bytes
- *   +285  vault u128                    → 16 bytes  (abs offset 733)
- *   +301  insurance u128                → 16 bytes  (abs offset 749)
- *   +317  c_tot u128                    → 16 bytes  (abs offset 765)
+ *   +285  vault u128                    → 16 bytes  (abs offset = V17_MARKET_GROUP_OFF + 285;
+ *                                                     512+285=797 post protocol-fee change,
+ *                                                     was 448+285=733 pre-change)
+ *   +301  insurance u128                → 16 bytes  (abs offset = V17_MARKET_GROUP_OFF + 301;
+ *                                                     512+301=813 post-change, was 749 pre-change)
+ *   +317  c_tot u128                    → 16 bytes  (abs offset = V17_MARKET_GROUP_OFF + 317;
+ *                                                     512+317=829 post-change, was 765 pre-change)
  *
  * NOTE: an earlier version used +32/+48/+64 on the false assumption that vault followed
  * market_group_id directly. That is wrong — the 249-byte V16ConfigAccount + 4-byte
@@ -209,9 +223,15 @@ function makeV17MarketConfig(data: Uint8Array): MarketConfig {
 
   // Asset-0 oracle profile: at V17_MARKET_GROUP_OFF + market_group_header_len.
   // The market group header has a fixed-size prefix before the per-asset oracle profiles.
-  // Based on the desync doc: asset-0 oracle_authority at absolute offset 1326 =
-  // 448 (V17_MARKET_GROUP_OFF) + 758 (market_group_header) + 120 (oracleAuthority within profile).
-  // V17_MARKET_GROUP_OFF=448, MARKET_GROUP_HDR=758, asset-0 profile starts at 448+758=1206.
+  // V17_MARKET_GROUP_OFF is SDK-imported (tracks WrapperConfigV16 length; see the
+  // block comment above), so asset0ProfileOff below is automatically correct across
+  // the 432->496B protocol-fee wrapper-config growth — only MARKET_GROUP_HDR_LEN (the
+  // MarketGroupV16HeaderAccount struct's own fixed size, unaffected by that growth)
+  // and the oracleAuthority-within-profile offset (120, also unaffected) are literals.
+  // Based on the desync doc: asset-0 oracle_authority absolute offset =
+  // V17_MARKET_GROUP_OFF + 758 (market_group_header) + 120 (oracleAuthority within profile)
+  // = 512+758+120=1390 post protocol-fee change (was 448+758+120=1326 pre-change);
+  // asset-0 profile itself starts at V17_MARKET_GROUP_OFF+758 = 1270 post-change (was 1206).
   const MARKET_GROUP_HDR_LEN = 758;
   const asset0ProfileOff = V17_MARKET_GROUP_OFF + MARKET_GROUP_HDR_LEN;
 
@@ -311,8 +331,14 @@ function makeV17RiskParamsStub(): RiskParams {
  * The program discriminates account kinds at byte[10] (check_header @v16_program.rs:986):
  *   KIND_MARKET=1, KIND_PORTFOLIO=2, KIND_BACKING_DOMAIN_LEDGER=3, KIND_INSURANCE_LEDGER=4.
  * Without this guard, 9347-byte PORTFOLIO accounts and other non-market v17 accounts
- * (any >=448-byte account with the v17 magic) would pass isV17Account and be parsed as
- * markets, producing bogus rows via StatsCollector.insertMarket.
+ * (any account of at least V17_MARKET_GROUP_OFF+ bytes with the v17 magic+version)
+ * would pass isV17Account and be parsed as markets, producing bogus rows via
+ * StatsCollector.insertMarket. Also note: isV17Account itself gates on the
+ * account's VERSION field matching the SDK's V17_EXPECTED_VERSION, so a wrapper
+ * VERSION bump this indexer hasn't picked up an updated SDK for fails closed here
+ * (isV17Account returns false, parseV17Account returns null) rather than
+ * misdecoding stale-offset fields — the version gate lives in the SDK, not
+ * duplicated locally in this file.
  */
 function parseV17Account(
   pubkey: PublicKey,
