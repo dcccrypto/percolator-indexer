@@ -4,6 +4,13 @@ ARG CACHE_BUST=20260403a
 RUN apk add --no-cache python3 make g++ && rm -rf /var/cache/apk/*
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
+# #175: package.json/pnpm-lock.yaml resolve @percolatorct/sdk as
+# `file:../percolator-sdk`. With WORKDIR=/app that is `/percolator-sdk`, which
+# is not in a bare build context — install died with
+# `ENOENT ... scandir '/percolator-sdk'` (exit 254). The CI docker job now
+# checks the SDK into the context (see .github/workflows/ci.yml) and we place
+# it at the path the lockfile expects. Must precede the install.
+COPY percolator-sdk /percolator-sdk
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN echo "CACHE_BUST=$CACHE_BUST" && pnpm install --frozen-lockfile && pnpm ls @percolator/sdk
 COPY tsconfig.json ./

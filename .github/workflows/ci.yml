@@ -51,5 +51,15 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # #175: the image needs @percolatorct/sdk inside the build context, since
+      # the lockfile resolves it as a filesystem path. Checked out INTO the
+      # context (unlike build-and-test, which needs it as a sibling).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-sdk
+          ref: main
+          path: percolator-sdk
+      - name: Verify SDK dist is present in the build context
+        run: test -f percolator-sdk/dist/index.js || { echo "SDK dist/ missing from build context"; exit 1; }
       - name: Build Docker image
         run: docker build -t percolator-indexer .

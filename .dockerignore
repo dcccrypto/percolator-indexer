@@ -4,3 +4,9 @@ dist
 .env
 *.md
 tests
+
+# #175: the SDK ships a COMMITTED dist/ (its `main` -> ./dist/index.js). A bare
+# `dist` pattern is anchored to the context root in Docker's matcher, so it should
+# not match percolator-sdk/dist — but negating explicitly makes this correct under
+# either interpretation rather than relying on that detail.
+!percolator-sdk/dist
