@@ -58,13 +58,16 @@ jobs:
       # input > pinned default.
       - name: Resolve SDK version
         id: sdk_ver
+        env:
+          PAYLOAD_VER: ${{ github.event.client_payload.version }}
+          INPUT_VER: ${{ inputs.sdk_version }}
         run: |
-          VERSION="${{ github.event.client_payload.version }}"
+          VERSION="$PAYLOAD_VER"
           if [ -z "$VERSION" ]; then
-            VERSION="${{ inputs.sdk_version }}"
+            VERSION="$INPUT_VER"
           fi
           if [ -z "$VERSION" ]; then
-            VERSION="${{ env.SDK_VERSION }}"
+            VERSION="${SDK_VERSION}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Testing @percolatorct/sdk@$VERSION"
@@ -72,22 +75,27 @@ jobs:
       # Install dependencies from the *existing* lockfile first so all other
       # packages (hono, vitest, @solana/web3.js, @supabase/supabase-js …) are
       # present, then override only the SDK dep to the target npm version.
-      # --no-frozen-lockfile is intentional: we are mutating one dep, not
-      # reproducing a build.
       - name: Install dependencies (frozen lockfile for non-SDK packages)
         run: pnpm install --frozen-lockfile
 
+      # `pnpm add` rewrites the lockfile by design and does NOT accept
+      # --no-frozen-lockfile (that flag belongs to `pnpm install`). Passing it
+      # made pnpm 10 abort with `Unknown option: 'frozen-lockfile'`, failing
+      # this job on every nightly run.
       - name: Override SDK dep with published npm version
+        env:
+          TARGET_VER: ${{ steps.sdk_ver.outputs.version }}
         run: |
-          pnpm add "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }}" \
-            --no-frozen-lockfile
+          pnpm add "@percolatorct/sdk@${TARGET_VER}"
 
       - name: Verify installed SDK version
+        env:
+          TARGET_VER: ${{ steps.sdk_ver.outputs.version }}
         run: |
           INSTALLED=$(node -e "console.log(require('./node_modules/@percolatorct/sdk/package.json').version)")
           echo "Installed: $INSTALLED"
-          if [ "$INSTALLED" != "${{ steps.sdk_ver.outputs.version }}" ]; then
-            echo "Version mismatch: expected ${{ steps.sdk_ver.outputs.version }}, got $INSTALLED"
+          if [ "$INSTALLED" != "$TARGET_VER" ]; then
+            echo "Version mismatch: expected $TARGET_VER, got $INSTALLED"
             exit 1
           fi
 
@@ -96,10 +104,13 @@ jobs:
 
       - name: Report result
         if: always()
+        env:
+          TARGET_VER: ${{ steps.sdk_ver.outputs.version }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }} smoke PASSED"
+          if [ "$JOB_STATUS" = "success" ]; then
+            echo "@percolatorct/sdk@${TARGET_VER} smoke PASSED"
           else
-            echo "@percolatorct/sdk@${{ steps.sdk_ver.outputs.version }} smoke FAILED"
+            echo "@percolatorct/sdk@${TARGET_VER} smoke FAILED"
             exit 1
           fi
