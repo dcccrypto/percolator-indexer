@@ -22,6 +22,23 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # #172: package.json/pnpm-lock.yaml resolve @percolatorct/sdk as
+      # `file:../percolator-sdk`, so a bare checkout has no SDK to install and
+      # `pnpm install --frozen-lockfile` dies with
+      # `ENOENT ... scandir '<runner>/work/percolator-indexer/percolator-sdk'`.
+      # Provide the sibling. actions/checkout cannot write outside
+      # GITHUB_WORKSPACE, so check out into the workspace and then move it up.
+      # percolator-sdk is public, so the default token suffices.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-sdk
+          ref: main
+          path: _percolator-sdk
+      - name: Place @percolatorct/sdk as a sibling checkout (#172)
+        run: |
+          rm -rf ../percolator-sdk
+          mv _percolator-sdk ../percolator-sdk
+          test -f ../percolator-sdk/dist/index.js || { echo "SDK dist/ missing — the SDK repo ships a committed dist; aborting"; exit 1; }
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
       - run: pnpm build
