@@ -395,6 +395,7 @@ function isDuplicateError(err: unknown): boolean {
 async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
+  let extractionFailures = 0;
 
   for (const tx of transactions) {
     try {
@@ -441,7 +442,15 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
       }
     } catch (err) {
-      logger.warn("Failed to process transaction", { error: err instanceof Error ? err.message : err });
+      extractionFailures++;
+      logger.error("Trade extraction failed", {
+        signature: tx.signature?.slice(0, 12),
+        error: err instanceof Error ? err.message : err,
+      });
+      captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { context: "webhook-extraction-failure" },
+        extra: { signature: tx.signature?.slice(0, 16) },
+      });
     }
   }
 
@@ -449,9 +458,17 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
     logger.info("Trades indexed", { count: indexed });
   }
 
-  // Surface persistent DB failures to the caller so Helius can retry
-  if (insertFailures > 0) {
-    throw new Error(`${insertFailures} trade insert(s) failed after retries`);
+  // Surface extraction and persistent DB failures so Helius retries the batch.
+  // Successful inserts are idempotent, so replaying a partially processed batch is safe.
+  if (extractionFailures > 0 || insertFailures > 0) {
+    const failures: string[] = [];
+    if (extractionFailures > 0) {
+      failures.push(`${extractionFailures} trade extraction(s) failed`);
+    }
+    if (insertFailures > 0) {
+      failures.push(`${insertFailures} trade insert(s) failed after retries`);
+    }
+    throw new Error(failures.join("; "));
   }
 }
 
