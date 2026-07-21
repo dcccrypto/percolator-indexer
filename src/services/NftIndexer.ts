@@ -23,7 +23,7 @@
 // CREATE INDEX idx_position_nft_events_owner     ON position_nft_events(owner);
 // CREATE INDEX idx_position_nft_events_slot      ON position_nft_events(slot);
 
-import { PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
+import { PublicKey, type AccountInfo, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import {
   config,
@@ -38,6 +38,27 @@ import {
 } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:nft-indexer");
+
+/**
+ * #165: the portfolio fetch could not be resolved for a TRANSIENT reason (RPC
+ * error persisting through retries), as opposed to a deterministic one (account
+ * absent, data too short, slab mismatch).
+ *
+ * The distinction drives cursor handling. A deterministic skip is final — the
+ * next poll would reach the same conclusion, so holding the cursor would spin
+ * forever. A transient skip is not: advancing past it drops the NFT
+ * ownership-transfer event permanently, because the signature falls below the
+ * cursor and is never re-fetched.
+ */
+export class PortfolioFetchUnavailableError extends Error {
+  constructor(readonly portfolio: string, cause: unknown) {
+    super(
+      `portfolio ${portfolio} could not be fetched after retries: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+    );
+    this.name = "PortfolioFetchUnavailableError";
+  }
+}
 
 function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
@@ -279,6 +300,7 @@ export class NftIndexerPolling {
     }
 
     let indexed = 0;
+    let cursorHeld = false;
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -310,16 +332,32 @@ export class NftIndexerPolling {
           );
           if (didIndex) indexed++;
         } catch (err) {
+          if (err instanceof PortfolioFetchUnavailableError) {
+            // #165: transient — stop and leave the cursor where it is so this
+            // transaction is re-fetched next poll. Mirrors the #147 fix in
+            // TradeIndexer. Advancing here drops the event permanently.
+            logger.warn("Portfolio fetch unavailable — cursor not advanced, will retry next poll", {
+              signature: sigInfo.signature.slice(0, 12),
+              slabAddress: slabAddress.slice(0, 8),
+              error: err.message,
+            });
+            cursorHeld = true;
+            break;
+          }
           logger.warn("Failed to process transaction", {
             signature: sigInfo.signature.slice(0, 12),
             error: err instanceof Error ? err.message : err,
           });
         }
       }
+      if (cursorHeld) break;
     }
 
-    // Update last signature (most recent first) after successful processing (M-2)
-    this.lastSignature.set(slabAddress, sigInfos[0].signature);
+    // Update last signature (most recent first) after successful processing (M-2).
+    // #165: skipped when a transient portfolio fetch failure held the cursor.
+    if (!cursorHeld) {
+      this.lastSignature.set(slabAddress, sigInfos[0].signature);
+    }
 
     if (indexed > 0) {
       logger.info("NFT events indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
@@ -382,30 +420,43 @@ export class NftIndexerPolling {
       // The original code left `actualSlab = slabAddress` on error, so the
       // event would be written attributed to the poll-loop slab even though we
       // could not verify it. An unverified attribution is wrong attribution.
+      // #165: this was a bare getAccountInfo — the only RPC call in the indexer
+      // without a retry wrapper. A single transient blip skipped the event while
+      // the cursor advanced past it anyway, dropping it permanently.
       let actualSlab: string | null = null;
+      let portfolioInfo: AccountInfo<Buffer> | null;
       try {
         const connection = getConnection();
-        const portfolioInfo = await connection.getAccountInfo(new PublicKey(portfolio));
-        if (portfolioInfo?.data) {
-          const portfolioData = new Uint8Array(portfolioInfo.data);
-          if (portfolioData.length >= 48) {
-            actualSlab = new PublicKey(portfolioData.subarray(16, 48)).toBase58();
-          } else {
-            logger.warn("Portfolio account data too short to read slab — skipping NFT event", {
-              portfolio,
-              dataLen: portfolioData.length,
-            });
-          }
-        } else {
-          // Account returned null — slab cannot be verified; skip.
-          logger.warn("Portfolio account not found on-chain — skipping NFT event", { portfolio });
-        }
+        portfolioInfo = await withRetry(
+          () => connection.getAccountInfo(new PublicKey(portfolio)),
+          {
+            maxRetries: 3,
+            baseDelayMs: 1000,
+            label: `getAccountInfo(portfolio ${portfolio.slice(0, 8)})`,
+          },
+        );
       } catch (err) {
-        // RPC error — slab cannot be verified; skip rather than mis-attribute.
-        logger.warn("Failed to fetch portfolio account — skipping NFT event to avoid wrong attribution", {
-          portfolio,
-          error: err instanceof Error ? err.message : err,
-        });
+        // Still failing after retries: TRANSIENT. Propagate so the caller holds
+        // the cursor and this transaction is re-fetched next poll, rather than
+        // silently dropping the event.
+        throw new PortfolioFetchUnavailableError(portfolio, err);
+      }
+
+      if (portfolioInfo?.data) {
+        const portfolioData = new Uint8Array(portfolioInfo.data);
+        if (portfolioData.length >= 48) {
+          actualSlab = new PublicKey(portfolioData.subarray(16, 48)).toBase58();
+        } else {
+          // Deterministic: re-fetching cannot lengthen the account. Skip and let
+          // the cursor advance.
+          logger.warn("Portfolio account data too short to read slab — skipping NFT event", {
+            portfolio,
+            dataLen: portfolioData.length,
+          });
+        }
+      } else {
+        // Deterministic: account absent. Slab cannot be verified; skip.
+        logger.warn("Portfolio account not found on-chain — skipping NFT event", { portfolio });
       }
 
       // Skip if we could not determine the actual slab OR if it doesn't match
