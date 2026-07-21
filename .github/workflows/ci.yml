@@ -48,7 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build-and-test
-    if: github.ref == 'refs/heads/main'
+    # #178 follow-up: this was gated to `refs/heads/main`, so the image was only
+    # ever built AFTER merge — a Dockerfile or dependency change that broke the
+    # build was invisible at review time and landed on main before anyone saw
+    # it. Same hazard percolator-keeper#384 describes for its own docker job.
+    # Running it on PRs is the only thing that makes a Dockerfile change
+    # reviewable; the job is already self-contained (it checks the SDK into the
+    # build context below).
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # #175: the image needs @percolatorct/sdk inside the build context, since
