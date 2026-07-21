@@ -1,5 +1,6 @@
 // SQL Schema:
-// -- position_nft_events: id, signature UNIQUE, event_type, slab, user_idx, owner, nft_mint, slot, timestamp, network
+// -- position_nft_events: id, signature, instruction_index, event_type, slab, user_idx, owner, nft_mint, slot, timestamp, network
+// -- UNIQUE(signature, instruction_index) prevents collapsing multiple NFT events in one transaction.
 //
 // v17 MIGRATION NOTE: Add 'transfer' to the CHECK constraint before deploying v17:
 //   ALTER TABLE position_nft_events DROP CONSTRAINT position_nft_events_event_type_check;
@@ -7,9 +8,10 @@
 //     CHECK (event_type IN ('mint', 'burn', 'transfer'));
 //
 // CREATE TABLE position_nft_events (
-//   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-//   signature  TEXT NOT NULL UNIQUE,
-//   event_type TEXT NOT NULL CHECK (event_type IN ('mint', 'burn', 'transfer')),
+//   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+//   signature         TEXT NOT NULL,
+//   instruction_index INT  NOT NULL DEFAULT 0,
+//   event_type        TEXT NOT NULL CHECK (event_type IN ('mint', 'burn', 'transfer')),
 //   slab       TEXT NOT NULL,
 //   user_idx   INT  NOT NULL,
 //   owner      TEXT NOT NULL,
@@ -17,7 +19,8 @@
 //   slot       BIGINT NOT NULL,
 //   timestamp  BIGINT NOT NULL,
 //   network    TEXT NOT NULL,
-//   created_at TIMESTAMPTZ DEFAULT NOW()
+//   created_at TIMESTAMPTZ DEFAULT NOW(),
+//   UNIQUE(signature, instruction_index)
 // );
 // CREATE INDEX idx_position_nft_events_slab      ON position_nft_events(slab);
 // CREATE INDEX idx_position_nft_events_owner     ON position_nft_events(owner);
@@ -279,6 +282,7 @@ export class NftIndexerPolling {
     }
 
     let indexed = 0;
+    let processingFailed = false;
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -310,12 +314,20 @@ export class NftIndexerPolling {
           );
           if (didIndex) indexed++;
         } catch (err) {
-          logger.warn("Failed to process transaction", {
+          processingFailed = true;
+          logger.warn("Failed to process transaction — cursor not advanced", {
             signature: sigInfo.signature.slice(0, 12),
             error: err instanceof Error ? err.message : err,
           });
         }
       }
+    }
+
+    if (processingFailed) {
+      logger.warn("NFT processing failed — cursor not advanced; will retry next poll", {
+        slabAddress: slabAddress.slice(0, 8),
+      });
+      return;
     }
 
     // Update last signature (most recent first) after successful processing (M-2)
@@ -337,51 +349,41 @@ export class NftIndexerPolling {
     if (!tx.meta || tx.meta.err) return false;
 
     const message = tx.transaction.message;
+    const events: Array<{
+      signature: string;
+      instruction_index: number;
+      event_type: "transfer";
+      slab: string;
+      user_idx: number;
+      owner: string;
+      slot: number;
+      timestamp: number;
+    }> = [];
 
-    for (const ix of message.instructions) {
-      // Skip parsed instructions (system, token, etc.)
+    for (let instructionIndex = 0; instructionIndex < message.instructions.length; instructionIndex++) {
+      const ix = message.instructions[instructionIndex];
+
       if ("parsed" in ix) continue;
 
-      // Check if this instruction is for one of our programs
       const programId = ix.programId.toBase58();
       if (!programIds.has(programId)) continue;
 
-      // Decode instruction tag from data
       const data = decodeBase58(ix.data);
       if (!data || data.length < 1) continue;
 
       const tag = data[0];
       if (!NFT_TAGS.has(tag)) continue;
 
-      // v17 wire decode — desync fix 7:
-      //   tag(1) + new_owner([u8;32]) + asset_index(u16 LE) = 35 bytes minimum
       if (data.length < 35) continue;
 
-      // new_owner is the recipient pubkey at data[1:33]
       const newOwnerBytes = data.slice(1, 33);
       const newOwnerPk = new PublicKey(newOwnerBytes).toBase58();
 
-      // asset_index (u16 LE) at data[33:35]
       const assetIndex = data[33] | (data[34] << 8);
 
-      // v17 account layout (desync fix 7):
-      //   [0] mint_auth (PDA signer — NOT the user wallet)
-      //   [1] portfolio (writable)
-      //   [2] nft_registry (PDA)
-      // The portfolio's new owner comes from the wire data new_owner field, not accounts[].
-      // The nft_registry at accounts[2] is NOT the market slab — we match on portfolio at [1].
       const portfolio = ix.accounts[1]?.toBase58();
-
       if (!newOwnerPk || !portfolio) continue;
 
-      // To prevent multi-slab attribution errors (L-3 / #134), fetch the portfolio
-      // account to derive the correct slab address from its on-chain state.
-      // v17 portfolio accounts store the market group (slab) address at offset 16.
-      //
-      // SEC (#134): on null response or RPC error we MUST skip this record.
-      // The original code left `actualSlab = slabAddress` on error, so the
-      // event would be written attributed to the poll-loop slab even though we
-      // could not verify it. An unverified attribution is wrong attribution.
       let actualSlab: string | null = null;
       try {
         const connection = getConnection();
@@ -397,83 +399,84 @@ export class NftIndexerPolling {
             });
           }
         } else {
-          // Account returned null — slab cannot be verified; skip.
           logger.warn("Portfolio account not found on-chain — skipping NFT event", { portfolio });
         }
       } catch (err) {
-        // RPC error — slab cannot be verified; skip rather than mis-attribute.
         logger.warn("Failed to fetch portfolio account — skipping NFT event to avoid wrong attribution", {
           portfolio,
           error: err instanceof Error ? err.message : err,
         });
       }
 
-      // Skip if we could not determine the actual slab OR if it doesn't match
-      // the slab we are currently polling (wrong-market guard).
       if (actualSlab === null || actualSlab !== slabAddress) continue;
 
-      // v17: all NFT events are portfolio ownership transfers
-      const eventType = "transfer" as const;
-
-      await this.upsertNftEvent({
+      events.push({
         signature,
-        event_type: eventType,
+        instruction_index: instructionIndex,
+        event_type: "transfer",
         slab: slabAddress,
-        user_idx: assetIndex,   // v17: asset_index used in user_idx column (schema compatible)
-        owner: newOwnerPk,      // v17: new_owner from wire data
+        user_idx: assetIndex,
+        owner: newOwnerPk,
         slot,
         timestamp,
       });
-
-      return true;
     }
 
-    return false;
+    if (events.length === 0) return false;
+
+    await this.upsertNftEvents(events);
+    return true;
   }
 
-  private async upsertNftEvent(event: {
+  private async upsertNftEvents(events: Array<{
     signature: string;
-    event_type: "mint" | "burn" | "transfer"; // v17 adds "transfer" for TransferPortfolioOwnership
+    instruction_index: number;
+    event_type: "mint" | "burn" | "transfer";
     slab: string;
     user_idx: number;
     owner: string;
     slot: number;
     timestamp: number;
-  }): Promise<void> {
+  }>): Promise<void> {
+    if (events.length === 0) return;
+
+    const rows = events.map((event) => ({
+      signature: event.signature,
+      instruction_index: event.instruction_index,
+      event_type: event.event_type,
+      slab: event.slab,
+      user_idx: event.user_idx,
+      owner: event.owner,
+      slot: event.slot,
+      timestamp: event.timestamp,
+      network: getNetwork(),
+    }));
+
     const { error } = await getSupabase()
       .from("position_nft_events")
-      .upsert(
-        {
-          signature: event.signature,
-          event_type: event.event_type,
-          slab: event.slab,
-          user_idx: event.user_idx,
-          owner: event.owner,
-          slot: event.slot,
-          timestamp: event.timestamp,
-          network: getNetwork(),
-        },
-        { onConflict: "signature" }
-      );
+      .upsert(rows, { onConflict: "signature,instruction_index" });
 
     if (error) {
-      // Duplicate inserts are expected when polling overlaps — not an error
       if (error.message.includes("23505") || error.message.toLowerCase().includes("duplicate")) {
-        logger.debug("Duplicate NFT event insert skipped", { signature: event.signature.slice(0, 12) });
+        logger.debug("Duplicate NFT event insert skipped", {
+          count: events.length,
+          signature: events[0]?.signature.slice(0, 12),
+        });
         return;
       }
-      throw new Error(`Failed to upsert NFT event: ${error.message}`);
+
+      throw new Error(`Failed to upsert NFT events: ${error.message}`);
     }
 
-    logger.debug("NFT event upserted", {
-      eventType: event.event_type,
-      owner: event.owner.slice(0, 8),
-      slab: event.slab.slice(0, 8),
-      signature: event.signature.slice(0, 12),
+    logger.debug("NFT events upserted", {
+      count: events.length,
+      signature: events[0]?.signature.slice(0, 12),
     });
   }
+
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
