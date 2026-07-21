@@ -162,6 +162,7 @@ export class InsuranceLPService {
         .from("insurance_snapshots")
         .select("redemption_rate_e6, created_at")
         .eq("slab", slab)
+        .eq("network", getNetwork())
         .gte("created_at", since)
         .order("created_at", { ascending: true })
         .limit(1);
