@@ -11,10 +11,13 @@ const logger = createLogger("indexer:webhook-manager");
  * To prevent the key from leaking into logs, Sentry breadcrumbs, or
  * error stack traces, use `redactedHeliusUrl()` for all logging.
  */
-function getHeliusWebhooksUrl(): string {
+function getHeliusWebhooksUrl(webhookId?: string): string {
   const isDevnet = config.rpcUrl.includes("devnet");
   const host = isDevnet ? "api-devnet.helius-rpc.com" : "api-mainnet.helius-rpc.com";
-  return `https://${host}/v0/webhooks?api-key=${config.heliusApiKey}`;
+  const path = webhookId
+    ? `/v0/webhooks/${encodeURIComponent(webhookId)}`
+    : "/v0/webhooks";
+  return `https://${host}${path}?api-key=${encodeURIComponent(config.heliusApiKey)}`;
 }
 
 /** Return the Helius URL with the API key redacted for safe logging. */
@@ -180,7 +183,7 @@ export class HeliusWebhookManager {
   }
 
   private async updateWebhook(webhookId: string): Promise<void> {
-    const res = await fetch(`${getHeliusWebhooksUrl()}/${webhookId}`, {
+    const res = await fetch(getHeliusWebhooksUrl(webhookId), {
       method: "PUT",
       headers: heliusHeaders(),
       body: JSON.stringify(this.webhookPayload),

@@ -359,6 +359,60 @@ describe('POST /webhook/trades — price extraction', () => {
     expect(res.status).toBe(500);
   });
 
+  it('#160: returns 500 when trade extraction throws so Helius retries', async () => {
+    vi.mocked(shared.decodeBase58).mockImplementationOnce(() => {
+      throw new Error('decode failure');
+    });
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: [],
+    };
+
+    const res = await app.fetch(makeRequest([tx]));
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({
+      error: 'Processing failed, please retry',
+    });
+    expect(shared.insertTrade).not.toHaveBeenCalled();
+  });
+  it('#160: continues processing a mixed batch but returns 500 when one extraction fails', async () => {
+    vi.mocked(shared.decodeBase58)
+      .mockImplementationOnce(() => {
+        throw new Error('decode failure');
+      });
+
+    const failingTx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: [],
+    };
+
+    const validTx = {
+      signature: SIG2,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [],
+      logs: [],
+    };
+
+    const res = await app.fetch(makeRequest([failingTx, validTx]));
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({
+      error: 'Processing failed, please retry',
+    });
+    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
+    expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect.objectContaining({ tx_signature: SIG2 }),
+    );
+  });
   it('v17: TradeCpiV2 (tag=35) is NOT indexed — removed from decoder', async () => {
     // v17 BREAKING: TradeCpiV2 was removed from the wrapper decoder.
     // Tag 35 no longer appears in v17 instruction streams. The old GH#1171

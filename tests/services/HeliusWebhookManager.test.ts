@@ -101,7 +101,9 @@ describe("HeliusWebhookManager", () => {
 
       const [putUrl, putOpts] = mockFetch.mock.calls[1];
       expect(putOpts.method).toBe("PUT");
-      expect(putUrl).toContain("/existing-456");
+      expect(putUrl).toBe(
+        "https://api-devnet.helius-rpc.com/v0/webhooks/existing-456?api-key=test-api-key",
+      );
       expect(manager.getStatus().webhookId).toBe("existing-456");
     });
 
