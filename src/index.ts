@@ -12,12 +12,15 @@ import { InsuranceLPService } from "./services/InsuranceLPService.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
+import { createHealthChecker } from "./lib/healthCache.js";
 
 // Initialize Sentry first
 initSentry("indexer");
 
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+/** #163: health probe cache window. Short so a real outage still surfaces fast. */
+const HEALTH_CACHE_TTL_MS = Number(process.env.HEALTH_CACHE_TTL_MS ?? 5000);
 // Restored: the HTTPS-enforcement guards in start() (WEBHOOK_URL / RPC_URL) reference this.
 // It was dropped during the H-1 fix while two usages remained — a runtime ReferenceError
 // on any non-HTTPS URL. The webhook auth fix itself now keys off NETWORK (see webhook.ts),
@@ -141,42 +144,41 @@ app.use("/webhook/trades", rateLimiter);
 // Health endpoint with connectivity checks
 // HTTP write path for trades: only POST /webhook/trades (mounted below), after signature verification
 // in routes/webhook.ts. Backup indexing uses TradeIndexerPolling (RPC), not this server.
-app.get("/health", async (c) => {
-  const checks: { db: boolean; rpc: boolean } = { db: false, rpc: false };
-  let status: "ok" | "degraded" | "down" = "ok";
-  
-  // Check RPC connectivity
-  try {
-    await withTimeout(getConnection().getSlot(), HEALTH_CHECK_TIMEOUT_MS, "RPC health check");
-    checks.rpc = true;
-  } catch (err) {
-    logger.warn("RPC health check failed", { error: err instanceof Error ? err.message : err });
-    checks.rpc = false;
-  }
+// #163: /health is unauthenticated and NOT covered by the rate limiter (which is
+// scoped to /webhook/trades), yet every request used to issue a live getSlot()
+// and a Supabase query. Sustained traffic burned the indexer's metered RPC
+// credits and DB quota — the same budget discovery/stats/trade polling use, so
+// flooding it could stall indexing. Probes are now cached for a short window
+// AND coalesced, so a burst collapses to one backend round-trip.
+const healthCheck = createHealthChecker({
+  probeRpc: async () => {
+    try {
+      await withTimeout(getConnection().getSlot(), HEALTH_CHECK_TIMEOUT_MS, "RPC health check");
+      return true;
+    } catch (err) {
+      logger.warn("RPC health check failed", { error: err instanceof Error ? err.message : err });
+      return false;
+    }
+  },
+  probeDb: async () => {
+    try {
+      await withTimeout(
+        Promise.resolve(getSupabase().from("markets").select("id", { count: "exact", head: true })),
+        HEALTH_CHECK_TIMEOUT_MS,
+        "DB health check",
+      );
+      return true;
+    } catch (err) {
+      logger.warn("DB health check failed", { error: err instanceof Error ? err.message : err });
+      return false;
+    }
+  },
+  ttlMs: HEALTH_CACHE_TTL_MS,
+});
 
-  // Check Supabase connectivity
-  try {
-    await withTimeout(
-      Promise.resolve(getSupabase().from("markets").select("id", { count: "exact", head: true })),
-      HEALTH_CHECK_TIMEOUT_MS,
-      "DB health check",
-    );
-    checks.db = true;
-  } catch (err) {
-    logger.warn("DB health check failed", { error: err instanceof Error ? err.message : err });
-    checks.db = false;
-  }
-  
-  // Determine overall status
-  const failedChecks = Object.values(checks).filter(v => !v).length;
-  if (failedChecks === 0) {
-    status = "ok";
-  } else if (failedChecks === Object.keys(checks).length) {
-    status = "down";
-  } else {
-    status = "degraded";
-  }
-  
+app.get("/health", async (c) => {
+  const { status } = await healthCheck();
+
   // Return 503 for both "down" and "degraded" so Docker healthcheck and
   // load balancers detect partial failures (e.g., DB down but RPC up).
   // Previously degraded returned 200, masking single-component outages.
