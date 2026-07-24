@@ -62,8 +62,14 @@ async function fetchEnhancedTxs(signatures: string[]): Promise<any[]> {
   } catch (err) {
     // A transport-level failure (DNS/TLS/connection reset) can embed the
     // request URL in the underlying error — rethrow with the key redacted
-    // before it reaches console.error/logs.
-    const message = err instanceof Error ? err.message : String(err);
+    // before it reaches console.error/logs. The raw error message can carry
+    // the key too (undici surfaces the request URL in some transport errors),
+    // so scrub it from the message text as well, not only the reconstructed
+    // URL — mirroring HeliusWebhookManager's message-level redaction.
+    const message = (err instanceof Error ? err.message : String(err)).replace(
+      /api-key=[^&\s]+/g,
+      "api-key=REDACTED",
+    );
     throw new Error(`Helius request to ${redactedHeliusUrl(url)} failed: ${message}`);
   }
   if (!res.ok) {
