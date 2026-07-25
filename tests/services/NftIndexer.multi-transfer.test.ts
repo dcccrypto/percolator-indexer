@@ -216,7 +216,7 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
 
     expect(storedInstructionIndexes).toEqual([0, 2]);
   });
-  it("captures transaction failures and keeps the cursor held for retry", async () => {
+  it("captures transaction failures and preserves the existing cursor for retry", async () => {
     mocks.getSignaturesForAddress.mockResolvedValue([
       {
         signature: SIG,
@@ -235,6 +235,9 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
     });
 
     const indexer = new NftIndexerPolling();
+    const previousSignature = "previous-signature";
+
+    (indexer as any).lastSignature.set(SLAB, previousSignature);
 
     await (indexer as any).indexNftEventsForSlab(SLAB, 1);
 
@@ -250,7 +253,9 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
       },
     );
 
-    expect((indexer as any).lastSignature.has(SLAB)).toBe(false);
+    expect(
+      (indexer as any).lastSignature.get(SLAB),
+    ).toBe(previousSignature);
   });
 
 });

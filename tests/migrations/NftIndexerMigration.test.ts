@@ -9,20 +9,38 @@ const migration = readFileSync(
   "utf8",
 );
 
+const validationMigration = readFileSync(
+  new URL(
+    "../../migrations/20260725_position_nft_events_validate_event_type_check.sql",
+    import.meta.url,
+  ),
+  "utf8",
+);
+
 describe("position_nft_events instruction-index migration", () => {
-  it("allows the v17 transfer event type", () => {
+  it("adds the v17 transfer event type without scanning existing rows", () => {
     expect(migration).toContain(
       "DROP CONSTRAINT IF EXISTS position_nft_events_event_type_check",
     );
 
     expect(migration).toContain(
-      "CHECK (event_type IN ('mint', 'burn', 'transfer'))",
+      "CHECK (event_type IN ('mint', 'burn', 'transfer')) NOT VALID",
     );
   });
 
-  it("removes signature-only uniqueness through the target table", () => {
+  it("validates the event-type constraint in a follow-up migration", () => {
+    expect(validationMigration).toMatch(
+      /ALTER TABLE position_nft_events\s+VALIDATE CONSTRAINT position_nft_events_event_type_check;/,
+    );
+  });
+
+  it("removes all legacy signature-only uniqueness", () => {
     expect(migration).toMatch(
       /ALTER TABLE position_nft_events\s+DROP CONSTRAINT IF EXISTS position_nft_events_signature_key;/,
+    );
+
+    expect(migration).toMatch(
+      /DROP INDEX IF EXISTS position_nft_events_signature_key;/,
     );
 
     expect(migration).not.toContain("FROM pg_constraint");
@@ -40,10 +58,16 @@ describe("position_nft_events instruction-index migration", () => {
 
   it("documents the coordinated deployment requirement", () => {
     expect(migration).toContain(
-      "Pause the NFT indexer before applying this migration",
+      "Pause the NFT indexer, apply this migration",
     );
 
-    expect(migration).not.toMatch(
+    expect(migration).toContain(
+      "20260725_position_nft_events_validate_event_type_check.sql",
+    );
+
+    const executableMigrations = `${migration}\n${validationMigration}`;
+
+    expect(executableMigrations).not.toMatch(
       /^\s*(?:CREATE\s+(?:UNIQUE\s+)?INDEX|DROP\s+INDEX)\s+CONCURRENTLY\b/im,
     );
   });

@@ -5,8 +5,9 @@
 -- the same transaction into one row.
 --
 -- Deployment requirement:
---   Pause the NFT indexer before applying this migration, deploy the updated
---   indexer only after the migration succeeds, then resume indexing.
+--   Pause the NFT indexer, apply this migration, then apply
+--   20260725_position_nft_events_validate_event_type_check.sql.
+--   Deploy the updated indexer only after both migrations succeed, then resume.
 --
 -- This migration intentionally avoids CREATE/DROP INDEX CONCURRENTLY so it
 -- remains compatible with migration runners that wrap migrations in a
@@ -21,9 +22,12 @@ ALTER TABLE position_nft_events
 ALTER TABLE position_nft_events
   DROP CONSTRAINT IF EXISTS position_nft_events_event_type_check;
 
+-- Add the replacement without scanning all existing rows under the initial
+-- ALTER TABLE lock. Existing rows are checked by the follow-up validation
+-- migration after this transaction completes.
 ALTER TABLE position_nft_events
   ADD CONSTRAINT position_nft_events_event_type_check
-  CHECK (event_type IN ('mint', 'burn', 'transfer'));
+  CHECK (event_type IN ('mint', 'burn', 'transfer')) NOT VALID;
 
 -- Remove the old signature-only uniqueness model. ALTER TABLE scopes the
 -- constraint lookup to position_nft_events and avoids matching a same-named
