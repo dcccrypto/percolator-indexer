@@ -319,6 +319,12 @@ export class NftIndexerPolling {
             signature: sigInfo.signature.slice(0, 12),
             error: err instanceof Error ? err.message : err,
           });
+          captureException(err, {
+            tags: {
+              context: "nft-indexer-process-tx",
+              slabAddress,
+            },
+          });
         }
       }
     }

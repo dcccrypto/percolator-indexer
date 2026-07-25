@@ -3,7 +3,10 @@ import { PublicKey } from "@solana/web3.js";
 
 const mocks = vi.hoisted(() => ({
   getAccountInfo: vi.fn(),
+  getSignaturesForAddress: vi.fn().mockResolvedValue([]),
+  getParsedTransactions: vi.fn().mockResolvedValue([]),
   upsert: vi.fn().mockResolvedValue({ error: null }),
+  captureException: vi.fn(),
 }));
 
 vi.mock("@percolatorct/sdk", () => ({
@@ -25,8 +28,8 @@ vi.mock("@percolatorct/shared", () => ({
     debug: vi.fn(),
   })),
   getConnection: vi.fn(() => ({
-    getSignaturesForAddress: vi.fn().mockResolvedValue([]),
-    getParsedTransactions: vi.fn().mockResolvedValue([]),
+    getSignaturesForAddress: mocks.getSignaturesForAddress,
+    getParsedTransactions: mocks.getParsedTransactions,
     getAccountInfo: mocks.getAccountInfo,
   })),
   getSupabase: vi.fn(() => ({
@@ -39,7 +42,7 @@ vi.mock("@percolatorct/shared", () => ({
   ]),
   getNetwork: vi.fn(() => "devnet"),
   withRetry: vi.fn(async (fn: any) => fn()),
-  captureException: vi.fn(),
+  captureException: mocks.captureException,
   decodeBase58: vi.fn((data: string) => {
     const buf = new Uint8Array(35);
     buf[0] = 72; // TransferPortfolioOwnership
@@ -113,6 +116,8 @@ function makeTxWithSeparatedTransferInstructions() {
 describe("NftIndexerPolling multi-transfer transaction handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getSignaturesForAddress.mockResolvedValue([]);
+    mocks.getParsedTransactions.mockResolvedValue([]);
     mocks.upsert.mockResolvedValue({ error: null });
 
     // Both portfolio accounts resolve to the same slab, so both events are valid
@@ -211,4 +216,41 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
 
     expect(storedInstructionIndexes).toEqual([0, 2]);
   });
+  it("captures transaction failures and keeps the cursor held for retry", async () => {
+    mocks.getSignaturesForAddress.mockResolvedValue([
+      {
+        signature: SIG,
+        err: null,
+        slot: 123,
+        blockTime: 1_700_000_000,
+      },
+    ]);
+
+    mocks.getParsedTransactions.mockResolvedValue([
+      makeTxWithSeparatedTransferInstructions(),
+    ]);
+
+    mocks.upsert.mockResolvedValue({
+      error: { message: "database unavailable" },
+    });
+
+    const indexer = new NftIndexerPolling();
+
+    await (indexer as any).indexNftEventsForSlab(SLAB, 1);
+
+    expect(mocks.upsert).toHaveBeenCalledTimes(1);
+    expect(mocks.captureException).toHaveBeenCalledTimes(1);
+    expect(mocks.captureException).toHaveBeenCalledWith(
+      expect.any(Error),
+      {
+        tags: {
+          context: "nft-indexer-process-tx",
+          slabAddress: SLAB,
+        },
+      },
+    );
+
+    expect((indexer as any).lastSignature.has(SLAB)).toBe(false);
+  });
+
 });
