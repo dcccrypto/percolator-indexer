@@ -63,6 +63,7 @@ import { NftIndexerPolling } from "../../src/services/NftIndexer.js";
 
 const SLAB = "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD";
 const PROGRAM_ID = "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD";
+const OTHER_PROGRAM_ID = "11111111111111111111111111111111";
 const TRADER = "So11111111111111111111111111111111111111112";
 const PORTFOLIO_A = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const PORTFOLIO_B = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -74,7 +75,7 @@ function makePortfolioData(slabAddress: string): Uint8Array {
   return data;
 }
 
-function makeTxWithTwoTransferInstructions() {
+function makeTxWithSeparatedTransferInstructions() {
   return {
     meta: { err: null },
     transaction: {
@@ -88,6 +89,11 @@ function makeTxWithTwoTransferInstructions() {
               { toBase58: () => PORTFOLIO_A },
               { toBase58: () => SLAB },
             ],
+          },
+          {
+            programId: { toBase58: () => OTHER_PROGRAM_ID },
+            data: "non-matching",
+            accounts: [],
           },
           {
             programId: { toBase58: () => PROGRAM_ID },
@@ -120,7 +126,7 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
     const indexer = new NftIndexerPolling();
 
     const didIndex = await (indexer as any).processTransaction(
-      makeTxWithTwoTransferInstructions(),
+      makeTxWithSeparatedTransferInstructions(),
       SIG,
       SLAB,
       new Set([PROGRAM_ID]),
@@ -142,10 +148,67 @@ describe("NftIndexerPolling multi-transfer transaction handling", () => {
     expect(indexedAssetIndexes).toEqual([0, 1]);
 
     const indexedInstructionIndexes = rows.map((row: any) => row.instruction_index);
-    expect(indexedInstructionIndexes).toEqual([0, 1]);
+    expect(indexedInstructionIndexes).toEqual([0, 2]);
 
     expect(mocks.upsert.mock.calls[0][1]).toEqual(expect.objectContaining({
       onConflict: "signature,instruction_index",
     }));
+  });
+
+  it("keeps re-indexing idempotent for the same transaction", async () => {
+    const storedRows = new Map<string, any>();
+
+    mocks.upsert.mockImplementation(
+      async (rows: any[], options: { onConflict: string }) => {
+        expect(options).toEqual(expect.objectContaining({
+          onConflict: "signature,instruction_index",
+        }));
+
+        for (const row of rows) {
+          storedRows.set(
+            `${row.signature}:${row.instruction_index}`,
+            row,
+          );
+        }
+
+        return { error: null };
+      },
+    );
+
+    const indexer = new NftIndexerPolling();
+    const tx = makeTxWithSeparatedTransferInstructions();
+
+    const firstPass = await (indexer as any).processTransaction(
+      tx,
+      SIG,
+      SLAB,
+      new Set([PROGRAM_ID]),
+      123,
+      1_700_000_000,
+    );
+
+    const secondPass = await (indexer as any).processTransaction(
+      tx,
+      SIG,
+      SLAB,
+      new Set([PROGRAM_ID]),
+      123,
+      1_700_000_000,
+    );
+
+    expect(firstPass).toBe(true);
+    expect(secondPass).toBe(true);
+    expect(mocks.upsert).toHaveBeenCalledTimes(2);
+
+    const firstRows = mocks.upsert.mock.calls[0][0];
+    const secondRows = mocks.upsert.mock.calls[1][0];
+
+    expect(secondRows).toEqual(firstRows);
+    expect(storedRows.size).toBe(2);
+
+    const storedInstructionIndexes = [...storedRows.values()]
+      .map((row: any) => row.instruction_index);
+
+    expect(storedInstructionIndexes).toEqual([0, 2]);
   });
 });
