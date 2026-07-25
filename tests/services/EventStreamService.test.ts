@@ -361,6 +361,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
   it("continues processing later fills when one slab fallback read throws", async () => {
     const insertTradeMock = vi.fn().mockResolvedValue(undefined);
     const readMarkMock = vi.fn().mockRejectedValueOnce(new Error("rpc unavailable"));
+    const warnMock = vi.fn();
     const parseFillsMock = vi.fn().mockReturnValue([
       {
         signature: "sigFallbackThrow",
@@ -385,7 +386,17 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     vi.resetModules();
     vi.doMock("@percolatorct/shared", async (orig) => {
       const mod = await (orig() as Promise<any>);
-      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
+      return {
+        ...mod,
+        createLogger: () => ({
+          info: vi.fn(),
+          warn: warnMock,
+          error: vi.fn(),
+          debug: vi.fn(),
+        }),
+        insertTrade: insertTradeMock,
+        insertOraclePrice: vi.fn(),
+      };
     });
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
@@ -427,6 +438,14 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     });
 
     expect(readMarkMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).toHaveBeenCalledWith(
+      "skipping fill — slab price fallback failed",
+      expect.objectContaining({
+        sig: "sigFallbackThrow",
+        slab: SLAB,
+        err: expect.stringContaining("rpc unavailable"),
+      }),
+    );
     expect(insertTradeMock).toHaveBeenCalledTimes(1);
     expect(insertTradeMock).toHaveBeenCalledWith(
       expect.objectContaining({
