@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
-import { insertTradeRow } from "../db/insertTradeRow.js";
+import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
 import { CURRENT_NETWORK } from "../network.js";
 
@@ -386,64 +386,65 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authDigest, secretDigest);
 }
 
-/** Supabase duplicate constraint — not retriable */
-function isDuplicateError(err: unknown): boolean {
-  if (!err) return false;
-  const msg = err instanceof Error ? err.message : String(err);
-  // Postgres unique constraint violation code 23505
-  return msg.includes("23505") || msg.toLowerCase().includes("duplicate");
-}
-
 async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
 
+  // Extract every fill in the delivery first, then write them in one round-trip.
+  // A delivery carries many transactions and each can carry several legs; inserting
+  // per-leg serialized that many round-trips inside Helius's ~15s window.
+  const pending: ReturnType<typeof extractTradesFromEnhancedTx> = [];
   for (const tx of transactions) {
     try {
-      const trades = extractTradesFromEnhancedTx(tx, discovery);
-      for (const trade of trades) {
-        try {
-          // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
-          // lose trades. Duplicate constraint (23505) is not retriable — skip immediately.
-          // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
-          await withRetry(() => insertTradeRow(trade), {
-            maxRetries: 2,
-            baseDelayMs: 100,
-            label: `insertTradeRow(${trade.tx_signature.slice(0, 12)})`,
-          });
-          eventBus.publish("trade.executed", trade.slab_address, {
-            signature: trade.tx_signature,
-            trader: trade.trader,
-            side: trade.side,
-            size: trade.size,
-            price: trade.price,
-            fee: trade.fee,
-          });
-          indexed++;
-        } catch (err) {
-          if (isDuplicateError(err)) {
-            // Duplicate insert — expected, not an error
-            logger.debug("Duplicate trade insert skipped", { signature: trade.tx_signature.slice(0, 12) });
-          } else {
-            // All retries exhausted — capture to Sentry so we know this happened
-            insertFailures++;
-            logger.error("Trade insert failed after retries", {
-              signature: trade.tx_signature.slice(0, 12),
-              slabAddress: trade.slab_address.slice(0, 8),
-              error: err instanceof Error ? err.message : err,
-            });
-            captureException(err instanceof Error ? err : new Error(String(err)), {
-              tags: { context: "webhook-insert-failure" },
-              extra: {
-                signature: trade.tx_signature.slice(0, 16),
-                slabAddress: trade.slab_address.slice(0, 16),
-              },
-            });
-          }
-        }
-      }
+      pending.push(...extractTradesFromEnhancedTx(tx, discovery));
     } catch (err) {
       logger.warn("Failed to process transaction", { error: err instanceof Error ? err.message : err });
+    }
+  }
+
+  if (pending.length > 0) {
+    try {
+      // insertTradeRows upserts with ignoreDuplicates, so already-indexed legs are
+      // skipped without failing the batch — no separate duplicate branch needed.
+      // GH#42: retry so transient DB failures don't silently lose trades.
+      // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
+      const inserted = await withRetry(() => insertTradeRows(pending), {
+        maxRetries: 2,
+        baseDelayMs: 100,
+        label: `insertTradeRows(${pending.length})`,
+      });
+      indexed = inserted.length;
+
+      // Publish only what was actually written, so a re-delivery of already-indexed
+      // trades doesn't re-emit events to subscribers.
+      const written = new Set(inserted.map(tradeKey));
+      for (const trade of pending) {
+        if (!written.has(tradeKey(trade))) continue;
+        eventBus.publish("trade.executed", trade.slab_address, {
+          signature: trade.tx_signature,
+          trader: trade.trader,
+          side: trade.side,
+          size: trade.size,
+          price: trade.price,
+          fee: trade.fee,
+        });
+      }
+    } catch (err) {
+      // All retries exhausted — capture to Sentry so we know this happened
+      insertFailures = pending.length;
+      logger.error("Trade batch insert failed after retries", {
+        count: pending.length,
+        slabAddress: pending[0]?.slab_address.slice(0, 8),
+        error: err instanceof Error ? err.message : err,
+      });
+      captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { context: "webhook-insert-failure" },
+        extra: {
+          count: pending.length,
+          firstSignature: pending[0]?.tx_signature?.slice(0, 16),
+          slabAddress: pending[0]?.slab_address.slice(0, 16),
+        },
+      });
     }
   }
 

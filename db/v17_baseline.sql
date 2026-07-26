@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS markets (
   lp_collateral     TEXT,
   matcher_context   TEXT,
   logo_url          TEXT,
+  -- Origin of symbol/name/logo_url. 'manual' rows are human-authored (set via
+  -- PATCH /api/markets/[slab]) and must NEVER be overwritten by the indexer:
+  -- v17 admin-oracle markets carry no on-chain pointer to a base asset, so the
+  -- indexer writes a neutral placeholder and a human supplies the real identity.
+  metadata_source   TEXT        NOT NULL DEFAULT 'auto' CHECK (metadata_source IN ('auto','manual')),
   mainnet_ca        TEXT,
   oracle_mode       TEXT        NOT NULL DEFAULT 'admin' CHECK (oracle_mode IN ('pyth','hyperp','admin')),
   dex_pool_address  TEXT,
@@ -71,6 +76,9 @@ CREATE INDEX IF NOT EXISTS idx_markets_mainnet_ca     ON markets(mainnet_ca) WHE
 CREATE INDEX IF NOT EXISTS idx_markets_network        ON markets(network);
 CREATE INDEX IF NOT EXISTS idx_markets_network_status ON markets(network, status);
 CREATE INDEX IF NOT EXISTS idx_markets_status         ON markets(status);
+-- Drives the metadata backfill: auto-resolved markets still missing a logo.
+CREATE INDEX IF NOT EXISTS idx_markets_metadata_refresh
+  ON markets (updated_at) WHERE metadata_source = 'auto' AND logo_url IS NULL;
 
 -- -----------------------------------------------------------------------------
 -- 2. market_stats — thin volume cache (24h volume/count derived from trades).
@@ -109,8 +117,13 @@ CREATE TABLE IF NOT EXISTS trades (
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 -- H2/H3: multi-fill batch legs share a tx_signature; dedupe per (sig, asset, leg).
+-- Deliberately NOT partial: a partial unique index cannot serve as an ON CONFLICT
+-- target (PostgREST's on_conflict takes column names only, and Postgres needs the
+-- predicate restated), which the batched webhook upsert relies on. asset_index and
+-- leg_index are NOT NULL and the index is NULLS DISTINCT, so NULL-signature rows
+-- never conflict — identical enforcement to `WHERE tx_signature IS NOT NULL`.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_sig_asset_leg
-  ON trades(tx_signature, asset_index, leg_index) WHERE tx_signature IS NOT NULL;
+  ON trades(tx_signature, asset_index, leg_index);
 CREATE INDEX IF NOT EXISTS idx_trades_slab           ON trades(slab_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_trader_created ON trades(trader, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_network        ON trades(network, slab_address, created_at DESC);

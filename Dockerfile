@@ -4,15 +4,15 @@ ARG CACHE_BUST=20260403a
 RUN apk add --no-cache python3 make g++ && rm -rf /var/cache/apk/*
 RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
-# #175: package.json/pnpm-lock.yaml resolve @percolatorct/sdk as
-# `file:../percolator-sdk`. With WORKDIR=/app that is `/percolator-sdk`, which
-# is not in a bare build context — install died with
-# `ENOENT ... scandir '/percolator-sdk'` (exit 254). The CI docker job now
-# checks the SDK into the context (see .github/workflows/ci.yml) and we place
-# it at the path the lockfile expects. Must precede the install.
-COPY percolator-sdk /percolator-sdk
+# #175 is resolved at the source: @percolatorct/sdk is a published npm package
+# now, not a `file:../percolator-sdk` link, so nothing has to be staged into the
+# build context first — the install resolves it from the registry.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN echo "CACHE_BUST=$CACHE_BUST" && pnpm install --frozen-lockfile && pnpm ls @percolator/sdk
+# The `pnpm ls` guard named `@percolator/sdk`, which is not a dependency of this
+# package (the scope is `@percolatorct`), so it matched nothing and exited 0 —
+# it never verified anything. Assert on the real name, and fail if it is absent.
+RUN echo "CACHE_BUST=$CACHE_BUST" && pnpm install --frozen-lockfile \
+    && pnpm ls @percolatorct/sdk | grep -q '@percolatorct/sdk'
 COPY tsconfig.json ./
 COPY src ./src
 RUN pnpm build
@@ -22,11 +22,10 @@ RUN pnpm build
 # without this the production image ships the entire test toolchain.
 #
 # Pruning here rather than doing a --prod install in the runner (the pattern
-# percolator-keeper uses): this repo resolves @percolatorct/sdk as
-# `file:../percolator-sdk` and pulls in native optional deps, so a second
-# install in the runner would need both the SDK in that stage's context and a
-# build toolchain (python3/make/g++) that the runner deliberately lacks.
-# Pruning reuses the tree that already built successfully.
+# percolator-keeper uses): the dependency tree pulls in native optional deps, so
+# a second install in the runner would need a build toolchain (python3/make/g++)
+# that the runner deliberately lacks. Pruning reuses the tree that already built
+# successfully.
 RUN pnpm prune --prod
 
 FROM node:22-alpine AS runner

@@ -2,7 +2,7 @@
  * StatsCollector — history-only: registers markets and rolls up trade volume.
  *
  * Runs after each crank cycle to read on-chain slab data and:
- * - Auto-register newly discovered markets (insertMarket)
+ * - Auto-register newly discovered markets (insertMarketRow)
  * - Auto-close stale/abandoned markets (dust vault + no accounts)
  * - Roll up volume_24h / trade_count_24h into the slim market_stats table
  *   (slab_address, volume_24h, volume_24h_usd, trade_count_24h, last_price,
@@ -228,11 +228,12 @@ function parseV17AccountStats(data: Uint8Array): {
 
   return { engine, marketConfig, params };
 }
+import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
+import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
+import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
   getConnection,
-  upsertMarketStats,
   getMarkets,
-  insertMarket,
   getSupabase,
   getNetwork,
   withRetry,
@@ -251,7 +252,17 @@ import {
  * because it issues a single bulk trade fetch + N upserts (cheap), but still
  * infrequent enough to avoid hammering the DB under high trade volume.
  */
+/** A row of the `markets` table, as returned by the shared getMarkets() helper. */
+type DbMarketRow = Awaited<ReturnType<typeof getMarkets>>[number];
+
 const VOLUME_SYNC_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * Markets whose identity is re-resolved per refresh cycle. Bounded so a large
+ * unresolved backlog cannot turn one cycle into a long DexScreener hammering;
+ * the remainder is picked up next cycle.
+ */
+const METADATA_REFRESH_LIMIT = 60;
 
 const logger = createLogger("indexer:stats-collector");
 
@@ -261,12 +272,13 @@ export interface MarketProvider {
 }
 
 /**
- * How often to collect stats. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
+ * How often the collect cycle runs. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
  *
- * Default: 60_000 (1 min). The old hardcoded 5 min left `oracle_prices` with long
- * gaps — frontend price charts need denser samples for smooth backfill. Keep the
- * env override so we can crank it down further if the RPC budget allows, or up
- * if we need to back off.
+ * Default: 60_000 (1 min). This cadence is now driven by market REGISTRATION, not
+ * stats: trades carry an FK to markets(slab_address), so a market that isn't
+ * registered yet can't have its fills indexed. Keeping this at 1 min bounds that
+ * window. The expensive part of the cycle (the per-slab RPC sweep) is separately
+ * gated by AUTOCLOSE_INTERVAL_MS below.
  */
 export const COLLECT_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_COLLECT_INTERVAL_MS;
@@ -280,6 +292,37 @@ export const COLLECT_INTERVAL_MS: number = (() => {
   }
 })();
 
+/**
+ * How often the per-slab on-chain sweep inside collect() runs (ms).
+ *
+ * Since the REDUCTION (2026-07-26) that sweep no longer writes any stats — the
+ * frontend reads price/OI/insurance live from chain. Its only remaining job is
+ * janitorial: auto-close abandoned slabs (dust vault + no accounts) and re-enable
+ * markets that came back. That does not need to run every minute, and running it
+ * every minute meant a getMultipleAccountsInfo round-trip per batch of markets
+ * plus an inter-batch sleep, every 60s, forever.
+ *
+ * Default: 10 min. Registration (syncMarkets) still runs every COLLECT_INTERVAL_MS.
+ */
+export const AUTOCLOSE_INTERVAL_MS: number = (() => {
+  const raw = process.env.STATS_AUTOCLOSE_INTERVAL_MS;
+  if (!raw) return 10 * 60_000;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n;
+  logger.warn("Invalid STATS_AUTOCLOSE_INTERVAL_MS env var, falling back to 600000ms", { raw });
+  return 10 * 60_000;
+})();
+
+/**
+ * Accounts per getMultipleAccountsInfo call in the sweep. The RPC accepts up to
+ * 100; 25 keeps each response modest while cutting round-trips 5x versus the
+ * previous batch of 5.
+ */
+const SWEEP_BATCH_SIZE = 25;
+
+/** Pause between sweep batches, to stay clear of RPC rate limits. */
+const SWEEP_BATCH_DELAY_MS = 250;
+
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
@@ -287,6 +330,12 @@ export class StatsCollector {
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  private _refreshingMetadata = false;
+  /**
+   * When the on-chain janitorial sweep last ran. 0 means "never", so the first
+   * collect cycle after start() always sweeps.
+   */
+  private _lastSweepAt = 0;
   /**
    * Tracks slabs already marked as closed this session to avoid repeated DB writes.
    *
@@ -345,7 +394,10 @@ export class StatsCollector {
     // Volume sync for ALL DB markets (including uncranked ones) — runs independently.
     // First sync after 30s to let the indexer warm up, then every 5 minutes.
     this.volumeInitTimeout = setTimeout(() => this.syncVolumeForAllDBMarkets(), 30_000);
-    this.volumeTimer = setInterval(() => this.syncVolumeForAllDBMarkets(), VOLUME_SYNC_INTERVAL_MS);
+    this.volumeTimer = setInterval(() => {
+      void this.syncVolumeForAllDBMarkets();
+      void this.refreshMarketMetadata();
+    }, VOLUME_SYNC_INTERVAL_MS);
 
     logger.info("StatsCollector started", {
       intervalMs: COLLECT_INTERVAL_MS,
@@ -371,127 +423,183 @@ export class StatsCollector {
   }
 
   /**
+   * Fill in identity for markets the on-chain path could not name.
+   *
+   * A playground market tracks a MAINNET token (markets.mainnet_ca) while this
+   * service talks to a devnet RPC, so DAS cannot see the asset — which is why
+   * these rows end up as UNKNOWN placeholders with no logo. DexScreener is
+   * chain-wide and keyed by contract address, so it can resolve them.
+   *
+   * Only touches rows that are still 'auto' AND still missing a logo, so it
+   * converges: once a market resolves it stops being a candidate, and a row a
+   * human has edited is never a candidate at all (the UPDATE is additionally
+   * fenced on metadata_source='auto', so a row flipped to 'manual' mid-pass
+   * matches nothing).
+   */
+  private async refreshMarketMetadata(): Promise<void> {
+    if (this._refreshingMetadata || !this._running) return;
+    this._refreshingMetadata = true;
+
+    try {
+      const { data, error } = await getSupabase()
+        .from("markets")
+        .select("slab_address, mainnet_ca")
+        .eq("network", getNetwork())
+        .eq("metadata_source", "auto")
+        .is("logo_url", null)
+        .not("mainnet_ca", "is", null)
+        .limit(METADATA_REFRESH_LIMIT);
+
+      if (error) {
+        logger.warn("refreshMarketMetadata: candidate query failed", { error: error.message });
+        return;
+      }
+
+      const candidates = (data ?? []) as Array<{ slab_address: string; mainnet_ca: string }>;
+      if (candidates.length === 0) return;
+
+      // One CA can back several slabs (the same token relaunched as a new
+      // market), so resolve the DISTINCT set and fan the result back out.
+      const bySlab = new Map<string, string>();
+      for (const c of candidates) bySlab.set(c.slab_address, c.mainnet_ca);
+      const uniqueCas = Array.from(new Set(bySlab.values()));
+
+      const identities = new Map<string, DexScreenerIdentity>();
+      for (const chunk of chunkForDexScreener(uniqueCas)) {
+        const resolved = await resolveIdentitiesByCa(chunk);
+        for (const [ca, identity] of resolved) identities.set(ca, identity);
+      }
+      if (identities.size === 0) {
+        logger.info("refreshMarketMetadata: nothing resolved", { candidates: candidates.length });
+        return;
+      }
+
+      let updated = 0;
+      for (const [slabAddress, ca] of bySlab) {
+        const identity = identities.get(ca);
+        if (!identity) continue;
+
+        // Merge only what resolved — a token with a symbol but no image should
+        // not blank the name, and a row must not be marked done without a logo
+        // (logo_url IS NULL is the candidate predicate, so writing null here
+        // would leave it looping forever).
+        const patch: { symbol?: string; name?: string; logo_url?: string } = {};
+        if (identity.symbol) patch.symbol = identity.symbol;
+        if (identity.name) patch.name = identity.name;
+        if (identity.logoUrl) patch.logo_url = identity.logoUrl;
+        if (Object.keys(patch).length === 0) continue;
+
+        if (await updateAutoMarketMetadata(slabAddress, patch)) {
+          updated++;
+          logger.info("Market metadata resolved from CA", {
+            slabAddress: slabAddress.slice(0, 8),
+            ca: ca.slice(0, 8),
+            symbol: patch.symbol,
+            hasLogo: patch.logo_url != null,
+          });
+        }
+      }
+
+      logger.info("refreshMarketMetadata complete", {
+        candidates: candidates.length,
+        resolved: identities.size,
+        updated,
+      });
+    } catch (err) {
+      logger.warn("refreshMarketMetadata failed", { error: err instanceof Error ? err.message : err });
+    } finally {
+      this._refreshingMetadata = false;
+    }
+  }
+
+  /**
    * Sync volume_24h and trade_count_24h for ALL markets in the DB.
    *
    * StatsCollector.collect() only processes markets discovered on-chain. Markets
    * that are deployed but no longer actively cranked (e.g. test markets, stale slabs)
    * fall out of the on-chain provider map and never get their volume updated.
    *
-   * This method fetches all trades in the last 24h, aggregates by slab_address, and
-   * bulk-upserts volume_24h + trade_count_24h for every market that has trades.
-   * It intentionally does NOT reset volume to 0 for markets with no trades — those
-   * are left unchanged (they'll naturally reach 0 as their last trades age out and
-   * the on-chain collect cycle picks them up).
+   * The aggregation runs server-side via the volume_24h_by_slab(network) SQL
+   * function (migration 20260726180000) and the result is written back in ONE
+   * bulk upsert. It intentionally does NOT reset volume to 0 for markets with no
+   * trades — those are left unchanged (they'll naturally reach 0 as their last
+   * trades age out).
+   *
+   * PERF: this previously paginated the whole 24h trade tape out of PostgREST
+   * (up to 20 round-trips x 5k rows = 100k rows), summed it in JS, then issued
+   * one sequential upsert per market. Both the transfer and the N round-trips
+   * are gone — it is now 1 RPC + 1 upsert regardless of trade volume, and the
+   * 100k-row MAX_PAGES cap that could silently under-report volume is gone too.
    *
    * Bug fixed: GH#1171 — volume_24h = 0 for all markets despite trades existing.
+   * Bug fixed: is_liquidation markers (NULL size) inflated trade_count_24h — the
+   * SQL function filters them (see the migration header for why the old JS path
+   * counted them as zero-volume trades instead of skipping them).
    */
   private async syncVolumeForAllDBMarkets(): Promise<void> {
     if (this._syncingVolume || !this._running) return;
     this._syncingVolume = true;
 
     try {
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      // Server-side rollup: one row per market with trades in the window.
+      // Filters is_liquidation markers and NULL sizes (see migration header).
+      const { data: rows, error } = await getSupabase().rpc("volume_24h_by_slab", {
+        p_network: getNetwork(),
+      });
 
-      // Paginated fetch: read all trades in last 24h in pages of PAGE_SIZE.
-      // Previously capped at 10k rows — if >10k trades occurred in 24h,
-      // volume was silently under-reported. Now fetches all pages with a
-      // safety cap (MAX_PAGES) to prevent runaway memory usage.
-      const PAGE_SIZE = 5_000;
-      const MAX_PAGES = 20; // 100k trades max — far beyond expected 24h volume
-      const allTrades: Array<{ slab_address: string; size: string }> = [];
-      let page = 0;
-      let hasMore = true;
-
-      while (hasMore && page < MAX_PAGES) {
-        const from = page * PAGE_SIZE;
-        const to = from + PAGE_SIZE - 1;
-        const { data: batch, error } = await getSupabase()
-          .from("trades")
-          .select("slab_address, size")
-          .eq("network", getNetwork())
-          .gte("created_at", since)
-          .range(from, to);
-
-        if (error) {
-          logger.warn("syncVolumeForAllDBMarkets: trade fetch failed", { error: error.message, page });
-          return;
-        }
-
-        if (!batch || batch.length === 0) break;
-        allTrades.push(...batch);
-        hasMore = batch.length === PAGE_SIZE;
-        page++;
+      if (error) {
+        logger.warn("syncVolumeForAllDBMarkets: rollup RPC failed", { error: error.message });
+        return;
       }
 
-      if (page >= MAX_PAGES) {
-        logger.warn("syncVolumeForAllDBMarkets: hit max page limit — volume may be under-reported", {
-          totalFetched: allTrades.length,
-          maxPages: MAX_PAGES,
-          pageSize: PAGE_SIZE,
+      const agg = (rows ?? []) as Array<{
+        slab_address: string;
+        volume_24h: string | number;
+        trade_count_24h: string | number;
+      }>;
+      if (agg.length === 0) return;
+
+      // volume_24h is NUMERIC in Postgres (arbitrary precision) but MarketStatsRow
+      // types it as number. postgres-js/PostgREST hands NUMERIC back as a string to
+      // avoid lossy parsing, so keep the string when it exceeds MAX_SAFE_INTEGER and
+      // let Postgres store it exactly; only downcast when it's safely representable.
+      const payload = agg.map((r) => {
+        const raw = String(r.volume_24h ?? "0");
+        const asNum = Number(raw);
+        const safe = Number.isFinite(asNum) && Math.abs(asNum) <= Number.MAX_SAFE_INTEGER;
+        if (!safe) {
+          logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, storing as string", {
+            slabAddress: r.slab_address.slice(0, 8),
+            volume: raw,
+          });
+        }
+        return {
+          slab_address: r.slab_address,
+          volume_24h: (safe ? asNum : raw) as unknown as number,
+          trade_count_24h: Number(r.trade_count_24h ?? 0),
+          network: getNetwork(),
+          updated_at: new Date().toISOString(),
+        };
+      });
+
+      // Single bulk upsert. Columns absent from the payload (last_price,
+      // volume_24h_usd) are left untouched on conflict.
+      const { error: upsertErr } = await getSupabase()
+        .from("market_stats")
+        .upsert(payload as never, { onConflict: "slab_address" });
+
+      if (upsertErr) {
+        // A row whose slab_address isn't in `markets` yet violates the FK — that
+        // market simply hasn't been registered by syncMarkets() yet, so it will
+        // land on the next cycle. Log rather than retry-loop.
+        logger.warn("syncVolumeForAllDBMarkets: bulk upsert failed", {
+          error: upsertErr.message,
+          markets: payload.length,
         });
+        return;
       }
 
-      if (allTrades.length === 0) return;
-
-      // Aggregate volume + trade count by slab_address in memory
-      const volumeMap = new Map<string, { volume: bigint; count: number }>();
-      for (const trade of allTrades) {
-        const current = volumeMap.get(trade.slab_address) ?? { volume: 0n, count: 0 };
-        try {
-          const raw = BigInt(trade.size);
-          const abs = raw < 0n ? -raw : raw;
-          volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
-        } catch {
-          // Fallback: size string isn't a valid BigInt literal. Parse via BigInt()
-          // instead of Math.abs(Number()) to avoid precision loss on large values.
-          try {
-            const numVal = Number(trade.size);
-            if (!Number.isFinite(numVal)) continue; // skip Infinity/NaN
-            const abs = BigInt(Math.trunc(Math.abs(numVal)));
-            volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
-          } catch {
-            // Completely unparseable size — skip this trade
-            logger.warn("syncVolumeForAllDBMarkets: unparseable trade size, skipping", {
-              slabAddress: trade.slab_address?.slice(0, 8),
-              size: String(trade.size).slice(0, 30),
-            });
-          }
-        }
-      }
-
-      // Upsert volume stats for each market that has trades.
-      // volume_24h is NUMERIC in PostgreSQL so it can hold arbitrary precision,
-      // but MarketStatsRow types it as number|null. Use Number() with a warning
-      // when precision would be lost (> MAX_SAFE_INTEGER = ~9e15).
-      let updated = 0;
-      for (const [slabAddress, { volume, count }] of volumeMap.entries()) {
-        try {
-          const exceedsSafeInt = volume > BigInt(Number.MAX_SAFE_INTEGER);
-          const volumeNum = Number(volume);
-          if (exceedsSafeInt) {
-            logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, precision loss", {
-              slabAddress: slabAddress.slice(0, 8),
-              volumeBigInt: volume.toString(),
-              volumeNumber: volumeNum,
-            });
-          }
-          await upsertMarketStats({
-            slab_address: slabAddress,
-            volume_24h: exceedsSafeInt ? (volume.toString() as any) : volumeNum,
-            trade_count_24h: count,
-          });
-          updated++;
-        } catch (err) {
-          logger.warn("syncVolumeForAllDBMarkets: upsert failed", {
-            slabAddress: slabAddress.slice(0, 8),
-            error: err instanceof Error ? err.message : err,
-          });
-        }
-      }
-
-      if (updated > 0) {
-        logger.info("Volume sync complete", { marketsUpdated: updated, totalTrades: allTrades.length, pages: page });
-      }
+      logger.info("Volume sync complete", { marketsUpdated: payload.length });
     } catch (err) {
       logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
     } finally {
@@ -501,12 +609,17 @@ export class StatsCollector {
 
   /**
    * Auto-register missing markets: compare on-chain markets vs DB and insert any missing.
+   *
+   * Returns the markets rows it read, so collect() can reuse them for the
+   * indexer_excluded pass instead of issuing a second full-table read in the
+   * same cycle. Returns null when no read happened (or it failed), in which
+   * case the caller falls back to fetching them itself.
    */
-  private async syncMarkets(): Promise<void> {
+  private async syncMarkets(): Promise<DbMarketRow[] | null> {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
-      if (onChainMarkets.size === 0) return;
+      if (onChainMarkets.size === 0) return null;
 
       // Get existing markets from DB
       const dbMarkets = await getMarkets();
@@ -520,7 +633,7 @@ export class StatsCollector {
         }
       }
 
-      if (missingMarkets.length === 0) return;
+      if (missingMarkets.length === 0) return dbMarkets;
 
       logger.info("New markets found", { count: missingMarkets.length });
 
@@ -529,11 +642,20 @@ export class StatsCollector {
       for (const [slabAddress, state] of missingMarkets) {
         try {
           const market = state.market;
-          const mintAddress = market.config.collateralMint.toBase58();
-          const admin = market.header.admin.toBase58();
-          const oracleAuthority = market.config.oracleAuthority.toBase58();
-          const priceE6 = Number(market.config.authorityPriceE6);
-          const initialMarginBps = Number(market.params.initialMarginBps);
+          // v17 market group accounts expose config under `configV17` (WrapperConfigV17);
+          // `config`/`header`/`params` are v12-only and undefined for v17. Prefer configV17.
+          const cfg: any = (market as any).configV17 ?? market.config;
+          const mintAddress = cfg?.collateralMint?.toBase58() ?? "";
+          if (!mintAddress) {
+            logger.warn("Skipping market registration — no collateralMint", { slabAddress });
+            continue;
+          }
+          // configV17 has no oracleAuthority / authorityPriceE6 / admin / margin — those are
+          // per-asset or v12-only; fall back safely (registry only needs mint + a deployer).
+          const oracleAuthority = cfg?.oracleAuthority?.toBase58() ?? "";
+          const admin = (market as any).header?.admin?.toBase58() ?? (oracleAuthority || mintAddress);
+          const priceE6 = Number(cfg?.authorityPriceE6 ?? cfg?.markEwmaE6 ?? 0n);
+          const initialMarginBps = Number(market.params?.initialMarginBps ?? cfg?.initialMarginBps ?? 0n);
 
           // Compute maxLeverage from initialMarginBps.
           // Guard against division-by-zero or garbage values (e.g. uninitialized slab
@@ -571,6 +693,7 @@ export class StatsCollector {
           // Try to resolve token metadata from on-chain (Helius DAS / Metaplex)
           let symbol = mintAddress.substring(0, 8); // fallback
           let name = `Market ${slabAddress.substring(0, 8)}`; // fallback
+          let logoUrl: string | null = null;
           let decimals = 9;
           try {
             const mintPubkey = new PublicKey(mintAddress);
@@ -578,38 +701,15 @@ export class StatsCollector {
             if (mintInfo.value?.data && "parsed" in mintInfo.value.data) {
               decimals = mintInfo.value.data.parsed.info.decimals ?? 9;
             }
-            // Try Helius DAS API if the RPC endpoint supports it
-            const endpoint = connection.rpcEndpoint;
-            if (endpoint.includes("helius-rpc.com")) {
-              const dasRes = await fetch(endpoint, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: `das-${mintAddress}`,
-                  method: "getAsset",
-                  params: { id: mintAddress, options: { showFungible: true } },
-                }),
-                signal: AbortSignal.timeout(5000),
-              });
-              if (dasRes.ok) {
-                const dasJson = await dasRes.json();
-                const metadata = dasJson?.result?.content?.metadata;
-                const tokenInfo = dasJson?.result?.token_info;
-                const dasSym = metadata?.symbol || tokenInfo?.symbol;
-                const dasName = metadata?.name;
-                const dasDecimals = tokenInfo?.decimals;
-                // Sanitize external metadata: truncate length and strip control
-                // characters / HTML to prevent DB bloat and stored XSS vectors
-                // (defense-in-depth — frontend must also escape).
-                if (typeof dasSym === "string" && dasSym.length > 0) {
-                  symbol = dasSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
-                }
-                if (typeof dasName === "string" && dasName.length > 0) {
-                  name = dasName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
-                }
-                if (dasDecimals != null) decimals = dasDecimals;
-              }
+            // Collateral identity via DAS (sanitization lives in the helper).
+            const collateralMeta = await fetchDasTokenMetadata(connection.rpcEndpoint, mintAddress);
+            if (collateralMeta) {
+              if (collateralMeta.symbol) symbol = collateralMeta.symbol;
+              if (collateralMeta.name) name = collateralMeta.name;
+              if (collateralMeta.decimals != null) decimals = collateralMeta.decimals;
+              // Provisional: for a hyperp market the block below replaces this with
+              // the BASE asset's logo, or clears it if the market can't be identified.
+              if (collateralMeta.logoUrl) logoUrl = collateralMeta.logoUrl;
             }
           } catch (metaErr) {
             logger.debug("Token metadata resolution failed, using fallback", { mintAddress, error: metaErr instanceof Error ? metaErr.message : metaErr });
@@ -626,18 +726,23 @@ export class StatsCollector {
           // Resolution path:
           //   1. Read the dexPool address from MarketConfig (set via SetDexPool instruction).
           //   2. Fetch and parse the pool account to extract baseMint.
-          //   3. Look up baseMint metadata via DAS API → use as symbol/name.
-          //   4. Construct the market name as "{baseSymbol}/USDC Perpetual".
-          //   5. Fall back to "SOL" / "SOL/USDC Perpetual" on any failure (only one hyperp
-          //      market type exists today; this should be generalised when more are added).
+          //   3. Look up baseMint metadata via DAS API → use as symbol/name/logo.
+          //   4. Construct the market name as "{baseSymbol}/{collateral} Perpetual".
+          //   5. If NONE of that resolves, write a neutral placeholder.
+          //
+          // Step 5 used to default to "SOL"/"SOL/USDC Perpetual". v17 admin-oracle
+          // markets have no dexPool, so that branch was the ONLY one that ever ran
+          // for them and every such market claimed to be SOL — six unrelated devnet
+          // markets all displayed as "SOL/USDC Perpetual". An unnamed market is
+          // honest and is queryable for follow-up; a market mislabelled SOL is not.
           const zeroKeyBytesHyperp = new Uint8Array(32);
-          const isHyperpMarket = market.config.indexFeedId.equals(new PublicKey(zeroKeyBytesHyperp));
+          const isHyperpMarket = (market as any).configV17 != null
+            || (cfg?.indexFeedId?.equals(new PublicKey(zeroKeyBytesHyperp)) ?? false);
           if (isHyperpMarket) {
-            let baseSymbol = "SOL";  // safe default: SOL/USDC is the only hyperp type today
-            let baseName = "Solana"; // safe default
-            let resolvedFromChain = false;
+            let baseSymbol: string | null = null;
+            let baseName: string | null = null;
             try {
-              const dexPool = market.config.dexPool;
+              const dexPool = cfg?.dexPool ?? null;
               if (dexPool != null) {
                 const poolAccountInfo = await connection.getAccountInfo(dexPool);
                 if (poolAccountInfo) {
@@ -645,61 +750,52 @@ export class StatsCollector {
                   if (dexType != null) {
                     const poolInfo = parseDexPool(dexType, dexPool, new Uint8Array(poolAccountInfo.data));
                     const baseMintAddress = poolInfo.baseMint.toBase58();
-                    // Resolve base mint metadata via DAS (same pattern as collateral above)
-                    const endpoint = connection.rpcEndpoint;
-                    if (endpoint.includes("helius-rpc.com")) {
-                      const baseDasRes = await fetch(endpoint, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          jsonrpc: "2.0",
-                          id: `das-base-${baseMintAddress}`,
-                          method: "getAsset",
-                          params: { id: baseMintAddress, options: { showFungible: true } },
-                        }),
-                        signal: AbortSignal.timeout(5000),
-                      });
-                      if (baseDasRes.ok) {
-                        const baseDasJson = await baseDasRes.json();
-                        const baseMeta = baseDasJson?.result?.content?.metadata;
-                        const baseTokenInfo = baseDasJson?.result?.token_info;
-                        const rawSym = baseMeta?.symbol || baseTokenInfo?.symbol;
-                        const rawName = baseMeta?.name;
-                        if (typeof rawSym === "string" && rawSym.length > 0) {
-                          baseSymbol = rawSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
-                          resolvedFromChain = true;
-                        }
-                        if (typeof rawName === "string" && rawName.length > 0) {
-                          baseName = rawName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
-                        }
-                      }
-                    } else {
-                      // Non-Helius endpoint: resolve via parsed account info for decimals only;
-                      // symbol stays at default "SOL" until a DAS-capable endpoint is available.
-                      resolvedFromChain = false;
+                    const baseMeta = await fetchDasTokenMetadata(connection.rpcEndpoint, baseMintAddress);
+                    if (baseMeta) {
+                      baseSymbol = baseMeta.symbol;
+                      baseName = baseMeta.name;
+                      // The market's logo is the BASE asset's logo (what is being
+                      // traded), not the collateral's — a SOL perp shows the SOL
+                      // mark, not USDC's.
+                      if (baseMeta.logoUrl) logoUrl = baseMeta.logoUrl;
                     }
                   }
                 }
               }
             } catch (hyperpErr) {
-              logger.debug("Hyperp base asset resolution failed, using SOL fallback", {
+              logger.debug("Hyperp base asset resolution failed", {
                 slabAddress,
                 error: hyperpErr instanceof Error ? hyperpErr.message : hyperpErr,
               });
             }
-            // Build market symbol/name from base asset.
-            // Collateral symbol is already in `symbol` from the DAS lookup above (e.g. "USDC").
-            // If collateral lookup also failed, fall back gracefully.
-            const collateralLabel = symbol === mintAddress.substring(0, 8) ? "USDC" : symbol;
-            symbol = baseSymbol;
-            name = `${baseSymbol}/${collateralLabel} Perpetual`;
+
+            if (baseSymbol) {
+              // Collateral symbol came from the DAS lookup above (e.g. "USDC").
+              // If that also failed, `symbol` is still the mint-prefix fallback.
+              const collateralLabel = symbol === mintAddress.substring(0, 8) ? "USDC" : symbol;
+              symbol = baseSymbol;
+              name = `${baseSymbol}/${collateralLabel} Perpetual`;
+            } else {
+              // Nothing on-chain identifies this market. Do NOT guess, and do NOT
+              // keep the collateral's identity (that would label every market
+              // "USDC"). A human sets the real values via PATCH /api/markets/[slab],
+              // which flips metadata_source to 'manual' so this never overwrites them.
+              const placeholder = placeholderIdentity(slabAddress);
+              symbol = placeholder.symbol;
+              name = placeholder.name;
+              // The collateral logo is wrong for an unidentified market — drop it
+              // rather than show USDC's mark on something that isn't a USDC market.
+              logoUrl = null;
+            }
+
             logger.info("Hyperp market metadata resolved", {
               slabAddress,
-              baseSymbol,
+              symbol,
+              name,
+              resolvedFromChain: baseSymbol != null,
+              hasLogo: logoUrl != null,
               baseName,
-              collateralLabel,
-              resolvedFromChain,
-              dexPool: market.config.dexPool?.toBase58() ?? null,
+              dexPool: cfg?.dexPool?.toBase58() ?? null,
             });
           }
 
@@ -714,7 +810,7 @@ export class StatsCollector {
           
           // Clamp decimals to sane range — some on-chain mints have garbage values
           const clampedDecimals = Math.min(Math.max(decimals, 0), 18);
-          await insertMarket({
+          await insertMarketRow({
             slab_address: slabAddress,
             mint_address: mintAddress,
             symbol,
@@ -728,28 +824,37 @@ export class StatsCollector {
             lp_collateral: null,
             matcher_context: null,
             status: "active",
+            logo_url: logoUrl,
           });
 
-          logger.info("Market registered", { slabAddress, symbol, name });
+          logger.info("Market registered", { slabAddress, symbol, name, hasLogo: logoUrl != null });
         } catch (err) {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });
         }
       }
+
+      // Newly-inserted rows are absent from dbMarkets, but the caller only reads
+      // indexer_excluded off it — which defaults to false for fresh inserts, the
+      // same answer a re-read would give.
+      return dbMarkets;
     } catch (err) {
       logger.error("Market sync failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
+      return null;
     }
   }
 
   /**
-   * Collect stats for all known markets by reading on-chain slab accounts.
+   * Registry sync every cycle; the on-chain janitorial sweep every
+   * AUTOCLOSE_INTERVAL_MS.
    */
   private async collect(): Promise<void> {
     if (this._collecting || !this._running) return;
     this._collecting = true;
 
     try {
-      // Auto-register missing markets at the start of each cycle
-      await this.syncMarkets();
+      // Auto-register missing markets at the start of each cycle. Reuse the rows
+      // it read for the indexer_excluded pass below (saves a full markets read).
+      const syncedDbMarkets = await this.syncMarkets();
 
       const markets = this.marketProvider.getMarkets();
       if (markets.size === 0) {
@@ -757,7 +862,14 @@ export class StatsCollector {
         return;
       }
 
-      logger.info("StatsCollector.collect started", { marketCount: markets.size });
+      // The sweep below is pure janitorial work (auto-close / re-enable) and costs
+      // one RPC round-trip per SWEEP_BATCH_SIZE markets. Registration above already
+      // ran; skip the sweep until it's due.
+      const now = Date.now();
+      if (now - this._lastSweepAt < AUTOCLOSE_INTERVAL_MS) return;
+      this._lastSweepAt = now;
+
+      logger.info("StatsCollector sweep started", { marketCount: markets.size });
 
       // GH#1218: load indexer_excluded flags from DB to skip corrupt slabs.
       // These are slabs where on-chain state is permanently corrupt and re-syncing
@@ -769,7 +881,7 @@ export class StatsCollector {
       // markets that recover after being abandoned.
       let excludedSlabs: Set<string> = new Set();
       try {
-        const dbMarkets = await getMarkets();
+        const dbMarkets = syncedDbMarkets ?? (await getMarkets());
         const excludedDbMarkets = dbMarkets.filter((m) => m.indexer_excluded === true);
 
         for (const m of excludedDbMarkets) {
@@ -822,11 +934,11 @@ export class StatsCollector {
       let updated = 0;
       let errors = 0;
 
-      // Process markets in batches of 5 to avoid RPC rate limits
-      // Use getMultipleAccountsInfo for batch fetching to reduce RPC round trips
+      // Batch the account reads: getMultipleAccountsInfo takes up to 100 keys, so
+      // SWEEP_BATCH_SIZE keys per call instead of one call per market.
       const entries = Array.from(markets.entries()).filter(([slabAddress]) => !excludedSlabs.has(slabAddress));
-      for (let i = 0; i < entries.length; i += 5) {
-        const batch = entries.slice(i, i + 5);
+      for (let i = 0; i < entries.length; i += SWEEP_BATCH_SIZE) {
+        const batch = entries.slice(i, i + SWEEP_BATCH_SIZE);
         const slabPubkeys = batch.map(([slabAddress]) => new PublicKey(slabAddress));
 
         try {
@@ -836,7 +948,7 @@ export class StatsCollector {
             { 
               maxRetries: 3, 
               baseDelayMs: 1000, 
-              label: `getMultipleAccountsInfo(batch ${i / 5 + 1})` 
+              label: `getMultipleAccountsInfo(batch ${i / SWEEP_BATCH_SIZE + 1})` 
             }
           );
 
@@ -911,7 +1023,7 @@ export class StatsCollector {
             // removed, along with oracle_prices, oi_history, insurance_history, and
             // funding_history writes — the frontend reads price/OI/insurance/funding-rate
             // live from chain, and chart history is not needed. StatsCollector now only
-            // maintains the markets registry (insertMarket via syncMarkets()) and the
+            // maintains the markets registry (insertMarketRow via syncMarkets()) and the
             // slim market_stats volume rollup (syncVolumeForAllDBMarkets — slab_address,
             // volume_24h, trade_count_24h only).
 
@@ -928,12 +1040,12 @@ export class StatsCollector {
         }
 
         // Small delay between batches
-        if (i + 5 < entries.length) {
-          await new Promise((r) => setTimeout(r, 1_000));
+        if (i + SWEEP_BATCH_SIZE < entries.length) {
+          await new Promise((r) => setTimeout(r, SWEEP_BATCH_DELAY_MS));
         }
       }
 
-      logger.info("StatsCollector.collect complete", { updated, errors, totalMarkets: markets.size });
+      logger.info("StatsCollector sweep complete", { updated, errors, totalMarkets: markets.size });
       if (errors > 0) {
         addBreadcrumb("StatsCollector completed with errors", {
           updated,

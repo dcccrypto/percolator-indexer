@@ -117,7 +117,23 @@ describe("EventStreamService auto-indexing", () => {
     });
     // H2/H3: trades are now written via the indexer-local insertTradeRow helper
     // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      // Real implementation — webhook.ts / EventStreamService.ts import this from
+      // the same module, so the mock must provide it or it resolves to undefined.
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      // EventStreamService now writes a tx's legs in one batched call. Forward each
+      // row to the per-row spy so the assertions below still read one call per leg.
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        // Mirrors the real writer: returns the dedupe key of every row written.
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
 
     // Re-import after mock
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
@@ -239,7 +255,23 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     });
     // H2/H3: trades are now written via the indexer-local insertTradeRow helper
     // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      // Real implementation — webhook.ts / EventStreamService.ts import this from
+      // the same module, so the mock must provide it or it resolves to undefined.
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      // EventStreamService now writes a tx's legs in one batched call. Forward each
+      // row to the per-row spy so the assertions below still read one call per leg.
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        // Mirrors the real writer: returns the dedupe key of every row written.
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -320,7 +352,23 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     });
     // H2/H3: trades are now written via the indexer-local insertTradeRow helper
     // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      // Real implementation — webhook.ts / EventStreamService.ts import this from
+      // the same module, so the mock must provide it or it resolves to undefined.
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      // EventStreamService now writes a tx's legs in one batched call. Forward each
+      // row to the per-row spy so the assertions below still read one call per leg.
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        // Mirrors the real writer: returns the dedupe key of every row written.
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -563,7 +611,23 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
     });
     // H2/H3: trades are now written via the indexer-local insertTradeRow helper
     // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      // Real implementation — webhook.ts / EventStreamService.ts import this from
+      // the same module, so the mock must provide it or it resolves to undefined.
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      // EventStreamService now writes a tx's legs in one batched call. Forward each
+      // row to the per-row spy so the assertions below still read one call per leg.
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        // Mirrors the real writer: returns the dedupe key of every row written.
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -660,7 +724,23 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
     });
     // H2/H3: trades are now written via the indexer-local insertTradeRow helper
     // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      // Real implementation — webhook.ts / EventStreamService.ts import this from
+      // the same module, so the mock must provide it or it resolves to undefined.
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      // EventStreamService now writes a tx's legs in one batched call. Forward each
+      // row to the per-row spy so the assertions below still read one call per leg.
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        // Mirrors the real writer: returns the dedupe key of every row written.
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
