@@ -46,6 +46,23 @@ const V17_MG_C_TOT_OFF = 317;      // abs: V17_MARKET_GROUP_OFF + 317 = 765
 const V17_MG_MIN_BYTES = 333;      // must cover the c_tot read at +317 (317 + 16)
 
 /**
+ * M1: upper bound for a sane price in micro-USD (1e6). An unset/sentinel u64
+ * (e.g. u64::MAX) otherwise divides to ~$1.8e13 and poisons the oracle_prices
+ * chart + funding_history. Mirrors markPrice.ts and TradeIndexer.readMarkPriceFromSlab
+ * (both use `< 1_000_000_000_000n`). Out-of-range prices are treated as absent (0n).
+ */
+export const MAX_SANE_PRICE_E6 = 1_000_000_000_000n;
+
+/**
+ * M1: return the price in micro-USD if it is in (0, MAX_SANE_PRICE_E6), else 0n.
+ * Extracted as a pure helper so the sentinel guard is unit-testable outside the
+ * ~1500-line collect() method.
+ */
+export function sanePriceE6(priceE6: bigint): bigint {
+  return priceE6 > 0n && priceE6 < MAX_SANE_PRICE_E6 ? priceE6 : 0n;
+}
+
+/**
  * Market group header length between V17_MARKET_GROUP_OFF and the first
  * AssetOracleProfileV17. From the desync doc: asset-0 oracle profile at
  * abs offset 1206 = 448 + 758, so MARKET_GROUP_HDR_LEN = 758.
@@ -677,6 +694,8 @@ export class StatsCollector {
                   ? marketConfig.authorityPriceE6
                   : marketConfig.lastEffectivePriceE6;
               }
+              // M1: drop out-of-range sentinel prices before they reach USD / oracle_prices.
+              priceE6 = sanePriceE6(priceE6);
               const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
 
               // Dust vault guard (mirrors collect())
@@ -1253,6 +1272,9 @@ export class StatsCollector {
                 ? marketConfig.authorityPriceE6
                 : marketConfig.lastEffectivePriceE6;
             }
+            // M1: drop out-of-range sentinel prices (unset u64 -> ~$1.8e13) before they
+            // reach last/mark/index price, oracle_prices, and funding_history.price_e6.
+            priceE6 = sanePriceE6(priceE6);
             const priceUsd = priceE6 > 0n ? Number(priceE6) / 1_000_000 : null;
 
             // Calculate 24h volume and trade count from trades table
