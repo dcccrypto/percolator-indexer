@@ -309,7 +309,6 @@ export class StatsCollector {
   private _collecting = false;
   private _syncingVolume = false;
   private _syncingOrphanStats = false;
-  private lastFundingHistoryTime = new Map<string, number>();
   /**
    * Tracks slabs already marked as closed this session to avoid repeated DB writes.
    *
@@ -1406,34 +1405,11 @@ export class StatsCollector {
               }
             }
 
-            // REDUCTION (2026-07-26): oracle_prices, oi_history and insurance_history
-            // writes were removed — 0 frontend readers (the UI reads price/OI/insurance
-            // live from chain via parseMarketGroupV17OI / parseWrapperConfigV17). Only
-            // funding_history remains (consumed by /api/funding/[slab] + /api/funding/global).
-
-            // Log funding history (rate-limited per market)
-            const FUNDING_HISTORY_INTERVAL_MS = 5 * 60 * 1000;
-            const lastFundLog = this.lastFundingHistoryTime.get(slabAddress) ?? 0;
-            if (Date.now() - lastFundLog >= FUNDING_HISTORY_INTERVAL_MS) {
-              try {
-                const { error: fundErr } = await getSupabase().from('funding_history').insert({
-                  market_slab: slabAddress,
-                  slot: safePgBigint(engine.lastCrankSlot),                    // BIGINT
-                  rate_bps_per_slot: Number(engine.fundingRateBpsPerSlotLast), // NUMERIC
-                  net_lp_pos: safeBigNum(engine.netLpPos),                     // NUMERIC
-                  price_e6: safeBigNum(priceE6),                               // NUMERIC
-                  funding_index_qpb_e6: engine.fundingIndexQpbE6.toString(),   // TEXT
-                  network: getNetwork(),                                        // PERC-8192: stamp network
-                });
-                if (fundErr && fundErr.code !== '23503' && fundErr.code !== '23505') {
-                  logger.warn("Funding history log failed", { slabAddress, error: fundErr.message, code: fundErr.code });
-                } else {
-                  this.lastFundingHistoryTime.set(slabAddress, Date.now());
-                }
-              } catch (e) {
-                logger.warn("Funding history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
-              }
-            }
+            // REDUCTION (2026-07-26): oracle_prices, oi_history, insurance_history AND
+            // funding_history writes were all removed — the frontend reads price/OI/
+            // insurance/funding-rate live from chain, and chart history is not needed.
+            // StatsCollector now only maintains the markets registry (insertMarket) and
+            // the volume rollup (syncVolumeForAllDBMarkets, derived from trades).
 
               updated++;
             } catch (err) {
@@ -1464,9 +1440,6 @@ export class StatsCollector {
 
       // Prune rate-limit maps: remove entries for slabs no longer in discovery.
       // Prevents unbounded growth if markets are delisted over time.
-      for (const key of this.lastFundingHistoryTime.keys()) {
-        if (!markets.has(key)) this.lastFundingHistoryTime.delete(key);
-      }
       for (const key of this.closedSlabs) {
         if (!markets.has(key)) this.closedSlabs.delete(key);
       }
