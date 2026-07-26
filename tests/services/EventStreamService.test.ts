@@ -115,6 +115,9 @@ describe("EventStreamService auto-indexing", () => {
       const mod = await (orig() as Promise<any>);
       return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: insertOraclePriceMock };
     });
+    // H2/H3: trades are now written via the indexer-local insertTradeRow helper
+    // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
 
     // Re-import after mock
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
@@ -160,6 +163,7 @@ describe("EventStreamService auto-indexing", () => {
     expect(insertTradeMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
   });
 
   it("skips tx when no known slab is referenced", async () => {
@@ -233,6 +237,9 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
         insertOraclePrice: insertOraclePriceMock,
       };
     });
+    // H2/H3: trades are now written via the indexer-local insertTradeRow helper
+    // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -286,6 +293,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     );
 
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
     vi.doUnmock("../../src/parsers/markPrice.js");
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
@@ -310,6 +318,9 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
       const mod = await (orig() as Promise<any>);
       return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
     });
+    // H2/H3: trades are now written via the indexer-local insertTradeRow helper
+    // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -354,13 +365,14 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     expect(insertTradeMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
     vi.doUnmock("../../src/parsers/markPrice.js");
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
 });
 
 describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
-  it("writes oracle_prices when tx contains an UpdateHyperpMark ix (tag 34)", async () => {
+  it("does NOT write oracle_prices even for an UpdateHyperpMark ix (reduction 2026-07-26)", async () => {
     const insertOraclePriceMock = vi.fn().mockResolvedValue(undefined);
     const readMarkMock = vi.fn().mockResolvedValue(85_187_279);
     // No fills in this tx — only the oracle update.
@@ -424,18 +436,9 @@ describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
     });
     await new Promise((r) => setTimeout(r, 20));
 
-    expect(readMarkMock).toHaveBeenCalled();
-    expect(insertOraclePriceMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        slab_address: SLAB,
-        price_e6: "85187279",
-        tx_signature: "sigMark",
-      }),
-    );
-    // Timestamp should be a positive epoch-seconds integer.
-    const arg = insertOraclePriceMock.mock.calls[0][0];
-    expect(typeof arg.timestamp).toBe("number");
-    expect(arg.timestamp).toBeGreaterThan(1_600_000_000);
+    // oracle_prices indexing was removed (price is read live from chain), so an
+    // UpdateHyperpMark tx must no longer trigger any oracle DB write.
+    expect(insertOraclePriceMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
     vi.doUnmock("../../src/parsers/markPrice.js");
@@ -558,6 +561,9 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
       const mod = await (orig() as Promise<any>);
       return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
     });
+    // H2/H3: trades are now written via the indexer-local insertTradeRow helper
+    // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -613,7 +619,14 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
     expect(fillB?.size).toBe("2000");
     expect(fillB?.side).toBe("short");
 
+    // H2/H3: each fill within a tx is indexed with a distinct leg_index (its
+    // position in the flattened fills array), so (tx_signature, asset_index,
+    // leg_index) is unique even though both fills share the same tx_signature.
+    const legIndices = insertTradeMock.mock.calls.map((c: any) => c[0].leg_index);
+    expect(new Set(legIndices).size).toBe(2);
+
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
     vi.doUnmock("../../src/parsers/markPrice.js");
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
@@ -645,6 +658,9 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
       const mod = await (orig() as Promise<any>);
       return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
     });
+    // H2/H3: trades are now written via the indexer-local insertTradeRow helper
+    // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: insertTradeMock }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
     vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
 
@@ -689,6 +705,7 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
     expect(insertTradeMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
     vi.doUnmock("../../src/parsers/markPrice.js");
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });

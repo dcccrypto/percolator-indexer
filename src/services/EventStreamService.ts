@@ -1,6 +1,7 @@
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
-import { createLogger, insertTrade, insertOraclePrice, eventBus, decodeBase58 } from "@percolatorct/shared";
+import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
+import { insertTradeRow } from "../db/insertTradeRow.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
@@ -106,30 +107,13 @@ export class EventStreamService {
     const signature = tx.signature ?? tx.transaction?.signatures?.[0];
     if (!signature) return;
 
-    // P2: oracle-update detection. Resolve slab for oracle updates tx-wide (only one
-    // oracle account per UpdateHyperpMark call), then fire before fill processing so
-    // even a tx that contains ONLY an UpdateHyperpMark (no trade) still writes an oracle row.
-    if (this.hasUpdateHyperpMark(tx)) {
-      const oracleSlab = this.resolveSlab(tx);
-      if (oracleSlab) {
-        try {
-          const markE6 = await readMarkPriceE6(this.deps.connection, oracleSlab);
-          if (markE6 != null) {
-            await insertOraclePrice({
-              slab_address: oracleSlab,
-              price_e6: String(markE6),
-              timestamp: Math.floor(Date.now() / 1000),
-              tx_signature: signature,
-            });
-          }
-        } catch (err) {
-          log.warn("insertOraclePrice failed", { sig: signature, err: String(err) });
-        }
-      }
-    }
+    // REDUCTION (2026-07-26): oracle_prices is no longer indexed — the frontend reads
+    // price live from chain. UpdateHyperpMark txs no longer trigger a DB write here.
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
-    for (const fill of fills) {
+    // legIndex is the fill's position within the whole tx (fills are flattened across
+    // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
+    for (const [legIndex, fill] of fills.entries()) {
       // #148: Use the per-fill slab derived from instruction accounts (fill.slabAddress),
       // not the tx-wide resolveSlab() result. resolveSlab returns the *first* known slab
       // in accountKeys and applies it to every fill in the tx — mis-attributing fills in
@@ -154,7 +138,7 @@ export class EventStreamService {
       }
 
       try {
-        await insertTrade({
+        await insertTradeRow({
           slab_address: slab,
           trader: fill.trader,
           side: fill.side,
@@ -162,9 +146,11 @@ export class EventStreamService {
           price,
           fee: 0,
           tx_signature: signature,
+          asset_index: fill.assetIndex,
+          leg_index: legIndex,
         });
       } catch (err) {
-        log.warn("insertTrade failed", { sig: signature, err: String(err) });
+        log.warn("insertTradeRow failed", { sig: signature, err: String(err) });
         continue;
       }
       // Fan out to percolator-api WS subscribers of trades:<slab>.

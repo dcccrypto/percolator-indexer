@@ -1,6 +1,7 @@
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { insertTradeRow } from "../db/insertTradeRow.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -334,8 +335,9 @@ export class TradeIndexerPolling {
         const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
         if (!base58PubkeyRegex.test(trader) || !base58SigRegex.test(signature)) return false;
 
-        const exists = await tradeExistsBySignature(signature);
-        if (exists) return false;
+        // H2/H3: do NOT short-circuit the whole tx on tradeExistsBySignature — with
+        // the (tx_signature, asset_index, leg_index) key that would skip legs which
+        // failed on an earlier pass. Each leg is deduped per-leg by 23505 instead.
 
         let price = this.extractPriceFromLogs(tx);
         if (price === 0) {
@@ -349,10 +351,11 @@ export class TradeIndexerPolling {
         for (let i = 0; i < nLegs; i++) {
           const legOff = 2 + i * 34;
           if (legOff + 34 > data.length) break;
+          const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
           const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
           if (sizeValue === 0n || sizeValue > i128Max) continue;
 
-          await insertTrade({
+          await insertTradeRow({
             slab_address: slabAddress,
             trader,
             side,
@@ -360,6 +363,8 @@ export class TradeIndexerPolling {
             price,
             fee,
             tx_signature: signature,
+            asset_index: assetIndex,
+            leg_index: i, // unique within the (single) batch instruction of this tx
           });
           eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
           insertedAny = true;
@@ -411,10 +416,10 @@ export class TradeIndexerPolling {
         return false;
       }
 
-      // v17 TODO (blocked on @percolatorct/shared regen): pass asset_index to insertTrade
-      // once TradeRow gains an asset_index column. The v17 wire gives us asset_index at
-      // data[1:3] — extracted above — but TradeRow in shared@beta.8 doesn't accept it yet.
-      await insertTrade({
+      // H2/H3: v17 single-fill wire has asset_index (u16 LE) at data[1:3]. leg_index=0
+      // since a single fill is the only leg of its tx.
+      const assetIndex = (data[1] | (data[2] << 8)) >>> 0;
+      await insertTradeRow({
         slab_address: slabAddress,
         trader,
         side,
@@ -422,6 +427,8 @@ export class TradeIndexerPolling {
         price,
         fee,
         tx_signature: signature,
+        asset_index: assetIndex,
+        leg_index: 0,
       });
 
       eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });

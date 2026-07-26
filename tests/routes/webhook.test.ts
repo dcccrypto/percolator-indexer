@@ -26,12 +26,15 @@ vi.mock('@percolatorct/sdk', () => ({
 // The string 'test-secret-token' is duplicated intentionally — do not replace with a variable reference.
 const TEST_WEBHOOK_SECRET = 'test-secret-token';
 
+// H2/H3: trades are now written via the indexer-local insertTradeRow helper
+// (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn() }));
+
 vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD'],
     webhookSecret: 'test-secret-token', // must be a literal — vi.mock is hoisted
   },
-  insertTrade: vi.fn(),
   eventBus: { publish: vi.fn() },
   createLogger: vi.fn(() => ({
     info: vi.fn(),
@@ -52,13 +55,14 @@ vi.mock('@percolatorct/shared', () => ({
     side: 'long' as const,
   })),
   readU128LE: vi.fn(() => 0n),
-  // GH#42: withRetry added in PERC-8265 — pass-through so insertTrade mock is called directly
+  // GH#42: withRetry added in PERC-8265 — pass-through so insertTradeRow mock is called directly
   withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   // captureException: no-op in tests
   captureException: vi.fn(),
 }));
 
 import * as shared from '@percolatorct/shared';
+import { insertTradeRow } from '../../src/db/insertTradeRow.js';
 import { webhookRoutes, verifyWebhookSignature } from '../../src/routes/webhook.js';
 
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
@@ -138,7 +142,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 85.599093 })
     );
   });
@@ -170,7 +174,7 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     // Log fallback is neutered (#150): price MUST be 0, not 3.75
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 })
     );
   });
@@ -195,7 +199,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 42.5 }) // 42_500_000 / 1_000_000
     );
   });
@@ -217,7 +221,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 10.0 })
     );
   });
@@ -234,7 +238,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 }) // log fallback neutered — backfill covers this
     );
   });
@@ -251,7 +255,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
@@ -267,7 +271,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
@@ -282,7 +286,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 })
     );
   });
@@ -297,7 +301,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 })
     );
   });
@@ -314,7 +318,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 0 }) // log fallback neutered
     );
   });
@@ -337,8 +341,8 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx1, tx2]));
 
-    expect(shared.insertTrade).toHaveBeenCalledTimes(2);
-    const prices = vi.mocked(shared.insertTrade).mock.calls.map((c) => (c[0] as any).price);
+    expect(insertTradeRow).toHaveBeenCalledTimes(2);
+    const prices = vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).price);
     // Log fallback neutered (#150) — both prices are 0, not 1.0 / 2.0
     expect(prices).toEqual([0, 0]);
   });
@@ -347,7 +351,7 @@ describe('POST /webhook/trades — price extraction', () => {
     // GH#42: PERC-8265 changed behavior — insertTrade failures now propagate as 500
     // so Helius will retry the webhook. insertTrade is idempotent (unique constraint),
     // so retries are safe. withRetry mock passes through, insertTrade throws → 500.
-    vi.mocked(shared.insertTrade).mockRejectedValueOnce(new Error('DB error'));
+    vi.mocked(insertTradeRow).mockRejectedValueOnce(new Error('DB error'));
     const tx = {
       signature: SIG,
       instructions: makeBaseInstructions(),
@@ -381,21 +385,30 @@ describe('POST /webhook/trades — price extraction', () => {
     await app.fetch(makeRequest([tx]));
 
     // Must NOT be indexed — TradeCpiV2 is dead in v17
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
-  it('v17: BatchTradeNoCpi (tag=66) — first-leg indexed as a trade', async () => {
+  it('v17: BatchTradeNoCpi (tag=66) — multi-leg batch produces one insertTradeRow call PER LEG', async () => {
     // v17 BatchTrade: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n
-    // Webhook extracts the first leg (size at [4:20]) and records it.
+    // H2/H3: every leg of a batch trade must be indexed separately with a distinct
+    // leg_index — this is the whole point of the H2/H3 fix (batch legs previously
+    // collapsed under a tx_signature-only unique constraint).
+    const N_LEGS = 3;
     const mockDecodeBase58 = vi.mocked(shared.decodeBase58);
     mockDecodeBase58.mockReturnValueOnce((() => {
-      const buf = new Uint8Array(2 + 34); // 1 leg, 36 bytes total
-      buf[0] = 66;  // BatchTradeNoCpi
-      buf[1] = 1;   // n_legs=1
-      buf[2] = 0;   // asset_index low byte
-      buf[3] = 0;   // asset_index high byte
-      // size_q at [4:20] — positive value = long
-      buf[4] = 0x40; buf[5] = 0x42; buf[6] = 0x0f; // ~1_000_000
+      const buf = new Uint8Array(2 + N_LEGS * 34);
+      buf[0] = 66;      // BatchTradeNoCpi
+      buf[1] = N_LEGS;  // n_legs
+      for (let i = 0; i < N_LEGS; i++) {
+        const legOff = 2 + i * 34;
+        buf[legOff] = i;     // asset_index low byte — distinct per leg
+        buf[legOff + 1] = 0; // asset_index high byte
+        // size_q at [legOff+2 : legOff+18] — positive value = long
+        // (parseTradeSize is mocked to a fixed return, so the exact bytes here
+        // don't matter beyond being present; asset_index/leg_index are read
+        // directly by webhook.ts, not through the mock.)
+        buf[legOff + 2] = 0x40; buf[legOff + 3] = 0x42; buf[legOff + 4] = 0x0f;
+      }
       return buf;
     })());
 
@@ -408,8 +421,17 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
 
-    // Must have been indexed — batch trades are valid v17 fills
-    expect(shared.insertTrade).toHaveBeenCalledOnce();
+    // Must have been indexed — batch trades are valid v17 fills, one insertTradeRow
+    // call PER LEG with a distinct leg_index (0, 1, 2, ...).
+    expect(insertTradeRow).toHaveBeenCalledTimes(N_LEGS);
+    const calls = vi.mocked(insertTradeRow).mock.calls;
+    expect(calls.map((c) => (c[0] as any).leg_index)).toEqual([0, 1, 2]);
+    expect(calls.map((c) => (c[0] as any).asset_index)).toEqual([0, 1, 2]);
+    for (const call of calls) {
+      expect(call[0]).toEqual(
+        expect.objectContaining({ side: 'long', size: '1000000', tx_signature: SIG })
+      );
+    }
   });
 
   it('rejects transactions with invalid signature format', async () => {
@@ -422,7 +444,7 @@ describe('POST /webhook/trades — price extraction', () => {
     };
     await app.fetch(makeRequest([tx]));
     // Invalid signature → trade extraction returns empty → no insert
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects trades with oversized i128 size values', async () => {
@@ -439,7 +461,7 @@ describe('POST /webhook/trades — price extraction', () => {
       logs: ['Program log: 1500000, 2000000'],
     };
     await app.fetch(makeRequest([tx]));
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('returns 400 for invalid JSON body', async () => {
@@ -483,7 +505,7 @@ describe('POST /webhook/trades — price extraction', () => {
     );
     expect(res.status).toBe(405);
     expect(res.headers.get('Allow')).toBe('POST');
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('returns 405 for PUT /webhook/trades even with valid auth body', async () => {
@@ -495,7 +517,7 @@ describe('POST /webhook/trades — price extraction', () => {
       }),
     );
     expect(res.status).toBe(405);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 });
 
@@ -624,7 +646,7 @@ describe('POST /webhook/trades — HMAC-SHA256 mode (PERC-750)', () => {
     });
     const res = await app.fetch(req);
     expect(res.status).toBe(401);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects a tampered body even when HMAC was computed over original body', async () => {
@@ -660,7 +682,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     const body = [{ signature: 12345, instructions: [] }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload where ix.programId is not a string', async () => {
@@ -670,7 +692,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload where ix.data is not a string', async () => {
@@ -680,7 +702,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload where ix.accounts contains a non-string element', async () => {
@@ -690,7 +712,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload where ad.account is not a string', async () => {
@@ -701,7 +723,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload with __proto__ key at tx level (prototype-pollution guard)', async () => {
@@ -716,7 +738,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     });
     const res = await app.fetch(req);
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload with constructor key at instruction level (prototype-pollution guard)', async () => {
@@ -731,7 +753,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
   it('rejects payload with prototype key at accountData level (prototype-pollution guard)', async () => {
@@ -742,7 +764,7 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);
-    expect(shared.insertTrade).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
   });
 });
 
@@ -779,9 +801,9 @@ describe('POST /webhook/trades — fee attribution (#153)', () => {
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(200);
-    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
+    expect(insertTradeRow).toHaveBeenCalledTimes(1);
     // Must NOT store the collateral movement as the protocol fee.
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ fee: 0 }),
     );
   });
@@ -805,8 +827,8 @@ describe('POST /webhook/trades — fee attribution (#153)', () => {
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(200);
-    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledTimes(1);
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ fee: 0 }),
     );
   });
@@ -823,8 +845,8 @@ describe('POST /webhook/trades — fee attribution (#153)', () => {
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(200);
-    expect(shared.insertTrade).toHaveBeenCalledTimes(1);
-    expect(shared.insertTrade).toHaveBeenCalledWith(
+    expect(insertTradeRow).toHaveBeenCalledTimes(1);
+    expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ fee: 0 }),
     );
   });

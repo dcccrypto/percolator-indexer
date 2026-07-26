@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, insertTrade, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
+import { config, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
+import { insertTradeRow } from "../db/insertTradeRow.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -404,10 +405,10 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
           // GH#42: Wrap insertTrade with retry so transient DB failures don't silently
           // lose trades. Duplicate constraint (23505) is not retriable — skip immediately.
           // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
-          await withRetry(() => insertTrade(trade), {
+          await withRetry(() => insertTradeRow(trade), {
             maxRetries: 2,
             baseDelayMs: 100,
-            label: `insertTrade(${trade.tx_signature.slice(0, 12)})`,
+            label: `insertTradeRow(${trade.tx_signature.slice(0, 12)})`,
           });
           eventBus.publish("trade.executed", trade.slab_address, {
             signature: trade.tx_signature,
@@ -463,6 +464,9 @@ interface TradeData {
   price: number;
   fee: number;
   tx_signature: string;
+  asset_index: number;   // H2/H3
+  leg_index: number;     // H2/H3 — reassigned tx-globally before return
+  is_liquidation: boolean;
 }
 
 function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): TradeData[] {
@@ -503,7 +507,8 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
     //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(8)+8B]*n — min 2+34 bytes
     //     Each leg is expanded separately.
     const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-    const legs: { sizeValue: bigint; side: "long" | "short" }[] = [];
+    // H2/H3: capture asset_index + leg_index so batch legs dedupe on the composite key.
+    const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = [];
 
     if (isBatch) {
       if (data.length < 2) continue;
@@ -512,15 +517,17 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
       for (let i = 0; i < nLegs; i++) {
         const legOff = 2 + i * 34;
         if (legOff + 34 > data.length) break;
+        const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
         const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
         if (sizeValue === 0n) continue;
-        legs.push({ sizeValue, side });
+        legs.push({ sizeValue, side, assetIndex, legIndex: i });
       }
     } else {
       if (data.length < 19) continue;
+      const assetIndex = (data[1] | (data[2] << 8)) >>> 0; // u16 LE
       const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
       if (sizeValue === 0n) continue;
-      legs.push({ sizeValue, side });
+      legs.push({ sizeValue, side, assetIndex, legIndex: 0 });
     }
 
     if (legs.length === 0) continue;
@@ -561,6 +568,9 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
         price,
         fee,
         tx_signature: signature,
+        asset_index: leg.assetIndex,
+        leg_index: leg.legIndex,
+        is_liquidation: false,
       });
     }
   }
@@ -580,7 +590,7 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
       if (!TRADE_TAGS.has(tag)) continue;
 
       const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      const legs: { sizeValue: bigint; side: "long" | "short" }[] = [];
+      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = [];
 
       if (isBatchInner) {
         if (data.length < 2) continue;
@@ -589,15 +599,17 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
         for (let i = 0; i < nLegs; i++) {
           const legOff = 2 + i * 34;
           if (legOff + 34 > data.length) break;
+          const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
           const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
           if (sizeValue === 0n) continue;
-          legs.push({ sizeValue, side });
+          legs.push({ sizeValue, side, assetIndex, legIndex: i });
         }
       } else {
         if (data.length < 19) continue;
+        const assetIndex = (data[1] | (data[2] << 8)) >>> 0; // u16 LE
         const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
         if (sizeValue === 0n) continue;
-        legs.push({ sizeValue, side });
+        legs.push({ sizeValue, side, assetIndex, legIndex: 0 });
       }
 
       if (legs.length === 0) continue;
@@ -635,10 +647,18 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
           price,
           fee,
           tx_signature: signature,
+          asset_index: leg.assetIndex,
+          leg_index: leg.legIndex,
+          is_liquidation: false,
         });
       }
     }
   }
+
+  // H2/H3: reassign leg_index to the tx-global fill order so (tx_signature,
+  // asset_index, leg_index) is unique across outer + inner instructions. Parsing is
+  // deterministic, so the same tx re-processes to the same keys (idempotent).
+  trades.forEach((t, i) => { t.leg_index = i; });
 
   return trades;
 }
