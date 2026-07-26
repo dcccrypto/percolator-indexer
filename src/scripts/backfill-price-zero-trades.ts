@@ -9,7 +9,10 @@
  * 2. Batch-request Helius Parse Transactions API (up to 100 sigs per call)
  * 3. Extract mark_price_e6 from slab account post-state data (same logic as
  *    the PERC-421 webhook fix, auto-detecting V0/V1 layout from data length;
- *    V0 slabs have no mark_price field; V1: ENGINE_OFF=640 + ENGINE_MARK_PRICE_OFF=400)
+ *    V0 slabs have no mark_price field; V1: ENGINE_OFF=640 + ENGINE_MARK_PRICE_OFF=400).
+ *    There is no log-derived fallback — see extractPriceFromLogs (#162).
+ *    Rows whose slab post-state is unavailable stay at 0 rather than being
+ *    filled from an untrusted source.
  * 4. UPDATE trades SET price = <recovered> WHERE id = <id>
  * 5. Print a summary (fixed / skipped / failed)
  *
@@ -21,6 +24,7 @@
  * Dry-run mode prints what would be updated without writing to DB.
  */
 
+import { pathToFileURL } from "node:url";
 import { getSupabase, getNetwork } from "@percolatorct/shared";
 import { config } from "@percolatorct/shared";
 import { detectSlabLayout } from "@percolatorct/sdk";
@@ -61,12 +65,11 @@ async function fetchEnhancedTxs(signatures: string[]): Promise<any[]> {
  * Extract execution price from an enhanced Helius transaction.
  *
  * Strategy (in order):
- * 1. Read mark_price_e6 from slab account post-state (V1 layout only).
- * 2. Fall back to parsing program logs (covers V0 slabs on devnet where the
- *    mark_price field does not exist).
- * 3. Return 0 if neither strategy yields a result.
+ * 1. Read mark_price_e6 from slab account post-state.
+ * 2. Return 0 — there is deliberately no log-derived fallback. See
+ *    extractPriceFromLogs below.
  */
-function extractPrice(tx: any, slabAddress: string): number {
+export function extractPrice(tx: any, slabAddress: string): number {
   const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
   if (priceFromAccount > 0) return priceFromAccount;
   return extractPriceFromLogs(tx);
@@ -123,33 +126,31 @@ function extractPriceFromAccountData(tx: any, slabAddress: string): number {
 }
 
 /**
- * Parse program logs for comma-separated numeric values (hex or decimal).
- * Mirrors the same logic in packages/indexer/src/routes/webhook.ts so that
- * V0 devnet slabs (no mark_price field) are recovered during backfill.
+ * #162 — NEUTERED: always returns 0.
+ *
+ * This function used to scrape `Program log:` lines and accept the first
+ * integer in [1_000, 1e12] as price_e6. A Percolator transaction can contain
+ * inner CPIs to arbitrary third-party programs, and any of them can emit a log
+ * line, so an attacker could include a CPI emitting a plausible-looking value
+ * and set the recorded price of their own trades. The `.eq("price", 0)` guard
+ * on the UPDATE does not help — the attacker's row is genuinely still 0, so the
+ * overwrite applies and the poisoned price reaches price history, candles, and
+ * the public chart.
+ *
+ * The same scraper was neutralised in the live ingestion paths by #150
+ * (webhook.ts and TradeIndexer.ts, both `return 0`). This script was missed and
+ * kept the original logic — which is exactly the drift that made it exploitable,
+ * since webhook.ts explicitly stores 0 and delegates recovery to THIS script.
+ * The shape is kept identical to webhook.ts so the three stay comparable and a
+ * future divergence is visible in a grep.
+ *
+ * The correct source of truth is extractPriceFromAccountData, which reads
+ * mark_price_e6 / mark_ewma_e6 from the slab's post-state. If log-based
+ * recovery is ever genuinely needed for V0 devnet slabs, it must be restricted
+ * to log lines emitted by a verified Percolator program — not any program in
+ * the transaction. Do not reintroduce the fuzzy scraper.
  */
-function extractPriceFromLogs(tx: any): number {
-  const logs: string[] = tx.logs ?? tx.logMessages ?? [];
-  const valuePattern = /0x[0-9a-fA-F]+|\d+/g;
-
-  for (const log of logs) {
-    if (!log.startsWith("Program log: ")) continue;
-    const payload = log.slice("Program log: ".length).trim();
-    if (!/^[\d, a-fA-Fx]+$/.test(payload)) continue;
-
-    const matches = payload.match(valuePattern);
-    if (!matches || matches.length < 2) continue;
-
-    const values = matches.map((v) =>
-      v.startsWith("0x") ? parseInt(v, 16) : Number(v),
-    );
-
-    for (const v of values) {
-      // Reasonable price_e6 range: $0.001 to $1,000,000
-      if (v >= 1_000 && v <= 1_000_000_000_000) {
-        return v / 1_000_000;
-      }
-    }
-  }
+export function extractPriceFromLogs(_tx: any): number {
   return 0;
 }
 
@@ -322,7 +323,16 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+// Only run when invoked directly (npx tsx src/scripts/backfill-price-zero-trades.ts).
+// Without this guard, importing the module to test its price extraction would
+// execute the whole backfill against Helius and Supabase.
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}
