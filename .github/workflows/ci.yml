@@ -22,24 +22,27 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      # #172: package.json/pnpm-lock.yaml resolve @percolatorct/sdk as
-      # `file:../percolator-sdk`, so a bare checkout has no SDK to install and
-      # `pnpm install --frozen-lockfile` dies with
-      # `ENOENT ... scandir '<runner>/work/percolator-indexer/percolator-sdk'`.
-      # Provide the sibling. actions/checkout cannot write outside
-      # GITHUB_WORKSPACE, so check out into the workspace and then move it up.
-      # percolator-sdk is public, so the default token suffices.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: dcccrypto/percolator-sdk
-          ref: main
-          path: _percolator-sdk
-      - name: Place @percolatorct/sdk as a sibling checkout (#172)
-        run: |
-          rm -rf ../percolator-sdk
-          mv _percolator-sdk ../percolator-sdk
-          test -f ../percolator-sdk/dist/index.js || { echo "SDK dist/ missing — the SDK repo ships a committed dist; aborting"; exit 1; }
+      # #172's sibling-checkout dance is gone: @percolatorct/sdk is a published
+      # npm package now, not a `file:../percolator-sdk` link, so a bare checkout
+      # installs it like any other dependency.
       - run: pnpm install --frozen-lockfile
+      # One HIGH advisory is suppressed via pnpm.auditConfig.ignoreGhsas in
+      # package.json (which cannot carry comments), so the reasoning lives here:
+      #
+      #   GHSA-3gc7-fjrx-p6mg — buffer overflow in bigint-buffer's toBigIntLE().
+      #   Reached only as @percolatorct/sdk > @solana/spl-token >
+      #   @solana/buffer-layout-utils > bigint-buffer. The advisory lists NO
+      #   patched version ("<0.0.0"); bigint-buffer last published in 2022 and is
+      #   unmaintained, so an override cannot fix it and nothing in our control
+      #   drops the dependency.
+      #
+      # This is not a new exposure. The package has always shipped in the runtime
+      # image; it only became VISIBLE to the audit when @percolatorct/sdk moved
+      # from a `file:` link (whose transitive tree pnpm audit does not traverse)
+      # to a registry dependency. Suppressing it explicitly keeps that fact
+      # recorded rather than hidden behind a link.
+      #
+      # Revisit when @solana/spl-token drops @solana/buffer-layout-utils.
       - run: pnpm audit --audit-level=high
       - run: pnpm build
       - run: pnpm test
@@ -57,16 +60,9 @@ jobs:
     # build context below).
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # #175: the image needs @percolatorct/sdk inside the build context, since
-      # the lockfile resolves it as a filesystem path. Checked out INTO the
-      # context (unlike build-and-test, which needs it as a sibling).
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: dcccrypto/percolator-sdk
-          ref: main
-          path: percolator-sdk
-      - name: Verify SDK dist is present in the build context
-        run: test -f percolator-sdk/dist/index.js || { echo "SDK dist/ missing from build context"; exit 1; }
+      # #175's in-context SDK checkout is gone for the same reason as #172's
+      # sibling: the lockfile resolves @percolatorct/sdk from the registry now,
+      # so the image installs it during its own pnpm install.
       - name: Build Docker image
         run: docker build -t percolator-indexer .
 

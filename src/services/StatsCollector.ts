@@ -229,7 +229,8 @@ function parseV17AccountStats(data: Uint8Array): {
   return { engine, marketConfig, params };
 }
 import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
-import { insertMarketRow } from "../db/insertMarketRow.js";
+import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
+import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
   getConnection,
   getMarkets,
@@ -255,6 +256,13 @@ import {
 type DbMarketRow = Awaited<ReturnType<typeof getMarkets>>[number];
 
 const VOLUME_SYNC_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * Markets whose identity is re-resolved per refresh cycle. Bounded so a large
+ * unresolved backlog cannot turn one cycle into a long DexScreener hammering;
+ * the remainder is picked up next cycle.
+ */
+const METADATA_REFRESH_LIMIT = 60;
 
 const logger = createLogger("indexer:stats-collector");
 
@@ -322,6 +330,7 @@ export class StatsCollector {
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  private _refreshingMetadata = false;
   /**
    * When the on-chain janitorial sweep last ran. 0 means "never", so the first
    * collect cycle after start() always sweeps.
@@ -385,7 +394,10 @@ export class StatsCollector {
     // Volume sync for ALL DB markets (including uncranked ones) — runs independently.
     // First sync after 30s to let the indexer warm up, then every 5 minutes.
     this.volumeInitTimeout = setTimeout(() => this.syncVolumeForAllDBMarkets(), 30_000);
-    this.volumeTimer = setInterval(() => this.syncVolumeForAllDBMarkets(), VOLUME_SYNC_INTERVAL_MS);
+    this.volumeTimer = setInterval(() => {
+      void this.syncVolumeForAllDBMarkets();
+      void this.refreshMarketMetadata();
+    }, VOLUME_SYNC_INTERVAL_MS);
 
     logger.info("StatsCollector started", {
       intervalMs: COLLECT_INTERVAL_MS,
@@ -408,6 +420,96 @@ export class StatsCollector {
       this.volumeInitTimeout = null;
     }
     logger.info("StatsCollector stopped");
+  }
+
+  /**
+   * Fill in identity for markets the on-chain path could not name.
+   *
+   * A playground market tracks a MAINNET token (markets.mainnet_ca) while this
+   * service talks to a devnet RPC, so DAS cannot see the asset — which is why
+   * these rows end up as UNKNOWN placeholders with no logo. DexScreener is
+   * chain-wide and keyed by contract address, so it can resolve them.
+   *
+   * Only touches rows that are still 'auto' AND still missing a logo, so it
+   * converges: once a market resolves it stops being a candidate, and a row a
+   * human has edited is never a candidate at all (the UPDATE is additionally
+   * fenced on metadata_source='auto', so a row flipped to 'manual' mid-pass
+   * matches nothing).
+   */
+  private async refreshMarketMetadata(): Promise<void> {
+    if (this._refreshingMetadata || !this._running) return;
+    this._refreshingMetadata = true;
+
+    try {
+      const { data, error } = await getSupabase()
+        .from("markets")
+        .select("slab_address, mainnet_ca")
+        .eq("network", getNetwork())
+        .eq("metadata_source", "auto")
+        .is("logo_url", null)
+        .not("mainnet_ca", "is", null)
+        .limit(METADATA_REFRESH_LIMIT);
+
+      if (error) {
+        logger.warn("refreshMarketMetadata: candidate query failed", { error: error.message });
+        return;
+      }
+
+      const candidates = (data ?? []) as Array<{ slab_address: string; mainnet_ca: string }>;
+      if (candidates.length === 0) return;
+
+      // One CA can back several slabs (the same token relaunched as a new
+      // market), so resolve the DISTINCT set and fan the result back out.
+      const bySlab = new Map<string, string>();
+      for (const c of candidates) bySlab.set(c.slab_address, c.mainnet_ca);
+      const uniqueCas = Array.from(new Set(bySlab.values()));
+
+      const identities = new Map<string, DexScreenerIdentity>();
+      for (const chunk of chunkForDexScreener(uniqueCas)) {
+        const resolved = await resolveIdentitiesByCa(chunk);
+        for (const [ca, identity] of resolved) identities.set(ca, identity);
+      }
+      if (identities.size === 0) {
+        logger.info("refreshMarketMetadata: nothing resolved", { candidates: candidates.length });
+        return;
+      }
+
+      let updated = 0;
+      for (const [slabAddress, ca] of bySlab) {
+        const identity = identities.get(ca);
+        if (!identity) continue;
+
+        // Merge only what resolved — a token with a symbol but no image should
+        // not blank the name, and a row must not be marked done without a logo
+        // (logo_url IS NULL is the candidate predicate, so writing null here
+        // would leave it looping forever).
+        const patch: { symbol?: string; name?: string; logo_url?: string } = {};
+        if (identity.symbol) patch.symbol = identity.symbol;
+        if (identity.name) patch.name = identity.name;
+        if (identity.logoUrl) patch.logo_url = identity.logoUrl;
+        if (Object.keys(patch).length === 0) continue;
+
+        if (await updateAutoMarketMetadata(slabAddress, patch)) {
+          updated++;
+          logger.info("Market metadata resolved from CA", {
+            slabAddress: slabAddress.slice(0, 8),
+            ca: ca.slice(0, 8),
+            symbol: patch.symbol,
+            hasLogo: patch.logo_url != null,
+          });
+        }
+      }
+
+      logger.info("refreshMarketMetadata complete", {
+        candidates: candidates.length,
+        resolved: identities.size,
+        updated,
+      });
+    } catch (err) {
+      logger.warn("refreshMarketMetadata failed", { error: err instanceof Error ? err.message : err });
+    } finally {
+      this._refreshingMetadata = false;
+    }
   }
 
   /**

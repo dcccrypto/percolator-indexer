@@ -17,8 +17,8 @@ export interface DasTokenMetadata {
 }
 
 /** Max lengths mirror the markets table columns (symbol TEXT/32, name TEXT/128). */
-const MAX_SYMBOL_LEN = 32;
-const MAX_NAME_LEN = 128;
+export const MAX_SYMBOL_LEN = 32;
+export const MAX_NAME_LEN = 128;
 const MAX_LOGO_URL_LEN = 512;
 
 /**
@@ -28,7 +28,7 @@ const MAX_LOGO_URL_LEN = 512;
  * token whose on-chain name contains markup must not survive the trip. The
  * frontend escapes too — this stops the value being stored in the first place.
  */
-function sanitizeText(value: unknown, maxLen: number): string | null {
+export function sanitizeText(value: unknown, maxLen: number): string | null {
   if (typeof value !== "string") return null;
   const cleaned = value.replace(/[\x00-\x1f\x7f<>]/g, "").trim().slice(0, maxLen);
   return cleaned.length > 0 ? cleaned : null;

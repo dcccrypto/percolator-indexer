@@ -53,3 +53,43 @@ export async function insertMarketRow(row: IndexerMarketRow): Promise<void> {
     throw new Error(`insertMarketRow failed: ${error.message}`);
   }
 }
+
+/** Identity fields the metadata refresh pass may update. */
+export interface MarketMetadataPatch {
+  symbol?: string;
+  name?: string;
+  logo_url?: string | null;
+}
+
+/**
+ * Update identity for an AUTO-sourced market.
+ *
+ * The `metadata_source = 'auto'` guard is in the WHERE clause rather than a
+ * read-then-write: a human could flip the row to 'manual' between those two
+ * steps and the write would silently clobber their edit. As one conditional
+ * UPDATE, a row that has become 'manual' simply matches nothing.
+ *
+ * Returns true when a row was actually updated.
+ */
+export async function updateAutoMarketMetadata(
+  slabAddress: string,
+  patch: MarketMetadataPatch,
+): Promise<boolean> {
+  const { data, error } = await getSupabase()
+    .from("markets")
+    .update(patch)
+    .eq("slab_address", slabAddress)
+    .eq("network", getNetwork())
+    .eq("metadata_source", "auto")
+    .select("slab_address");
+
+  if (error) {
+    logger.warn("updateAutoMarketMetadata failed", {
+      slab: slabAddress.slice(0, 8),
+      code: error.code,
+      error: error.message,
+    });
+    return false;
+  }
+  return (data?.length ?? 0) > 0;
+}

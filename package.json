@@ -28,6 +28,11 @@
       "hono": ">=4.12.25",
       "ws": "8.21.1",
       "brace-expansion": ">=5.0.8"
+    },
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-3gc7-fjrx-p6mg"
+      ]
     }
   },
   "devDependencies": {
