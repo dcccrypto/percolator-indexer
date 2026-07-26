@@ -5,6 +5,15 @@ import { PublicKey } from '@solana/web3.js';
 const mockGetAccountInfo = vi.fn();
 const mockGetMultipleAccountsInfo = vi.fn();
 
+// Registration moved off shared.insertMarket to the indexer-local writer, which
+// also carries logo_url / metadata_source (see src/db/insertMarketRow.ts).
+// vi.hoisted: vi.mock factories are lifted above const declarations, so the spy
+// has to be created in the hoisted scope to be referenceable from the factory.
+const { insertMarketRowMock } = vi.hoisted(() => ({ insertMarketRowMock: vi.fn() }));
+vi.mock('../../src/db/insertMarketRow.js', () => ({
+  insertMarketRow: insertMarketRowMock,
+}));
+
 vi.mock('@percolatorct/sdk', () => ({
   parseEngine: vi.fn(),
   // v17 desync additions — default to false so existing v12 test paths pass through.
@@ -124,14 +133,14 @@ describe('StatsCollector', () => {
       statsCollector.start();
 
       // Before initial delay — no calls yet
-      expect(shared.insertMarket).not.toHaveBeenCalled();
+      expect(insertMarketRowMock).not.toHaveBeenCalled();
 
       // Advance past 10s initial delay
       await vi.advanceTimersByTimeAsync(10_500);
 
-      // collect() registers newly discovered markets (insertMarket) — it no longer
+      // collect() registers newly discovered markets (insertMarketRow) — it no longer
       // writes market_stats itself (that's the slim syncVolumeForAllDBMarkets path).
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB1 })
       );
     });
@@ -147,7 +156,7 @@ describe('StatsCollector', () => {
 
       // Advance past initial delay to trigger first collect
       await vi.advanceTimersByTimeAsync(10_500);
-      const callCountAfterFirstCollect = vi.mocked(shared.insertMarket).mock.calls.length;
+      const callCountAfterFirstCollect = insertMarketRowMock.mock.calls.length;
       expect(callCountAfterFirstCollect).toBeGreaterThan(0);
 
       // Stop the collector
@@ -156,7 +165,7 @@ describe('StatsCollector', () => {
       // Advance time by 2 full intervals — no further calls should happen
       await vi.advanceTimersByTimeAsync(60_000);
 
-      expect(vi.mocked(shared.insertMarket).mock.calls.length).toBe(callCountAfterFirstCollect);
+      expect(insertMarketRowMock.mock.calls.length).toBe(callCountAfterFirstCollect);
     });
 
     it('should not start twice', async () => {
@@ -171,12 +180,12 @@ describe('StatsCollector', () => {
 
       // Advance past initial delay
       await vi.advanceTimersByTimeAsync(10_500);
-      const callsAfterInitial = vi.mocked(shared.insertMarket).mock.calls.length;
+      const callsAfterInitial = insertMarketRowMock.mock.calls.length;
 
       // Advance by exactly one more interval (references the exported const so this
       // test stays in sync if the default / env override changes).
       await vi.advanceTimersByTimeAsync(COLLECT_INTERVAL_MS);
-      const callsAfterOneInterval = vi.mocked(shared.insertMarket).mock.calls.length;
+      const callsAfterOneInterval = insertMarketRowMock.mock.calls.length;
 
       // With double-started timers we'd get 2 extra calls; with single timer we get 1
       expect(callsAfterOneInterval).toBe(callsAfterInitial + 1);
@@ -195,7 +204,7 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
 
       // collect() still registers newly discovered markets...
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB1 })
       );
 
@@ -249,10 +258,10 @@ describe('StatsCollector', () => {
 
       // A null accountInfo for SLAB1 must not abort registration/processing of
       // SLAB2 — both markets are still registered via insertMarket.
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB1 })
       );
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB2 })
       );
     });
@@ -271,7 +280,7 @@ describe('StatsCollector', () => {
 
       // Market registration (syncMarkets) is independent of slab-data parsing, so
       // it still succeeds even though engine parsing failed for this slab.
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({ slab_address: SLAB1 })
       );
       expect(shared.upsertMarketStats).not.toHaveBeenCalled();
@@ -283,7 +292,7 @@ describe('StatsCollector', () => {
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
 
-      expect(shared.insertMarket).not.toHaveBeenCalled();
+      expect(insertMarketRowMock).not.toHaveBeenCalled();
       expect(shared.upsertMarketStats).not.toHaveBeenCalled();
     });
   });
@@ -330,7 +339,7 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
 
       // insertMarket should have been called with max_leverage=10 (safe default, not skipped)
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({
           slab_address: SLAB1,
           max_leverage: 10,
@@ -364,7 +373,7 @@ describe('StatsCollector', () => {
       await vi.advanceTimersByTimeAsync(10_500);
 
       // initialMarginBps=99999 → Math.floor(10000/99999)=0 → invalid → should use default 10
-      expect(shared.insertMarket).toHaveBeenCalledWith(
+      expect(insertMarketRowMock).toHaveBeenCalledWith(
         expect.objectContaining({
           slab_address: SLAB1,
           max_leverage: 10,

@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS markets (
   lp_collateral     TEXT,
   matcher_context   TEXT,
   logo_url          TEXT,
+  -- Origin of symbol/name/logo_url. 'manual' rows are human-authored (set via
+  -- PATCH /api/markets/[slab]) and must NEVER be overwritten by the indexer:
+  -- v17 admin-oracle markets carry no on-chain pointer to a base asset, so the
+  -- indexer writes a neutral placeholder and a human supplies the real identity.
+  metadata_source   TEXT        NOT NULL DEFAULT 'auto' CHECK (metadata_source IN ('auto','manual')),
   mainnet_ca        TEXT,
   oracle_mode       TEXT        NOT NULL DEFAULT 'admin' CHECK (oracle_mode IN ('pyth','hyperp','admin')),
   dex_pool_address  TEXT,
@@ -71,6 +76,9 @@ CREATE INDEX IF NOT EXISTS idx_markets_mainnet_ca     ON markets(mainnet_ca) WHE
 CREATE INDEX IF NOT EXISTS idx_markets_network        ON markets(network);
 CREATE INDEX IF NOT EXISTS idx_markets_network_status ON markets(network, status);
 CREATE INDEX IF NOT EXISTS idx_markets_status         ON markets(status);
+-- Drives the metadata backfill: auto-resolved markets still missing a logo.
+CREATE INDEX IF NOT EXISTS idx_markets_metadata_refresh
+  ON markets (updated_at) WHERE metadata_source = 'auto' AND logo_url IS NULL;
 
 -- -----------------------------------------------------------------------------
 -- 2. market_stats — thin volume cache (24h volume/count derived from trades).

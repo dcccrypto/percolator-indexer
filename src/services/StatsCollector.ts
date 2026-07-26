@@ -2,7 +2,7 @@
  * StatsCollector — history-only: registers markets and rolls up trade volume.
  *
  * Runs after each crank cycle to read on-chain slab data and:
- * - Auto-register newly discovered markets (insertMarket)
+ * - Auto-register newly discovered markets (insertMarketRow)
  * - Auto-close stale/abandoned markets (dust vault + no accounts)
  * - Roll up volume_24h / trade_count_24h into the slim market_stats table
  *   (slab_address, volume_24h, volume_24h_usd, trade_count_24h, last_price,
@@ -228,10 +228,11 @@ function parseV17AccountStats(data: Uint8Array): {
 
   return { engine, marketConfig, params };
 }
+import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
+import { insertMarketRow } from "../db/insertMarketRow.js";
 import {
   getConnection,
   getMarkets,
-  insertMarket,
   getSupabase,
   getNetwork,
   withRetry,
@@ -590,6 +591,7 @@ export class StatsCollector {
           // Try to resolve token metadata from on-chain (Helius DAS / Metaplex)
           let symbol = mintAddress.substring(0, 8); // fallback
           let name = `Market ${slabAddress.substring(0, 8)}`; // fallback
+          let logoUrl: string | null = null;
           let decimals = 9;
           try {
             const mintPubkey = new PublicKey(mintAddress);
@@ -597,38 +599,15 @@ export class StatsCollector {
             if (mintInfo.value?.data && "parsed" in mintInfo.value.data) {
               decimals = mintInfo.value.data.parsed.info.decimals ?? 9;
             }
-            // Try Helius DAS API if the RPC endpoint supports it
-            const endpoint = connection.rpcEndpoint;
-            if (endpoint.includes("helius-rpc.com")) {
-              const dasRes = await fetch(endpoint, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: `das-${mintAddress}`,
-                  method: "getAsset",
-                  params: { id: mintAddress, options: { showFungible: true } },
-                }),
-                signal: AbortSignal.timeout(5000),
-              });
-              if (dasRes.ok) {
-                const dasJson = await dasRes.json();
-                const metadata = dasJson?.result?.content?.metadata;
-                const tokenInfo = dasJson?.result?.token_info;
-                const dasSym = metadata?.symbol || tokenInfo?.symbol;
-                const dasName = metadata?.name;
-                const dasDecimals = tokenInfo?.decimals;
-                // Sanitize external metadata: truncate length and strip control
-                // characters / HTML to prevent DB bloat and stored XSS vectors
-                // (defense-in-depth — frontend must also escape).
-                if (typeof dasSym === "string" && dasSym.length > 0) {
-                  symbol = dasSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
-                }
-                if (typeof dasName === "string" && dasName.length > 0) {
-                  name = dasName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
-                }
-                if (dasDecimals != null) decimals = dasDecimals;
-              }
+            // Collateral identity via DAS (sanitization lives in the helper).
+            const collateralMeta = await fetchDasTokenMetadata(connection.rpcEndpoint, mintAddress);
+            if (collateralMeta) {
+              if (collateralMeta.symbol) symbol = collateralMeta.symbol;
+              if (collateralMeta.name) name = collateralMeta.name;
+              if (collateralMeta.decimals != null) decimals = collateralMeta.decimals;
+              // Provisional: for a hyperp market the block below replaces this with
+              // the BASE asset's logo, or clears it if the market can't be identified.
+              if (collateralMeta.logoUrl) logoUrl = collateralMeta.logoUrl;
             }
           } catch (metaErr) {
             logger.debug("Token metadata resolution failed, using fallback", { mintAddress, error: metaErr instanceof Error ? metaErr.message : metaErr });
@@ -645,17 +624,21 @@ export class StatsCollector {
           // Resolution path:
           //   1. Read the dexPool address from MarketConfig (set via SetDexPool instruction).
           //   2. Fetch and parse the pool account to extract baseMint.
-          //   3. Look up baseMint metadata via DAS API → use as symbol/name.
-          //   4. Construct the market name as "{baseSymbol}/USDC Perpetual".
-          //   5. Fall back to "SOL" / "SOL/USDC Perpetual" on any failure (only one hyperp
-          //      market type exists today; this should be generalised when more are added).
+          //   3. Look up baseMint metadata via DAS API → use as symbol/name/logo.
+          //   4. Construct the market name as "{baseSymbol}/{collateral} Perpetual".
+          //   5. If NONE of that resolves, write a neutral placeholder.
+          //
+          // Step 5 used to default to "SOL"/"SOL/USDC Perpetual". v17 admin-oracle
+          // markets have no dexPool, so that branch was the ONLY one that ever ran
+          // for them and every such market claimed to be SOL — six unrelated devnet
+          // markets all displayed as "SOL/USDC Perpetual". An unnamed market is
+          // honest and is queryable for follow-up; a market mislabelled SOL is not.
           const zeroKeyBytesHyperp = new Uint8Array(32);
           const isHyperpMarket = (market as any).configV17 != null
             || (cfg?.indexFeedId?.equals(new PublicKey(zeroKeyBytesHyperp)) ?? false);
           if (isHyperpMarket) {
-            let baseSymbol = "SOL";  // safe default: SOL/USDC is the only hyperp type today
-            let baseName = "Solana"; // safe default
-            let resolvedFromChain = false;
+            let baseSymbol: string | null = null;
+            let baseName: string | null = null;
             try {
               const dexPool = cfg?.dexPool ?? null;
               if (dexPool != null) {
@@ -665,60 +648,51 @@ export class StatsCollector {
                   if (dexType != null) {
                     const poolInfo = parseDexPool(dexType, dexPool, new Uint8Array(poolAccountInfo.data));
                     const baseMintAddress = poolInfo.baseMint.toBase58();
-                    // Resolve base mint metadata via DAS (same pattern as collateral above)
-                    const endpoint = connection.rpcEndpoint;
-                    if (endpoint.includes("helius-rpc.com")) {
-                      const baseDasRes = await fetch(endpoint, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          jsonrpc: "2.0",
-                          id: `das-base-${baseMintAddress}`,
-                          method: "getAsset",
-                          params: { id: baseMintAddress, options: { showFungible: true } },
-                        }),
-                        signal: AbortSignal.timeout(5000),
-                      });
-                      if (baseDasRes.ok) {
-                        const baseDasJson = await baseDasRes.json();
-                        const baseMeta = baseDasJson?.result?.content?.metadata;
-                        const baseTokenInfo = baseDasJson?.result?.token_info;
-                        const rawSym = baseMeta?.symbol || baseTokenInfo?.symbol;
-                        const rawName = baseMeta?.name;
-                        if (typeof rawSym === "string" && rawSym.length > 0) {
-                          baseSymbol = rawSym.replace(/[\x00-\x1f<>]/g, "").slice(0, 32);
-                          resolvedFromChain = true;
-                        }
-                        if (typeof rawName === "string" && rawName.length > 0) {
-                          baseName = rawName.replace(/[\x00-\x1f<>]/g, "").slice(0, 128);
-                        }
-                      }
-                    } else {
-                      // Non-Helius endpoint: resolve via parsed account info for decimals only;
-                      // symbol stays at default "SOL" until a DAS-capable endpoint is available.
-                      resolvedFromChain = false;
+                    const baseMeta = await fetchDasTokenMetadata(connection.rpcEndpoint, baseMintAddress);
+                    if (baseMeta) {
+                      baseSymbol = baseMeta.symbol;
+                      baseName = baseMeta.name;
+                      // The market's logo is the BASE asset's logo (what is being
+                      // traded), not the collateral's — a SOL perp shows the SOL
+                      // mark, not USDC's.
+                      if (baseMeta.logoUrl) logoUrl = baseMeta.logoUrl;
                     }
                   }
                 }
               }
             } catch (hyperpErr) {
-              logger.debug("Hyperp base asset resolution failed, using SOL fallback", {
+              logger.debug("Hyperp base asset resolution failed", {
                 slabAddress,
                 error: hyperpErr instanceof Error ? hyperpErr.message : hyperpErr,
               });
             }
-            // Build market symbol/name from base asset.
-            // Collateral symbol is already in `symbol` from the DAS lookup above (e.g. "USDC").
-            // If collateral lookup also failed, fall back gracefully.
-            const collateralLabel = symbol === mintAddress.substring(0, 8) ? "USDC" : symbol;
-            symbol = baseSymbol;
-            name = `${baseSymbol}/${collateralLabel} Perpetual`;
+
+            if (baseSymbol) {
+              // Collateral symbol came from the DAS lookup above (e.g. "USDC").
+              // If that also failed, `symbol` is still the mint-prefix fallback.
+              const collateralLabel = symbol === mintAddress.substring(0, 8) ? "USDC" : symbol;
+              symbol = baseSymbol;
+              name = `${baseSymbol}/${collateralLabel} Perpetual`;
+            } else {
+              // Nothing on-chain identifies this market. Do NOT guess, and do NOT
+              // keep the collateral's identity (that would label every market
+              // "USDC"). A human sets the real values via PATCH /api/markets/[slab],
+              // which flips metadata_source to 'manual' so this never overwrites them.
+              const placeholder = placeholderIdentity(slabAddress);
+              symbol = placeholder.symbol;
+              name = placeholder.name;
+              // The collateral logo is wrong for an unidentified market — drop it
+              // rather than show USDC's mark on something that isn't a USDC market.
+              logoUrl = null;
+            }
+
             logger.info("Hyperp market metadata resolved", {
               slabAddress,
-              baseSymbol,
+              symbol,
+              name,
+              resolvedFromChain: baseSymbol != null,
+              hasLogo: logoUrl != null,
               baseName,
-              collateralLabel,
-              resolvedFromChain,
               dexPool: cfg?.dexPool?.toBase58() ?? null,
             });
           }
@@ -734,7 +708,7 @@ export class StatsCollector {
           
           // Clamp decimals to sane range — some on-chain mints have garbage values
           const clampedDecimals = Math.min(Math.max(decimals, 0), 18);
-          await insertMarket({
+          await insertMarketRow({
             slab_address: slabAddress,
             mint_address: mintAddress,
             symbol,
@@ -748,9 +722,10 @@ export class StatsCollector {
             lp_collateral: null,
             matcher_context: null,
             status: "active",
+            logo_url: logoUrl,
           });
 
-          logger.info("Market registered", { slabAddress, symbol, name });
+          logger.info("Market registered", { slabAddress, symbol, name, hasLogo: logoUrl != null });
         } catch (err) {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });
         }
@@ -946,7 +921,7 @@ export class StatsCollector {
             // removed, along with oracle_prices, oi_history, insurance_history, and
             // funding_history writes — the frontend reads price/OI/insurance/funding-rate
             // live from chain, and chart history is not needed. StatsCollector now only
-            // maintains the markets registry (insertMarket via syncMarkets()) and the
+            // maintains the markets registry (insertMarketRow via syncMarkets()) and the
             // slim market_stats volume rollup (syncVolumeForAllDBMarkets — slab_address,
             // volume_24h, trade_count_24h only).
 
