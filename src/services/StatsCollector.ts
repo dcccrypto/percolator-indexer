@@ -325,6 +325,42 @@ export class StatsCollector {
   private static readonly MAX_CLOSED_SLABS_CACHE = 1000;
 
   /**
+   * Consecutive "account not found" responses per orphan slab (#158).
+   *
+   * `getMultipleAccountsInfo()` returning null for one entry does NOT prove the
+   * account is gone — a lagging RPC node, a partial batch response, or a rate-limit
+   * side effect all produce the same null. Closing on the first null turned a
+   * transient read into permanent DB state (`status=closed`, `indexer_excluded=true`),
+   * which hides a live market from the API/UI and needs manual repair.
+   *
+   * Instead we require ORPHAN_MISS_THRESHOLD consecutive misses, each one a separate
+   * sync cycle (ORPHAN_STATS_SYNC_INTERVAL_MS apart), before writing. A single
+   * successful read clears the streak.
+   *
+   * Bounded like closedSlabs: evict insertion-order-oldest before inserting so the
+   * map can never exceed MAX_ORPHAN_MISS_ENTRIES.
+   */
+  private orphanMissCounts = new Map<string, number>();
+  private static readonly ORPHAN_MISS_THRESHOLD = 3;
+  private static readonly MAX_ORPHAN_MISS_ENTRIES = 1000;
+
+  /**
+   * Record one "not found" for `slabAddress` and report whether the slab has now
+   * missed enough consecutive cycles to be safely treated as gone on-chain.
+   */
+  private recordOrphanMiss(slabAddress: string): number {
+    const next = (this.orphanMissCounts.get(slabAddress) ?? 0) + 1;
+    if (!this.orphanMissCounts.has(slabAddress)) {
+      if (this.orphanMissCounts.size >= StatsCollector.MAX_ORPHAN_MISS_ENTRIES) {
+        const oldest = this.orphanMissCounts.keys().next().value;
+        if (oldest !== undefined) this.orphanMissCounts.delete(oldest);
+      }
+    }
+    this.orphanMissCounts.set(slabAddress, next);
+    return next;
+  }
+
+  /**
    * Add `slabAddress` to the closedSlabs LRU cache.
    * Evicts the insertion-order-oldest entry first if the cache is already full,
    * so the set size never exceeds MAX_CLOSED_SLABS_CACHE (#132 off-by-one fix).
@@ -580,12 +616,31 @@ export class StatsCollector {
             try {
               const accountInfo = accountInfos[batchIdx];
               if (!accountInfo?.data) {
-                // Account doesn't exist on-chain — mark as closed + excluded
+                // A null here is NOT proof the account is gone — a lagging RPC node or
+                // a partial batch response looks identical (#158). Require several
+                // consecutive misses, one per sync cycle, before writing.
+                const misses = this.recordOrphanMiss(dbMarket.slab_address);
+                if (misses < StatsCollector.ORPHAN_MISS_THRESHOLD) {
+                  logger.warn("Orphan market account not found — deferring close", {
+                    slab: dbMarket.slab_address.slice(0, 8),
+                    misses,
+                    threshold: StatsCollector.ORPHAN_MISS_THRESHOLD,
+                  });
+                  return;
+                }
+
                 const db = getSupabase();
                 await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", dbMarket.slab_address).eq("network", getNetwork());
-                logger.info("Auto-closed non-existent orphan market", { slab: dbMarket.slab_address.slice(0, 8) });
+                this.orphanMissCounts.delete(dbMarket.slab_address);
+                logger.info("Auto-closed non-existent orphan market", {
+                  slab: dbMarket.slab_address.slice(0, 8),
+                  misses,
+                });
                 return;
               }
+
+              // Account is present — any earlier miss was transient, so clear the streak.
+              this.orphanMissCounts.delete(dbMarket.slab_address);
 
               const data = new Uint8Array(accountInfo.data);
 
