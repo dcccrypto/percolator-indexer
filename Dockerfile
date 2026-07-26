@@ -17,6 +17,18 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN pnpm build
 
+# #178: strip devDependencies (vitest, vite, tsx, @types/*) and their CVEs from
+# the tree the runner inherits. The runner copies node_modules wholesale, so
+# without this the production image ships the entire test toolchain.
+#
+# Pruning here rather than doing a --prod install in the runner (the pattern
+# percolator-keeper uses): this repo resolves @percolatorct/sdk as
+# `file:../percolator-sdk` and pulls in native optional deps, so a second
+# install in the runner would need both the SDK in that stage's context and a
+# build toolchain (python3/make/g++) that the runner deliberately lacks.
+# Pruning reuses the tree that already built successfully.
+RUN pnpm prune --prod
+
 FROM node:22-alpine AS runner
 RUN apk add --no-cache curl && rm -rf /var/cache/apk/*
 WORKDIR /app

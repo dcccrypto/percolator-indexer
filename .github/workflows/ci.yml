@@ -48,7 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build-and-test
-    if: github.ref == 'refs/heads/main'
+    # #178 follow-up: this was gated to `refs/heads/main`, so the image was only
+    # ever built AFTER merge — a Dockerfile or dependency change that broke the
+    # build was invisible at review time and landed on main before anyone saw
+    # it. Same hazard percolator-keeper#384 describes for its own docker job.
+    # Running it on PRs is the only thing that makes a Dockerfile change
+    # reviewable; the job is already self-contained (it checks the SDK into the
+    # build context below).
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # #175: the image needs @percolatorct/sdk inside the build context, since
@@ -63,3 +69,28 @@ jobs:
         run: test -f percolator-sdk/dist/index.js || { echo "SDK dist/ missing from build context"; exit 1; }
       - name: Build Docker image
         run: docker build -t percolator-indexer .
+
+      # #178: "the image builds" does NOT prove the devDependencies were
+      # actually dropped — the prune could silently no-op and this job would
+      # stay green. Assert the outcome, not just the build.
+      - name: Assert devDependencies are absent from the runtime image
+        run: |
+          set -euo pipefail
+          for pkg in vitest vite tsx; do
+            if docker run --rm --entrypoint sh percolator-indexer -c "test -e /app/node_modules/$pkg"; then
+              echo "::error::devDependency '$pkg' is present in the runtime image (#178 regression)"
+              exit 1
+            fi
+          done
+          echo "OK: vitest, vite and tsx are absent from the runtime image"
+
+      - name: Assert production dependencies survived the prune
+        run: |
+          set -euo pipefail
+          # The mirror check: an over-aggressive prune that removed real
+          # dependencies would also make the assertion above pass.
+          for pkg in hono @supabase/supabase-js @solana/web3.js; do
+            docker run --rm --entrypoint sh percolator-indexer -c "test -e /app/node_modules/$pkg" \
+              || { echo "::error::production dependency '$pkg' missing from the runtime image"; exit 1; }
+          done
+          echo "OK: production dependencies are present"
