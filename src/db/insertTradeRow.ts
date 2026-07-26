@@ -15,9 +15,10 @@ const logger = createLogger("indexer:trades");
 export interface IndexerTradeRow {
   slab_address: string;
   trader: string;
-  side: "long" | "short";
-  size: string | number; // i128 magnitude; string preserves full precision
-  price: number;
+  /** null for is_liquidation markers (v17 exposes no side/size/price for forced closes). */
+  side: "long" | "short" | null;
+  size: string | number | null; // i128 magnitude; string preserves full precision
+  price: number | null;
   fee: number;
   tx_signature: string | null;
   /** u16 asset/domain index within the market group (0 for legacy single-asset). */

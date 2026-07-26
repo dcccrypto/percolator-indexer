@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
+import { parseLiquidation } from "../parsers/liquidations.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -459,9 +460,9 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
 interface TradeData {
   slab_address: string;
   trader: string;
-  side: "long" | "short";
-  size: string;
-  price: number;
+  side: "long" | "short" | null;   // null for liquidation markers
+  size: string | null;
+  price: number | null;
   fee: number;
   tx_signature: string;
   asset_index: number;   // H2/H3
@@ -498,6 +499,26 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
     if (!data || data.length < 2) continue;
 
     const tag = data[0];
+    // Liquidation marker (crank tag 5, action 1) — not a TRADE_TAG, handle before the skip.
+    // No size/price/side; excluded from volume/candles. leg_index reassigned tx-globally.
+    const liq = parseLiquidation(tag, data, ix.accounts ?? []);
+    if (liq) {
+      if (!discovery || discovery.getMarkets().has(liq.slabAddress)) {
+        trades.push({
+          slab_address: liq.slabAddress,
+          trader: liq.portfolio,
+          side: null,
+          size: null,
+          price: null,
+          fee: 0,
+          tx_signature: signature,
+          asset_index: liq.assetIndex,
+          leg_index: 0,
+          is_liquidation: true,
+        });
+      }
+      continue;
+    }
     if (!TRADE_TAGS.has(tag)) continue;
 
     // v17 wire format:

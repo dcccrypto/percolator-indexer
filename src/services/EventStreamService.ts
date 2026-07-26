@@ -3,7 +3,7 @@ import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
 import { IX_TAG } from "@percolatorct/sdk";
-import { parsePercolatorFills } from "../parsers/percolatorTxParser.js";
+import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
 
 const log = createLogger("indexer:event-stream");
@@ -169,6 +169,29 @@ export class EventStreamService {
         });
       } catch (err) {
         log.warn("eventBus emit failed", { err: String(err) });
+      }
+    }
+
+    // Liquidation markers (v17 crank action=1). No size/price/side — excluded from
+    // volume/candles. leg_index offset (1000+) keeps them clear of fill leg indices.
+    const liqs = parsePercolatorLiquidations(tx, signature, [this.deps.programId]);
+    for (const [i, liq] of liqs.entries()) {
+      if (!this.slabSet.has(liq.slabAddress)) continue;
+      try {
+        await insertTradeRow({
+          slab_address: liq.slabAddress,
+          trader: liq.portfolio,
+          side: null,
+          size: null,
+          price: null,
+          fee: 0,
+          tx_signature: signature,
+          asset_index: liq.assetIndex,
+          leg_index: 1000 + i,
+          is_liquidation: true,
+        });
+      } catch (err) {
+        log.warn("liquidation insert failed", { sig: signature, err: String(err) });
       }
     }
   }

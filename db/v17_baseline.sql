@@ -94,15 +94,17 @@ CREATE INDEX IF NOT EXISTS idx_market_stats_updated ON market_stats(updated_at D
 CREATE TABLE IF NOT EXISTS trades (
   id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   slab_address   TEXT        NOT NULL REFERENCES markets(slab_address) ON DELETE CASCADE,
-  trader         TEXT        NOT NULL,
-  side           TEXT        NOT NULL CHECK (side IN ('long','short')),
-  size           NUMERIC     NOT NULL,
-  price          NUMERIC     NOT NULL,
+  trader         TEXT        NOT NULL,                -- wallet for fills; liquidated portfolio addr for markers
+  -- side/size/price are NULL for is_liquidation markers: v17 liquidations run through
+  -- the crank and expose no size/price/side. Real fills always populate them.
+  side           TEXT        CHECK (side IS NULL OR side IN ('long','short')),
+  size           NUMERIC,
+  price          NUMERIC,
   fee            NUMERIC     DEFAULT 0,
   tx_signature   TEXT,
   asset_index    SMALLINT    NOT NULL DEFAULT 0,      -- H2/H3
   leg_index      SMALLINT    NOT NULL DEFAULT 0,      -- H2/H3
-  is_liquidation BOOLEAN     NOT NULL DEFAULT false,  -- forced close via crank (see note)
+  is_liquidation BOOLEAN     NOT NULL DEFAULT false,  -- forced close via crank (marker, no amounts)
   network        TEXT        NOT NULL DEFAULT 'devnet' CHECK (network IN ('devnet','mainnet')),
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );

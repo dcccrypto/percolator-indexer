@@ -2,6 +2,7 @@ import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/w
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
+import { parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -291,6 +292,29 @@ export class TradeIndexerPolling {
     if (!tx.meta || tx.meta.err) return false;
 
     const message = tx.transaction.message;
+
+    // Liquidation markers (crank action=1) for the slab being polled. No size/price/side;
+    // excluded from volume/candles. leg_index offset (1000+) keeps clear of fill legs.
+    const liqs = parsePercolatorLiquidations(tx, signature, Array.from(programIds))
+      .filter((l) => l.slabAddress === slabAddress);
+    for (const [i, liq] of liqs.entries()) {
+      try {
+        await insertTradeRow({
+          slab_address: liq.slabAddress,
+          trader: liq.portfolio,
+          side: null,
+          size: null,
+          price: null,
+          fee: 0,
+          tx_signature: signature,
+          asset_index: liq.assetIndex,
+          leg_index: 1000 + i,
+          is_liquidation: true,
+        });
+      } catch (err) {
+        logger.warn("liquidation insert failed", { signature: signature.slice(0, 12), err: String(err) });
+      }
+    }
 
     for (const ix of message.instructions) {
       // Skip parsed instructions (system, token, etc.)
