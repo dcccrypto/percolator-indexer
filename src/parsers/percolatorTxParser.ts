@@ -1,5 +1,6 @@
 import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
+import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
 
 /**
  * v17 single-fill trade tags (TradeNoCpi=6, TradeCpi=10).
@@ -83,7 +84,7 @@ export interface ParsedFill {
  *
  * v17 wire format changes vs v12.x:
  *   - Single fill: tag(1)+asset_index(2)+size_q(16)+... → size at [3:19], NOT [5:21]
- *   - Batch fill: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*n (26B/leg)
+ *   - Batch fill: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n (34B/leg)
  *   - TradeCpiV2 (was tag 35 / alias TradeCpiV=105) is NOT a valid v17 instruction
  *
  * Input shape matches either `getParsedTransaction` or Helius Atlas WS
@@ -191,6 +192,37 @@ export function parsePercolatorFills(
   }
 
   return fills;
+}
+
+/**
+ * Extract v17 liquidation markers (PermissionlessCrank action=1) from a tx. Mirrors
+ * parsePercolatorFills' instruction iteration. Markers carry no size/price/side.
+ */
+export function parsePercolatorLiquidations(
+  tx: {
+    transaction?: { message?: { instructions?: any[] } };
+    meta?: { err?: unknown } | null;
+  },
+  signature: string,
+  programIds: string[],
+): Array<LiquidationMarker & { signature: string }> {
+  if (!tx.meta || tx.meta.err) return [];
+  const ixs = tx.transaction?.message?.instructions ?? [];
+  if (ixs.length === 0) return [];
+  const programIdSet = new Set(programIds);
+  const out: Array<LiquidationMarker & { signature: string }> = [];
+
+  for (const ix of ixs) {
+    if (ix && typeof ix === "object" && "parsed" in ix) continue;
+    const programId = pubkeyToBase58(ix.programId);
+    if (!programId || !programIdSet.has(programId)) continue;
+    const data = decodeBase58(ix.data);
+    if (!data || data.length < 1) continue;
+    const accounts = (ix.accounts ?? []).map((a: unknown) => pubkeyToBase58(a));
+    const marker = parseLiquidation(data[0], data, accounts);
+    if (marker) out.push({ ...marker, signature });
+  }
+  return out;
 }
 
 function pubkeyToBase58(key: unknown): string | undefined {

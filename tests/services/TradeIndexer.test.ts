@@ -23,6 +23,10 @@ vi.mock('@percolatorct/sdk', () => ({
   V17_HEADER_LEN: 16,
 }));
 
+// H2/H3: trades are now written via the indexer-local insertTradeRow helper
+// (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
+vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn() }));
+
 vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD'],
@@ -38,7 +42,6 @@ vi.mock('@percolatorct/shared', () => ({
     getParsedTransaction: mockGetParsedTransaction,
     getParsedTransactions: mockGetParsedTransactions,
   })),
-  insertTrade: vi.fn(),
   tradeExistsBySignature: vi.fn(async () => false),
   getMarkets: vi.fn(async () => []),
   eventBus: {
@@ -75,6 +78,7 @@ vi.mock('@percolatorct/shared', () => ({
 
 import { TradeIndexerPolling } from '../../src/services/TradeIndexer.js';
 import * as shared from '@percolatorct/shared';
+import { insertTradeRow } from '../../src/db/insertTradeRow.js';
 
 const SLAB = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
@@ -173,7 +177,7 @@ describe('TradeIndexerPolling', () => {
       await new Promise(r => setTimeout(r, 6500));
 
       // Should NOT insert because tradeExistsBySignature returns true
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
     it('should insert trade when not duplicate', async () => {
@@ -208,7 +212,7 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      expect(shared.insertTrade).toHaveBeenCalledWith(
+      expect(insertTradeRow).toHaveBeenCalledWith(
         expect.objectContaining({
           slab_address: SLAB,
           trader: TRADER,
@@ -247,7 +251,7 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
     it('should handle getSignaturesForAddress failure', async () => {
@@ -258,7 +262,7 @@ describe('TradeIndexerPolling', () => {
       await new Promise(r => setTimeout(r, 6500));
 
       // Should not crash
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
     it('should skip instructions with data too short', async () => {
@@ -288,7 +292,7 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
     it('v17: TradeCpiV2 (tag=35) NOT indexed — removed from decoder', async () => {
@@ -320,21 +324,32 @@ describe('TradeIndexerPolling', () => {
       await new Promise(r => setTimeout(r, 6500));
 
       // Tag=35 is NOT a trade tag in v17 — must not be indexed
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
-    it('v17: BatchTradeNoCpi (tag=66) IS indexed', async () => {
+    it('v17: BatchTradeNoCpi (tag=66) IS indexed — one insertTradeRow call per leg', async () => {
       // v17 NEW: BatchTradeNoCpi=66 replaces the old BurnPositionNft=66 tag.
+      // H2/H3: a multi-leg batch must produce ONE insertTradeRow call PER LEG, each
+      // with a distinct leg_index — this is the whole point of the H2/H3 fix (batch
+      // legs previously collapsed under a tx_signature-only unique constraint).
       vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
       vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: 7_000_000n, side: 'long' as const });
 
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
 
-      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*1 = 36 bytes
-      const ixData = new Uint8Array(36);
-      ixData[0] = 66;  // BatchTradeNoCpi
-      ixData[1] = 1;   // n_legs
+      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n
+      // 3 legs = 2 + 3*34 = 104 bytes. Each leg gets a distinct asset_index so we can
+      // verify per-leg fields are read from the correct offset.
+      const N_LEGS = 3;
+      const ixData = new Uint8Array(2 + N_LEGS * 34);
+      ixData[0] = 66;      // BatchTradeNoCpi
+      ixData[1] = N_LEGS;  // n_legs
+      for (let i = 0; i < N_LEGS; i++) {
+        const legOff = 2 + i * 34;
+        ixData[legOff] = i;     // asset_index low byte
+        ixData[legOff + 1] = 0; // asset_index high byte
+      }
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
 
       mockGetParsedTransaction.mockResolvedValue({
@@ -353,10 +368,15 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      expect(shared.insertTrade).toHaveBeenCalledOnce();
-      expect(shared.insertTrade).toHaveBeenCalledWith(
-        expect.objectContaining({ side: 'long', size: '7000000', slab_address: SLAB })
-      );
+      expect(insertTradeRow).toHaveBeenCalledTimes(N_LEGS);
+      const calls = vi.mocked(insertTradeRow).mock.calls;
+      expect(calls.map((c) => (c[0] as any).leg_index)).toEqual([0, 1, 2]);
+      expect(calls.map((c) => (c[0] as any).asset_index)).toEqual([0, 1, 2]);
+      for (const call of calls) {
+        expect(call[0]).toEqual(
+          expect.objectContaining({ side: 'long', size: '7000000', slab_address: SLAB, tx_signature: VALID_SIG })
+        );
+      }
     }, 10000);
 
     it('should skip non-trade instruction tags', async () => {
@@ -388,7 +408,7 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
   });
 
@@ -424,8 +444,8 @@ describe('TradeIndexerPolling', () => {
       // Wait for backfill to run
       await new Promise(r => setTimeout(r, 6500));
 
-      // insertTrade must NOT have been called — the tx batch failed
-      expect(shared.insertTrade).not.toHaveBeenCalled();
+      // insertTradeRow must NOT have been called — the tx batch failed
+      expect(insertTradeRow).not.toHaveBeenCalled();
 
       // The FIRST getSignaturesForAddress call had no `until` (fresh cursor).
       // After the failure the cursor must still be unset, so if a second
@@ -484,8 +504,8 @@ describe('TradeIndexerPolling', () => {
 
       // With the log parser neutered AND no getAccountInfo mock (so slab fallback
       // also returns 0), price must not come out at 1.5 — it should be 0.
-      if (vi.mocked(shared.insertTrade).mock.calls.length > 0) {
-        const call = vi.mocked(shared.insertTrade).mock.calls[0][0] as any;
+      if (vi.mocked(insertTradeRow).mock.calls.length > 0) {
+        const call = vi.mocked(insertTradeRow).mock.calls[0][0] as any;
         expect(call.price).not.toBe(1.5);
       }
     }, 10000);

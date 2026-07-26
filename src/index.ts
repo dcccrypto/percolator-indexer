@@ -6,9 +6,6 @@ import { config, createLogger, initSentry, captureException, getSupabase, getCon
 import { MarketDiscovery } from "./services/MarketDiscovery.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
-import { NftIndexerPolling } from "./services/NftIndexer.js";
-import { AdlIndexerPolling } from "./services/AdlIndexer.js";
-import { InsuranceLPService } from "./services/InsuranceLPService.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
@@ -92,9 +89,6 @@ try {
 const discovery = new MarketDiscovery();
 const statsCollector = new StatsCollector(discovery);
 const tradeIndexer = new TradeIndexerPolling();
-const nftIndexer = new NftIndexerPolling();
-const adlIndexer = new AdlIndexerPolling();
-const insuranceService = new InsuranceLPService(discovery);
 const webhookManager = new HeliusWebhookManager();
 
 let atlasWs: AtlasWs | null = null;
@@ -302,14 +296,11 @@ async function start() {
   const rpcPollingEnabled = process.env.INDEXER_RPC_POLLING_ENABLED !== "false";
   if (rpcPollingEnabled) {
     tradeIndexer.start();
-    nftIndexer.start();
-    adlIndexer.start();
   } else {
     logger.info("RPC fallback pollers disabled", {
       reason: "INDEXER_RPC_POLLING_ENABLED=false",
     });
   }
-  insuranceService.start();
   await webhookManager.start();
 
   // Phase 2: Atlas WebSocket event stream (opt-in; real-time complement to webhooks + polling).
@@ -397,15 +388,6 @@ async function shutdown(signal: string): Promise<void> {
 
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
-
-    logger.info("Stopping NFT indexer");
-    nftIndexer.stop();
-
-    logger.info("Stopping ADL indexer");
-    adlIndexer.stop();
-
-    logger.info("Stopping insurance LP service");
-    insuranceService.stop();
 
     logger.info("Stopping webhook manager");
     webhookManager.stop();

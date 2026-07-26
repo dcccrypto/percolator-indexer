@@ -1,8 +1,9 @@
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
-import { createLogger, insertTrade, insertOraclePrice, eventBus, decodeBase58 } from "@percolatorct/shared";
+import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
+import { insertTradeRow } from "../db/insertTradeRow.js";
 import { IX_TAG } from "@percolatorct/sdk";
-import { parsePercolatorFills } from "../parsers/percolatorTxParser.js";
+import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
 
 const log = createLogger("indexer:event-stream");
@@ -106,30 +107,13 @@ export class EventStreamService {
     const signature = tx.signature ?? tx.transaction?.signatures?.[0];
     if (!signature) return;
 
-    // P2: oracle-update detection. Resolve slab for oracle updates tx-wide (only one
-    // oracle account per UpdateHyperpMark call), then fire before fill processing so
-    // even a tx that contains ONLY an UpdateHyperpMark (no trade) still writes an oracle row.
-    if (this.hasUpdateHyperpMark(tx)) {
-      const oracleSlab = this.resolveSlab(tx);
-      if (oracleSlab) {
-        try {
-          const markE6 = await readMarkPriceE6(this.deps.connection, oracleSlab);
-          if (markE6 != null) {
-            await insertOraclePrice({
-              slab_address: oracleSlab,
-              price_e6: String(markE6),
-              timestamp: Math.floor(Date.now() / 1000),
-              tx_signature: signature,
-            });
-          }
-        } catch (err) {
-          log.warn("insertOraclePrice failed", { sig: signature, err: String(err) });
-        }
-      }
-    }
+    // REDUCTION (2026-07-26): oracle_prices is no longer indexed — the frontend reads
+    // price live from chain. UpdateHyperpMark txs no longer trigger a DB write here.
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
-    for (const fill of fills) {
+    // legIndex is the fill's position within the whole tx (fills are flattened across
+    // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
+    for (const [legIndex, fill] of fills.entries()) {
       // #148: Use the per-fill slab derived from instruction accounts (fill.slabAddress),
       // not the tx-wide resolveSlab() result. resolveSlab returns the *first* known slab
       // in accountKeys and applies it to every fill in the tx — mis-attributing fills in
@@ -145,16 +129,23 @@ export class EventStreamService {
       if (!price) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
         // hit the slab for the authoritative post-tx mark price.
-        const fallback = await readMarkPriceE6(this.deps.connection, slab);
-        if (fallback == null) {
-          log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
+        // #170: isolate the fallback read — one failed slab read skips only THIS fill
+        // instead of aborting the whole tx handler and losing every later fill.
+        try {
+          const fallback = await readMarkPriceE6(this.deps.connection, slab);
+          if (fallback == null) {
+            log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
+            continue;
+          }
+          price = fallback;
+        } catch (err) {
+          log.warn("skipping fill — slab price fallback failed", { sig: signature, slab, err: String(err) });
           continue;
         }
-        price = fallback;
       }
 
       try {
-        await insertTrade({
+        await insertTradeRow({
           slab_address: slab,
           trader: fill.trader,
           side: fill.side,
@@ -162,9 +153,11 @@ export class EventStreamService {
           price,
           fee: 0,
           tx_signature: signature,
+          asset_index: fill.assetIndex,
+          leg_index: legIndex,
         });
       } catch (err) {
-        log.warn("insertTrade failed", { sig: signature, err: String(err) });
+        log.warn("insertTradeRow failed", { sig: signature, err: String(err) });
         continue;
       }
       // Fan out to percolator-api WS subscribers of trades:<slab>.
@@ -183,6 +176,29 @@ export class EventStreamService {
         });
       } catch (err) {
         log.warn("eventBus emit failed", { err: String(err) });
+      }
+    }
+
+    // Liquidation markers (v17 crank action=1). No size/price/side — excluded from
+    // volume/candles. leg_index offset (1000+) keeps them clear of fill leg indices.
+    const liqs = parsePercolatorLiquidations(tx, signature, [this.deps.programId]);
+    for (const [i, liq] of liqs.entries()) {
+      if (!this.slabSet.has(liq.slabAddress)) continue;
+      try {
+        await insertTradeRow({
+          slab_address: liq.slabAddress,
+          trader: liq.portfolio,
+          side: null,
+          size: null,
+          price: null,
+          fee: 0,
+          tx_signature: signature,
+          asset_index: liq.assetIndex,
+          leg_index: 1000 + i,
+          is_liquidation: true,
+        });
+      } catch (err) {
+        log.warn("liquidation insert failed", { sig: signature, err: String(err) });
       }
     }
   }
