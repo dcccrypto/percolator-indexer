@@ -104,7 +104,8 @@ function makePortfolioData(slabAddress: string): Uint8Array {
 // Import after mocks
 // ---------------------------------------------------------------------------
 
-import { NftIndexerPolling } from '../../src/services/NftIndexer.js';
+import { NftIndexerPolling, PortfolioFetchUnavailableError } from '../../src/services/NftIndexer.js';
+import * as shared from '@percolatorct/shared';
 
 // ---------------------------------------------------------------------------
 // Helpers to invoke private methods
@@ -182,20 +183,27 @@ describe('NftIndexerPolling — processTransaction (#134: skip-on-null portfolio
     expect(mockUpsert).not.toHaveBeenCalled();
   });
 
-  it('skips the NFT event when portfolio getAccountInfo throws an error (#134)', async () => {
+  it('does not write the NFT event when portfolio getAccountInfo keeps failing (#134/#165)', async () => {
+    // #134's guarantee is unchanged: an unverified portfolio must NEVER be
+    // written, because unverified attribution is wrong attribution.
+    // #165 changes only the MECHANISM — it now raises instead of returning
+    // false, so the poll loop can tell a transient failure apart from a
+    // deterministic skip and hold its cursor rather than dropping the event.
     mockGetAccountInfo.mockRejectedValue(new Error('RPC 503 Service Unavailable'));
 
     const indexer = new NftIndexerPolling();
-    const didIndex = await asPrivate(indexer).processTransaction(
-      makeParsedTx(),
-      SIG,
-      SLAB,
-      programIds,
-      100,
-      1_000_000,
-    );
 
-    expect(didIndex).toBe(false);
+    await expect(
+      asPrivate(indexer).processTransaction(
+        makeParsedTx(),
+        SIG,
+        SLAB,
+        programIds,
+        100,
+        1_000_000,
+      ),
+    ).rejects.toBeInstanceOf(PortfolioFetchUnavailableError);
+
     expect(mockUpsert).not.toHaveBeenCalled();
   });
 
@@ -234,5 +242,95 @@ describe('NftIndexerPolling — processTransaction (#134: skip-on-null portfolio
     // actualSlab !== slabAddress → skip
     expect(didIndex).toBe(false);
     expect(mockUpsert).not.toHaveBeenCalled();
+  });
+});
+
+describe('NftIndexerPolling — #165: cursor must not advance past a transient failure', () => {
+  const programIds = new Set([PROGRAM_ID]);
+  const OTHER_SIG = '5'.repeat(87);
+
+  /**
+   * Drives indexNftEventsForSlab with one signature in the window, so the only
+   * variable is what the portfolio fetch does.
+   */
+  function armPoll() {
+    const getSignaturesForAddress = vi.fn().mockResolvedValue([
+      { signature: SIG, err: null, slot: 100, blockTime: 1_000_000 },
+    ]);
+    const getParsedTransactions = vi.fn().mockResolvedValue([makeParsedTx()]);
+    vi.mocked(shared.getConnection).mockReturnValue({
+      getSignaturesForAddress,
+      getParsedTransactions,
+      getAccountInfo: mockGetAccountInfo,
+    } as any);
+    return { getSignaturesForAddress };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUpsert.mockResolvedValue({ error: null });
+  });
+
+  it('holds the cursor when the portfolio fetch fails transiently', async () => {
+    armPoll();
+    mockGetAccountInfo.mockRejectedValue(new Error('RPC 503 Service Unavailable'));
+
+    const indexer = new NftIndexerPolling();
+    await asPrivate(indexer).indexNftEventsForSlab(SLAB);
+
+    // Cursor left unset → the next poll re-fetches this window and the NFT
+    // ownership-transfer event gets another chance. Advancing here would put
+    // the signature below the cursor forever.
+    expect(asPrivate(indexer).lastSignature.get(SLAB)).toBeUndefined();
+    expect(mockUpsert).not.toHaveBeenCalled();
+  });
+
+  it('advances the cursor on a DETERMINISTIC skip (portfolio absent)', async () => {
+    // The other half. Holding the cursor for a permanent condition would spin
+    // the same window forever — re-fetching cannot make the account exist.
+    armPoll();
+    mockGetAccountInfo.mockResolvedValue(null);
+
+    const indexer = new NftIndexerPolling();
+    await asPrivate(indexer).indexNftEventsForSlab(SLAB);
+
+    expect(asPrivate(indexer).lastSignature.get(SLAB)).toBe(SIG);
+    expect(mockUpsert).not.toHaveBeenCalled();
+  });
+
+  it('advances the cursor on a successful index', async () => {
+    armPoll();
+    mockGetAccountInfo.mockResolvedValue({ data: makePortfolioData(SLAB) });
+
+    const indexer = new NftIndexerPolling();
+    await asPrivate(indexer).indexNftEventsForSlab(SLAB);
+
+    expect(asPrivate(indexer).lastSignature.get(SLAB)).toBe(SIG);
+    expect(mockUpsert).toHaveBeenCalled();
+  });
+
+  it('retries the portfolio fetch instead of giving up on the first blip', async () => {
+    // The bare getAccountInfo had no retry wrapper — every other RPC call in
+    // the indexer has one. A single blip should not cost the event at all.
+    armPoll();
+    // NOT mockImplementationOnce: indexNftEventsForSlab's own
+    // getSignaturesForAddress call goes through withRetry first and would
+    // consume it, leaving the portfolio fetch on the no-retry default.
+    vi.mocked(shared.withRetry).mockImplementation(async (fn: any) => {
+      try {
+        return await fn();
+      } catch {
+        return await fn(); // one retry, mirroring withRetry's real contract
+      }
+    });
+    mockGetAccountInfo
+      .mockRejectedValueOnce(new Error('RPC 503 Service Unavailable'))
+      .mockResolvedValue({ data: makePortfolioData(SLAB) });
+
+    const indexer = new NftIndexerPolling();
+    await asPrivate(indexer).indexNftEventsForSlab(SLAB);
+
+    expect(mockUpsert).toHaveBeenCalled();
+    expect(asPrivate(indexer).lastSignature.get(SLAB)).toBe(SIG);
   });
 });
