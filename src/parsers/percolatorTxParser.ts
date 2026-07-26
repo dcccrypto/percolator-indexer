@@ -83,7 +83,7 @@ export interface ParsedFill {
  *
  * v17 wire format changes vs v12.x:
  *   - Single fill: tag(1)+asset_index(2)+size_q(16)+... → size at [3:19], NOT [5:21]
- *   - Batch fill: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+8B]*n (26B/leg)
+ *   - Batch fill: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n (34B/leg)
  *   - TradeCpiV2 (was tag 35 / alias TradeCpiV=105) is NOT a valid v17 instruction
  *
  * Input shape matches either `getParsedTransaction` or Helius Atlas WS
