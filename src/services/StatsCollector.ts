@@ -529,11 +529,20 @@ export class StatsCollector {
       for (const [slabAddress, state] of missingMarkets) {
         try {
           const market = state.market;
-          const mintAddress = market.config.collateralMint.toBase58();
-          const admin = market.header.admin.toBase58();
-          const oracleAuthority = market.config.oracleAuthority.toBase58();
-          const priceE6 = Number(market.config.authorityPriceE6);
-          const initialMarginBps = Number(market.params.initialMarginBps);
+          // v17 market group accounts expose config under `configV17` (WrapperConfigV17);
+          // `config`/`header`/`params` are v12-only and undefined for v17. Prefer configV17.
+          const cfg: any = (market as any).configV17 ?? market.config;
+          const mintAddress = cfg?.collateralMint?.toBase58() ?? "";
+          if (!mintAddress) {
+            logger.warn("Skipping market registration — no collateralMint", { slabAddress });
+            continue;
+          }
+          // configV17 has no oracleAuthority / authorityPriceE6 / admin / margin — those are
+          // per-asset or v12-only; fall back safely (registry only needs mint + a deployer).
+          const oracleAuthority = cfg?.oracleAuthority?.toBase58() ?? "";
+          const admin = (market as any).header?.admin?.toBase58() ?? (oracleAuthority || mintAddress);
+          const priceE6 = Number(cfg?.authorityPriceE6 ?? cfg?.markEwmaE6 ?? 0n);
+          const initialMarginBps = Number(market.params?.initialMarginBps ?? cfg?.initialMarginBps ?? 0n);
 
           // Compute maxLeverage from initialMarginBps.
           // Guard against division-by-zero or garbage values (e.g. uninitialized slab
@@ -631,13 +640,14 @@ export class StatsCollector {
           //   5. Fall back to "SOL" / "SOL/USDC Perpetual" on any failure (only one hyperp
           //      market type exists today; this should be generalised when more are added).
           const zeroKeyBytesHyperp = new Uint8Array(32);
-          const isHyperpMarket = market.config.indexFeedId.equals(new PublicKey(zeroKeyBytesHyperp));
+          const isHyperpMarket = (market as any).configV17 != null
+            || (cfg?.indexFeedId?.equals(new PublicKey(zeroKeyBytesHyperp)) ?? false);
           if (isHyperpMarket) {
             let baseSymbol = "SOL";  // safe default: SOL/USDC is the only hyperp type today
             let baseName = "Solana"; // safe default
             let resolvedFromChain = false;
             try {
-              const dexPool = market.config.dexPool;
+              const dexPool = cfg?.dexPool ?? null;
               if (dexPool != null) {
                 const poolAccountInfo = await connection.getAccountInfo(dexPool);
                 if (poolAccountInfo) {
@@ -699,7 +709,7 @@ export class StatsCollector {
               baseName,
               collateralLabel,
               resolvedFromChain,
-              dexPool: market.config.dexPool?.toBase58() ?? null,
+              dexPool: cfg?.dexPool?.toBase58() ?? null,
             });
           }
 
