@@ -109,8 +109,13 @@ CREATE TABLE IF NOT EXISTS trades (
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 -- H2/H3: multi-fill batch legs share a tx_signature; dedupe per (sig, asset, leg).
+-- Deliberately NOT partial: a partial unique index cannot serve as an ON CONFLICT
+-- target (PostgREST's on_conflict takes column names only, and Postgres needs the
+-- predicate restated), which the batched webhook upsert relies on. asset_index and
+-- leg_index are NOT NULL and the index is NULLS DISTINCT, so NULL-signature rows
+-- never conflict — identical enforcement to `WHERE tx_signature IS NOT NULL`.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_sig_asset_leg
-  ON trades(tx_signature, asset_index, leg_index) WHERE tx_signature IS NOT NULL;
+  ON trades(tx_signature, asset_index, leg_index);
 CREATE INDEX IF NOT EXISTS idx_trades_slab           ON trades(slab_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_trader_created ON trades(trader, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_network        ON trades(network, slab_address, created_at DESC);

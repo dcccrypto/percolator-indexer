@@ -230,7 +230,6 @@ function parseV17AccountStats(data: Uint8Array): {
 }
 import {
   getConnection,
-  upsertMarketStats,
   getMarkets,
   insertMarket,
   getSupabase,
@@ -251,6 +250,9 @@ import {
  * because it issues a single bulk trade fetch + N upserts (cheap), but still
  * infrequent enough to avoid hammering the DB under high trade volume.
  */
+/** A row of the `markets` table, as returned by the shared getMarkets() helper. */
+type DbMarketRow = Awaited<ReturnType<typeof getMarkets>>[number];
+
 const VOLUME_SYNC_INTERVAL_MS = 10 * 60_000;
 
 const logger = createLogger("indexer:stats-collector");
@@ -261,12 +263,13 @@ export interface MarketProvider {
 }
 
 /**
- * How often to collect stats. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
+ * How often the collect cycle runs. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
  *
- * Default: 60_000 (1 min). The old hardcoded 5 min left `oracle_prices` with long
- * gaps — frontend price charts need denser samples for smooth backfill. Keep the
- * env override so we can crank it down further if the RPC budget allows, or up
- * if we need to back off.
+ * Default: 60_000 (1 min). This cadence is now driven by market REGISTRATION, not
+ * stats: trades carry an FK to markets(slab_address), so a market that isn't
+ * registered yet can't have its fills indexed. Keeping this at 1 min bounds that
+ * window. The expensive part of the cycle (the per-slab RPC sweep) is separately
+ * gated by AUTOCLOSE_INTERVAL_MS below.
  */
 export const COLLECT_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_COLLECT_INTERVAL_MS;
@@ -280,6 +283,37 @@ export const COLLECT_INTERVAL_MS: number = (() => {
   }
 })();
 
+/**
+ * How often the per-slab on-chain sweep inside collect() runs (ms).
+ *
+ * Since the REDUCTION (2026-07-26) that sweep no longer writes any stats — the
+ * frontend reads price/OI/insurance live from chain. Its only remaining job is
+ * janitorial: auto-close abandoned slabs (dust vault + no accounts) and re-enable
+ * markets that came back. That does not need to run every minute, and running it
+ * every minute meant a getMultipleAccountsInfo round-trip per batch of markets
+ * plus an inter-batch sleep, every 60s, forever.
+ *
+ * Default: 10 min. Registration (syncMarkets) still runs every COLLECT_INTERVAL_MS.
+ */
+export const AUTOCLOSE_INTERVAL_MS: number = (() => {
+  const raw = process.env.STATS_AUTOCLOSE_INTERVAL_MS;
+  if (!raw) return 10 * 60_000;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n;
+  logger.warn("Invalid STATS_AUTOCLOSE_INTERVAL_MS env var, falling back to 600000ms", { raw });
+  return 10 * 60_000;
+})();
+
+/**
+ * Accounts per getMultipleAccountsInfo call in the sweep. The RPC accepts up to
+ * 100; 25 keeps each response modest while cutting round-trips 5x versus the
+ * previous batch of 5.
+ */
+const SWEEP_BATCH_SIZE = 25;
+
+/** Pause between sweep batches, to stay clear of RPC rate limits. */
+const SWEEP_BATCH_DELAY_MS = 250;
+
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
@@ -287,6 +321,11 @@ export class StatsCollector {
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  /**
+   * When the on-chain janitorial sweep last ran. 0 means "never", so the first
+   * collect cycle after start() always sweeps.
+   */
+  private _lastSweepAt = 0;
   /**
    * Tracks slabs already marked as closed this session to avoid repeated DB writes.
    *
@@ -377,121 +416,87 @@ export class StatsCollector {
    * that are deployed but no longer actively cranked (e.g. test markets, stale slabs)
    * fall out of the on-chain provider map and never get their volume updated.
    *
-   * This method fetches all trades in the last 24h, aggregates by slab_address, and
-   * bulk-upserts volume_24h + trade_count_24h for every market that has trades.
-   * It intentionally does NOT reset volume to 0 for markets with no trades — those
-   * are left unchanged (they'll naturally reach 0 as their last trades age out and
-   * the on-chain collect cycle picks them up).
+   * The aggregation runs server-side via the volume_24h_by_slab(network) SQL
+   * function (migration 20260726180000) and the result is written back in ONE
+   * bulk upsert. It intentionally does NOT reset volume to 0 for markets with no
+   * trades — those are left unchanged (they'll naturally reach 0 as their last
+   * trades age out).
+   *
+   * PERF: this previously paginated the whole 24h trade tape out of PostgREST
+   * (up to 20 round-trips x 5k rows = 100k rows), summed it in JS, then issued
+   * one sequential upsert per market. Both the transfer and the N round-trips
+   * are gone — it is now 1 RPC + 1 upsert regardless of trade volume, and the
+   * 100k-row MAX_PAGES cap that could silently under-report volume is gone too.
    *
    * Bug fixed: GH#1171 — volume_24h = 0 for all markets despite trades existing.
+   * Bug fixed: is_liquidation markers (NULL size) inflated trade_count_24h — the
+   * SQL function filters them (see the migration header for why the old JS path
+   * counted them as zero-volume trades instead of skipping them).
    */
   private async syncVolumeForAllDBMarkets(): Promise<void> {
     if (this._syncingVolume || !this._running) return;
     this._syncingVolume = true;
 
     try {
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      // Server-side rollup: one row per market with trades in the window.
+      // Filters is_liquidation markers and NULL sizes (see migration header).
+      const { data: rows, error } = await getSupabase().rpc("volume_24h_by_slab", {
+        p_network: getNetwork(),
+      });
 
-      // Paginated fetch: read all trades in last 24h in pages of PAGE_SIZE.
-      // Previously capped at 10k rows — if >10k trades occurred in 24h,
-      // volume was silently under-reported. Now fetches all pages with a
-      // safety cap (MAX_PAGES) to prevent runaway memory usage.
-      const PAGE_SIZE = 5_000;
-      const MAX_PAGES = 20; // 100k trades max — far beyond expected 24h volume
-      const allTrades: Array<{ slab_address: string; size: string }> = [];
-      let page = 0;
-      let hasMore = true;
-
-      while (hasMore && page < MAX_PAGES) {
-        const from = page * PAGE_SIZE;
-        const to = from + PAGE_SIZE - 1;
-        const { data: batch, error } = await getSupabase()
-          .from("trades")
-          .select("slab_address, size")
-          .eq("network", getNetwork())
-          .gte("created_at", since)
-          .range(from, to);
-
-        if (error) {
-          logger.warn("syncVolumeForAllDBMarkets: trade fetch failed", { error: error.message, page });
-          return;
-        }
-
-        if (!batch || batch.length === 0) break;
-        allTrades.push(...batch);
-        hasMore = batch.length === PAGE_SIZE;
-        page++;
+      if (error) {
+        logger.warn("syncVolumeForAllDBMarkets: rollup RPC failed", { error: error.message });
+        return;
       }
 
-      if (page >= MAX_PAGES) {
-        logger.warn("syncVolumeForAllDBMarkets: hit max page limit — volume may be under-reported", {
-          totalFetched: allTrades.length,
-          maxPages: MAX_PAGES,
-          pageSize: PAGE_SIZE,
+      const agg = (rows ?? []) as Array<{
+        slab_address: string;
+        volume_24h: string | number;
+        trade_count_24h: string | number;
+      }>;
+      if (agg.length === 0) return;
+
+      // volume_24h is NUMERIC in Postgres (arbitrary precision) but MarketStatsRow
+      // types it as number. postgres-js/PostgREST hands NUMERIC back as a string to
+      // avoid lossy parsing, so keep the string when it exceeds MAX_SAFE_INTEGER and
+      // let Postgres store it exactly; only downcast when it's safely representable.
+      const payload = agg.map((r) => {
+        const raw = String(r.volume_24h ?? "0");
+        const asNum = Number(raw);
+        const safe = Number.isFinite(asNum) && Math.abs(asNum) <= Number.MAX_SAFE_INTEGER;
+        if (!safe) {
+          logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, storing as string", {
+            slabAddress: r.slab_address.slice(0, 8),
+            volume: raw,
+          });
+        }
+        return {
+          slab_address: r.slab_address,
+          volume_24h: (safe ? asNum : raw) as unknown as number,
+          trade_count_24h: Number(r.trade_count_24h ?? 0),
+          network: getNetwork(),
+          updated_at: new Date().toISOString(),
+        };
+      });
+
+      // Single bulk upsert. Columns absent from the payload (last_price,
+      // volume_24h_usd) are left untouched on conflict.
+      const { error: upsertErr } = await getSupabase()
+        .from("market_stats")
+        .upsert(payload as never, { onConflict: "slab_address" });
+
+      if (upsertErr) {
+        // A row whose slab_address isn't in `markets` yet violates the FK — that
+        // market simply hasn't been registered by syncMarkets() yet, so it will
+        // land on the next cycle. Log rather than retry-loop.
+        logger.warn("syncVolumeForAllDBMarkets: bulk upsert failed", {
+          error: upsertErr.message,
+          markets: payload.length,
         });
+        return;
       }
 
-      if (allTrades.length === 0) return;
-
-      // Aggregate volume + trade count by slab_address in memory
-      const volumeMap = new Map<string, { volume: bigint; count: number }>();
-      for (const trade of allTrades) {
-        const current = volumeMap.get(trade.slab_address) ?? { volume: 0n, count: 0 };
-        try {
-          const raw = BigInt(trade.size);
-          const abs = raw < 0n ? -raw : raw;
-          volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
-        } catch {
-          // Fallback: size string isn't a valid BigInt literal. Parse via BigInt()
-          // instead of Math.abs(Number()) to avoid precision loss on large values.
-          try {
-            const numVal = Number(trade.size);
-            if (!Number.isFinite(numVal)) continue; // skip Infinity/NaN
-            const abs = BigInt(Math.trunc(Math.abs(numVal)));
-            volumeMap.set(trade.slab_address, { volume: current.volume + abs, count: current.count + 1 });
-          } catch {
-            // Completely unparseable size — skip this trade
-            logger.warn("syncVolumeForAllDBMarkets: unparseable trade size, skipping", {
-              slabAddress: trade.slab_address?.slice(0, 8),
-              size: String(trade.size).slice(0, 30),
-            });
-          }
-        }
-      }
-
-      // Upsert volume stats for each market that has trades.
-      // volume_24h is NUMERIC in PostgreSQL so it can hold arbitrary precision,
-      // but MarketStatsRow types it as number|null. Use Number() with a warning
-      // when precision would be lost (> MAX_SAFE_INTEGER = ~9e15).
-      let updated = 0;
-      for (const [slabAddress, { volume, count }] of volumeMap.entries()) {
-        try {
-          const exceedsSafeInt = volume > BigInt(Number.MAX_SAFE_INTEGER);
-          const volumeNum = Number(volume);
-          if (exceedsSafeInt) {
-            logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, precision loss", {
-              slabAddress: slabAddress.slice(0, 8),
-              volumeBigInt: volume.toString(),
-              volumeNumber: volumeNum,
-            });
-          }
-          await upsertMarketStats({
-            slab_address: slabAddress,
-            volume_24h: exceedsSafeInt ? (volume.toString() as any) : volumeNum,
-            trade_count_24h: count,
-          });
-          updated++;
-        } catch (err) {
-          logger.warn("syncVolumeForAllDBMarkets: upsert failed", {
-            slabAddress: slabAddress.slice(0, 8),
-            error: err instanceof Error ? err.message : err,
-          });
-        }
-      }
-
-      if (updated > 0) {
-        logger.info("Volume sync complete", { marketsUpdated: updated, totalTrades: allTrades.length, pages: page });
-      }
+      logger.info("Volume sync complete", { marketsUpdated: payload.length });
     } catch (err) {
       logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
     } finally {
@@ -501,12 +506,17 @@ export class StatsCollector {
 
   /**
    * Auto-register missing markets: compare on-chain markets vs DB and insert any missing.
+   *
+   * Returns the markets rows it read, so collect() can reuse them for the
+   * indexer_excluded pass instead of issuing a second full-table read in the
+   * same cycle. Returns null when no read happened (or it failed), in which
+   * case the caller falls back to fetching them itself.
    */
-  private async syncMarkets(): Promise<void> {
+  private async syncMarkets(): Promise<DbMarketRow[] | null> {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
-      if (onChainMarkets.size === 0) return;
+      if (onChainMarkets.size === 0) return null;
 
       // Get existing markets from DB
       const dbMarkets = await getMarkets();
@@ -520,7 +530,7 @@ export class StatsCollector {
         }
       }
 
-      if (missingMarkets.length === 0) return;
+      if (missingMarkets.length === 0) return dbMarkets;
 
       logger.info("New markets found", { count: missingMarkets.length });
 
@@ -745,21 +755,29 @@ export class StatsCollector {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });
         }
       }
+
+      // Newly-inserted rows are absent from dbMarkets, but the caller only reads
+      // indexer_excluded off it — which defaults to false for fresh inserts, the
+      // same answer a re-read would give.
+      return dbMarkets;
     } catch (err) {
       logger.error("Market sync failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
+      return null;
     }
   }
 
   /**
-   * Collect stats for all known markets by reading on-chain slab accounts.
+   * Registry sync every cycle; the on-chain janitorial sweep every
+   * AUTOCLOSE_INTERVAL_MS.
    */
   private async collect(): Promise<void> {
     if (this._collecting || !this._running) return;
     this._collecting = true;
 
     try {
-      // Auto-register missing markets at the start of each cycle
-      await this.syncMarkets();
+      // Auto-register missing markets at the start of each cycle. Reuse the rows
+      // it read for the indexer_excluded pass below (saves a full markets read).
+      const syncedDbMarkets = await this.syncMarkets();
 
       const markets = this.marketProvider.getMarkets();
       if (markets.size === 0) {
@@ -767,7 +785,14 @@ export class StatsCollector {
         return;
       }
 
-      logger.info("StatsCollector.collect started", { marketCount: markets.size });
+      // The sweep below is pure janitorial work (auto-close / re-enable) and costs
+      // one RPC round-trip per SWEEP_BATCH_SIZE markets. Registration above already
+      // ran; skip the sweep until it's due.
+      const now = Date.now();
+      if (now - this._lastSweepAt < AUTOCLOSE_INTERVAL_MS) return;
+      this._lastSweepAt = now;
+
+      logger.info("StatsCollector sweep started", { marketCount: markets.size });
 
       // GH#1218: load indexer_excluded flags from DB to skip corrupt slabs.
       // These are slabs where on-chain state is permanently corrupt and re-syncing
@@ -779,7 +804,7 @@ export class StatsCollector {
       // markets that recover after being abandoned.
       let excludedSlabs: Set<string> = new Set();
       try {
-        const dbMarkets = await getMarkets();
+        const dbMarkets = syncedDbMarkets ?? (await getMarkets());
         const excludedDbMarkets = dbMarkets.filter((m) => m.indexer_excluded === true);
 
         for (const m of excludedDbMarkets) {
@@ -832,11 +857,11 @@ export class StatsCollector {
       let updated = 0;
       let errors = 0;
 
-      // Process markets in batches of 5 to avoid RPC rate limits
-      // Use getMultipleAccountsInfo for batch fetching to reduce RPC round trips
+      // Batch the account reads: getMultipleAccountsInfo takes up to 100 keys, so
+      // SWEEP_BATCH_SIZE keys per call instead of one call per market.
       const entries = Array.from(markets.entries()).filter(([slabAddress]) => !excludedSlabs.has(slabAddress));
-      for (let i = 0; i < entries.length; i += 5) {
-        const batch = entries.slice(i, i + 5);
+      for (let i = 0; i < entries.length; i += SWEEP_BATCH_SIZE) {
+        const batch = entries.slice(i, i + SWEEP_BATCH_SIZE);
         const slabPubkeys = batch.map(([slabAddress]) => new PublicKey(slabAddress));
 
         try {
@@ -846,7 +871,7 @@ export class StatsCollector {
             { 
               maxRetries: 3, 
               baseDelayMs: 1000, 
-              label: `getMultipleAccountsInfo(batch ${i / 5 + 1})` 
+              label: `getMultipleAccountsInfo(batch ${i / SWEEP_BATCH_SIZE + 1})` 
             }
           );
 
@@ -938,12 +963,12 @@ export class StatsCollector {
         }
 
         // Small delay between batches
-        if (i + 5 < entries.length) {
-          await new Promise((r) => setTimeout(r, 1_000));
+        if (i + SWEEP_BATCH_SIZE < entries.length) {
+          await new Promise((r) => setTimeout(r, SWEEP_BATCH_DELAY_MS));
         }
       }
 
-      logger.info("StatsCollector.collect complete", { updated, errors, totalMarkets: markets.size });
+      logger.info("StatsCollector sweep complete", { updated, errors, totalMarkets: markets.size });
       if (errors > 0) {
         addBreadcrumb("StatsCollector completed with errors", {
           updated,

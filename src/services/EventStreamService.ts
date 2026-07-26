@@ -1,7 +1,7 @@
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
-import { insertTradeRow } from "../db/insertTradeRow.js";
+import { insertTradeRows, tradeKey, type IndexerTradeRow } from "../db/insertTradeRow.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
@@ -111,6 +111,17 @@ export class EventStreamService {
     // price live from chain. UpdateHyperpMark txs no longer trigger a DB write here.
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
+
+    // Collect this tx's rows and write them in one round-trip at the end, instead
+    // of one insert per leg.
+    const rows: IndexerTradeRow[] = [];
+    const emits: Array<{ slab: string; side: "long" | "short"; size: string; price: number; trader: string; key: string }> = [];
+
+    // Fills on the same slab within one tx resolve to the same post-tx mark price,
+    // so the fallback slab read is memoized per slab (it was previously repeated
+    // once per fill). null = the read failed or returned nothing for that slab.
+    const priceBySlab = new Map<string, number | null>();
+
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
     for (const [legIndex, fill] of fills.entries()) {
@@ -131,61 +142,54 @@ export class EventStreamService {
         // hit the slab for the authoritative post-tx mark price.
         // #170: isolate the fallback read — one failed slab read skips only THIS fill
         // instead of aborting the whole tx handler and losing every later fill.
-        try {
-          const fallback = await readMarkPriceE6(this.deps.connection, slab);
-          if (fallback == null) {
-            log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
-            continue;
+        if (!priceBySlab.has(slab)) {
+          try {
+            priceBySlab.set(slab, await readMarkPriceE6(this.deps.connection, slab));
+          } catch (err) {
+            log.warn("slab price fallback failed", { sig: signature, slab, err: String(err) });
+            priceBySlab.set(slab, null);
           }
-          price = fallback;
-        } catch (err) {
-          log.warn("skipping fill — slab price fallback failed", { sig: signature, slab, err: String(err) });
+        }
+        const fallback = priceBySlab.get(slab) ?? null;
+        if (fallback == null) {
+          log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
           continue;
         }
+        price = fallback;
       }
 
-      try {
-        await insertTradeRow({
-          slab_address: slab,
-          trader: fill.trader,
-          side: fill.side,
-          size: fill.sizeAbs.toString(),
-          price,
-          fee: 0,
-          tx_signature: signature,
-          asset_index: fill.assetIndex,
-          leg_index: legIndex,
-        });
-      } catch (err) {
-        log.warn("insertTradeRow failed", { sig: signature, err: String(err) });
-        continue;
-      }
-      // Fan out to percolator-api WS subscribers of trades:<slab>.
-      // The ws.ts handler picks this up and pushes to live chart clients.
-      try {
-        eventBus.emit("trade.executed", {
-          slabAddress: slab,
-          timestamp: Date.now(),
-          data: {
-            side: fill.side,
-            size: fill.sizeAbs.toString(),
-            price,
-            trader: fill.trader,
-            signature,
-          },
-        });
-      } catch (err) {
-        log.warn("eventBus emit failed", { err: String(err) });
-      }
+      rows.push({
+        slab_address: slab,
+        trader: fill.trader,
+        side: fill.side,
+        size: fill.sizeAbs.toString(),
+        price,
+        fee: 0,
+        tx_signature: signature,
+        asset_index: fill.assetIndex,
+        leg_index: legIndex,
+      });
+      emits.push({
+        slab,
+        side: fill.side,
+        size: fill.sizeAbs.toString(),
+        price,
+        trader: fill.trader,
+        key: tradeKey({ tx_signature: signature, asset_index: fill.assetIndex, leg_index: legIndex }),
+      });
     }
 
     // Liquidation markers (v17 crank action=1). No size/price/side — excluded from
     // volume/candles. leg_index offset (1000+) keeps them clear of fill leg indices.
-    const liqs = parsePercolatorLiquidations(tx, signature, [this.deps.programId]);
-    for (const [i, liq] of liqs.entries()) {
-      if (!this.slabSet.has(liq.slabAddress)) continue;
-      try {
-        await insertTradeRow({
+    //
+    // #170-style isolation: fills are now written in one batch AFTER this block, so
+    // an exception here would discard the tx's fills too. Previously the fills were
+    // already durable by this point. Contain the failure to the liquidation markers.
+    try {
+      const liqs = parsePercolatorLiquidations(tx, signature, [this.deps.programId]);
+      for (const [i, liq] of liqs.entries()) {
+        if (!this.slabSet.has(liq.slabAddress)) continue;
+        rows.push({
           slab_address: liq.slabAddress,
           trader: liq.portfolio,
           side: null,
@@ -197,8 +201,35 @@ export class EventStreamService {
           leg_index: 1000 + i,
           is_liquidation: true,
         });
+      }
+    } catch (err) {
+      log.warn("liquidation parse failed — fills still indexed", { sig: signature, err: String(err) });
+    }
+
+    if (rows.length === 0) return;
+
+    let written: Set<string>;
+    try {
+      written = new Set((await insertTradeRows(rows)).map(tradeKey));
+    } catch (err) {
+      // Whole batch failed — nothing was written, so emit nothing.
+      log.warn("insertTradeRows failed", { sig: signature, count: rows.length, err: String(err) });
+      return;
+    }
+
+    // Fan out to percolator-api WS subscribers of trades:<slab>.
+    // The ws.ts handler picks this up and pushes to live chart clients.
+    // Skip legs that were already indexed (re-delivered tx) — they were not written.
+    for (const e of emits) {
+      if (!written.has(e.key)) continue;
+      try {
+        eventBus.emit("trade.executed", {
+          slabAddress: e.slab,
+          timestamp: Date.now(),
+          data: { side: e.side, size: e.size, price: e.price, trader: e.trader, signature },
+        });
       } catch (err) {
-        log.warn("liquidation insert failed", { sig: signature, err: String(err) });
+        log.warn("eventBus emit failed", { err: String(err) });
       }
     }
   }

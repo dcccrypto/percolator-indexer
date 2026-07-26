@@ -28,7 +28,29 @@ const TEST_WEBHOOK_SECRET = 'test-secret-token';
 
 // H2/H3: trades are now written via the indexer-local insertTradeRow helper
 // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn() }));
+//
+// The webhook now writes a whole delivery's legs in ONE batched call
+// (insertTradeRows). The batch mock forwards each row to the per-row spy so the
+// existing per-trade assertions still hold, and returns the inserted count that
+// processTransactions reports back.
+vi.mock('../../src/db/insertTradeRow.js', () => {
+  const insertTradeRow = vi.fn();
+  return {
+    insertTradeRow,
+    // Real implementation — webhook.ts imports this from the same module, so the
+    // mock must provide it or it resolves to undefined.
+    tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+    insertTradeRows: vi.fn(async (rows: any[]) => {
+      for (const r of rows) await insertTradeRow(r);
+      // Mirrors the real writer: returns the dedupe key of every row written.
+      return rows.map((r) => ({
+        tx_signature: r.tx_signature,
+        asset_index: r.asset_index,
+        leg_index: r.leg_index,
+      }));
+    }),
+  };
+});
 
 vi.mock('@percolatorct/shared', () => ({
   config: {
