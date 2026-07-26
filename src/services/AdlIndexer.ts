@@ -96,6 +96,19 @@ export class AdlIndexerPolling {
 
   start(): void {
     if (this._running) return;
+
+    // M7: v17 has no standalone ADL instruction, so ADL_TAGS is empty and no
+    // signature can ever match. Without this guard the poller + startup backfill
+    // still issue getSignaturesForAddress + getParsedTransactions for every market
+    // every cycle only to discard 100% of the results — pure wasted RPC credits.
+    // Short-circuit until a real v17 ADL tag is added to ADL_TAGS.
+    if (ADL_TAGS.size === 0) {
+      logger.info(
+        "AdlIndexerPolling not started: ADL_TAGS is empty (no v17 ADL instruction to index). Skipping poll/backfill to save RPC.",
+      );
+      return;
+    }
+
     this._running = true;
 
     // Initial backfill after short delay to let discovery finish.
