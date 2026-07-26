@@ -45,13 +45,33 @@ function getHeliusParseUrl(): string {
   return `https://${host}/v0/transactions?api-key=${config.heliusApiKey}`;
 }
 
+/**
+ * Return the Helius URL with the API key redacted for safe logging (#169/#187).
+ * Mirrors HeliusWebhookManager.ts's redaction — this script builds the same kind of
+ * api-key-bearing URL, so any error path must redact it too.
+ */
+function redactedHeliusUrl(url: string): string {
+  return url.replace(/api-key=[^&]+/, "api-key=REDACTED");
+}
+
 async function fetchEnhancedTxs(signatures: string[]): Promise<any[]> {
   const url = getHeliusParseUrl();
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ transactions: signatures }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transactions: signatures }),
+    });
+  } catch (err) {
+    // Transport-level failures (DNS/TLS/reset) can embed the request URL — with the
+    // api-key — in the error. Scrub both the reconstructed URL and the raw message.
+    const message = (err instanceof Error ? err.message : String(err)).replace(
+      /api-key=[^&\s]+/g,
+      "api-key=REDACTED",
+    );
+    throw new Error(`Helius request to ${redactedHeliusUrl(url)} failed: ${message}`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "(no body)");
     throw new Error(`Helius ${res.status}: ${text}`);

@@ -129,12 +129,19 @@ export class EventStreamService {
       if (!price) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
         // hit the slab for the authoritative post-tx mark price.
-        const fallback = await readMarkPriceE6(this.deps.connection, slab);
-        if (fallback == null) {
-          log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
+        // #170: isolate the fallback read — one failed slab read skips only THIS fill
+        // instead of aborting the whole tx handler and losing every later fill.
+        try {
+          const fallback = await readMarkPriceE6(this.deps.connection, slab);
+          if (fallback == null) {
+            log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
+            continue;
+          }
+          price = fallback;
+        } catch (err) {
+          log.warn("skipping fill — slab price fallback failed", { sig: signature, slab, err: String(err) });
           continue;
         }
-        price = fallback;
       }
 
       try {
