@@ -241,7 +241,7 @@ describe('StatsCollector', () => {
       );
     });
 
-    it('should log oracle prices on first collect', async () => {
+    it('does NOT write oracle_prices anymore (reduction 2026-07-26 — read live from chain)', async () => {
       const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
       vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
       mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
@@ -251,36 +251,9 @@ describe('StatsCollector', () => {
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
 
-      expect(shared.insertOraclePrice).toHaveBeenCalledWith(
-        expect.objectContaining({
-          slab_address: SLAB1,
-          price_e6: '1500000',
-        })
-      );
-    });
-
-    it('should rate-limit oracle price logging (60s per market)', async () => {
-      const markets = new Map([[SLAB1, makeMockMarket(SLAB1)]]);
-      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(markets);
-      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(2048) });
-      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
-      setupParseMocks();
-
-      const baseTime = Date.now();
-      statsCollector.start();
-
-      // First collect at ~10s
-      vi.setSystemTime(baseTime + 10_500);
-      await vi.advanceTimersByTimeAsync(10_500);
-      expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBe(1);
-
-      // Wait at least ORACLE_LOG_INTERVAL_MS (60s) + one COLLECT_INTERVAL_MS so a
-      // fresh collect fires AFTER the 60s dedup window has elapsed and the oracle
-      // write is allowed again.
-      const waitMs = 60_000 + COLLECT_INTERVAL_MS;
-      vi.setSystemTime(baseTime + 10_500 + waitMs);
-      await vi.advanceTimersByTimeAsync(waitMs);
-      expect(vi.mocked(shared.insertOraclePrice).mock.calls.length).toBeGreaterThanOrEqual(2);
+      // oracle_prices / oi_history / insurance_history are no longer indexed —
+      // the frontend reads price/OI/insurance live via parseMarketGroupV17OI etc.
+      expect(shared.insertOraclePrice).not.toHaveBeenCalled();
     });
 
     it('should handle errored markets gracefully and continue', async () => {

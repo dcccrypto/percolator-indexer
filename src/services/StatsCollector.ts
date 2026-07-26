@@ -229,8 +229,7 @@ function parseV17AccountStats(data: Uint8Array): {
 }
 import { 
   getConnection,
-  upsertMarketStats, 
-  insertOraclePrice, 
+  upsertMarketStats,
   get24hVolume,
   getMarkets,
   insertMarket,
@@ -300,9 +299,6 @@ export const COLLECT_INTERVAL_MS: number = (() => {
   }
 })();
 
-/** How often to log oracle prices to DB (every 60s per market to avoid bloat) */
-const ORACLE_LOG_INTERVAL_MS = 60_000;
-
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
@@ -313,9 +309,6 @@ export class StatsCollector {
   private _collecting = false;
   private _syncingVolume = false;
   private _syncingOrphanStats = false;
-  private lastOracleLogTime = new Map<string, number>();
-  private lastOiHistoryTime = new Map<string, number>();
-  private lastInsHistoryTime = new Map<string, number>();
   private lastFundingHistoryTime = new Map<string, number>();
   /**
    * Tracks slabs already marked as closed this session to avoid repeated DB writes.
@@ -1413,73 +1406,10 @@ export class StatsCollector {
               }
             }
 
-            // Log oracle price to DB (rate-limited per market)
-            if (priceE6 > 0n) {
-              const lastLog = this.lastOracleLogTime.get(slabAddress) ?? 0;
-              if (Date.now() - lastLog >= ORACLE_LOG_INTERVAL_MS) {
-                try {
-                  await insertOraclePrice({
-                    slab_address: slabAddress,
-                    price_e6: priceE6.toString(),
-                    timestamp: Math.floor(Date.now() / 1000),
-                  });
-                  this.lastOracleLogTime.set(slabAddress, Date.now());
-                } catch (oracleErr) {
-                  // Non-fatal — oracle logging shouldn't break stats collection
-                  logger.warn("Oracle price log failed", { slabAddress, error: oracleErr instanceof Error ? oracleErr.message : oracleErr });
-                }
-              }
-            }
-
-            // Log OI history (rate-limited per market)
-            // History tables have FK to market_stats(slab_address). If the market
-            // hasn't been inserted yet, we get FK violation (23503) — skip gracefully.
-            const OI_HISTORY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-            const lastOiLog = this.lastOiHistoryTime.get(slabAddress) ?? 0;
-            if (Date.now() - lastOiLog >= OI_HISTORY_INTERVAL_MS) {
-              try {
-                const { error: oiErr } = await getSupabase().from('oi_history').insert({
-                  market_slab: slabAddress,
-                  slot: safePgBigint(engine.lastCrankSlot),        // BIGINT
-                  total_oi: safeBigNum(engine.totalOpenInterest),  // NUMERIC
-                  net_lp_pos: safeBigNum(engine.netLpPos),         // NUMERIC
-                  lp_sum_abs: safeBigNum(engine.lpSumAbs),         // NUMERIC
-                  lp_max_abs: safeBigNum(engine.lpMaxAbs),         // NUMERIC
-                  network: getNetwork(),                            // PERC-8192: stamp network
-                });
-                // Ignore FK violations (23503) and unique constraint violations (23505)
-                if (oiErr && oiErr.code !== '23503' && oiErr.code !== '23505') {
-                  logger.warn("OI history log failed", { slabAddress, error: oiErr.message, code: oiErr.code });
-                } else {
-                  this.lastOiHistoryTime.set(slabAddress, Date.now());
-                }
-              } catch (e) {
-                // Non-fatal
-                logger.warn("OI history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
-              }
-            }
-
-            // Log insurance history (rate-limited per market)
-            const INS_HISTORY_INTERVAL_MS = 5 * 60 * 1000;
-            const lastInsLog = this.lastInsHistoryTime.get(slabAddress) ?? 0;
-            if (Date.now() - lastInsLog >= INS_HISTORY_INTERVAL_MS) {
-              try {
-                const { error: insErr } = await getSupabase().from('insurance_history').insert({
-                  market_slab: slabAddress,
-                  slot: safePgBigint(engine.lastCrankSlot),                // BIGINT
-                  balance: safeBigNum(engine.insuranceFund.balance),       // NUMERIC
-                  fee_revenue: safeBigNum(engine.insuranceFund.feeRevenue), // NUMERIC
-                  network: getNetwork(),                                    // PERC-8192: stamp network
-                });
-                if (insErr && insErr.code !== '23503' && insErr.code !== '23505') {
-                  logger.warn("Insurance history log failed", { slabAddress, error: insErr.message, code: insErr.code });
-                } else {
-                  this.lastInsHistoryTime.set(slabAddress, Date.now());
-                }
-              } catch (e) {
-                logger.warn("Insurance history log failed", { slabAddress, error: e instanceof Error ? e.message : e });
-              }
-            }
+            // REDUCTION (2026-07-26): oracle_prices, oi_history and insurance_history
+            // writes were removed — 0 frontend readers (the UI reads price/OI/insurance
+            // live from chain via parseMarketGroupV17OI / parseWrapperConfigV17). Only
+            // funding_history remains (consumed by /api/funding/[slab] + /api/funding/global).
 
             // Log funding history (rate-limited per market)
             const FUNDING_HISTORY_INTERVAL_MS = 5 * 60 * 1000;
@@ -1534,15 +1464,6 @@ export class StatsCollector {
 
       // Prune rate-limit maps: remove entries for slabs no longer in discovery.
       // Prevents unbounded growth if markets are delisted over time.
-      for (const key of this.lastOracleLogTime.keys()) {
-        if (!markets.has(key)) this.lastOracleLogTime.delete(key);
-      }
-      for (const key of this.lastOiHistoryTime.keys()) {
-        if (!markets.has(key)) this.lastOiHistoryTime.delete(key);
-      }
-      for (const key of this.lastInsHistoryTime.keys()) {
-        if (!markets.has(key)) this.lastInsHistoryTime.delete(key);
-      }
       for (const key of this.lastFundingHistoryTime.keys()) {
         if (!markets.has(key)) this.lastFundingHistoryTime.delete(key);
       }
