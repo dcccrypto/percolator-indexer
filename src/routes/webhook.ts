@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
+import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
 import { CURRENT_NETWORK } from "../network.js";
 
@@ -394,12 +395,25 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // A delivery carries many transactions and each can carry several legs; inserting
   // per-leg serialized that many round-trips inside Helius's ~15s window.
   const pending: ReturnType<typeof extractTradesFromEnhancedTx> = [];
+  let blockedFills = 0;
   for (const tx of transactions) {
     try {
-      pending.push(...extractTradesFromEnhancedTx(tx, discovery));
+      for (const trade of extractTradesFromEnhancedTx(tx, discovery)) {
+        // Retired markets are deleted from `markets`, and trades carry an FK to
+        // it — so a fill here would fail the insert and burn the batch's retries.
+        // Skip cleanly instead. See src/blocklist.ts.
+        if (isBlockedSlab(trade.slab_address)) {
+          blockedFills++;
+          continue;
+        }
+        pending.push(trade);
+      }
     } catch (err) {
       logger.warn("Failed to process transaction", { error: err instanceof Error ? err.message : err });
     }
+  }
+  if (blockedFills > 0) {
+    logger.debug("Skipped fills on blocked slabs", { count: blockedFills });
   }
 
   if (pending.length > 0) {

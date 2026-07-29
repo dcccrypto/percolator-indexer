@@ -230,6 +230,7 @@ function parseV17AccountStats(data: Uint8Array): {
 }
 import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
 import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
+import { isBlockedSlab } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
   getConnection,
@@ -625,12 +626,23 @@ export class StatsCollector {
       const dbMarkets = await getMarkets();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
 
-      // Find missing markets
+      // Find missing markets. Blocked slabs are skipped here rather than
+      // deleted afterwards: discovery sees them on chain every cycle, so
+      // without this a retired market is re-inserted within a minute of being
+      // removed from the database. See src/blocklist.ts.
       const missingMarkets: Array<[string, any]> = [];
+      let blockedSkipped = 0;
       for (const [slabAddress, state] of onChainMarkets.entries()) {
+        if (isBlockedSlab(slabAddress)) {
+          blockedSkipped++;
+          continue;
+        }
         if (!dbSlabAddresses.has(slabAddress)) {
           missingMarkets.push([slabAddress, state]);
         }
+      }
+      if (blockedSkipped > 0) {
+        logger.debug("Skipped blocked slabs during registration", { count: blockedSkipped });
       }
 
       if (missingMarkets.length === 0) return dbMarkets;

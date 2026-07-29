@@ -2,6 +2,7 @@ import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey, type IndexerTradeRow } from "../db/insertTradeRow.js";
+import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
@@ -135,6 +136,8 @@ export class EventStreamService {
         log.warn("skipping fill — slab not in known set", { sig: signature, slab });
         continue;
       }
+      // Retired market — the markets row is gone and trades FK to it.
+      if (isBlockedSlab(slab)) continue;
 
       let price = fill.priceE6 ?? 0;
       if (!price) {
@@ -189,6 +192,7 @@ export class EventStreamService {
       const liqs = parsePercolatorLiquidations(tx, signature, [this.deps.programId]);
       for (const [i, liq] of liqs.entries()) {
         if (!this.slabSet.has(liq.slabAddress)) continue;
+        if (isBlockedSlab(liq.slabAddress)) continue;
         rows.push({
           slab_address: liq.slabAddress,
           trader: liq.portfolio,
