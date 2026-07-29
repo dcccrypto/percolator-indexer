@@ -900,10 +900,31 @@ export class StatsCollector {
           // If the market is back in the live discovery map, it may have recovered.
           // Re-enable it so collect() processes it this cycle.
           if (markets.has(m.slab_address)) {
-            const state = markets.get(m.slab_address);
-            const engine = state?.market.engine;
-            const vault = engine ? BigInt(engine.vault) : 0n;
-            const numUsedAccounts = engine ? Number(engine.numUsedAccounts) : 0;
+            // DiscoveredMarket.engine is a v12 field — the SDK documents it as
+            // "Absent (undefined) for v17 market group accounts". Reading it
+            // here made `vault` 0 for EVERY v17 market, so isLive was always
+            // false and a market auto-closed once could never be re-enabled: a
+            // launch that stalled between InitMarket and its funding step got
+            // closed by the sweep, and stayed hidden forever even after the
+            // creator completed the deposit and the vault held real collateral.
+            //
+            // Read the vault from chain instead, v17-aware, the same way the
+            // sweep below does (parseV17AccountStats). One account read per
+            // excluded market, and the excluded set is normally tiny.
+            let vault = 0n;
+            let numUsedAccounts = 0;
+            try {
+              const info = await getConnection().getAccountInfo(new PublicKey(m.slab_address));
+              if (info?.data) {
+                const data = new Uint8Array(info.data);
+                const eng = isV17Account(data) ? parseV17AccountStats(data).engine : parseEngine(data);
+                vault = eng.vault;
+                numUsedAccounts = eng.numUsedAccounts;
+              }
+            } catch {
+              // Unreadable — leave it excluded and try again next cycle rather
+              // than un-hiding a market we cannot verify.
+            }
             const isLive = vault > 1_000_000n || numUsedAccounts > 0;
 
             if (isLive) {
