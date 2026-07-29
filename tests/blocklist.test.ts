@@ -23,7 +23,7 @@ describe("indexer blocklist", () => {
 
   it("covers every market that was in the DB at retirement", () => {
     // All 21 rows present when the wipe ran. A future launch must NOT be here.
-    expect(blockedSlabCount()).toBeGreaterThanOrEqual(21);
+    expect(blockedSlabCount()).toBeGreaterThanOrEqual(23);
   });
 
   it("does NOT block an unknown slab — new launches must register", () => {

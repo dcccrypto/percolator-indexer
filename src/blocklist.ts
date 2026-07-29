@@ -56,6 +56,12 @@ const BLOCKED: readonly string[] = [
   "DE2c59suA6NVxRMHvhEhaWJxtBQu8XSMB2CM8wxwyoT7",
   "EtgRphLa69F15krir2E1kZL6LCCuQHDS9Cher3hmYunJ",
   "5kSw1fX8Ps2kBkVU4bc1qHgUQ8AKFXHkqoq2u2ztcdJs",
+  // 2026-07-29 launch-verification markets. Both funded and wrapper-owned, but
+  // both seeded with insurance = 0 — the step-4 idempotency check mistook the
+  // backing-bucket collateral for the insurance seed and skipped TopUpInsurance
+  // (tag 9 appears in neither launch). Insurance is write-once at creation.
+  "H9ey1RBnVoBBit2o7EUCPZWJLMNtQpuA6QiqGmM95ZJ4",  // FRANK
+  "4hJ9hUotH6BwUXVmgLGmXWHfg3YLjnmA8fwAtjex3wBU",  // Percolator
 ];
 
 /**
