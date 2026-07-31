@@ -84,6 +84,47 @@ const BLOCKED: readonly string[] = [
   // on the median-smoothed AuthMark keeper) ──
   "6CFMN29zPgsczCQUjeZZiWxVPDUKN52RJqBLvRsTTERn",  // CATE (bankrupt LP, hlocked)
   "5erG74dYhhjhB3ReATJmFPh1XRb9MVnUjVgV4BSM21c1",  // Percolator (pre-smoother launch)
+
+  // ── 2026-07-31 sync backfill: every app-blocklist entry the indexer copy
+  // was missing (35 pre-2026-07-27 old-wrapper/phantom slabs). Mostly inert
+  // today — discovery only scans current program ids — but the file's own
+  // KEEP-IN-SYNC contract was violated and the safety silently depended on
+  // allProgramIds never re-including an old wrapper. ──
+  "BxJPaMaCfEGTBsjZ8wfj3Yfzf4wpasmxKAEvqZZRcGPP",
+  "HjBePQZnoZVftg9B52gyeuHGjBvt2f8FNCVP4FeoP3YT",
+  "H5Vunzd2yAMygnpFiGUASDSx2s8P3bfPTzjCfrRsPeph",
+  "3bmCyPee8GWJR5aPGTyN5EyyQJLzYyD8Wkg9m1Afd1SD",
+  "3YDqCJGz88xGiPBiRvx4vrM51mWTiTZPZ95hxYDZqKpJ",
+  "3ZKKwsKoo5UP28cYmMpvGpwoFpWLVgEWLQJCejJnECQn",
+  "CRJH9Gtk7qQDdjzDufnAZdfa7AHisfvxCmVVvzpzQN9v",
+  "J6UU4VHbYXpCAACr5o5xjUVmquagiP2NGbbMp68VUCX9",
+  "8L47yqvQRLxZ6PzW3b9jawEM79CmokBvUzeLR7mvtyuU",
+  "8kkED3uZznGzSidr8kYJPd3VhzSh7LVngNUx2V1qnW9L",
+  "8pKtAV3z6iTKekieF9EenQ4tk1rkAVa9oYsqe7h1PGjx",
+  "Eekuz2TgXRPq3rsp5brRW5hofxLdwt6KUXbLUQCKHK9G",
+  "Av3zVrW5deLpLo1qZZ7yNJ5Lq5ja4Z9ixijVhV4MuRzE",
+  "CrbDmfiooBUTFfGyMhJ1hpToCrBLAXXKySBwEnLHV6kj",
+  "FhpPmmuh5UDAjvEjrYBPFwmj4CP4otvsYMxtTb46p1Ss",
+  "7xozYEbKhEdjQn5pCAV8bUDQGugZttqZTduPeHkoqRb8",
+  "3dp3e288oPjs5w92fg26cVYQMHGuUpsj8YbSFn6wrzp4",
+  "8nzjXMvdkC4fRF491QkpKE6aFTLmEcpXEnbh4wQT4iUA",
+  "3bmCyPeeDwAfLbhfnRpYJHkWVqAf3Q5JaWXGfZjbmjNp",
+  "8eFFEFBY3HHbBgzxJJP5hyxdzMNMAumnYNhkWXErBM4c",
+  "FLF9ghf6H4sfSexcQzDwse4gcGZKPb6qYCqo5Btat98",
+  "8NY7rvQJXNTinJkAQG1GUV8NQ1hQzdtF7iWNjK9p7tQN",
+  "9TGSmPLTLMii4UqstL629twGeVJ9Ndr8VD3pexnvQTsV",
+  "5Rdxh3n4CbLEpzovbMtUJ7M3iaZkoso8jGdfVwkv2eV8",
+  "GRAgHm9utZy6kWJj1ZpAVntbyFxCBJyZJ1nSJmiMPPpq",
+  "6QSHWb4Vm1M6f1r14t1jB7Jc4en2uieQuLpKqey71Y2S",
+  "4txSGha4zABqt2NUbBtbkzv3vA4rfi9J6Yr95adA4fc5",
+  "DxrZXhTC11gCVtv4b2nkbszScgZPqm9DFqit5X7FvsF7",
+  "7mzqfnuAhANvDV8PiqJBG3jehyv3rPrCMr9V6j2bCHPV",
+  "Fs13SX1b33wRh3DBbh1NmkuHSz5Z89oRb2ew7aNn1jMH",
+  "J9unPVyDykcoQyxGxF1MfSE6mGyaaCfZhGEAk5eQokXG",
+  "8WNAuxLDvo3S5Yf9Z5sm2me69N4d1RLvxoS1tCnPpo83",
+  "DeWGMtVo8VHjUJ5qsPXSZsQS9rFJhnB3gE4tPGWrEcCB",
+  "dLKhJAVPgmgxJJWvbcGvfQUNBmc7wwjdQp8Jzpg4UGq",
+  "9oBMLGXq9mLGa5DQapTL2gia9eM425dNvf4DUNoMrzz6",
 ];
 
 /**
