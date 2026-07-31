@@ -77,6 +77,13 @@ const BLOCKED: readonly string[] = [
   "2DDBehzGAKJPzwZXZ9HbcHBEtdkoHPRPaGBDjMCqSAUv",  // unnamed
   "FaNFCmyputbCTvSGGmxe7EU1DyjagtGKf6eYPDTvmdFC",  // unnamed
   "6RobABa7gpPvN8WsoQuXgbKKinpURwGXzUS4NJiYNaPR",  // unnamed
+
+  // ── 2026-07-31: retired after the CATE LP drain (bankrupt LP, permanent
+  // bankruptcy hlock blocks every close/withdraw; Percolator launched on the
+  // same raw-spot feed the drain exploited — both replaced by markets created
+  // on the median-smoothed AuthMark keeper) ──
+  "6CFMN29zPgsczCQUjeZZiWxVPDUKN52RJqBLvRsTTERn",  // CATE (bankrupt LP, hlocked)
+  "5erG74dYhhjhB3ReATJmFPh1XRb9MVnUjVgV4BSM21c1",  // Percolator (pre-smoother launch)
 ];
 
 /**
