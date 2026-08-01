@@ -157,9 +157,43 @@ if (blocked.size !== BLOCKED.length) {
   });
 }
 
+/**
+ * DB-driven retirement — the lever that needs NO code change and NO deploy.
+ *
+ * Set `markets.keeper_status = 'retired'` and this indexer stops ingesting
+ * that slab within one StatsCollector sweep (60s). Populated from the rows
+ * StatsCollector already fetches each sweep, so it costs zero extra queries.
+ *
+ * Why this is durable (verified 2026-07-31): nothing in this repo ever WRITES
+ * `keeper_status` (the indexer can only touch status/indexer_excluded/auto
+ * metadata), and migration 047 defaults the column to 'retired', so even a
+ * row re-inserted by discovery comes back retired.
+ *
+ * The hardcoded BLOCKED list above remains the permanent backstop for the one
+ * case the DB cannot cover: a slab whose ROW WAS DELETED is invisible here, so
+ * discovery would re-register it. Prefer keeper_status for routine retirement;
+ * add to BLOCKED only when a market must never come back regardless of what
+ * happens to its row.
+ */
+let dbRetiredSlabs: ReadonlySet<string> = new Set<string>();
+
+/** Replace the DB-derived retired set. Called once per StatsCollector sweep. */
+export function setDbRetiredSlabs(slabs: Iterable<string>): void {
+  const next = new Set(slabs);
+  if (next.size !== dbRetiredSlabs.size) {
+    logger.info("DB-retired slab set updated", {
+      hardcoded: blocked.size,
+      dbRetired: next.size,
+    });
+  }
+  dbRetiredSlabs = next;
+}
+
 /** True when the indexer must ignore this slab entirely. */
 export function isBlockedSlab(slabAddress: string | null | undefined): boolean {
-  return slabAddress != null && blocked.has(slabAddress);
+  return (
+    slabAddress != null && (blocked.has(slabAddress) || dbRetiredSlabs.has(slabAddress))
+  );
 }
 
 /** Current blocklist size — for startup logging. */

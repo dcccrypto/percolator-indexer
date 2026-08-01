@@ -230,7 +230,7 @@ function parseV17AccountStats(data: Uint8Array): {
 }
 import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
 import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
-import { isBlockedSlab } from "../blocklist.js";
+import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
   getConnection,
@@ -625,6 +625,16 @@ export class StatsCollector {
       // Get existing markets from DB
       const dbMarkets = await getMarkets();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
+
+      // Feed the DB-driven half of the blocklist from the rows we just read
+      // (zero extra queries). Setting markets.keeper_status='retired' now
+      // retires a market for registration AND trade/event ingest within one
+      // sweep — no code change, no deploy. See src/blocklist.ts.
+      setDbRetiredSlabs(
+        dbMarkets
+          .filter((m) => (m as { keeper_status?: string }).keeper_status === "retired")
+          .map((m) => m.slab_address),
+      );
 
       // Find missing markets. Blocked slabs are skipped here rather than
       // deleted afterwards: discovery sees them on chain every cycle, so
