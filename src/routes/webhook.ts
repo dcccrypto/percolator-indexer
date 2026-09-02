@@ -691,10 +691,31 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
     }
   }
 
-  // H2/H3: reassign leg_index to the tx-global fill order so (tx_signature,
-  // asset_index, leg_index) is unique across outer + inner instructions. Parsing is
-  // deterministic, so the same tx re-processes to the same keys (idempotent).
-  trades.forEach((t, i) => { t.leg_index = i; });
+  // H2/H3: reassign leg_index so (tx_signature, asset_index, leg_index) is unique
+  // across outer + inner instructions. Parsing is deterministic, so the same tx
+  // re-processes to the same keys (idempotent).
+  //
+  // #195: fills are numbered 0-based and liquidation markers are offset by 1000,
+  // SEPARATELY. This must match TradeIndexer.ts and EventStreamService.ts, which
+  // both already number this way — the dedup key is shared across all three
+  // ingestion paths, so a path that numbers differently does not dedup against
+  // the others, it duplicates against them.
+  //
+  // This used to renumber the whole array by position (`t.leg_index = i`) with
+  // markers interleaved among the fills. A tx carrying a liquidation marker
+  // followed by a real fill gave that fill leg_index 1 here (the marker took slot
+  // 0) and leg_index 0 on the poll/backfill paths, so `ignoreDuplicates` on the
+  // upsert never collapsed them and the fill was stored TWICE — double-counting
+  // its ABS(size) into volume_24h_by_slab, trade counts and candle volume.
+  // Attacker-constructible: bundle a trade with a liquidation crank in one tx.
+  //
+  // Single-fill, no-marker txs were unaffected (leg_index 0 everywhere), which is
+  // why this survived: the common case agreed and only mixed txs diverged.
+  let fillSeq = 0;
+  let markerSeq = 0;
+  for (const t of trades) {
+    t.leg_index = t.is_liquidation ? 1000 + markerSeq++ : fillSeq++;
+  }
 
   return trades;
 }
