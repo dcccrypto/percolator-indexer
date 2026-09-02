@@ -122,8 +122,15 @@ function readU64LE(data: Uint8Array, offset: number): bigint {
  * All v12-engine fields are zeroed. The vault and insurance values come from
  * the v17 market group header at V17_MARKET_GROUP_OFF.
  *
- * InsuranceLPService.poll() reads engine.insuranceFund.balance and engine.lastCrankSlot —
- * these are populated from the real v17 on-chain layout.
+ * `insuranceFund.balance` IS read from the real v17 on-chain layout
+ * (V17_MG_INSURANCE_OFF, below).
+ *
+ * `lastCrankSlot` is NOT. It is zeroed with the other v12-only fields, so every
+ * v17 row lands with snapshot_slot = 0 — see #166. This comment previously
+ * claimed both were populated from chain, which was true of only the first.
+ * Deriving a real crank/current-slot offset for the v17 market-group header is
+ * the open half of #166; guessing one would put plausible garbage into a
+ * freshness column, which is worse than an honest zero.
  */
 function makeV17EngineStub(data: Uint8Array): EngineState {
   const mgOff = V17_MARKET_GROUP_OFF;
