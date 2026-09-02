@@ -396,6 +396,9 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // per-leg serialized that many round-trips inside Helius's ~15s window.
   const pending: ReturnType<typeof extractTradesFromEnhancedTx> = [];
   let blockedFills = 0;
+  // #160: extraction failures are COUNTED, not swallowed. See the throw at the end.
+  let extractionFailures = 0;
+  let firstExtractionError: unknown = null;
   for (const tx of transactions) {
     try {
       for (const trade of extractTradesFromEnhancedTx(tx, discovery)) {
@@ -409,7 +412,24 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         pending.push(trade);
       }
     } catch (err) {
-      logger.warn("Failed to process transaction", { error: err instanceof Error ? err.message : err });
+      // #160: this used to warn and continue, so processTransactions resolved and
+      // the route answered 200. Helius does not retry a 2xx, so a transaction that
+      // threw during EXTRACTION was silently and permanently dropped — no insert
+      // was ever attempted for it, and nothing downstream could tell.
+      //
+      // GH#42 fixed the same class on the far side of the insert (retry, then 500).
+      // This is the near side: a parse/extraction throw before insertTradeRows is
+      // reached. Same failure, earlier in the pipeline, and still silent.
+      extractionFailures++;
+      if (firstExtractionError === null) firstExtractionError = err;
+      logger.error("Trade extraction failed — will 500 so Helius redelivers", {
+        signature: tx.signature?.slice(0, 16),
+        error: err instanceof Error ? err.message : err,
+      });
+      captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { context: "webhook-extraction-failure" },
+        extra: { signature: tx.signature?.slice(0, 16) },
+      });
     }
   }
   if (blockedFills > 0) {
@@ -469,6 +489,24 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Surface persistent DB failures to the caller so Helius can retry
   if (insertFailures > 0) {
     throw new Error(`${insertFailures} trade insert(s) failed after retries`);
+  }
+
+  // #160: and extraction failures, for the same reason.
+  //
+  // Thrown AFTER the insert above, deliberately: every trade that WAS extracted is
+  // already durably written, and insertTradeRows upserts with ignoreDuplicates, so
+  // the redelivery this triggers re-inserts nothing. Failing before the insert would
+  // discard good fills in order to report a bad one.
+  //
+  // A permanently-unparseable transaction will therefore be redelivered until Helius
+  // gives up. That is the correct trade: a bounded number of idempotent retries plus
+  // a loud Sentry trail beats silently losing a fill. If a payload shape appears that
+  // can never parse, that is a parser bug — and this is how we find out about it.
+  if (extractionFailures > 0) {
+    throw new Error(
+      `${extractionFailures} transaction(s) failed trade extraction` +
+        (firstExtractionError instanceof Error ? `: ${firstExtractionError.message}` : ""),
+    );
   }
 }
 
