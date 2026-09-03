@@ -47,7 +47,35 @@ export async function insertTradeRow(row: IndexerTradeRow): Promise<void> {
 }
 
 /** Map the indexer-side shape to the `trades` column set. */
+/**
+ * GH#195: reject a missing `tx_signature` at the WRITER, not just at the index.
+ *
+ * The dedup key is `(tx_signature, asset_index, leg_index)`. The migration makes
+ * that index NULLS NOT DISTINCT so NULL-signature rows are deduplicated rather
+ * than exempt — but a NULL signature is still not a usable identity: every such
+ * row from every different transaction collapses onto ONE key, so the second
+ * genuine fill lacking a signature would be silently dropped as a duplicate.
+ *
+ * The index prevents unbounded duplication; this prevents silent LOSS. Both are
+ * wanted, and neither substitutes for the other.
+ *
+ * The webhook path already validates signatures, which is why the exposure was
+ * described as latent. This puts the guarantee in the single place every writer
+ * goes through — backfill scripts and EventStreamService included — instead of
+ * relying on each of them to have remembered.
+ */
+function assertHasSignature(row: IndexerTradeRow): void {
+  if (typeof row.tx_signature !== "string" || row.tx_signature.length === 0) {
+    throw new Error(
+      "trade row is missing tx_signature — it is part of the dedupe key, so a row " +
+        "without one cannot be deduplicated against anything and would collide " +
+        "with every other signature-less row (GH#195)",
+    );
+  }
+}
+
 function toDbRow(row: IndexerTradeRow) {
+  assertHasSignature(row);
   return {
     slab_address: row.slab_address,
     trader: row.trader,
