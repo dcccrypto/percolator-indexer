@@ -21,6 +21,7 @@ import {
   isV17Account,
   parseWrapperConfigV17,
   parseAssetOracleProfileV17,
+  parseMarketGroupV17OI,
   V17_HEADER_LEN,
   V17_MARKET_GROUP_OFF,
   V17_ASSET_ORACLE_PROFILE_LEN,
@@ -85,8 +86,11 @@ function readU128LESB(data: Uint8Array, offset: number): bigint {
  *   - Use parseWrapperConfigV17 for config fields (correct v17 offsets)
  *   - Use parseAssetOracleProfileV17 for oracleAuthority / price
  *   - Read vault and insurance from the v17 market group header
+ *   - Sum per-asset open interest via the SDK's parseMarketGroupV17OI
+ *
+ * Exported for unit testing (the OI wiring in particular).
  */
-function parseV17AccountStats(data: Uint8Array): {
+export function parseV17AccountStats(data: Uint8Array): {
   engine: EngineState;
   marketConfig: MarketConfig;
   params: RiskParams;
@@ -159,6 +163,26 @@ function parseV17AccountStats(data: Uint8Array): {
   const insurance = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_INSURANCE_OFF) : 0n;
   const cTot = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_C_TOT_OFF) : 0n;
 
+  // Open interest is stored PER ASSET in the v17/v18 engine (oi_eff_long_q /
+  // oi_eff_short_q inside each AssetStateV16Account), not as an aggregate in the
+  // market-group header — so it has to be summed across the asset slots. The SDK's
+  // parseMarketGroupV17OI does exactly that with version-correct offsets
+  // (V17_MARKET_GROUP_OFF / V17_MARKET_ASSET_SLOT_LEN / V17_ASSET_STATE_OI_*_REL).
+  // These fields were previously hard-coded to 0n, so total_open_interest was always
+  // 0 for every v17/v18 market regardless of real positions. Quantities are raw
+  // oi_eff (micro-units, not scaled by token decimals), matching how the other
+  // engine values here are stored raw. Guarded: a parse failure leaves OI at 0
+  // rather than throwing out the whole stats row.
+  let totalLongOiQ = 0n;
+  let totalShortOiQ = 0n;
+  try {
+    const oi = parseMarketGroupV17OI(data);
+    totalLongOiQ = oi.totalLongOiQ;
+    totalShortOiQ = oi.totalShortOiQ;
+  } catch {
+    // Not a well-formed v17 group account / truncated buffer — leave OI at 0.
+  }
+
   const engine: EngineState = {
     vault,
     insuranceFund: { balance: insurance, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
@@ -170,9 +194,9 @@ function parseV17AccountStats(data: Uint8Array): {
     marketMode: null,
     lastCrankSlot: 0n,
     maxCrankStalenessSlots: 0n,
-    totalOpenInterest: 0n,
-    longOi: 0n,
-    shortOi: 0n,
+    totalOpenInterest: totalLongOiQ + totalShortOiQ,
+    longOi: totalLongOiQ,
+    shortOi: totalShortOiQ,
     cTot,
     pnlPosTot: 0n,
     pnlMaturedPosTot: 0n,
