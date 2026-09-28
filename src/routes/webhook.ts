@@ -1,10 +1,11 @@
 import { Hono } from "hono";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, eventBus, decodeBase58, parseTradeSize, withRetry, captureException, createLogger } from "@percolatorct/shared";
+import { config, eventBus, decodeBase58, withRetry, captureException, createLogger } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
+import { decodeV18SingleFill, decodeV18BatchLegs } from "../parsers/percolatorTxParser.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -13,8 +14,8 @@ const logger = createLogger("indexer:webhook");
 type WebhookVariables = { verifiedWebhookBody: Buffer };
 
 /**
- * v17 trade tags for webhook parsing.
- * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v17 wrapper instruction — removed.
+ * v18 trade tags for webhook parsing.
+ * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v18 wrapper instruction — removed.
  * BatchTradeNoCpi (66) and BatchTradeCpi (67) are now included.
  */
 const TRADE_TAGS = new Set<number>([
@@ -574,39 +575,24 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
     }
     if (!TRADE_TAGS.has(tag)) continue;
 
-    // v17 wire format:
-    //   Single fill (TradeNoCpi=6, TradeCpi=10):
-    //     tag(1)+asset_index(u16=2)+size_q(i128=16)+... — min 19 bytes, size at [3:19]
-    //   Batch fill (BatchTradeNoCpi=66, BatchTradeCpi=67):
-    //     tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(8)+8B]*n — min 2+34 bytes
-    //     Each leg is expanded separately.
+    // v18 wire format — decode lives in percolatorTxParser.ts (decodeV18SingleFill /
+    // decodeV18BatchLegs); see that file for the exact byte layout. TradeNoCpi and
+    // TradeCpi have DIFFERENT single-fill layouts in v18 (unlike v17, where they
+    // matched), which is why decodeV18SingleFill takes the tag.
     const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
     // H2/H3: capture asset_index + leg_index so batch legs dedupe on the composite key.
-    const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = [];
-
-    if (isBatch) {
-      if (data.length < 2) continue;
-      const nLegs = data[1];
-      if (nLegs === 0) continue;
-      for (let i = 0; i < nLegs; i++) {
-        const legOff = 2 + i * 34;
-        if (legOff + 34 > data.length) break;
-        const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
-        const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
-        if (sizeValue === 0n) continue;
-        legs.push({ sizeValue, side, assetIndex, legIndex: i });
-      }
-    } else {
-      if (data.length < 19) continue;
-      const assetIndex = (data[1] | (data[2] << 8)) >>> 0; // u16 LE
-      const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
-      if (sizeValue === 0n) continue;
-      legs.push({ sizeValue, side, assetIndex, legIndex: 0 });
-    }
+    const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = isBatch
+      ? decodeV18BatchLegs(data)
+      : (() => {
+          const decoded = decodeV18SingleFill(tag, data);
+          return decoded ? [{ ...decoded, legIndex: 0 }] : [];
+        })();
 
     if (legs.length === 0) continue;
 
-    // Account layout (v17) — desync fix 5: TradeCpi market is at accounts[1], not accounts[2].
+    // Account layout (v17/v18 — unchanged by the v18 wire migration, which only
+    // moved instruction-DATA offsets, not account ordering) — desync fix 5:
+    // TradeCpi market is at accounts[1], not accounts[2].
     //   TradeNoCpi (tag 6) / BatchTradeNoCpi (tag 66):
     //     [0]=signer_a, [1]=signer_b, [2]=market (writable), [3]=account_a, [4]=account_b
     //   TradeCpi (tag 10) / BatchTradeCpi (tag 67):
@@ -664,31 +650,16 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
       if (!TRADE_TAGS.has(tag)) continue;
 
       const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = [];
-
-      if (isBatchInner) {
-        if (data.length < 2) continue;
-        const nLegs = data[1];
-        if (nLegs === 0) continue;
-        for (let i = 0; i < nLegs; i++) {
-          const legOff = 2 + i * 34;
-          if (legOff + 34 > data.length) break;
-          const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
-          const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
-          if (sizeValue === 0n) continue;
-          legs.push({ sizeValue, side, assetIndex, legIndex: i });
-        }
-      } else {
-        if (data.length < 19) continue;
-        const assetIndex = (data[1] | (data[2] << 8)) >>> 0; // u16 LE
-        const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
-        if (sizeValue === 0n) continue;
-        legs.push({ sizeValue, side, assetIndex, legIndex: 0 });
-      }
+      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = isBatchInner
+        ? decodeV18BatchLegs(data)
+        : (() => {
+            const decoded = decodeV18SingleFill(tag, data);
+            return decoded ? [{ ...decoded, legIndex: 0 }] : [];
+          })();
 
       if (legs.length === 0) continue;
 
-      // Same v17 account layout with CPI dispatch fix (desync fix 5)
+      // Same account layout with CPI dispatch fix (desync fix 5) — unchanged by v18
       const accounts: string[] = ix.accounts ?? [];
       const trader = accounts[0] ?? "";
       const isNoCpiInner = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);

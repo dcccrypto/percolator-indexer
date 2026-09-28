@@ -24,17 +24,105 @@ const ALL_TRADE_TAGS = new Set<number>([
   ...BATCH_TRADE_TAGS,
 ]);
 
-/** v17 single-fill wire: tag(1)+asset_index(2)+size_q(16)+exec_price(8)+fee_bps(8) = 35 bytes. */
-const V17_SINGLE_MIN_LEN = 19; // only need tag+asset_index+size_q to parse fills
-const V17_SINGLE_ASSET_IDX_OFF = 1; // u16 LE
-const V17_SINGLE_SIZE_OFF = 3;      // i128 LE, 16 bytes
+/**
+ * v18 single-fill wire (integration `a9318945`, byte-exact vs the SDK's
+ * `encodeTradeNoCpi`/`encodeTradeCpi` and `app/lib/v18-wire.ts`).
+ *
+ * Unlike v17 — where TradeNoCpi and TradeCpi shared one layout — v18 gives
+ * each its own layout because TradeCpi carries an extra
+ * `accountBMatcherSequence` (u64) field TradeNoCpi does not:
+ *
+ *   TradeNoCpi (tag 6), 77 bytes:
+ *     tag(1) + accountAPortfolioId(u64=8) + accountAPositionEpoch(u64=8)
+ *     + accountBPortfolioId(u64=8) + accountBPositionEpoch(u64=8)
+ *     + asset_index(u16=2) @33 + market_id(u64=8) + size_q(i128=16) @43
+ *     + exec_price(u64=8) @59 + fee_bps(u64=8) + backing_fee_cap_bps(u16=2)
+ *
+ *   TradeCpi (tag 10), 85 bytes:
+ *     tag(1) + accountAPortfolioId(u64=8) + accountAPositionEpoch(u64=8)
+ *     + accountBPortfolioId(u64=8) + accountBPositionEpoch(u64=8)
+ *     + accountBMatcherSequence(u64=8) + asset_index(u16=2) @41
+ *     + market_id(u64=8) + size_q(i128=16) @51 + fee_bps(u64=8)
+ *     + limit_price(u64=8) + backing_fee_cap_bps(u16=2)
+ *
+ * `minLen` is only the bytes needed to reach the end of size_q — the indexer
+ * does not read the trailing fee/price fields (price is resolved from slab
+ * state via readMarkPriceE6, not the instruction data).
+ */
+const V18_SINGLE_OFFSETS: Readonly<Record<number, { assetIdxOff: number; sizeOff: number; minLen: number }>> = {
+  [IX_TAG.TradeNoCpi]: { assetIdxOff: 33, sizeOff: 43, minLen: 59 },
+  [IX_TAG.TradeCpi]: { assetIdxOff: 41, sizeOff: 51, minLen: 67 },
+};
 
-/** v17 BatchTrade leg wire: asset_index(2)+size_q(16)+exec_price(8)+fee_bps_or_limit(8) = 34 bytes/leg.
- *  (Matches v16_program.rs decode arms for tags 66/67 and the SDK encodeBatchTrade{NoCpi,Cpi}.) */
-const V17_BATCH_HEADER_LEN = 2;    // tag(1)+n_legs(1)
-const V17_BATCH_LEG_LEN = 34;      // asset_index(2)+size_q(16)+exec_price(8)+trailing u64(8)
-const V17_BATCH_LEG_ASSET_OFF = 0; // u16 LE within leg
-const V17_BATCH_LEG_SIZE_OFF = 2;  // i128 LE within leg
+/**
+ * v18 BatchTrade leg wire (byte-exact vs the SDK's `encodeBatchTradeNoCpi`/
+ * `encodeBatchTradeCpi`): asset_index(u16=2) + market_id(u64=8) + size_q(i128=16)
+ * + 16 trailing bytes whose MEANING differs by variant but whose LENGTH does not
+ * (NoCpi: exec_price(8)+fee_bps(8); Cpi: fee_bps(8)+limit_price(8)) = 42 bytes/leg.
+ *
+ * asset_index and size_q sit at the SAME leg-relative offsets in both variants,
+ * so one leg decoder covers both BatchTradeNoCpi (66) and BatchTradeCpi (67) —
+ * unlike the single-fill case above, where the two tags diverge.
+ *
+ * v17 legs were 34 bytes (no market_id field); v18 inserted market_id(u64=8)
+ * between asset_index and size_q, growing every leg by 8 bytes.
+ */
+const V18_BATCH_HEADER_LEN = 2;    // tag(1)+n_legs(1)
+const V18_BATCH_LEG_LEN = 42;      // asset_index(2)+market_id(8)+size_q(16)+16B trailer
+const V18_BATCH_LEG_ASSET_OFF = 0; // u16 LE within leg
+const V18_BATCH_LEG_SIZE_OFF = 10; // i128 LE within leg (after asset_index+market_id)
+
+export interface DecodedFill {
+  /** Asset/domain index within the market group (u16 LE). */
+  assetIndex: number;
+  /** Absolute trade size (positive bigint). */
+  sizeValue: bigint;
+  /** "long" = positive i128 size, "short" = negative. */
+  side: "long" | "short";
+}
+
+/**
+ * Decode a v18 single-fill instruction (TradeNoCpi=6 or TradeCpi=10).
+ * Returns `null` for an unknown tag, undersized data, or a zero-size fill.
+ *
+ * Single source of truth for the single-fill offsets above — reused by
+ * `parsePercolatorFills` (this file), `TradeIndexer.processTransaction`, and
+ * `webhook.ts`'s `extractTradesFromEnhancedTx` (outer + inner instructions) so
+ * all four ingestion paths decode identically instead of carrying their own
+ * copies of the offset math (the pre-v18 duplication was itself a source of
+ * drift risk across the poll/webhook/event-stream paths).
+ */
+export function decodeV18SingleFill(tag: number, data: Uint8Array): DecodedFill | null {
+  const off = V18_SINGLE_OFFSETS[tag];
+  if (!off || data.length < off.minLen) return null;
+  const assetIndex = (data[off.assetIdxOff] | (data[off.assetIdxOff + 1] << 8)) >>> 0;
+  const { sizeValue, side } = parseTradeSize(data.slice(off.sizeOff, off.sizeOff + 16));
+  if (sizeValue === 0n) return null;
+  return { assetIndex, sizeValue, side };
+}
+
+/**
+ * Decode all legs of a v18 batch-fill instruction (BatchTradeNoCpi=66 or
+ * BatchTradeCpi=67). Zero-size legs are skipped, not returned. See
+ * {@link decodeV18SingleFill} for the shared-decoder rationale.
+ */
+export function decodeV18BatchLegs(data: Uint8Array): Array<DecodedFill & { legIndex: number }> {
+  const out: Array<DecodedFill & { legIndex: number }> = [];
+  if (data.length < V18_BATCH_HEADER_LEN) return out;
+  const nLegs = data[1];
+  for (let i = 0; i < nLegs; i++) {
+    const legOff = V18_BATCH_HEADER_LEN + i * V18_BATCH_LEG_LEN;
+    if (legOff + V18_BATCH_LEG_LEN > data.length) break;
+    const assetIndex =
+      (data[legOff + V18_BATCH_LEG_ASSET_OFF] | (data[legOff + V18_BATCH_LEG_ASSET_OFF + 1] << 8)) >>> 0;
+    const { sizeValue, side } = parseTradeSize(
+      data.slice(legOff + V18_BATCH_LEG_SIZE_OFF, legOff + V18_BATCH_LEG_SIZE_OFF + 16),
+    );
+    if (sizeValue === 0n) continue;
+    out.push({ assetIndex, sizeValue, side, legIndex: i });
+  }
+  return out;
+}
 
 export interface ParsedFill {
   signature: string;
@@ -76,16 +164,12 @@ export interface ParsedFill {
 }
 
 /**
- * Parse fill events from a Percolator v17 transaction.
+ * Parse fill events from a Percolator v18 transaction.
  *
  * Handles both single-fill instructions (TradeNoCpi=6, TradeCpi=10) and
  * batch-fill instructions (BatchTradeNoCpi=66, BatchTradeCpi=67) by expanding
- * each batch leg into a separate ParsedFill entry.
- *
- * v17 wire format changes vs v12.x:
- *   - Single fill: tag(1)+asset_index(2)+size_q(16)+... → size at [3:19], NOT [5:21]
- *   - Batch fill: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n (34B/leg)
- *   - TradeCpiV2 (was tag 35 / alias TradeCpiV=105) is NOT a valid v17 instruction
+ * each batch leg into a separate ParsedFill entry, via {@link decodeV18SingleFill}
+ * / {@link decodeV18BatchLegs} (see those for the exact v18 byte layout).
  *
  * Input shape matches either `getParsedTransaction` or Helius Atlas WS
  * `transactionSubscribe` notifications — both produce ParsedTransactionWithMeta-shaped objects.
@@ -136,54 +220,28 @@ export function parsePercolatorFills(
     const slabAddress = pubkeyToBase58(ix.accounts?.[marketAccountIdx]);
 
     if (SINGLE_TRADE_TAGS.has(tag)) {
-      // v17 single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... min 19 bytes
-      if (data.length < V17_SINGLE_MIN_LEN) continue;
-
-      const assetIndex =
-        (data[V17_SINGLE_ASSET_IDX_OFF] | (data[V17_SINGLE_ASSET_IDX_OFF + 1] << 8)) >>> 0;
-      const { sizeValue, side } = parseTradeSize(
-        data.slice(V17_SINGLE_SIZE_OFF, V17_SINGLE_SIZE_OFF + 16),
-      );
-      if (sizeValue === 0n) continue;
+      const decoded = decodeV18SingleFill(tag, data);
+      if (!decoded) continue;
 
       fills.push({
         signature,
         trader,
         programId,
-        assetIndex,
-        sizeAbs: sizeValue,
-        side,
+        assetIndex: decoded.assetIndex,
+        sizeAbs: decoded.sizeValue,
+        side: decoded.side,
         slabAddress,
         priceE6: undefined,
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
-      // v17 batch-fill: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+8B]*n
-      if (data.length < V17_BATCH_HEADER_LEN) continue;
-      const nLegs = data[1];
-      if (nLegs === 0) continue;
-
-      for (let i = 0; i < nLegs; i++) {
-        const legOff = V17_BATCH_HEADER_LEN + i * V17_BATCH_LEG_LEN;
-        if (legOff + V17_BATCH_LEG_LEN > data.length) break;
-
-        const assetIndex =
-          (data[legOff + V17_BATCH_LEG_ASSET_OFF] |
-            (data[legOff + V17_BATCH_LEG_ASSET_OFF + 1] << 8)) >>> 0;
-        const { sizeValue, side } = parseTradeSize(
-          data.slice(
-            legOff + V17_BATCH_LEG_SIZE_OFF,
-            legOff + V17_BATCH_LEG_SIZE_OFF + 16,
-          ),
-        );
-        if (sizeValue === 0n) continue;
-
+      for (const leg of decodeV18BatchLegs(data)) {
         fills.push({
           signature,
           trader,
           programId,
-          assetIndex,
-          sizeAbs: sizeValue,
-          side,
+          assetIndex: leg.assetIndex,
+          sizeAbs: leg.sizeValue,
+          side: leg.side,
           slabAddress,
           priceE6: undefined,
         });

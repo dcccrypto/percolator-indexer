@@ -14,8 +14,8 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.11",
-    "@percolatorct/sdk": "^4.3.0",
-    "@percolatorct/shared": "1.0.0-beta.8",
+    "@percolatorct/sdk": "^6.0.0",
+    "@percolatorct/shared": "^1.1.0",
     "@solana/web3.js": "1.98.4",
     "@supabase/supabase-js": "^2.49.1",
     "dotenv": "^16.4.7",

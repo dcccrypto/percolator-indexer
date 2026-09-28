@@ -5,17 +5,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  *
  * The dedup key is `(tx_signature, asset_index, leg_index)` and is SHARED by all
  * three ingestion paths. TradeIndexer and EventStreamService both number fills
- * 0-based and offset liquidation markers by `1000 + i`. The webhook path used to
- * renumber the whole collected array by position, with markers interleaved among
- * the fills — so a tx carrying a marker followed by a real fill gave that fill
- * leg_index 1 here and leg_index 0 there. Different key, `ignoreDuplicates` never
- * collapses them, and the fill is stored twice — inflating volume_24h_by_slab,
- * trade counts and candle volume.
+ * 0-based. The webhook path used to renumber the whole collected array by position,
+ * so a non-fill instruction (a crank) sitting ahead of a real fill gave that fill
+ * leg_index 1 here and 0 there. Different key, `ignoreDuplicates` never collapses
+ * them, and the fill is stored twice — inflating volume_24h_by_slab, trade counts
+ * and candle volume. The fix numbers fills in their own sequence, so a skipped
+ * instruction between fills does not shift them.
  *
- * Attacker-constructible: bundle a trade with a liquidation crank in one tx.
- *
- * Single-fill, no-marker txs agreed on all three paths (leg_index 0), which is why
- * this survived — only MIXED txs diverge, so this test builds a mixed one.
+ * v18 note: PermissionlessCrank (tag 5) is `nowSlot + observations` with no action
+ * byte, and there is no other instruction-level liquidation signal, so cranks yield
+ * NO rows (see src/parsers/liquidations.ts). The divergence risk this guards is
+ * therefore just "a crank interleaved among fills must not shift the fills" — which
+ * this test builds and pins. (Historically the crank produced a `1000+`-offset
+ * liquidation marker; those no longer exist under v18.)
  */
 
 const TEST_WEBHOOK_SECRET = 'test-secret-token';
@@ -25,9 +27,8 @@ const SLAB = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const PORTFOLIO = '4VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzr';
 const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 
-// Unlike webhook.test.ts, this mock DOES expose PermissionlessCrank — parseLiquidation
-// early-outs on `tag !== IX_TAG.PermissionlessCrank`, so without it no marker can ever
-// be produced and the mixed-tx case is untestable.
+// The mock DOES expose PermissionlessCrank so the crank instruction is recognised
+// as a crank (and correctly yields no row) rather than an unknown tag.
 vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: {
     TradeNoCpi: 10,
@@ -84,18 +85,19 @@ function makeRequest(body: any): Request {
   });
 }
 
-// A liquidation crank: tag 5, action 1 (Liquidate), asset_index u16 LE.
-function liquidationBytes(assetIndex: number): Uint8Array {
-  const b = new Uint8Array(8);
-  b[0] = 5; b[1] = 1;
-  b[2] = assetIndex & 0xff; b[3] = (assetIndex >> 8) & 0xff;
+// A v18 PermissionlessCrank: tag 5 + nowSlot(u64) + n_obs(u8). No action byte, so
+// it yields no row. nowSlot low byte 0x01 is the exact v17 false-positive shape.
+function crankBytes(): Uint8Array {
+  const b = new Uint8Array(10);
+  b[0] = 5; b[1] = 1; // b[1] is nowSlot's low byte, NOT an action
   return b;
 }
 
-// An ordinary single-leg fill.
+// An ordinary single-leg fill — v18 TradeNoCpi (77B; asset_index@33, size_q@43;
+// see src/parsers/percolatorTxParser.ts's decodeV18SingleFill).
 function tradeBytes(): Uint8Array {
-  const b = new Uint8Array(21);
-  b[0] = 10; b[5] = 0x40; b[6] = 0x42; b[7] = 0x0f;
+  const b = new Uint8Array(77);
+  b[0] = 10; b[43] = 0x40; b[44] = 0x42; b[45] = 0x0f;
   return b;
 }
 
@@ -107,54 +109,49 @@ describe('webhook leg_index parity with TradeIndexer / EventStreamService (GH#19
     app = webhookRoutes({ getMarkets: () => new Map([[SLAB, {}]]) });
   });
 
-  it('numbers a marker 1000+ and the fill AFTER it 0 — not 0 and 1', async () => {
-    // The exact shape the report calls attacker-constructible: a liquidation crank
-    // bundled ahead of a real trade in one transaction.
+  it('a crank bundled ahead of a trade yields no row and the fill still numbers 0', async () => {
+    // The exact shape the report calls attacker-constructible: a crank bundled
+    // ahead of a real trade in one transaction. Under v18 the crank is not a
+    // liquidation (no marker), and it must not shift the fill off leg_index 0.
     const mockDecode = vi.mocked(shared.decodeBase58);
-    mockDecode.mockReturnValueOnce(liquidationBytes(0)).mockReturnValueOnce(tradeBytes());
+    mockDecode.mockReturnValueOnce(crankBytes()).mockReturnValueOnce(tradeBytes());
 
     await app.fetch(makeRequest([{
       signature: SIG,
       instructions: [
-        { programId: PROGRAM_ID, data: 'liq', accounts: [TRADER, SLAB, PORTFOLIO] },
+        { programId: PROGRAM_ID, data: 'crank', accounts: [TRADER, SLAB, PORTFOLIO] },
         { programId: PROGRAM_ID, data: 'trade', accounts: [TRADER, TRADER, SLAB] },
       ],
       innerInstructions: [], accountData: [], logs: [],
     }]));
 
     const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
-    const marker = rows.find((r) => r.is_liquidation);
     const fill = rows.find((r) => !r.is_liquidation);
 
-    expect(marker).toBeDefined();
+    // No liquidation marker is produced under v18.
+    expect(rows.some((r) => r.is_liquidation)).toBe(false);
+    // The fill is numbered as if the crank were not there — matching the
+    // poll/backfill paths, so the shared dedup key agrees and it is not stored twice.
     expect(fill).toBeDefined();
-
-    // The fill is numbered as if the marker were not there. Under the old
-    // position-based renumbering this was 1, which is the whole defect: the
-    // poll/backfill paths give the same fill 0, so the dedup key differs and the
-    // row is stored twice.
     expect(fill.leg_index).toBe(0);
-
-    // Markers live in their own 1000+ range on all three paths.
-    expect(marker.leg_index).toBeGreaterThanOrEqual(1000);
   });
 
-  it('numbers markers and fills in independent sequences when interleaved', async () => {
+  it('cranks interleaved among fills produce no rows and do not shift fill numbering', async () => {
     const mockDecode = vi.mocked(shared.decodeBase58);
     mockDecode
       .mockReturnValueOnce(tradeBytes())
-      .mockReturnValueOnce(liquidationBytes(0))
+      .mockReturnValueOnce(crankBytes())
       .mockReturnValueOnce(tradeBytes())
-      .mockReturnValueOnce(liquidationBytes(0))
+      .mockReturnValueOnce(crankBytes())
       .mockReturnValueOnce(tradeBytes());
 
     await app.fetch(makeRequest([{
       signature: SIG,
       instructions: [
         { programId: PROGRAM_ID, data: 't1', accounts: [TRADER, TRADER, SLAB] },
-        { programId: PROGRAM_ID, data: 'l1', accounts: [TRADER, SLAB, PORTFOLIO] },
+        { programId: PROGRAM_ID, data: 'c1', accounts: [TRADER, SLAB, PORTFOLIO] },
         { programId: PROGRAM_ID, data: 't2', accounts: [TRADER, TRADER, SLAB] },
-        { programId: PROGRAM_ID, data: 'l2', accounts: [TRADER, SLAB, PORTFOLIO] },
+        { programId: PROGRAM_ID, data: 'c2', accounts: [TRADER, SLAB, PORTFOLIO] },
         { programId: PROGRAM_ID, data: 't3', accounts: [TRADER, TRADER, SLAB] },
       ],
       innerInstructions: [], accountData: [], logs: [],
@@ -162,14 +159,14 @@ describe('webhook leg_index parity with TradeIndexer / EventStreamService (GH#19
 
     const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
     const fills = rows.filter((r) => !r.is_liquidation).map((r) => r.leg_index);
-    const markers = rows.filter((r) => r.is_liquidation).map((r) => r.leg_index);
 
-    // Fills are contiguous from 0 regardless of how many markers sit between them.
+    // Fills are contiguous from 0 regardless of how many cranks sit between them.
     expect(fills).toEqual([0, 1, 2]);
-    expect(markers).toEqual([1000, 1001]);
+    // No liquidation markers exist under v18.
+    expect(rows.filter((r) => r.is_liquidation)).toHaveLength(0);
   });
 
-  it('leaves the no-marker case alone — fills still number 0,1,2', async () => {
+  it('leaves the no-crank case alone — fills still number 0,1,2', async () => {
     // Regression guard: the common path agreed across all three ingesters before
     // this change and must still agree after it.
     const mockDecode = vi.mocked(shared.decodeBase58);

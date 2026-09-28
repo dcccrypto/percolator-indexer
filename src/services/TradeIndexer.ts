@@ -1,15 +1,15 @@
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, parseTradeSize, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
-import { parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
+import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs } from "../parsers/percolatorTxParser.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
 /**
- * v17 trade tags to index.
+ * v18 trade tags to index.
  *
- * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v17 wrapper instruction — removed.
+ * TradeCpiV2 (alias TradeCpiV=105) is NOT a valid v18 wrapper instruction — removed.
  * BatchTradeNoCpi (66) and BatchTradeCpi (67) emit fills and are included.
  */
 const TRADE_TAGS = new Set<number>([
@@ -331,9 +331,10 @@ export class TradeIndexerPolling {
       const tag = data[0];
       if (!TRADE_TAGS.has(tag)) continue;
 
-      // v17 single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... = 19 bytes min
-      // v17 batch-fill: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+8B]*n
-      // The batch path is forwarded to parseBatchTradeSize helper below.
+      // v18 single-fill / batch-fill decode lives in percolatorTxParser.ts
+      // (decodeV18SingleFill / decodeV18BatchLegs) — see that file for the
+      // exact byte layout. TradeNoCpi and TradeCpi have DIFFERENT single-fill
+      // layouts in v18 (unlike v17, where they matched).
       const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
 
       // Desync fix 6: verify this instruction is for the slab we're polling.
@@ -347,9 +348,8 @@ export class TradeIndexerPolling {
       if (ixMarket && ixMarket !== slabAddress) continue;
 
       if (isBatch) {
-        if (data.length < 2) continue;
-        const nLegs = data[1];
-        if (nLegs === 0 || data.length < 2 + nLegs * 34) continue;
+        const legs = decodeV18BatchLegs(data);
+        if (legs.length === 0) continue;
 
         const traderKey = ix.accounts[0];
         if (!traderKey) continue;
@@ -372,36 +372,31 @@ export class TradeIndexerPolling {
         const i128Max = (1n << 127n) - 1n;
         let insertedAny = false;
 
-        for (let i = 0; i < nLegs; i++) {
-          const legOff = 2 + i * 34;
-          if (legOff + 34 > data.length) break;
-          const assetIndex = (data[legOff] | (data[legOff + 1] << 8)) >>> 0; // u16 LE
-          const { sizeValue, side } = parseTradeSize(data.slice(legOff + 2, legOff + 18));
-          if (sizeValue === 0n || sizeValue > i128Max) continue;
+        for (const leg of legs) {
+          if (leg.sizeValue > i128Max) continue;
 
           await insertTradeRow({
             slab_address: slabAddress,
             trader,
-            side,
-            size: sizeValue.toString(),
+            side: leg.side,
+            size: leg.sizeValue.toString(),
             price,
             fee,
             tx_signature: signature,
-            asset_index: assetIndex,
-            leg_index: i, // unique within the (single) batch instruction of this tx
+            asset_index: leg.assetIndex,
+            leg_index: leg.legIndex, // unique within the (single) batch instruction of this tx
           });
-          eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
+          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: leg.sizeValue.toString() });
           insertedAny = true;
         }
         return insertedAny;
       }
 
-      // Single-fill: tag(1)+asset_index(u16=2)+size_q(i128=16)+... = 19 bytes min
-      if (data.length < 19) continue;
-
-      // Parse size as signed i128 (little-endian) — size starts at byte 3 (after tag+asset_index)
-      const { sizeValue, side } = parseTradeSize(data.slice(3, 19));
-      if (sizeValue === 0n) continue;
+      // Single-fill (TradeNoCpi=6 / TradeCpi=10) — see decodeV18SingleFill for the
+      // v18 byte layout (the two tags have DIFFERENT offsets in v18).
+      const decoded = decodeV18SingleFill(tag, data);
+      if (!decoded) continue;
+      const { sizeValue, side } = decoded;
 
       // Determine trader from account keys
       const traderKey = ix.accounts[0];
@@ -440,9 +435,7 @@ export class TradeIndexerPolling {
         return false;
       }
 
-      // H2/H3: v17 single-fill wire has asset_index (u16 LE) at data[1:3]. leg_index=0
-      // since a single fill is the only leg of its tx.
-      const assetIndex = (data[1] | (data[2] << 8)) >>> 0;
+      // H2/H3: leg_index=0 since a single fill is the only leg of its tx.
       await insertTradeRow({
         slab_address: slabAddress,
         trader,
@@ -451,7 +444,7 @@ export class TradeIndexerPolling {
         price,
         fee,
         tx_signature: signature,
-        asset_index: assetIndex,
+        asset_index: decoded.assetIndex,
         leg_index: 0,
       });
 

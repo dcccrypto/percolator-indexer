@@ -148,14 +148,15 @@ describe('TradeIndexerPolling', () => {
         { signature: VALID_SIG, err: null },
       ]);
 
-      // Build a realistic instruction data buffer:
-      // tag(1) + lpIdx(2) + userIdx(2) + size(16) = 21 bytes
-      const ixData = new Uint8Array(21);
-      ixData[0] = 10; // IX_TAG.TradeNoCpi
-      // size bytes (positive = long)
-      ixData[5] = 0x40; // some size
-      ixData[6] = 0x42;
-      ixData[7] = 0x0f;
+      // Build a realistic v18 TradeNoCpi instruction data buffer (77 bytes;
+      // asset_index@33 u16, size_q@43 i128 — see decodeV18SingleFill).
+      const ixData = new Uint8Array(77);
+      ixData[0] = 10; // IX_TAG.TradeNoCpi (per the mocked IX_TAG above)
+      // size bytes (positive = long) — byte 15 of the 16-byte size_q slice
+      // (absolute offset 43+15=58) is the sign byte the parseTradeSize mock reads.
+      ixData[43] = 0x40; // some size
+      ixData[44] = 0x42;
+      ixData[45] = 0x0f;
 
       // decodeBase58 returns the instruction data
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
@@ -188,11 +189,11 @@ describe('TradeIndexerPolling', () => {
         { signature: VALID_SIG, err: null },
       ]);
 
-      const ixData = new Uint8Array(21);
+      const ixData = new Uint8Array(77); // v18 TradeNoCpi (asset_index@33, size_q@43)
       ixData[0] = 10; // TradeNoCpi
-      ixData[5] = 0x40;
-      ixData[6] = 0x42;
-      ixData[7] = 0x0f;
+      ixData[43] = 0x40;
+      ixData[44] = 0x42;
+      ixData[45] = 0x0f;
 
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
 
@@ -273,7 +274,7 @@ describe('TradeIndexerPolling', () => {
         { signature: VALID_SIG, err: null },
       ]);
 
-      // Return data that's too short (< 21 bytes)
+      // Return data that's too short (v18 TradeNoCpi needs >= 59 bytes to reach size_q)
       vi.mocked(shared.decodeBase58).mockReturnValue(new Uint8Array([10, 0, 0]));
 
       mockGetParsedTransaction.mockResolvedValue({
@@ -327,8 +328,8 @@ describe('TradeIndexerPolling', () => {
       expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
 
-    it('v17: BatchTradeNoCpi (tag=66) IS indexed — one insertTradeRow call per leg', async () => {
-      // v17 NEW: BatchTradeNoCpi=66 replaces the old BurnPositionNft=66 tag.
+    it('v18: BatchTradeNoCpi (tag=66) IS indexed — one insertTradeRow call per leg', async () => {
+      // v18 NEW: BatchTradeNoCpi=66 replaces the old BurnPositionNft=66 tag.
       // H2/H3: a multi-leg batch must produce ONE insertTradeRow call PER LEG, each
       // with a distinct leg_index — this is the whole point of the H2/H3 fix (batch
       // legs previously collapsed under a tx_signature-only unique constraint).
@@ -338,15 +339,17 @@ describe('TradeIndexerPolling', () => {
 
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
 
-      // BatchTradeNoCpi: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n
-      // 3 legs = 2 + 3*34 = 104 bytes. Each leg gets a distinct asset_index so we can
+      // v18 BatchTradeNoCpi leg: asset_index(2)+market_id(8)+size_q(16)+16B trailer = 42B/leg
+      // (v17 legs were 34B — v18 inserted market_id between asset_index and size_q).
+      // 3 legs = 2 + 3*42 = 128 bytes. Each leg gets a distinct asset_index so we can
       // verify per-leg fields are read from the correct offset.
       const N_LEGS = 3;
-      const ixData = new Uint8Array(2 + N_LEGS * 34);
+      const LEG_LEN = 42;
+      const ixData = new Uint8Array(2 + N_LEGS * LEG_LEN);
       ixData[0] = 66;      // BatchTradeNoCpi
       ixData[1] = N_LEGS;  // n_legs
       for (let i = 0; i < N_LEGS; i++) {
-        const legOff = 2 + i * 34;
+        const legOff = 2 + i * LEG_LEN;
         ixData[legOff] = i;     // asset_index low byte
         ixData[legOff + 1] = 0; // asset_index high byte
       }
@@ -459,6 +462,14 @@ describe('TradeIndexerPolling', () => {
           expect((calls[1][1] as any)?.until).toBeUndefined();
         }
       }
+
+      // Restore the default pass-through withRetry behavior. `mockImplementation`
+      // (unlike `mockImplementationOnce`) persists past this test — the outer
+      // `beforeEach(vi.clearAllMocks)` clears call history but not implementations
+      // — and this closure's `withRetryCalls` counter would otherwise keep
+      // incrementing (and intermittently throwing) across every later test in
+      // this file that calls withRetry.
+      vi.mocked(shared.withRetry).mockImplementation(async (fn: any) => fn());
     }, 10_000);
   });
 
@@ -476,10 +487,15 @@ describe('TradeIndexerPolling', () => {
         { signature: VALID_SIG, err: null },
       ]);
 
-      const ixData = new Uint8Array(21);
+      const ixData = new Uint8Array(77); // v18 TradeNoCpi (asset_index@33, size_q@43)
       ixData[0] = 10; // TradeNoCpi
-      ixData[5] = 1;
+      ixData[43] = 1;
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
+      // Explicit override (not relying on the module-level default): an earlier
+      // test in this file sets parseTradeSize via `.mockReturnValue` (persists
+      // past `clearAllMocks`, which clears call history but not implementations),
+      // so this test must not assume the default sign-byte-reading behavior.
+      vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: 1_000_000n, side: 'long' as const });
 
       mockGetParsedTransaction.mockResolvedValue({
         meta: {
@@ -504,10 +520,9 @@ describe('TradeIndexerPolling', () => {
 
       // With the log parser neutered AND no getAccountInfo mock (so slab fallback
       // also returns 0), price must not come out at 1.5 — it should be 0.
-      if (vi.mocked(insertTradeRow).mock.calls.length > 0) {
-        const call = vi.mocked(insertTradeRow).mock.calls[0][0] as any;
-        expect(call.price).not.toBe(1.5);
-      }
+      expect(insertTradeRow).toHaveBeenCalled();
+      const call = vi.mocked(insertTradeRow).mock.calls[0][0] as any;
+      expect(call.price).not.toBe(1.5);
     }, 10000);
   });
 });

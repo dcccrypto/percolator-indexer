@@ -1,7 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { PublicKey } from "@solana/web3.js";
-import { IX_TAG } from "@percolatorct/sdk";
-import { parsePercolatorFills } from "../../src/parsers/percolatorTxParser.js";
+import {
+  IX_TAG,
+  encodeTradeNoCpi,
+  encodeTradeCpi,
+  encodeBatchTradeNoCpi,
+  encodeBatchTradeCpi,
+} from "@percolatorct/sdk";
+import { parsePercolatorFills, decodeV18SingleFill, decodeV18BatchLegs } from "../../src/parsers/percolatorTxParser.js";
 
 const PERC = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
 const TRADER = "11111111111111111111111111111111";
@@ -35,47 +41,219 @@ function encodeBase58(bytes: Uint8Array): string {
 }
 
 /**
- * Build a synthetic v17 single-fill instruction data buffer.
- * v17 layout: tag(1) + asset_index(u16 LE=2) + size_q(i128 LE=16) = 19 bytes min.
- *
- * BREAKING CHANGE vs v12: size is at bytes [3:19], not [5:21].
- * The old v12 format was: tag(1)+lpIdx(2)+userIdx(2)+size(16) = 21 bytes.
+ * v18 fixture builders — these wrap the REAL SDK encoders (encodeTradeNoCpi /
+ * encodeTradeCpi / encodeBatchTradeNoCpi / encodeBatchTradeCpi) rather than
+ * hand-rolling instruction bytes. This anchors every fixture to the SDK's own
+ * ground truth, so a parser/encoder offset drift fails here instead of only
+ * showing up against a real on-chain v18 TradeCpi (see also the empirical
+ * decode proof against v18-wire.ts's live devnet reads).
  */
-function makeTradeIxData(tag: number, size: bigint, assetIndex = 0): string {
-  const buf = new Uint8Array(19);
-  const dv = new DataView(buf.buffer);
-  dv.setUint8(0, tag);
-  dv.setUint16(1, assetIndex, true); // asset_index (u16 LE) — was lpIdx in v12
-  // i128 LE — write low i64 at bytes 3..11; bytes 11..19 remain 0 (positive values only here).
-  dv.setBigInt64(3, size, true);     // size_q starts at byte 3 in v17 (was byte 5 in v12)
-  return encodeBase58(buf);
+function tradeNoCpiIxData(sizeQ: bigint, assetIndex = 0): string {
+  const bytes = encodeTradeNoCpi({
+    accountAPortfolioId: 1n,
+    accountAPositionEpoch: 0n,
+    accountBPortfolioId: 2n,
+    accountBPositionEpoch: 0n,
+    assetIndex,
+    marketId: 9n,
+    sizeQ,
+    execPrice: 50_000_000_000n,
+    feeBps: 30n,
+    backingFeeCapBps: 0,
+  });
+  expect(bytes.length).toBe(77); // TradeNoCpi is fixed-size — a length drift is a wire break
+  return encodeBase58(bytes);
 }
 
-/**
- * Build a synthetic v17 batch-fill instruction data buffer.
- * v17 layout: tag(1)+n_legs(u8=1)+[asset_index(u16=2)+size_q(i128=16)+exec_price(u64=8)+fee_bps_or_limit(u64=8)]*n
- * Each leg = 34 bytes; total = 2 + n*34 bytes (matches v16_program.rs tags 66/67 and SDK encoders).
- */
-function makeBatchTradeIxData(
-  tag: number,
-  legs: Array<{ assetIndex: number; size: bigint }>,
-): string {
-  const legLen = 34;
-  const buf = new Uint8Array(2 + legs.length * legLen);
-  const dv = new DataView(buf.buffer);
-  dv.setUint8(0, tag);
-  dv.setUint8(1, legs.length);
-  for (let i = 0; i < legs.length; i++) {
-    const off = 2 + i * legLen;
-    dv.setUint16(off, legs[i].assetIndex, true);     // asset_index
-    dv.setBigInt64(off + 2, legs[i].size, true);     // size_q low i64
-    // bytes off+10 .. off+33: high i64 of i128 + exec_price(8) + fee_bps/limit(8) — all zero
-  }
-  return encodeBase58(buf);
+function tradeCpiIxData(sizeQ: bigint, assetIndex = 0): string {
+  const bytes = encodeTradeCpi({
+    accountAPortfolioId: 1n,
+    accountAPositionEpoch: 0n,
+    accountBPortfolioId: 2n,
+    accountBPositionEpoch: 0n,
+    accountBMatcherSequence: 7n,
+    assetIndex,
+    marketId: 9n,
+    sizeQ,
+    feeBps: 30n,
+    limitPrice: 51_000_000_000n,
+    backingFeeCapBps: 0,
+  });
+  expect(bytes.length).toBe(85); // TradeCpi is fixed-size — a length drift is a wire break
+  return encodeBase58(bytes);
 }
+
+function batchTradeNoCpiIxData(legs: Array<{ assetIndex: number; sizeQ: bigint }>): string {
+  const bytes = encodeBatchTradeNoCpi({
+    legs: legs.map((l) => ({
+      assetIndex: l.assetIndex,
+      marketId: 9n,
+      sizeQ: l.sizeQ,
+      execPrice: 50_000_000_000n,
+      feeBps: 30n,
+    })),
+    accountAPortfolioId: 1n,
+    accountAPositionEpoch: 0n,
+    accountBPortfolioId: 2n,
+    accountBPositionEpoch: 0n,
+  });
+  expect(bytes.length).toBe(2 + legs.length * 42 + 32); // header + N legs*42B + 32B trailer
+  return encodeBase58(bytes);
+}
+
+function batchTradeCpiIxData(legs: Array<{ assetIndex: number; sizeQ: bigint }>): string {
+  const bytes = encodeBatchTradeCpi({
+    legs: legs.map((l) => ({
+      assetIndex: l.assetIndex,
+      marketId: 9n,
+      sizeQ: l.sizeQ,
+      feeBps: 30n,
+      limitPrice: 51_000_000_000n,
+    })),
+    maxSlippageAtoms: 0n,
+    maxFeeAtoms: 0n,
+    accountAPortfolioId: 1n,
+    accountAPositionEpoch: 0n,
+    accountBPortfolioId: 2n,
+    accountBPositionEpoch: 0n,
+    accountBMatcherSequence: 7n,
+  });
+  expect(bytes.length).toBe(2 + legs.length * 42 + 72); // header + N legs*42B + 72B trailer
+  return encodeBase58(bytes);
+}
+
+describe("decodeV18SingleFill — byte-exact against the SDK encoders", () => {
+  it("round-trips TradeNoCpi (tag 6, 77B) — asset_index@33, size_q@43", () => {
+    const bytes = encodeTradeNoCpi({
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+      assetIndex: 2,
+      marketId: 9n,
+      sizeQ: 1_000_000n,
+      execPrice: 50_000_000_000n,
+      feeBps: 30n,
+      backingFeeCapBps: 0,
+    });
+    const decoded = decodeV18SingleFill(IX_TAG.TradeNoCpi, bytes);
+    expect(decoded).toEqual({ assetIndex: 2, sizeValue: 1_000_000n, side: "long" });
+  });
+
+  it("round-trips TradeCpi (tag 10, 85B) — asset_index@41, size_q@51, negative size = short", () => {
+    const bytes = encodeTradeCpi({
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+      accountBMatcherSequence: 7n,
+      assetIndex: 5,
+      marketId: 9n,
+      sizeQ: -500_000n,
+      feeBps: 30n,
+      limitPrice: 51_000_000_000n,
+      backingFeeCapBps: 0,
+    });
+    const decoded = decodeV18SingleFill(IX_TAG.TradeCpi, bytes);
+    expect(decoded).toEqual({ assetIndex: 5, sizeValue: 500_000n, side: "short" });
+  });
+
+  it("returns null for a zero-size fill", () => {
+    const bytes = encodeTradeNoCpi({
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+      assetIndex: 0,
+      marketId: 9n,
+      sizeQ: 0n,
+      execPrice: 0n,
+      feeBps: 0n,
+      backingFeeCapBps: 0,
+    });
+    expect(decodeV18SingleFill(IX_TAG.TradeNoCpi, bytes)).toBeNull();
+  });
+
+  it("does NOT misread a TradeCpi buffer using TradeNoCpi's offsets (the two tags diverge in v18)", () => {
+    // TradeCpi's asset_index(41)/size_q(51) sit 8 bytes later than TradeNoCpi's
+    // (33/43) because of the extra accountBMatcherSequence field. Decoding a
+    // TradeCpi buffer with the TradeNoCpi tag must NOT silently succeed.
+    const cpiBytes = encodeTradeCpi({
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+      accountBMatcherSequence: 7n,
+      assetIndex: 5,
+      marketId: 9n,
+      sizeQ: 1_000_000n,
+      feeBps: 30n,
+      limitPrice: 51_000_000_000n,
+      backingFeeCapBps: 0,
+    });
+    const wrongTagDecode = decodeV18SingleFill(IX_TAG.TradeNoCpi, cpiBytes);
+    // TradeNoCpi's asset_index offset (33) inside a TradeCpi buffer reads part
+    // of accountBMatcherSequence/marketId, not the real assetIndex (5).
+    expect(wrongTagDecode?.assetIndex).not.toBe(5);
+  });
+});
+
+describe("decodeV18BatchLegs — byte-exact against the SDK encoders", () => {
+  it("decodes BatchTradeNoCpi legs (42B/leg, market_id inserted before size_q)", () => {
+    const bytes = encodeBatchTradeNoCpi({
+      legs: [
+        { assetIndex: 0, marketId: 1n, sizeQ: 100n, execPrice: 50_000_000_000n, feeBps: 30n },
+        { assetIndex: 1, marketId: 2n, sizeQ: -200n, execPrice: 40_000_000_000n, feeBps: 30n },
+      ],
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+    });
+    const legs = decodeV18BatchLegs(bytes);
+    expect(legs).toEqual([
+      { assetIndex: 0, sizeValue: 100n, side: "long", legIndex: 0 },
+      { assetIndex: 1, sizeValue: 200n, side: "short", legIndex: 1 },
+    ]);
+  });
+
+  it("decodes BatchTradeCpi legs (42B/leg, feeBps+limitPrice trailer)", () => {
+    const bytes = encodeBatchTradeCpi({
+      legs: [{ assetIndex: 3, marketId: 4n, sizeQ: 999n, feeBps: 30n, limitPrice: 51_000_000_000n }],
+      maxSlippageAtoms: 0n,
+      maxFeeAtoms: 0n,
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+      accountBMatcherSequence: 7n,
+    });
+    const legs = decodeV18BatchLegs(bytes);
+    expect(legs).toEqual([{ assetIndex: 3, sizeValue: 999n, side: "long", legIndex: 0 }]);
+  });
+
+  it("would misdecode under the old v17 34B/leg stride (regression guard)", () => {
+    // Sanity-check that the v18 fixture is NOT accidentally parseable under the
+    // retired v17 stride (34B/leg, no market_id) — if this ever passed, the v18
+    // decoder constants silently regressed back to v17.
+    const bytes = encodeBatchTradeNoCpi({
+      legs: [{ assetIndex: 7, marketId: 1n, sizeQ: 42n, execPrice: 1n, feeBps: 1n }],
+      accountAPortfolioId: 1n,
+      accountAPositionEpoch: 0n,
+      accountBPortfolioId: 2n,
+      accountBPositionEpoch: 0n,
+    });
+    // Under the old (wrong) v17 34B stride, leg 0's "size" would be read from
+    // bytes [2:18] — which under the v18 layout is [asset_index(2)=7][market_id
+    // low 6 bytes of 8]. That is NOT 42n, proving the two layouts disagree.
+    const legacyOffsetSize = new DataView(bytes.buffer, bytes.byteOffset + 2, 16);
+    const legacyLow64 = legacyOffsetSize.getBigUint64(0, true);
+    expect(legacyLow64).not.toBe(42n);
+  });
+});
 
 describe("parsePercolatorFills", () => {
-  it("extracts a fill from TradeNoCpi with asset_index (v17 wire format)", () => {
+  it("extracts a fill from TradeNoCpi with asset_index (v18 wire format)", () => {
     const tx: any = {
       transaction: {
         message: {
@@ -83,7 +261,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeTradeIxData(IX_TAG.TradeNoCpi, 1_000_000n, /* assetIndex */ 2),
+              data: tradeNoCpiIxData(1_000_000n, /* assetIndex */ 2),
             },
           ],
         },
@@ -100,9 +278,9 @@ describe("parsePercolatorFills", () => {
       signature: "signature123",
       trader: TRADER,
       programId: PERC,
-      assetIndex: 2,         // v17: asset_index from bytes [1:3] of instruction data
+      assetIndex: 2,
       sizeAbs: 1_000_000n,
-      side: expect.stringMatching(/long|short/),
+      side: "long",
     });
     // Post-refactor (2026-04-20): parser NEVER pulls price from logs — the old
     // `mark_price=<n>` regex was bogus on real program output. Callers must
@@ -118,7 +296,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeTradeIxData(IX_TAG.TradeCpi, 500_000n, 0),
+              data: tradeCpiIxData(500_000n, 0),
             },
           ],
         },
@@ -142,7 +320,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeTradeIxData(IX_TAG.TradeCpi, 1_000_000n),
+              data: tradeCpiIxData(1_000_000n),
             },
           ],
         },
@@ -169,9 +347,9 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeBatchTradeIxData(IX_TAG.BatchTradeNoCpi, [
-                { assetIndex: 0, size: 100n },
-                { assetIndex: 1, size: 200n },
+              data: batchTradeNoCpiIxData([
+                { assetIndex: 0, sizeQ: 100n },
+                { assetIndex: 1, sizeQ: 200n },
               ]),
             },
           ],
@@ -197,9 +375,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              data: makeBatchTradeIxData(IX_TAG.BatchTradeCpi, [
-                { assetIndex: 3, size: 999n },
-              ]),
+              data: batchTradeCpiIxData([{ assetIndex: 3, sizeQ: 999n }]),
             },
           ],
         },
@@ -213,6 +389,12 @@ describe("parsePercolatorFills", () => {
   });
 
   it("skips batch instruction when n_legs=0", () => {
+    // The SDK's own encoder refuses to build a zero-leg batch instruction
+    // ("at least one leg is required"), so this malformed-wire case (a
+    // hand-built buffer, not encoder output) has to be constructed directly —
+    // it exercises the parser's defensive handling of on-chain bytes that
+    // don't match any legitimate encoder output.
+    const emptyBatch = new Uint8Array([IX_TAG.BatchTradeNoCpi, 0]);
     const tx: any = {
       transaction: {
         message: {
@@ -220,8 +402,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(PERC),
               accounts: [new PublicKey(TRADER)],
-              // Empty leg list
-              data: makeBatchTradeIxData(IX_TAG.BatchTradeNoCpi, []),
+              data: encodeBase58(emptyBatch),
             },
           ],
         },
@@ -248,7 +429,7 @@ describe("parsePercolatorFills", () => {
             {
               programId: new PublicKey(OTHER),
               accounts: [new PublicKey(TRADER)],
-              data: makeTradeIxData(IX_TAG.TradeNoCpi, 100n),
+              data: tradeNoCpiIxData(100n),
             },
           ],
         },

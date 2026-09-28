@@ -7,7 +7,7 @@
  * This test does NOT make RPC calls or DB connections. Everything is pure in-process
  * computation so it runs reliably in CI without any environment secrets.
  *
- * Pinned version: @percolatorct/sdk@2.0.7 (v12.19 mainnet alignment)
+ * Pinned version: @percolatorct/sdk@6.0.0 (v18 wire migration)
  * Update this comment when the workflow pins a new version.
  */
 

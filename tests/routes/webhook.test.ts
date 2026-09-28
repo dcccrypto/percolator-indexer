@@ -64,12 +64,15 @@ vi.mock('@percolatorct/shared', () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
+  // v18 single-fill wire (TradeNoCpi, tag=10 per the IX_TAG mock above): the
+  // real SDK layout is 77 bytes with asset_index@33 (u16) and size_q@43
+  // (i128) — see src/parsers/percolatorTxParser.ts's decodeV18SingleFill.
+  // parseTradeSize is separately mocked below to ignore its input, so only
+  // the BUFFER LENGTH matters here (must clear decodeV18SingleFill's minLen
+  // gate for TradeNoCpi); the byte values at 33/43 are inert filler.
   decodeBase58: vi.fn(() => {
-    const buf = new Uint8Array(21);
-    buf[0] = 10; // IX_TAG.TradeNoCpi
-    buf[5] = 0x40;
-    buf[6] = 0x42;
-    buf[7] = 0x0f;
+    const buf = new Uint8Array(77);
+    buf[0] = 10; // IX_TAG.TradeNoCpi (per the mocked IX_TAG above)
     return buf;
   }),
   parseTradeSize: vi.fn(() => ({
@@ -410,26 +413,30 @@ describe('POST /webhook/trades — price extraction', () => {
     expect(insertTradeRow).not.toHaveBeenCalled();
   });
 
-  it('v17: BatchTradeNoCpi (tag=66) — multi-leg batch produces one insertTradeRow call PER LEG', async () => {
-    // v17 BatchTrade: tag(1)+n_legs(1)+[asset_index(2)+size_q(16)+exec_price(8)+8B]*n
+  it('v18: BatchTradeNoCpi (tag=66) — multi-leg batch produces one insertTradeRow call PER LEG', async () => {
+    // v18 BatchTrade leg: asset_index(2)+market_id(8)+size_q(16)+16B trailer = 42B/leg
+    // (v17 legs were 34B — v18 inserted market_id between asset_index and size_q).
+    // See src/parsers/percolatorTxParser.ts's decodeV18BatchLegs.
     // H2/H3: every leg of a batch trade must be indexed separately with a distinct
     // leg_index — this is the whole point of the H2/H3 fix (batch legs previously
     // collapsed under a tx_signature-only unique constraint).
     const N_LEGS = 3;
+    const LEG_LEN = 42;
     const mockDecodeBase58 = vi.mocked(shared.decodeBase58);
     mockDecodeBase58.mockReturnValueOnce((() => {
-      const buf = new Uint8Array(2 + N_LEGS * 34);
+      const buf = new Uint8Array(2 + N_LEGS * LEG_LEN);
       buf[0] = 66;      // BatchTradeNoCpi
       buf[1] = N_LEGS;  // n_legs
       for (let i = 0; i < N_LEGS; i++) {
-        const legOff = 2 + i * 34;
+        const legOff = 2 + i * LEG_LEN;
         buf[legOff] = i;     // asset_index low byte — distinct per leg
         buf[legOff + 1] = 0; // asset_index high byte
-        // size_q at [legOff+2 : legOff+18] — positive value = long
+        // market_id at [legOff+2 : legOff+10] (u64) — unread by the indexer, left 0.
+        // size_q at [legOff+10 : legOff+26] — positive value = long
         // (parseTradeSize is mocked to a fixed return, so the exact bytes here
         // don't matter beyond being present; asset_index/leg_index are read
         // directly by webhook.ts, not through the mock.)
-        buf[legOff + 2] = 0x40; buf[legOff + 3] = 0x42; buf[legOff + 4] = 0x0f;
+        buf[legOff + 10] = 0x40; buf[legOff + 11] = 0x42; buf[legOff + 12] = 0x0f;
       }
       return buf;
     })());

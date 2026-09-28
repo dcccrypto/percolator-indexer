@@ -66,9 +66,11 @@ function makeRequest(body: any): Request {
   });
 }
 
+// v18 TradeNoCpi (77B; asset_index@33, size_q@43 — see
+// src/parsers/percolatorTxParser.ts's decodeV18SingleFill).
 function tradeBytes(): Uint8Array {
-  const b = new Uint8Array(21);
-  b[0] = 10; b[5] = 0x40; b[6] = 0x42; b[7] = 0x0f;
+  const b = new Uint8Array(77);
+  b[0] = 10; b[43] = 0x40; b[44] = 0x42; b[45] = 0x0f;
   return b;
 }
 
