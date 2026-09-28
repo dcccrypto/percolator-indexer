@@ -313,16 +313,108 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
     await new Promise((r) => setTimeout(r, 20));
 
     expect(readMarkMock).toHaveBeenCalled();
+    // readMarkPriceE6 returns the RAW e6 integer (84_123_456 == $84.123456).
+    // trades.price is dollars-scaled everywhere else (webhook.ts, TradeIndexer.ts
+    // both divide by 1_000_000) — the stored value here must match, not the raw
+    // e6 magnitude. See the dedicated e6-scale regression test below.
     expect(insertTradeMock).toHaveBeenCalledWith(
       expect.objectContaining({
         slab_address: SLAB,
         trader: "trader1",
         side: "long",
         size: "1000000",
-        price: 84_123_456,
+        price: 84.123456,
         tx_signature: "sigX",
       }),
     );
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
+  });
+
+  it("regression (percolatorbounty#2): divides the raw e6 slab-fallback price by 1_000_000 before storing trades.price", async () => {
+    // Same harness as the test above, with a price chosen so the pre-fix bug
+    // (storing the raw e6 integer) and the post-fix behaviour (dollars) are
+    // unambiguously distinguishable — and so a naive off-by-a-different-factor
+    // fix would also be caught.
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    const insertOraclePriceMock = vi.fn().mockResolvedValue(undefined);
+    const RAW_E6 = 85_187_279; // true price $85.187279
+    const readMarkMock = vi.fn().mockResolvedValue(RAW_E6);
+    const parseFillsMock = vi.fn().mockReturnValue([
+      {
+        signature: "sigE6",
+        trader: "trader-e6",
+        programId: PERC,
+        sizeAbs: 1_000_000n,
+        side: "long" as const,
+        slabAddress: SLAB,
+        priceE6: undefined,
+      },
+    ]);
+
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: insertOraclePriceMock };
+    });
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        return rows.map((r) => ({
+          tx_signature: r.tx_signature,
+          asset_index: r.asset_index,
+          leg_index: r.leg_index,
+        }));
+      }),
+    }));
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+
+    const { EventStreamService } = await import("../../src/services/EventStreamService.js");
+
+    const listeners: Array<(msg: any) => void> = [];
+    const ws = {
+      sub: () => {},
+      onNotification: (cb: any) => { listeners.push(cb); },
+      close: () => {},
+      isOpen: true,
+    };
+
+    const svc = new EventStreamService({
+      ws: ws as any,
+      programId: PERC,
+      connection: mockConn(),
+      autoIndex: true,
+      knownSlabs: [SLAB],
+    });
+    await svc.start();
+
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: {
+        result: {
+          transaction: {
+            message: { instructions: [], accountKeys: [{ pubkey: { toBase58: () => SLAB } }] },
+          },
+          meta: { err: null, logMessages: [] },
+          signature: "sigE6",
+        },
+        subscription: 1,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(insertTradeMock).toHaveBeenCalledTimes(1);
+    const storedRow = insertTradeMock.mock.calls[0][0];
+    // The stored price must be dollars ($85.187279), never the raw e6 integer.
+    expect(storedRow.price).toBeCloseTo(85.187279, 6);
+    expect(storedRow.price).not.toBe(RAW_E6);
 
     vi.doUnmock("@percolatorct/shared");
     vi.doUnmock("../../src/db/insertTradeRow.js");
