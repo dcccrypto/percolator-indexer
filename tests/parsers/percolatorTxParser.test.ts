@@ -7,7 +7,7 @@ import {
   encodeBatchTradeNoCpi,
   encodeBatchTradeCpi,
 } from "@percolatorct/sdk";
-import { parsePercolatorFills, decodeV18SingleFill, decodeV18BatchLegs } from "../../src/parsers/percolatorTxParser.js";
+import { parsePercolatorFills, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../../src/parsers/percolatorTxParser.js";
 
 const PERC = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
 const TRADER = "11111111111111111111111111111111";
@@ -137,7 +137,15 @@ describe("decodeV18SingleFill — byte-exact against the SDK encoders", () => {
       backingFeeCapBps: 0,
     });
     const decoded = decodeV18SingleFill(IX_TAG.TradeNoCpi, bytes);
-    expect(decoded).toEqual({ assetIndex: 2, sizeValue: 1_000_000n, side: "long" });
+    // #205: TradeNoCpi also carries the wire fee_bps@67 and exec_price@59 —
+    // the actual fill price and rate, not just asset/size/side.
+    expect(decoded).toEqual({
+      assetIndex: 2,
+      sizeValue: 1_000_000n,
+      side: "long",
+      feeBps: 30,
+      execPriceE6: 50_000_000_000n,
+    });
   });
 
   it("round-trips TradeCpi (tag 10, 85B) — asset_index@41, size_q@51, negative size = short", () => {
@@ -155,7 +163,16 @@ describe("decodeV18SingleFill — byte-exact against the SDK encoders", () => {
       backingFeeCapBps: 0,
     });
     const decoded = decodeV18SingleFill(IX_TAG.TradeCpi, bytes);
-    expect(decoded).toEqual({ assetIndex: 5, sizeValue: 500_000n, side: "short" });
+    // #205: TradeCpi carries fee_bps@67 too, but NEVER exec_price (only
+    // limit_price, the requested cap, at a different offset) — undefined,
+    // not 0, so callers can tell "no wire price" from "priced at $0".
+    expect(decoded).toEqual({
+      assetIndex: 5,
+      sizeValue: 500_000n,
+      side: "short",
+      feeBps: 30,
+      execPriceE6: undefined,
+    });
   });
 
   it("returns null for a zero-size fill", () => {
@@ -210,10 +227,12 @@ describe("decodeV18BatchLegs — byte-exact against the SDK encoders", () => {
       accountBPortfolioId: 2n,
       accountBPositionEpoch: 0n,
     });
-    const legs = decodeV18BatchLegs(bytes);
+    const legs = decodeV18BatchLegs(IX_TAG.BatchTradeNoCpi, bytes);
+    // #205: each NoCpi leg carries its OWN exec_price/fee_bps (different
+    // assets in one batch can fill at different prices).
     expect(legs).toEqual([
-      { assetIndex: 0, sizeValue: 100n, side: "long", legIndex: 0 },
-      { assetIndex: 1, sizeValue: 200n, side: "short", legIndex: 1 },
+      { assetIndex: 0, sizeValue: 100n, side: "long", legIndex: 0, feeBps: 30, execPriceE6: 50_000_000_000n },
+      { assetIndex: 1, sizeValue: 200n, side: "short", legIndex: 1, feeBps: 30, execPriceE6: 40_000_000_000n },
     ]);
   });
 
@@ -228,8 +247,11 @@ describe("decodeV18BatchLegs — byte-exact against the SDK encoders", () => {
       accountBPositionEpoch: 0n,
       accountBMatcherSequence: 7n,
     });
-    const legs = decodeV18BatchLegs(bytes);
-    expect(legs).toEqual([{ assetIndex: 3, sizeValue: 999n, side: "long", legIndex: 0 }]);
+    const legs = decodeV18BatchLegs(IX_TAG.BatchTradeCpi, bytes);
+    // #205: Cpi legs carry fee_bps but never exec_price (only limit_price).
+    expect(legs).toEqual([
+      { assetIndex: 3, sizeValue: 999n, side: "long", legIndex: 0, feeBps: 30, execPriceE6: undefined },
+    ]);
   });
 
   it("would misdecode under the old v17 34B/leg stride (regression guard)", () => {
@@ -454,5 +476,41 @@ describe("parsePercolatorFills", () => {
       meta: { err: null, logMessages: [] },
     };
     expect(parsePercolatorFills(tx, "sig", [PERC])).toEqual([]);
+  });
+});
+
+describe("computeFeeUsd — #205, mirrors the engine's notional*fee_bps/MAX_MARGIN_BPS", () => {
+  it("computes the dollar fee for a 1.0-unit fill at $50, 30 bps (0.30%)", () => {
+    // notional = 1.0 * 50 = $50; fee = 50 * 30 / 10_000 = $0.15
+    expect(computeFeeUsd(1_000_000n, 50, 30)).toBeCloseTo(0.15, 10);
+  });
+
+  it("computes the dollar fee for a 0.5-unit fill at $100, 100 bps (1%)", () => {
+    // notional = 0.5 * 100 = $50; fee = 50 * 100 / 10_000 = $0.50
+    expect(computeFeeUsd(500_000n, 100, 100)).toBeCloseTo(0.5, 10);
+  });
+
+  it("returns 0 when feeBps is undefined (buffer too short to read it)", () => {
+    expect(computeFeeUsd(1_000_000n, 50, undefined)).toBe(0);
+  });
+
+  it("returns 0 for a genuine 0 bps fee (not an error — some markets/orders may be feeless)", () => {
+    expect(computeFeeUsd(1_000_000n, 50, 0)).toBe(0);
+  });
+
+  it("returns 0 when price is 0 or not finite — a fee cannot be priced without a price", () => {
+    expect(computeFeeUsd(1_000_000n, 0, 30)).toBe(0);
+    expect(computeFeeUsd(1_000_000n, NaN, 30)).toBe(0);
+    expect(computeFeeUsd(1_000_000n, -50, 30)).toBe(0);
+  });
+
+  it("returns 0 for a zero-size fill", () => {
+    expect(computeFeeUsd(0n, 50, 30)).toBe(0);
+  });
+
+  it("scales linearly with size", () => {
+    const one = computeFeeUsd(1_000_000n, 50, 30);
+    const ten = computeFeeUsd(10_000_000n, 50, 30);
+    expect(ten).toBeCloseTo(one * 10, 8);
   });
 });

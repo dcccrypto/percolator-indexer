@@ -55,6 +55,28 @@ const V18_SINGLE_OFFSETS: Readonly<Record<number, { assetIdxOff: number; sizeOff
 };
 
 /**
+ * #205 — fee_bps sits at the SAME absolute offset (67) in both single-fill
+ * variants: TradeNoCpi is size_q(16)@43 + exec_price(8)@59 + fee_bps(8)@67;
+ * TradeCpi is size_q(16)@51 + fee_bps(8)@67 + limit_price(8)@75. Reading it
+ * needs `data.length >= 75` (past the end of fee_bps) — `minLen` above only
+ * guarantees enough bytes for asset_index/size_q, not the trailing fee/price
+ * fields, so this is checked separately and is best-effort (absent on a
+ * truncated buffer, never a decode failure for the core fields).
+ */
+const V18_SINGLE_FEE_BPS_OFF = 67;
+const V18_SINGLE_FEE_BPS_END = V18_SINGLE_FEE_BPS_OFF + 8; // 75
+
+/**
+ * #205 — only TradeNoCpi carries the actual fill price on the wire
+ * (exec_price@59); TradeCpi only carries `limit_price` (the requested cap,
+ * not what the fill executed at) — see the layout doc above `decodeV18SingleFill`.
+ * Callers must resolve TradeCpi's price from slab state, same as before.
+ */
+const V18_SINGLE_EXEC_PRICE_OFF: Partial<Record<number, number>> = {
+  [IX_TAG.TradeNoCpi]: 59,
+};
+
+/**
  * v18 BatchTrade leg wire (byte-exact vs the SDK's `encodeBatchTradeNoCpi`/
  * `encodeBatchTradeCpi`): asset_index(u16=2) + market_id(u64=8) + size_q(i128=16)
  * + 16 trailing bytes whose MEANING differs by variant but whose LENGTH does not
@@ -71,6 +93,12 @@ const V18_BATCH_HEADER_LEN = 2;    // tag(1)+n_legs(1)
 const V18_BATCH_LEG_LEN = 42;      // asset_index(2)+market_id(8)+size_q(16)+16B trailer
 const V18_BATCH_LEG_ASSET_OFF = 0; // u16 LE within leg
 const V18_BATCH_LEG_SIZE_OFF = 10; // i128 LE within leg (after asset_index+market_id)
+// #205 — the 16-byte trailer after size_q (leg-relative offset 26) holds
+// exec_price(8)+fee_bps(8) for a NoCpi leg, or fee_bps(8)+limit_price(8) for a
+// Cpi leg — same "same length, different meaning" split as the single-fill
+// layouts above. Needs the leg's variant (its parent instruction's tag) to
+// read the right field from the right slot.
+const V18_BATCH_LEG_TRAILER_OFF = 26;
 
 export interface DecodedFill {
   /** Asset/domain index within the market group (u16 LE). */
@@ -79,6 +107,70 @@ export interface DecodedFill {
   sizeValue: bigint;
   /** "long" = positive i128 size, "short" = negative. */
   side: "long" | "short";
+  /**
+   * #205 — the fill's fee rate straight off the wire (u64 basis points,
+   * e.g. 30 = 0.30%), present on every trade variant. `undefined` only when
+   * the buffer was too short to reach it (never 0-vs-absent ambiguity for a
+   * well-formed instruction — a real fee_bps of 0 and "couldn't read it" are
+   * both representable, callers that need to distinguish should check length
+   * themselves; in practice every live encoder always emits the full struct).
+   */
+  feeBps?: number;
+  /**
+   * #205 — the actual fill price (u64, e6-scaled USD), present ONLY for
+   * TradeNoCpi / BatchTradeNoCpi legs. TradeCpi/BatchTradeCpi never carry it
+   * (only `limit_price`, the requested cap) — `undefined` there, not a
+   * missing-data case. A wire value of exactly 0 is treated as absent (no
+   * legitimate fill executes at $0).
+   */
+  execPriceE6?: bigint;
+}
+
+function readFeeBpsAt(data: Uint8Array, off: number): number | undefined {
+  if (data.length < off + 8) return undefined;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const raw = dv.getBigUint64(off, true);
+  return raw <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(raw) : undefined;
+}
+
+function readExecPriceAt(data: Uint8Array, off: number): bigint | undefined {
+  if (data.length < off + 8) return undefined;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const raw = dv.getBigUint64(off, true);
+  return raw > 0n ? raw : undefined;
+}
+
+/** size_q is POS_SCALE(1e6)-fixed-point (percolator/src/lib.rs POS_SCALE), same
+ * scale as `parseTradeSize`'s bigint output — not a token-decimals scale. */
+const POS_SCALE = 1_000_000;
+/** MAX_MARGIN_BPS (percolator/src/lib.rs) — 10_000 bps = 100%, the bps denominator
+ * the engine's own `checked_fee_bps` divides by. */
+const MAX_MARGIN_BPS = 10_000;
+
+/**
+ * #205 — the dollar fee for a fill, mirroring the engine's own
+ * `notional = size_q * exec_price / POS_SCALE`, `fee = notional * fee_bps / MAX_MARGIN_BPS`
+ * (percolator/src/v16.rs `trade_notional_floor` + `checked_fee_bps`), computed
+ * here in floating point for DISPLAY purposes (the DB's `trades.fee`/`price`
+ * columns are already floats, e.g. `extractPriceFromAccountData`'s
+ * `Number(markEwmaE6) / 1_000_000`) rather than the engine's exact integer
+ * ceil-rounding — a sub-cent rounding difference is immaterial for a trade
+ * history display and this is not used for any on-chain or balance-affecting
+ * calculation.
+ *
+ * Returns 0 when either input is missing/non-positive — a fee cannot be priced
+ * without a size and a price, and that must never throw the ingestion pipeline.
+ */
+export function computeFeeUsd(
+  sizeAbs: bigint,
+  priceUsd: number,
+  feeBps: number | undefined,
+): number {
+  if (!feeBps || feeBps <= 0 || !Number.isFinite(priceUsd) || priceUsd <= 0 || sizeAbs <= 0n) {
+    return 0;
+  }
+  const notionalUsd = (Number(sizeAbs) / POS_SCALE) * priceUsd;
+  return (notionalUsd * feeBps) / MAX_MARGIN_BPS;
 }
 
 /**
@@ -98,17 +190,28 @@ export function decodeV18SingleFill(tag: number, data: Uint8Array): DecodedFill 
   const assetIndex = (data[off.assetIdxOff] | (data[off.assetIdxOff + 1] << 8)) >>> 0;
   const { sizeValue, side } = parseTradeSize(data.slice(off.sizeOff, off.sizeOff + 16));
   if (sizeValue === 0n) return null;
-  return { assetIndex, sizeValue, side };
+  const feeBps = readFeeBpsAt(data, V18_SINGLE_FEE_BPS_OFF);
+  const execPriceOff = V18_SINGLE_EXEC_PRICE_OFF[tag];
+  const execPriceE6 = execPriceOff !== undefined ? readExecPriceAt(data, execPriceOff) : undefined;
+  return { assetIndex, sizeValue, side, feeBps, execPriceE6 };
 }
 
 /**
  * Decode all legs of a v18 batch-fill instruction (BatchTradeNoCpi=66 or
  * BatchTradeCpi=67). Zero-size legs are skipped, not returned. See
  * {@link decodeV18SingleFill} for the shared-decoder rationale.
+ *
+ * `tag` selects the trailer layout (#205: NoCpi carries exec_price+fee_bps,
+ * Cpi carries fee_bps+limit_price — same offset, different meaning, so this
+ * can't be inferred from the bytes alone).
  */
-export function decodeV18BatchLegs(data: Uint8Array): Array<DecodedFill & { legIndex: number }> {
+export function decodeV18BatchLegs(
+  tag: number,
+  data: Uint8Array,
+): Array<DecodedFill & { legIndex: number }> {
   const out: Array<DecodedFill & { legIndex: number }> = [];
   if (data.length < V18_BATCH_HEADER_LEN) return out;
+  const isNoCpi = tag === IX_TAG.BatchTradeNoCpi;
   const nLegs = data[1];
   for (let i = 0; i < nLegs; i++) {
     const legOff = V18_BATCH_HEADER_LEN + i * V18_BATCH_LEG_LEN;
@@ -119,7 +222,11 @@ export function decodeV18BatchLegs(data: Uint8Array): Array<DecodedFill & { legI
       data.slice(legOff + V18_BATCH_LEG_SIZE_OFF, legOff + V18_BATCH_LEG_SIZE_OFF + 16),
     );
     if (sizeValue === 0n) continue;
-    out.push({ assetIndex, sizeValue, side, legIndex: i });
+    const trailerOff = legOff + V18_BATCH_LEG_TRAILER_OFF;
+    // NoCpi: exec_price(8) then fee_bps(8). Cpi: fee_bps(8) then limit_price(8).
+    const feeBps = readFeeBpsAt(data, isNoCpi ? trailerOff + 8 : trailerOff);
+    const execPriceE6 = isNoCpi ? readExecPriceAt(data, trailerOff) : undefined;
+    out.push({ assetIndex, sizeValue, side, legIndex: i, feeBps, execPriceE6 });
   }
   return out;
 }
@@ -234,7 +341,7 @@ export function parsePercolatorFills(
         priceE6: undefined,
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
-      for (const leg of decodeV18BatchLegs(data)) {
+      for (const leg of decodeV18BatchLegs(tag, data)) {
         fills.push({
           signature,
           trader,

@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { PublicKey } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, eventBus, decodeBase58, withRetry, captureException, createLogger } from "@percolatorct/shared";
+import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
-import { decodeV18SingleFill, decodeV18BatchLegs } from "../parsers/percolatorTxParser.js";
+import { decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -395,14 +396,14 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Extract every fill in the delivery first, then write them in one round-trip.
   // A delivery carries many transactions and each can carry several legs; inserting
   // per-leg serialized that many round-trips inside Helius's ~15s window.
-  const pending: ReturnType<typeof extractTradesFromEnhancedTx> = [];
+  const pending: Awaited<ReturnType<typeof extractTradesFromEnhancedTx>> = [];
   let blockedFills = 0;
   // #160: extraction failures are COUNTED, not swallowed. See the throw at the end.
   let extractionFailures = 0;
   let firstExtractionError: unknown = null;
   for (const tx of transactions) {
     try {
-      for (const trade of extractTradesFromEnhancedTx(tx, discovery)) {
+      for (const trade of await extractTradesFromEnhancedTx(tx, discovery)) {
         // Retired markets are deleted from `markets`, and trades carry an FK to
         // it — so a fill here would fail the insert and burn the batch's retries.
         // Skip cleanly instead. See src/blocklist.ts.
@@ -524,7 +525,7 @@ interface TradeData {
   is_liquidation: boolean;
 }
 
-function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): TradeData[] {
+async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): Promise<TradeData[]> {
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -581,8 +582,10 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
     // matched), which is why decodeV18SingleFill takes the tag.
     const isBatch = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
     // H2/H3: capture asset_index + leg_index so batch legs dedupe on the composite key.
-    const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = isBatch
-      ? decodeV18BatchLegs(data)
+    // #205: feeBps/execPriceE6 carried through from the decoder — see there for
+    // which variants carry a real execPriceE6 (only *NoCpi).
+    const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number; feeBps?: number; execPriceE6?: bigint }[] = isBatch
+      ? decodeV18BatchLegs(tag, data)
       : (() => {
           const decoded = decodeV18SingleFill(tag, data);
           return decoded ? [{ ...decoded, legIndex: 0 }] : [];
@@ -613,12 +616,21 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
       continue;
     }
 
-    // Extract price from slab account data or program logs
-    const price = extractPrice(tx, slabAddress);
-    const fee = extractFeeFromTransfers(tx, trader);
+    // #205: resolve the account/RPC fallback price at most once per instruction
+    // (not once per leg) — only legs without a wire execPriceE6 need it.
+    let fallbackPrice: number | null = null;
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
+
+      let price: number;
+      if (leg.execPriceE6 !== undefined) {
+        price = Number(leg.execPriceE6) / 1_000_000;
+      } else {
+        if (fallbackPrice === null) fallbackPrice = await extractPrice(tx, slabAddress);
+        price = fallbackPrice;
+      }
+      const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
       trades.push({
         slab_address: slabAddress,
@@ -650,8 +662,8 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
       if (!TRADE_TAGS.has(tag)) continue;
 
       const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number }[] = isBatchInner
-        ? decodeV18BatchLegs(data)
+      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number; feeBps?: number; execPriceE6?: bigint }[] = isBatchInner
+        ? decodeV18BatchLegs(tag, data)
         : (() => {
             const decoded = decodeV18SingleFill(tag, data);
             return decoded ? [{ ...decoded, legIndex: 0 }] : [];
@@ -675,14 +687,22 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
         continue;
       }
 
-      const price = extractPrice(tx, slabAddress);
-      const fee = extractFeeFromTransfers(tx, trader);
+      let fallbackPriceInner: number | null = null;
 
       for (const leg of legs) {
         if (leg.sizeValue > I128_MAX) continue;
 
         // Avoid duplicates within same tx (match on trader + side + size + slab)
         if (trades.some((t) => t.tx_signature === signature && t.trader === trader && t.slab_address === slabAddress && t.side === leg.side && t.size === leg.sizeValue.toString())) continue;
+
+        let price: number;
+        if (leg.execPriceE6 !== undefined) {
+          price = Number(leg.execPriceE6) / 1_000_000;
+        } else {
+          if (fallbackPriceInner === null) fallbackPriceInner = await extractPrice(tx, slabAddress);
+          price = fallbackPriceInner;
+        }
+        const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
         trades.push({
           slab_address: slabAddress,
@@ -739,13 +759,87 @@ function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): 
  *    lines from any CPI program enables price poisoning; the backfill script
  *    covers fills that land with price=0).
  */
-function extractPrice(tx: ValidatedTransaction, slabAddress: string): number {
-  // Strategy 1: read mark_price_e6 from slab post-state account data
+/**
+ * #205: was sync (account-post-state only, then give up). Helius enhanced
+ * webhook payloads don't reliably carry `accountData` for the slab, so that
+ * strategy alone left every such trade at price=0 forever — nothing else in
+ * the pipeline ever re-visits an already-written row. Added strategy 2: a
+ * live RPC re-read of the slab, same source `readMarkPriceFromSlab` (the
+ * polling path, `TradeIndexer.ts`) already uses as its ONLY strategy. This is
+ * the current mark at webhook-processing time, not the fill's exact price —
+ * the same approximation the poll path has always made, and the best
+ * available source for TradeCpi/BatchTradeCpi fills, which don't carry a fill
+ * price on the wire at all (see decodeV18SingleFill/decodeV18BatchLegs).
+ */
+async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Promise<number> {
+  // Strategy 1: read mark_price_e6 from slab post-state account data (no RPC).
   const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
   if (priceFromAccount > 0) return priceFromAccount;
 
-  // Strategy 2: parse program logs
+  // Strategy 2: fresh RPC read of the slab's current mark.
+  const priceFromRpc = await readFreshMarkPriceE6(slabAddress);
+  if (priceFromRpc > 0) return priceFromRpc;
+
+  // Strategy 3: parse program logs (neutered — see extractPriceFromLogs).
   return extractPriceFromLogs(tx);
+}
+
+/**
+ * Parse `mark_price_e6` (or, pre-v12.17, `config.mark_ewma_e6`) out of a raw
+ * slab account buffer. Shared by both the post-state path (bytes embedded in
+ * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
+ * so the v17/v0/v1 layout logic has one copy, not two that can drift.
+ */
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array): number {
+  // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
+  // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
+  if (isV17Account(raw)) {
+    try {
+      const cfg = parseWrapperConfigV17(raw, V17_HEADER_LEN);
+      const markEwmaE6 = cfg.markEwmaE6;
+      if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+        return Number(markEwmaE6) / 1_000_000;
+      }
+    } catch {
+      // parseWrapperConfigV17 failed — fall through (returns 0 below)
+    }
+    return 0;
+  }
+
+  // Auto-detect layout version from the actual slab data length.
+  // V0 (legacy devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
+  // V1: ENGINE_OFF=640, mark_price at +400.
+  // v12.17: no stored engine.mark_price; fall back to config.mark_ewma_e6
+  //         (configMarkEwmaOff, absolute offset inside the slab).
+  const layout = detectSlabLayout(raw.length);
+  if (!layout) return 0;
+
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+
+  // Primary: engine.mark_price for layouts that have it.
+  if (layout.engineMarkPriceOff >= 0) {
+    const off = layout.engineOff + layout.engineMarkPriceOff;
+    if (raw.length >= off + 8) {
+      const markPriceE6 = dv.getBigUint64(off, true);
+      if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
+        return Number(markPriceE6) / 1_000_000;
+      }
+    }
+  }
+
+  // Fallback for v12.17+: config.mark_ewma_e6. The Passive matcher quotes
+  // fills against this value, so it is the correct "fill price" proxy when
+  // engine.mark_price is absent.
+  if (layout.configMarkEwmaOff != null && layout.configMarkEwmaOff >= 0) {
+    const off = layout.configMarkEwmaOff;
+    if (raw.length >= off + 8) {
+      const markEwmaE6 = dv.getBigUint64(off, true);
+      if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+        return Number(markEwmaE6) / 1_000_000;
+      }
+    }
+  }
+  return 0;
 }
 
 /**
@@ -766,56 +860,34 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
     }
     if (!raw) continue;
 
-    // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
-    // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
-    if (isV17Account(raw)) {
-      try {
-        const cfg = parseWrapperConfigV17(raw, V17_HEADER_LEN);
-        const markEwmaE6 = cfg.markEwmaE6;
-        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-          return Number(markEwmaE6) / 1_000_000;
-        }
-      } catch {
-        // parseWrapperConfigV17 failed — fall through to log-based extraction
-      }
-      continue;
-    }
-
-    // Auto-detect layout version from the actual slab data length.
-    // V0 (legacy devnet): ENGINE_OFF=480, no mark_price field (engineMarkPriceOff=-1).
-    // V1: ENGINE_OFF=640, mark_price at +400.
-    // v12.17: no stored engine.mark_price; fall back to config.mark_ewma_e6
-    //         (configMarkEwmaOff, absolute offset inside the slab).
-    const layout = detectSlabLayout(raw.length);
-    if (!layout) continue;
-
-    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-
-    // Primary: engine.mark_price for layouts that have it.
-    if (layout.engineMarkPriceOff >= 0) {
-      const off = layout.engineOff + layout.engineMarkPriceOff;
-      if (raw.length >= off + 8) {
-        const markPriceE6 = dv.getBigUint64(off, true);
-        if (markPriceE6 > 0n && markPriceE6 < 1_000_000_000_000n) {
-          return Number(markPriceE6) / 1_000_000;
-        }
-      }
-    }
-
-    // Fallback for v12.17+: config.mark_ewma_e6. The Passive matcher quotes
-    // fills against this value, so it is the correct "fill price" proxy when
-    // engine.mark_price is absent.
-    if (layout.configMarkEwmaOff != null && layout.configMarkEwmaOff >= 0) {
-      const off = layout.configMarkEwmaOff;
-      if (raw.length >= off + 8) {
-        const markEwmaE6 = dv.getBigUint64(off, true);
-        if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-          return Number(markEwmaE6) / 1_000_000;
-        }
-      }
-    }
+    const price = parseMarkPriceE6FromAccountBytes(raw);
+    if (price > 0) return price;
   }
   return 0;
+}
+
+/**
+ * #205 strategy 2: a live `getAccountInfo` read of the slab, mirroring
+ * `TradeIndexer.readMarkPriceFromSlab` exactly (same retry policy, same byte
+ * parser). Failures are logged and swallowed — a webhook delivery must not
+ * fail the whole batch because one RPC read timed out; the trade is still
+ * indexed, just with price=0 (unchanged from before this fix in that case).
+ */
+async function readFreshMarkPriceE6(slabAddress: string): Promise<number> {
+  try {
+    const info = await withRetry(
+      () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+      { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+    );
+    if (!info?.data) return 0;
+    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data));
+  } catch (err) {
+    logger.warn("Failed to read fresh mark price from slab", {
+      slabAddress: slabAddress.slice(0, 8),
+      error: err instanceof Error ? err.message : err,
+    });
+    return 0;
+  }
 }
 
 /**
