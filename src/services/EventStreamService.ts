@@ -139,8 +139,8 @@ export class EventStreamService {
       // Retired market — the markets row is gone and trades FK to it.
       if (isBlockedSlab(slab)) continue;
 
-      let price = fill.priceE6 ?? 0;
-      if (!price) {
+      let priceE6Value = fill.priceE6 ?? 0;
+      if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
         // hit the slab for the authoritative post-tx mark price.
         // #170: isolate the fallback read — one failed slab read skips only THIS fill
@@ -158,8 +158,16 @@ export class EventStreamService {
           log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
           continue;
         }
-        price = fallback;
+        priceE6Value = fallback;
       }
+
+      // `trades.price` is dollars-scaled everywhere else (webhook.ts
+      // extractPriceFromAccountData, TradeIndexer.ts readMarkPriceFromSlab both
+      // divide by 1_000_000 before returning). `readMarkPriceE6` — like the
+      // `priceE6` field name on the fill — returns the raw e6 integer, so it must
+      // be divided here too. Previously this raw e6 value was stored directly
+      // into `trades.price`, inflating every Atlas-indexed fill 1,000,000x.
+      const price = priceE6Value / 1_000_000;
 
       rows.push({
         slab_address: slab,
