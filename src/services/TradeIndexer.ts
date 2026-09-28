@@ -2,7 +2,7 @@ import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/w
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
-import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs } from "../parsers/percolatorTxParser.js";
+import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -348,7 +348,7 @@ export class TradeIndexerPolling {
       if (ixMarket && ixMarket !== slabAddress) continue;
 
       if (isBatch) {
-        const legs = decodeV18BatchLegs(data);
+        const legs = decodeV18BatchLegs(tag, data);
         if (legs.length === 0) continue;
 
         const traderKey = ix.accounts[0];
@@ -363,17 +363,27 @@ export class TradeIndexerPolling {
         // the (tx_signature, asset_index, leg_index) key that would skip legs which
         // failed on an earlier pass. Each leg is deduped per-leg by 23505 instead.
 
-        let price = this.extractPriceFromLogs(tx);
-        if (price === 0) {
-          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
-        }
-        const fee = this.extractFeeFromBalances(tx, trader);
+        // #205: fall back to the slab read only when the leg itself doesn't carry
+        // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
+        let fallbackPrice: number | null = null;
+        const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> => {
+          if (leg.execPriceE6 !== undefined) return Number(leg.execPriceE6) / 1_000_000;
+          if (fallbackPrice === null) {
+            fallbackPrice = this.extractPriceFromLogs(tx);
+            if (fallbackPrice === 0) {
+              fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+            }
+          }
+          return fallbackPrice;
+        };
 
         const i128Max = (1n << 127n) - 1n;
         let insertedAny = false;
 
         for (const leg of legs) {
           if (leg.sizeValue > i128Max) continue;
+          const price = await resolvePrice(leg);
+          const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
           await insertTradeRow({
             slab_address: slabAddress,
@@ -403,12 +413,19 @@ export class TradeIndexerPolling {
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
 
-      // Get price: try logs first, then read slab account mark_price
-      let price = this.extractPriceFromLogs(tx);
-      if (price === 0) {
-        price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+      // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
+      // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the
+      // requested cap), so it still falls back to the slab read.
+      let price: number;
+      if (decoded.execPriceE6 !== undefined) {
+        price = Number(decoded.execPriceE6) / 1_000_000;
+      } else {
+        price = this.extractPriceFromLogs(tx);
+        if (price === 0) {
+          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+        }
       }
-      const fee = this.extractFeeFromBalances(tx, trader);
+      const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
 
       // Check for duplicate
       const exists = await tradeExistsBySignature(signature);

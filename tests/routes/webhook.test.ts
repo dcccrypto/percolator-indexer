@@ -84,6 +84,13 @@ vi.mock('@percolatorct/shared', () => ({
   withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   // captureException: no-op in tests
   captureException: vi.fn(),
+  // #205: extractPrice's fresh-RPC fallback (readFreshMarkPriceE6). Defaults to
+  // "no account" (price stays 0, same as pre-#205 behaviour) so every existing
+  // test that doesn't care about the RPC path is unaffected; tests that DO care
+  // override this mock's return value per-test.
+  getConnection: vi.fn(() => ({
+    getAccountInfo: vi.fn(async () => null),
+  })),
 }));
 
 import * as shared from '@percolatorct/shared';
@@ -547,6 +554,129 @@ describe('POST /webhook/trades — price extraction', () => {
     );
     expect(res.status).toBe(405);
     expect(insertTradeRow).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #205: wire exec_price/fee_bps price+fee, and the fresh-RPC price fallback
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a v18 TradeNoCpi/TradeCpi-shaped instruction buffer with a real
+ * exec_price@59 and fee_bps@67 (both u64 LE, matching the layout documented
+ * in src/parsers/percolatorTxParser.ts). `tag` is whatever this file's mocked
+ * IX_TAG.TradeNoCpi/TradeCpi currently is (10/11) — decodeV18SingleFill keys
+ * V18_SINGLE_OFFSETS off the same (mocked) IX_TAG import, so this stays in
+ * sync with the rest of the file automatically.
+ */
+function tradeIxBytes(tag: number, execPriceE6: bigint, feeBps: bigint): Uint8Array {
+  const buf = new Uint8Array(77);
+  buf[0] = tag;
+  const dv = new DataView(buf.buffer);
+  dv.setBigUint64(59, execPriceE6, true);
+  dv.setBigUint64(67, feeBps, true);
+  return buf;
+}
+
+/**
+ * TradeCpi's account layout differs from TradeNoCpi's: market is at
+ * accounts[1], not accounts[2] (see the "Account layout" comment in
+ * webhook.ts) — makeBaseInstructions() above is TradeNoCpi-shaped.
+ */
+function makeCpiInstructions() {
+  return [{
+    programId: PROGRAM_ID,
+    data: 'validbase58data',
+    accounts: [TRADER, SLAB, TRADER],
+  }];
+}
+
+describe('POST /webhook/trades — #205 wire price/fee + fresh-RPC price fallback', () => {
+  let app: ReturnType<typeof webhookRoutes>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const mockDiscovery = { getMarkets: () => new Map([[SLAB, {}]]) };
+    app = webhookRoutes(mockDiscovery);
+  });
+
+  it('TradeNoCpi: prices and fees a fill straight off the wire — no accountData, no RPC needed', async () => {
+    const { decodeBase58 } = await import('@percolatorct/shared') as any;
+    // TradeNoCpi mocked tag = 10 (see the IX_TAG mock above this file).
+    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(10, 84_500_000n, 25n));
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [], // deliberately empty — price must come from the wire, not account state
+      logs: [],
+    };
+    await app.fetch(makeRequest([tx]));
+
+    // notional = 1.0 (mocked parseTradeSize sizeValue) * 84.5 = $84.50
+    // fee = 84.50 * 25 / 10_000 = $0.21125
+    expect(insertTradeRow).toHaveBeenCalledWith(
+      expect.objectContaining({ price: 84.5, fee: expect.closeTo(0.21125, 10) }),
+    );
+    // getConnection must NOT have been reached — the wire price made it unnecessary.
+    const { getConnection } = await import('@percolatorct/shared') as any;
+    expect(vi.mocked(getConnection)).not.toHaveBeenCalled();
+  });
+
+  it('TradeCpi: no wire price (only limit_price) — falls back to a fresh RPC read when accountData is absent', async () => {
+    const { decodeBase58, getConnection } = await import('@percolatorct/shared') as any;
+    // TradeCpi mocked tag = 11. execPriceE6 arg here lands at TradeCpi's
+    // fee_bps offset too (both tags share offset 67), so pass 0n for the
+    // "exec_price" slot (TradeCpi never reads offset 59 — it's inert) and a
+    // real fee_bps at 67.
+    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(11, 0n, 40n));
+
+    // Fresh-RPC slab read returns a V1-layout buffer with mark_price_e6 =
+    // $90.25 at ENGINE_OFF(640)+ENGINE_MARK_PRICE_OFF(400) = 1040, matching
+    // this file's global detectSlabLayout mock.
+    const slabBuf = new Uint8Array(1048);
+    new DataView(slabBuf.buffer).setBigUint64(1040, 90_250_000n, true);
+    vi.mocked(getConnection).mockReturnValueOnce({
+      getAccountInfo: vi.fn(async () => ({ data: Buffer.from(slabBuf) })),
+    } as any);
+
+    const tx = {
+      signature: SIG,
+      instructions: makeCpiInstructions(),
+      innerInstructions: [],
+      accountData: [], // no post-state — forces the NEW RPC fallback
+      logs: [],
+    };
+    await app.fetch(makeRequest([tx]));
+
+    // notional = 1.0 * 90.25 = $90.25; fee = 90.25 * 40 / 10_000 = $0.361
+    expect(insertTradeRow).toHaveBeenCalledWith(
+      expect.objectContaining({ price: 90.25, fee: expect.closeTo(0.361, 10) }),
+    );
+    expect(vi.mocked(getConnection)).toHaveBeenCalled();
+  });
+
+  it('TradeCpi: accountData present takes priority over the RPC fallback (no extra RPC read)', async () => {
+    const { decodeBase58, getConnection } = await import('@percolatorct/shared') as any;
+    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(11, 0n, 40n));
+
+    const slabBuf = new Uint8Array(1048);
+    new DataView(slabBuf.buffer).setBigUint64(1040, 77_000_000n, true);
+
+    const tx = {
+      signature: SIG,
+      instructions: makeCpiInstructions(),
+      innerInstructions: [],
+      accountData: [{ account: SLAB, data: Buffer.from(slabBuf).toString('base64') }],
+      logs: [],
+    };
+    await app.fetch(makeRequest([tx]));
+
+    expect(insertTradeRow).toHaveBeenCalledWith(
+      expect.objectContaining({ price: 77, fee: expect.closeTo(0.308, 10) }),
+    );
+    expect(vi.mocked(getConnection)).not.toHaveBeenCalled();
   });
 });
 
