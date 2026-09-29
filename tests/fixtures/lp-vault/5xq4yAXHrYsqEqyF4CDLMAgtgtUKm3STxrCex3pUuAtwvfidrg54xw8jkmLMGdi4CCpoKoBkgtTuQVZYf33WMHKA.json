@@ -1,0 +1,94 @@
+{
+ "transaction": {
+  "signatures": [
+   "5xq4yAXHrYsqEqyF4CDLMAgtgtUKm3STxrCex3pUuAtwvfidrg54xw8jkmLMGdi4CCpoKoBkgtTuQVZYf33WMHKA"
+  ],
+  "message": {
+   "header": {
+    "numRequiredSignatures": 1,
+    "numReadonlySignedAccounts": 0,
+    "numReadonlyUnsignedAccounts": 3
+   },
+   "accountKeys": [
+    "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+    "7mgX3bkzEivRrCffCJ7XzqfAp3gpjm63RNinwDhr7b41",
+    "9AzmW8Rd2bQA6HHDNABBdVMsmr8sHLKsygjkhmvRW18S",
+    "AWTs4SP3WQ57ZkETbQgupG4kKpBFFwmk4KzVBuXmpQPq",
+    "FXUCNnxbkZBed2cax5waBWCaGiHg7BRzxEjrcZie7iDC",
+    "11111111111111111111111111111111",
+    "ComputeBudget111111111111111111111111111111",
+    "GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ"
+   ],
+   "recentBlockhash": "A7bredYzBtNawspup5JiiuBLAgd4A2wnB3bFbvMwiy2",
+   "instructions": [
+    {
+     "programIdIndex": 6,
+     "accounts": [],
+     "data": "K1wVZZ",
+     "stackHeight": 1
+    },
+    {
+     "programIdIndex": 7,
+     "accounts": [
+      0,
+      1,
+      4,
+      2,
+      3,
+      5
+     ],
+     "data": "TCZd",
+     "stackHeight": 1
+    }
+   ]
+  }
+ },
+ "meta": {
+  "err": null,
+  "status": {
+   "Ok": null
+  },
+  "fee": 5000,
+  "preBalances": [
+   77285544121,
+   172862240,
+   1869440,
+   0,
+   1544320,
+   1,
+   1,
+   833120
+  ],
+  "postBalances": [
+   77285539121,
+   172862240,
+   1869440,
+   0,
+   1544320,
+   1,
+   1,
+   833120
+  ],
+  "innerInstructions": [],
+  "logMessages": [
+   "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+   "Program ComputeBudget111111111111111111111111111111 success",
+   "Program GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ invoke [1]",
+   "Program GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ consumed 24397 of 119850 compute units",
+   "Program GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ success"
+  ],
+  "preTokenBalances": [],
+  "postTokenBalances": [],
+  "rewards": [],
+  "loadedAddresses": {
+   "writable": [],
+   "readonly": []
+  },
+  "computeUnitsConsumed": 24547,
+  "costUnits": 27161
+ },
+ "version": "legacy",
+ "slot": 505466773,
+ "transactionIndex": 5,
+ "blockTime": 1790670396
+}
