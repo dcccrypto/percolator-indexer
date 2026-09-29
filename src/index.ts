@@ -10,6 +10,10 @@ import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
+import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
+import { RpcLpVaultChain } from "./lpVault/chain.js";
+import { SupabaseLpVaultStore } from "./lpVault/store.js";
+import { CURRENT_NETWORK } from "./network.js";
 
 // Initialize Sentry first
 initSentry("indexer");
@@ -90,6 +94,9 @@ const discovery = new MarketDiscovery();
 const statsCollector = new StatsCollector(discovery);
 const tradeIndexer = new TradeIndexerPolling();
 const webhookManager = new HeliusWebhookManager();
+// GH#207: Earn LP-vault cost basis. Polls each vault's registry PDA; see the service doc.
+// Constructed in start() so a missing Supabase/RPC env fails there, not at import.
+let lpVaultIndexer: LpVaultIndexer | null = null;
 
 let atlasWs: AtlasWs | null = null;
 let eventStream: EventStreamService | null = null;
@@ -301,6 +308,18 @@ async function start() {
       reason: "INDEXER_RPC_POLLING_ENABLED=false",
     });
   }
+  if (process.env.LP_VAULT_INDEXER_ENABLED !== "false") {
+    lpVaultIndexer = new LpVaultIndexer({
+      chain: new RpcLpVaultChain(getConnection()),
+      store: new SupabaseLpVaultStore(getSupabase()),
+      network: CURRENT_NETWORK,
+      programIds: config.allProgramIds,
+      pollIntervalMs: Number(process.env.LP_VAULT_POLL_INTERVAL_MS ?? 30_000),
+    });
+    lpVaultIndexer.start();
+  } else {
+    logger.info("LP-vault indexer disabled", { reason: "LP_VAULT_INDEXER_ENABLED=false" });
+  }
   await webhookManager.start();
 
   // Phase 2: Atlas WebSocket event stream (opt-in; real-time complement to webhooks + polling).
@@ -388,6 +407,7 @@ async function shutdown(signal: string): Promise<void> {
 
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
+    lpVaultIndexer?.stop();
 
     logger.info("Stopping webhook manager");
     webhookManager.stop();
