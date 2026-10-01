@@ -30,6 +30,22 @@ export interface IndexerMarketRow {
 }
 
 /**
+ * keeper_status for every indexer-inserted row.
+ *
+ * Not 'active': auto-discovery must never enroll a market for keeper pricing
+ * (the oracle keeper and price-ws read only keeper_status='active'). Only the
+ * authenticated registration path in the app sets 'active'.
+ *
+ * Not the column default 'retired' either. 'retired' is this indexer's own
+ * stop-ingesting lever (blocklist.ts setDbRetiredSlabs), so a brand-new market
+ * came back retired and its trades and events were dropped until someone
+ * registered it. Measured 2026-10-01: 9EPm8nB8… was inserted at 01:21 and
+ * registered at 01:55. 'pending' means discovered and not yet registered.
+ * Migration 20261001020000 adds it to markets_keeper_status_check.
+ */
+export const AUTO_ROW_KEEPER_STATUS = "pending";
+
+/**
  * Register a market. Everything the indexer writes is 'auto' by definition —
  * only PATCH /api/markets/[slab] produces 'manual' rows, and this never runs for
  * a slab that already exists (syncMarkets only inserts missing ones), so a
@@ -41,6 +57,7 @@ export async function insertMarketRow(row: IndexerMarketRow): Promise<void> {
   const { error } = await getSupabase().from("markets").insert({
     ...row,
     metadata_source: "auto",
+    keeper_status: AUTO_ROW_KEEPER_STATUS,
     network: getNetwork(),
   });
 

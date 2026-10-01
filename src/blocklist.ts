@@ -164,14 +164,16 @@ if (blocked.size !== BLOCKED.length) {
  * that slab within one StatsCollector sweep (60s). Populated from the rows
  * StatsCollector already fetches each sweep, so it costs zero extra queries.
  *
- * Why this is durable (verified 2026-07-31): nothing in this repo ever WRITES
- * `keeper_status` (the indexer can only touch status/indexer_excluded/auto
- * metadata), and migration 047 defaults the column to 'retired', so even a
- * row re-inserted by discovery comes back retired.
+ * Why this is durable: the indexer never UPDATES `keeper_status`, and discovery
+ * only inserts rows that are missing, so a retired row stays retired. The one
+ * place the indexer writes it is the INSERT of a newly discovered slab, which
+ * sets 'pending' (insertMarketRow.ts, since 2026-10-01; it used to take the
+ * column default 'retired', which silently dropped every new market's trades
+ * until it was registered).
  *
  * The hardcoded BLOCKED list above remains the permanent backstop for the one
  * case the DB cannot cover: a slab whose ROW WAS DELETED is invisible here, so
- * discovery would re-register it. Prefer keeper_status for routine retirement;
+ * discovery would re-register it (as 'pending', and ingest it). Prefer keeper_status for routine retirement;
  * add to BLOCKED only when a market must never come back regardless of what
  * happens to its row.
  */
