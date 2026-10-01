@@ -4,8 +4,8 @@
  * Reads the FULL history of every LP-vault registry on the configured wrapper(s)
  * (an exact average-cost basis needs every deposit, so there is no --since: a
  * partial history would be silently wrong). On devnet that history starts with
- * the v18 wrapper (GnwdeQr…, deployed 2026-09-22), so it covers everything from
- * the 2026-09-24 re-seed onward.
+ * the 2026-10-01 relaunch wrapper (ETDLAdiA…); the earlier GnwdeQr… wrapper is
+ * abandoned, so its vaults are not backfilled unless listed in ALL_PROGRAM_IDS.
  *
  * DRY RUN BY DEFAULT: folds into memory and prints the positions. Pass --write
  * to upsert into Supabase (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY — the
