@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, TransactionInstruction, TransactionMessage } from '@solana/web3.js';
 
 // Mock external dependencies
 const mockGetAccountInfo = vi.fn();
 const mockGetMultipleAccountsInfo = vi.fn();
+const mockGetSignaturesForAddress = vi.fn();
+const mockGetTransaction = vi.fn();
 
 // Registration moved off shared.insertMarket to the indexer-local writer, which
 // also carries logo_url / metadata_source (see src/db/insertMarketRow.ts).
@@ -38,6 +40,8 @@ vi.mock('@percolatorct/shared', () => ({
     getAccountInfo: mockGetAccountInfo,
     getMultipleAccountsInfo: mockGetMultipleAccountsInfo,
     getParsedAccountInfo: vi.fn().mockResolvedValue({ value: null }),
+    getSignaturesForAddress: mockGetSignaturesForAddress,
+    getTransaction: mockGetTransaction,
     rpcEndpoint: 'https://api.devnet.solana.com',
   })),
   upsertMarketStats: vi.fn(),
@@ -57,6 +61,7 @@ vi.mock('@percolatorct/shared', () => ({
 import { StatsCollector, COLLECT_INTERVAL_MS } from '../../src/services/StatsCollector.js';
 import type { MarketProvider } from '../../src/services/StatsCollector.js';
 import * as core from '@percolatorct/sdk';
+import { V17_INITIAL_MARGIN_BPS_OFF } from '../../src/db/autoMarketFields.js';
 import * as shared from '@percolatorct/shared';
 
 const SLAB1 = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
@@ -311,6 +316,92 @@ describe('StatsCollector', () => {
   // GH#1748: SKR/SEEKER slab Bk7XfKWs3Sr was silently skipped by syncMarkets when
   // initialMarginBps=0, causing FK violation on market_stats insert (stats never written).
   // Fix: use default max_leverage=10 instead of skipping; ensure market is registered.
+  // 2026-10-01 real case 9EPm8nB8: the auto row recorded the collateral mint as deployer
+  // and a hard-coded fee of 10. See tests/db/autoMarketFields.test.ts.
+  describe('auto-registration of a v17/v18 market (9EPm8nB8)', () => {
+    const WRAPPER = new PublicKey('ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB');
+    const SLAB = new PublicKey('9EPm8nB8Fs7WcEZgE1WGFPTGc6rAzD6GhFJyMm4dEFHn');
+    const CREATOR = new PublicKey('9sM73A4MvS2ye2Fuvpr1tmkj68iA61eebuRKz1rnGUWa');
+    const MINT = new PublicKey('DJ54k4wH92NTtNP8RuHAwG8si1bevXEknzctDdqYN8eC');
+    const MARKETAUTH = new PublicKey('GE8NTjew1sjLVb53J1jUczDKFwn6CAqT1HhbLZ8363QV');
+    const v17 = () => ({
+      market: {
+        slabAddress: SLAB,
+        programId: WRAPPER,
+        header: {},
+        config: {},
+        params: {},
+        configV17: { marketauth: MARKETAUTH, collateralMint: MINT, tradeFeeBps: 5n, oracleTargetPriceE6: 3630n },
+      },
+    });
+
+    function creationTx() {
+      const message = new TransactionMessage({
+        payerKey: CREATOR,
+        recentBlockhash: '11111111111111111111111111111111',
+        instructions: [new TransactionInstruction({
+          programId: WRAPPER,
+          keys: [
+            { pubkey: CREATOR, isSigner: true, isWritable: true },
+            { pubkey: SLAB, isSigner: true, isWritable: true },
+            { pubkey: MINT, isSigner: false, isWritable: false },
+          ],
+          data: Buffer.from([0]),
+        })],
+      }).compileToV0Message();
+      return { slot: 1, blockTime: null, transaction: { message, signatures: [] }, meta: null, version: 0 };
+    }
+
+    beforeEach(() => {
+      vi.mocked(shared.getMarkets).mockResolvedValue([]);
+      vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('no network in tests'); }));
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('records the creation-tx signer as deployer and the on-chain fee', async () => {
+      mockGetSignaturesForAddress.mockResolvedValue([
+        { signature: 'create', slot: 1, err: null, memo: null, blockTime: null },
+      ]);
+      mockGetTransaction.mockResolvedValue(creationTx());
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(new Map([[SLAB.toBase58(), v17()]]) as never);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+      // The slab's engine config: initial_margin_bps = 1819 (9EPm8nB8 on chain), so 5x.
+      const slabData = new Uint8Array(4096);
+      new DataView(slabData.buffer).setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 1819n, true);
+      mockGetAccountInfo.mockResolvedValue({ data: slabData });
+      setupParseMocks();
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(insertMarketRowMock).toHaveBeenCalledWith(expect.objectContaining({
+        slab_address: SLAB.toBase58(),
+        mint_address: MINT.toBase58(),
+        deployer: CREATOR.toBase58(),
+        oracle_authority: null,
+        initial_price_e6: 3630,
+        trading_fee_bps: 5,
+        max_leverage: 5,
+      }));
+      const row = insertMarketRowMock.mock.calls[0][0];
+      expect(row.deployer).not.toBe(MINT.toBase58());
+    });
+
+    it('falls back to marketauth (never the mint) when the creator lookup fails', async () => {
+      mockGetSignaturesForAddress.mockRejectedValue(new Error('429'));
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(new Map([[SLAB.toBase58(), v17()]]) as never);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+      setupParseMocks();
+
+      statsCollector.start();
+      await vi.advanceTimersByTimeAsync(10_500);
+
+      expect(insertMarketRowMock).toHaveBeenCalledWith(expect.objectContaining({
+        deployer: MARKETAUTH.toBase58(),
+      }));
+    });
+  });
+
   describe('GH#1748 — market registration with invalid initialMarginBps', () => {
     it('should register a market with max_leverage=10 when initialMarginBps=0', async () => {
       // Slab is NOT in the DB (getMarkets returns empty), is discovered on-chain with initialMarginBps=0

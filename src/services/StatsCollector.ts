@@ -230,6 +230,12 @@ function parseV17AccountStats(data: Uint8Array): {
 }
 import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
 import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
+import {
+  findSlabCreator,
+  resolveAutoMarketFields,
+  v17InitialMarginBps,
+  type AutoRowMarketInput,
+} from "../db/autoMarketFields.js";
 import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
@@ -672,12 +678,48 @@ export class StatsCollector {
             logger.warn("Skipping market registration — no collateralMint", { slabAddress });
             continue;
           }
-          // configV17 has no oracleAuthority / authorityPriceE6 / admin / margin — those are
-          // per-asset or v12-only; fall back safely (registry only needs mint + a deployer).
-          const oracleAuthority = cfg?.oracleAuthority?.toBase58() ?? "";
-          const admin = (market as any).header?.admin?.toBase58() ?? (oracleAuthority || mintAddress);
-          const priceE6 = Number(cfg?.authorityPriceE6 ?? cfg?.markEwmaE6 ?? 0n);
-          const initialMarginBps = Number(market.params?.initialMarginBps ?? cfg?.initialMarginBps ?? 0n);
+          // deployer / oracle_authority / initial_price_e6 / trading_fee_bps come from the
+          // creation transaction and on-chain config (src/db/autoMarketFields.ts). The old
+          // inline fallback `header.admin ?? (oracleAuthority || mint)` recorded the
+          // COLLATERAL MINT as deployer for every v17/v18 market.
+          let creator: string | null = null;
+          try {
+            creator = await findSlabCreator(
+              {
+                getSignaturesForAddress: (address, options) =>
+                  connection.getSignaturesForAddress(address, options, "confirmed"),
+                getTransaction: (signature) =>
+                  connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }),
+              },
+              new PublicKey(slabAddress),
+              market.programId,
+            );
+          } catch (creatorErr) {
+            logger.debug("Creator lookup failed; falling back to on-chain config", {
+              slabAddress,
+              error: creatorErr instanceof Error ? creatorErr.message : creatorErr,
+            });
+          }
+          const autoFields = resolveAutoMarketFields(market as AutoRowMarketInput, creator);
+          if (!autoFields.deployer) {
+            logger.warn("Skipping market registration: no creator, admin or marketauth on chain", { slabAddress });
+            continue;
+          }
+          // v17/v18 discovery carries no `params`; read the engine's initial margin from the
+          // slab itself, otherwise every v17 row got the max_leverage=10 fallback below.
+          let v17ImBps: bigint | null = null;
+          if ((market as AutoRowMarketInput).configV17) {
+            try {
+              const info = await connection.getAccountInfo(new PublicKey(slabAddress));
+              v17ImBps = info ? v17InitialMarginBps(info.data) : null;
+            } catch (imErr) {
+              logger.debug("Slab read for initial margin failed; using default leverage", {
+                slabAddress,
+                error: imErr instanceof Error ? imErr.message : imErr,
+              });
+            }
+          }
+          const initialMarginBps = Number(v17ImBps ?? market.params?.initialMarginBps ?? cfg?.initialMarginBps ?? 0n);
 
           // Compute maxLeverage from initialMarginBps.
           // Guard against division-by-zero or garbage values (e.g. uninitialized slab
@@ -838,11 +880,11 @@ export class StatsCollector {
             symbol,
             name,
             decimals: clampedDecimals,
-            deployer: admin,
-            oracle_authority: oracleAuthority,
-            initial_price_e6: priceE6,
+            deployer: autoFields.deployer,
+            oracle_authority: autoFields.oracle_authority,
+            initial_price_e6: autoFields.initial_price_e6,
             max_leverage: maxLeverage,
-            trading_fee_bps: 10,
+            trading_fee_bps: autoFields.trading_fee_bps,
             lp_collateral: null,
             matcher_context: null,
             status: "active",
