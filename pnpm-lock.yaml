@@ -20,11 +20,11 @@ importers:
         specifier: ^1.19.11
         version: 1.19.11(hono@4.12.31)
       '@percolatorct/sdk':
-        specifier: ^6.0.0
-        version: 6.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        specifier: ^8.0.0
+        version: 8.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
         specifier: ^1.1.0
-        version: 1.1.0(@percolatorct/sdk@6.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        version: 1.1.0(@percolatorct/sdk@8.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js':
         specifier: 1.98.4
         version: 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -463,8 +463,8 @@ packages:
   '@oxc-project/types@0.133.0':
     resolution: {integrity: sha512-KzkdCd6Uxqnf6l3HOw1xfatAlUURA0g14cvBYFyJ5SaNOQbOUvBr9PKArcPcrNIeRsBdgcUzOGrhKveVpvOIGA==}
 
-  '@percolatorct/sdk@6.0.0':
-    resolution: {integrity: sha512-ol6qrMd52Sxsykypnv5uDy2ca/vzBcdJ6DYNVFQ9iGDHTxH7Ui8PaJmH6Tygwi0t+eVBbmbSpT2dOE/Drv+/Xg==}
+  '@percolatorct/sdk@8.0.0':
+    resolution: {integrity: sha512-exAUInhiOWZcqm6oPgcmQfWdEPTQkDbCcLJ/tn+5xOiIsqPMgMxjAbr+dpmaQW8LnDVD8vjvdjdNW9NUzRVliA==}
     engines: {node: '>=20.0.0'}
 
   '@percolatorct/shared@1.1.0':
@@ -1762,7 +1762,7 @@ snapshots:
 
   '@oxc-project/types@0.133.0': {}
 
-  '@percolatorct/sdk@6.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/sdk@8.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
       '@solana/spl-token': 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -1773,9 +1773,9 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@percolatorct/shared@1.1.0(@percolatorct/sdk@6.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)':
+  '@percolatorct/shared@1.1.0(@percolatorct/sdk@8.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6))(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)':
     dependencies:
-      '@percolatorct/sdk': 6.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@percolatorct/sdk': 8.0.0(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@sentry/node': 10.46.0
       '@solana/web3.js': 1.98.4(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@supabase/supabase-js': 2.100.1(bufferutil@4.1.0)(utf-8-validate@6.0.6)
