@@ -1,4 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
+import { isUnreadableTxError } from "../lib/tolerantTxFetch.js";
 import { V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
 import type {
   ConfirmedSignatureInfo,
@@ -198,7 +199,13 @@ export async function findSlabCreator(
     .slice(-CREATOR_LOOKUP_MAX_TX)
     .reverse(); // oldest first
   for (const sig of candidates) {
-    const tx = await rpc.getTransaction(sig.signature);
+    let tx;
+    try {
+      tx = await rpc.getTransaction(sig.signature);
+    } catch (err) {
+      if (isUnreadableTxError(err)) continue; // X-1: skip a transaction this client cannot return
+      throw err;
+    }
     if (!tx) continue;
     const creator = creatorFromCreationTx(tx, slab, programId);
     if (creator) return creator;

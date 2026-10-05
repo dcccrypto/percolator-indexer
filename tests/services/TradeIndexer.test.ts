@@ -223,6 +223,43 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
   });
 
+  describe('X-1 — an unreadable (v1) transaction in the batch does not wedge the slab', () => {
+    it('indexes the readable trade and skips the poisoned signature', async () => {
+      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      // newest first, as getSignaturesForAddress returns: the poison tx is the newest
+      mockGetSignaturesForAddress.mockResolvedValue([
+        { signature: VALID_SIG2, err: null },
+        { signature: VALID_SIG, err: null },
+      ]);
+      const ixData = new Uint8Array(77);
+      ixData[0] = 10;
+      ixData[43] = 0x40;
+      ixData[44] = 0x42;
+      ixData[45] = 0x0f;
+      vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
+      mockGetParsedTransaction.mockImplementation(async (sig: string) => {
+        if (sig === VALID_SIG2) {
+          throw new Error('failed to get transaction: Transaction version (1) is not supported by the requesting client');
+        }
+        return {
+          meta: { err: null, logMessages: [] },
+          transaction: { message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(TRADER)], data: 'x' }] } },
+        };
+      });
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+
+      expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ slab_address: SLAB, tx_signature: VALID_SIG }));
+      expect(insertTradeRow).not.toHaveBeenCalledWith(expect.objectContaining({ tx_signature: VALID_SIG2 }));
+      // the cursor advanced past the poisoned signature: a later poll asks only for newer signatures
+      const withUntil = mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean);
+      if (mockGetSignaturesForAddress.mock.calls.length > 1) expect(withUntil).toContain(VALID_SIG2);
+      mockGetParsedTransaction.mockReset();
+    }, 12000);
+  });
+
   describe('error handling', () => {
     it('should skip errored transactions from signatures', async () => {
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);

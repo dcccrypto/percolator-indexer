@@ -65,3 +65,64 @@ describe("normalizeRpcTransaction on a v1 response", () => {
     expect(() => normalizeRpcTransaction("sig", r)).toThrow(/out of range/);
   });
 });
+
+import { fetchParsedTxsTolerant, isUnreadableTxError } from "../src/lib/tolerantTxFetch";
+
+// X-1: one unreadable transaction in a batch must never wedge the cursor.
+describe("poison-pill tolerant fetch (X-1)", () => {
+  const retry = <R>(fn: () => Promise<R>): Promise<R> => fn();
+  const V1_ERR = new Error("failed to get transaction: Transaction version (1) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 1");
+  const mk = (bad: Set<string>, transient?: Set<string>) => {
+    const calls = { batch: 0, single: [] as string[] };
+    return {
+      calls,
+      conn: {
+        async getParsedTransactions(sigs: string[]) {
+          calls.batch++;
+          if (sigs.some((s) => bad.has(s))) throw V1_ERR; // web3.js throws for the WHOLE batch
+          return sigs.map((s) => ({ sig: s }));
+        },
+        async getParsedTransaction(sig: string) {
+          calls.single.push(sig);
+          if (bad.has(sig)) throw V1_ERR;
+          if (transient?.has(sig)) throw new Error("429 Too Many Requests");
+          return { sig };
+        },
+      },
+    };
+  };
+
+  it("a batch containing an unreadable tx: the others are returned, the poison one is skipped and logged, the cursor may advance", async () => {
+    const { conn } = mk(new Set(["b"]));
+    const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
+    expect(r.failed).toBe(false);
+    expect(r.txs).toEqual([{ sig: "a" }, null, { sig: "c" }]);
+    expect(r.skipped.map((s) => s.signature)).toEqual(["b"]);
+  });
+  it("a healthy batch is one call, nothing skipped", async () => {
+    const { conn, calls } = mk(new Set());
+    const r = await fetchParsedTxsTolerant(conn, ["a", "b"], retry);
+    expect(r).toMatchObject({ failed: false, skipped: [] });
+    expect(calls).toEqual({ batch: 1, single: [] });
+  });
+  it("a single-signature batch that is unreadable is skipped too", async () => {
+    const { conn } = mk(new Set(["a"]));
+    const r = await fetchParsedTxsTolerant(conn, ["a"], retry);
+    expect(r).toMatchObject({ failed: false, txs: [null] });
+    expect(r.skipped).toHaveLength(1);
+  });
+  it("negative control: a TRANSIENT failure still holds the cursor (#147 unchanged), it is never skipped", async () => {
+    const { conn } = mk(new Set(["b"]), new Set(["c"]));
+    const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
+    expect(r.failed).toBe(true);
+    expect(String((r.error as Error).message)).toContain("429");
+    expect(r.skipped.map((s) => s.signature)).toEqual(["b"]);
+    const whole = await fetchParsedTxsTolerant({ ...conn, getParsedTransactions: async () => { throw new Error("ECONNRESET"); } }, ["a"], retry);
+    expect(whole.failed).toBe(true);
+    expect(whole.skipped).toEqual([]);
+  });
+  it("classifies unreadable-tx errors narrowly", () => {
+    for (const m of ["Transaction version (1) is not supported by the requesting client", "-32015 something", "At path: version -- Expected the value to satisfy a union of `literal | literal`, but received: 1"]) expect(isUnreadableTxError(new Error(m))).toBe(true);
+    for (const m of ["429 Too Many Requests", "ECONNRESET", "503 Service Unavailable", "Node is behind by 120 slots"]) expect(isUnreadableTxError(new Error(m))).toBe(false);
+  });
+});

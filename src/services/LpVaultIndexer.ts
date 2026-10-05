@@ -20,6 +20,7 @@
  * transfer is exactly what survives the guard.
  */
 import { createLogger, captureException } from "@percolatorct/shared";
+import { isUnreadableTxError } from "../lib/tolerantTxFetch.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
 import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
@@ -152,7 +153,16 @@ export class LpVaultIndexer {
     // Oldest first, so a partially failed batch never leaves a gap behind the cursor.
     for (const s of [...sigs].reverse()) {
       if (s.failed) continue;
-      const tx = await chain.getTransaction(s.signature);
+      let tx;
+      try {
+        tx = await chain.getTransaction(s.signature);
+      } catch (err) {
+        // X-1: a transaction this client cannot return (a v1 tx on an old reader, -32015) must not wedge the vault's
+        // cursor forever. Skip and log it; any other error still aborts the sync so the batch is re-read.
+        if (!isUnreadableTxError(err)) throw err;
+        logger.warn("LP-vault: skipping unreadable transaction (poison pill)", { registry: reg.registry, signature: s.signature.slice(0, 12), error: String(err instanceof Error ? err.message : err).slice(0, 160) });
+        continue;
+      }
       if (!tx) throw new Error(`getTransaction returned null for ${s.signature}`);
       const events = decodeLpVaultEvents(tx, this.wrapperIds)
         .filter((e) => e.registry === reg.registry)
