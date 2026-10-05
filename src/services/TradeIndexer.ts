@@ -1,4 +1,5 @@
 import { fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
@@ -241,11 +242,17 @@ export class TradeIndexerPolling {
         batch,
         (fn, label) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label }),
       );
-      for (const sk of fetched.skipped) {
-        logger.warn("Skipping unreadable transaction (poison pill) — cursor will still advance", {
-          slabAddress: slabAddress.slice(0, 8),
-          signature: sk.signature.slice(0, 12),
-          error: sk.error.slice(0, 160),
+      if (fetched.skipped.length > 0) {
+        // Durable + loud: FULL signature and slab, counter, DB table (or JSONL fallback). Re-index from there.
+        await recordSkippedSignatures(
+          fetched.skipped.map((sk) => ({ signature: sk.signature, source: "trade-indexer" as const, slab: slabAddress, error: sk.error })),
+        );
+      }
+      if (fetched.massSkip) {
+        logger.error("Mass-skip circuit breaker tripped: cursor held, nothing skipped (RPC or reader is broken, not a poison pill)", {
+          slabAddress,
+          skipped: fetched.massSkip.skipped,
+          batch: fetched.massSkip.total,
         });
       }
       if (fetched.failed) {

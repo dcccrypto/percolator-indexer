@@ -11,11 +11,37 @@
  * so #147's guarantee for transient failures is unchanged.
  */
 
-/** Errors that mean "this particular transaction cannot be returned to this client", not "the RPC is unhealthy". */
+/** Highest transaction version this indexer asks the RPC for (maxSupportedTransactionVersion). */
+export const MAX_REQUESTED_TX_VERSION = 1;
+
+/**
+ * "This one transaction is of a version the client cannot return": EXACTLY the node's -32015 error
+ * (`.code === -32015`, or the exact text "Transaction version (N) is not supported ...") and only for a version N
+ * ABOVE what we asked for. Everything else is an unhealthy RPC or a bug, not a poison pill, and must hold the cursor:
+ * request-body/param errors, parse errors, proxy HTML, and a "(0)" / "(1)" version complaint when we asked for 1
+ * (a node anomaly that would otherwise skip EVERY transaction).
+ */
 export function isUnreadableTxError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : JSON.stringify(err ?? "");
-  return /-32015|Transaction version \(\S+\) is not supported|maxSupportedTransactionVersion|At path:\s*(?:transaction|version|meta)|Expected the value to satisfy a union|failed to deserialize|unsupported transaction version|Reached end of buffer/i.test(msg);
+  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  const text = /Transaction version \((\d+)\) is not supported/.exec(msg);
+  if (text && Number(text[1]) <= MAX_REQUESTED_TX_VERSION) return false;
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  return code === -32015 || text !== null;
 }
+
+/** Rate-limit / network / gateway failures: the RPC is unhealthy; never isolate per signature, never skip. */
+export function isTransientRpcError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  return (
+    code === 429 || code === -32429 || code === -32005 ||
+    /\b(429|502|503|504)\b|too many requests|rate.?limit|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|network|timed? ?out|gateway|service unavailable/i.test(msg)
+  );
+}
+
+/** Mass-skip circuit breaker: skipping more than 1 signature, or more than 20% of the batch, means the RPC is broken, not poisoned. */
+export const MAX_SKIPS_ABSOLUTE = 1;
+export const MAX_SKIP_FRACTION = 0.2;
 
 export interface TxFetcher<T> {
   getParsedTransactions(sigs: string[], opts: { maxSupportedTransactionVersion: number }): Promise<(T | null)[]>;
@@ -31,6 +57,8 @@ export interface TolerantFetchResult<T> {
   failed: boolean;
   /** The non-poison error, when `failed`. */
   error?: unknown;
+  /** Set when the mass-skip circuit breaker tripped. */
+  massSkip?: { skipped: number; total: number };
 }
 
 /**
@@ -49,8 +77,9 @@ export async function fetchParsedTxsTolerant<T>(
     const txs = await retry(() => connection.getParsedTransactions(sigs, opts), `getParsedTransactions(${sigs.length})`);
     return { txs, skipped: [], failed: false };
   } catch (batchErr) {
-    // Isolate: fetch one by one. A single-signature batch has nothing to isolate.
-    if (sigs.length === 1 && !isUnreadableTxError(batchErr)) return { txs: [null], skipped: [], failed: true, error: batchErr };
+    // Isolate ONLY a version-unsupported batch error. Rate limits, network errors, bad params, parse errors and
+    // anything else mean the RPC is unhealthy: hold the cursor, do not fan out, do not skip.
+    if (isTransientRpcError(batchErr) || !isUnreadableTxError(batchErr)) return { txs: sigs.map(() => null), skipped: [], failed: true, error: batchErr };
     const txs: (T | null)[] = [];
     const skipped: { signature: string; error: string }[] = [];
     for (const sig of sigs) {
@@ -64,6 +93,16 @@ export async function fetchParsedTxsTolerant<T>(
         }
         return { txs: [...txs, ...sigs.slice(txs.length).map(() => null)], skipped, failed: true, error: err };
       }
+    }
+    if (skipped.length > MAX_SKIPS_ABSOLUTE || skipped.length / sigs.length > MAX_SKIP_FRACTION) {
+      // Circuit breaker: this is not a poison pill, it is a broken reader or RPC. Hold the cursor, skip nothing.
+      return {
+        txs: sigs.map(() => null),
+        skipped: [],
+        failed: true,
+        error: new Error(`mass skip refused: ${skipped.length}/${sigs.length} signatures unreadable (limit ${MAX_SKIPS_ABSOLUTE} and ${MAX_SKIP_FRACTION * 100}%); cursor held`),
+        massSkip: { skipped: skipped.length, total: sigs.length },
+      };
     }
     return { txs, skipped, failed: false };
   }

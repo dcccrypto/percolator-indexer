@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { PublicKey } from '@solana/web3.js';
 
 const mockGetSignaturesForAddress = vi.fn();
@@ -223,15 +224,13 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
   });
 
-  describe('X-1 — an unreadable (v1) transaction in the batch does not wedge the slab', () => {
-    it('indexes the readable trade and skips the poisoned signature', async () => {
+  describe('X-1 — an unreadable transaction in the batch does not wedge the slab, and is never skipped silently', () => {
+    const SIGS = ['A', 'B', 'C', 'D', 'E', 'F'].map((c) => c.repeat(88));
+    const V2 = Object.assign(new Error('failed to get transaction: Transaction version (2) is not supported by the requesting client'), { code: -32015 });
+    const setup = (badSigs: string[]) => {
       vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
-      // newest first, as getSignaturesForAddress returns: the poison tx is the newest
-      mockGetSignaturesForAddress.mockResolvedValue([
-        { signature: VALID_SIG2, err: null },
-        { signature: VALID_SIG, err: null },
-      ]);
+      mockGetSignaturesForAddress.mockResolvedValue(SIGS.map((signature) => ({ signature, err: null })));
       const ixData = new Uint8Array(77);
       ixData[0] = 10;
       ixData[43] = 0x40;
@@ -239,24 +238,36 @@ describe('TradeIndexerPolling', () => {
       ixData[45] = 0x0f;
       vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
       mockGetParsedTransaction.mockImplementation(async (sig: string) => {
-        if (sig === VALID_SIG2) {
-          throw new Error('failed to get transaction: Transaction version (1) is not supported by the requesting client');
-        }
+        if (badSigs.includes(sig)) throw V2;
         return {
           meta: { err: null, logMessages: [] },
           transaction: { message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(TRADER)], data: 'x' }] } },
         };
       });
+    };
+    const file = `/tmp/ti-skipped-${process.pid}.jsonl`;
+    beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = file; rmSync(file, { force: true }); });
+    afterEach(() => { delete process.env.SKIPPED_SIGNATURES_FILE; mockGetParsedTransaction.mockReset(); });
 
+    it('1 unreadable in 6 (16%): the 5 readable trades are indexed, the poison one is recorded with its FULL signature + slab', async () => {
+      setup([SIGS[1]]);
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
+      const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
+      expect(inserted).toContain(SIGS[0]);
+      expect(inserted).not.toContain(SIGS[1]);
+      const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rec[0]).toMatchObject({ signature: SIGS[1], slab: SLAB, source: 'trade-indexer' });
+    }, 12000);
 
-      expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ slab_address: SLAB, tx_signature: VALID_SIG }));
-      expect(insertTradeRow).not.toHaveBeenCalledWith(expect.objectContaining({ tx_signature: VALID_SIG2 }));
-      // the cursor advanced past the poisoned signature: a later poll asks only for newer signatures
-      const withUntil = mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean);
-      if (mockGetSignaturesForAddress.mock.calls.length > 1) expect(withUntil).toContain(VALID_SIG2);
-      mockGetParsedTransaction.mockReset();
+    it('negative control: 2 unreadable in 6 trips the circuit breaker: NOTHING is indexed or skipped, cursor held', async () => {
+      setup([SIGS[1], SIGS[2]]);
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(existsSync(file)).toBe(false);
+      const untils = mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean);
+      expect(untils).toEqual([]);
     }, 12000);
   });
 

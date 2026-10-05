@@ -20,7 +20,8 @@
  * transfer is exactly what survives the guard.
  */
 import { createLogger, captureException } from "@percolatorct/shared";
-import { isUnreadableTxError } from "../lib/tolerantTxFetch.js";
+import { isUnreadableTxError, MAX_SKIPS_ABSOLUTE, MAX_SKIP_FRACTION } from "../lib/tolerantTxFetch.js";
+import { recordSkippedSignatures, type SkippedSignature } from "../lib/skippedSignatures.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
 import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
@@ -150,6 +151,7 @@ export class LpVaultIndexer {
 
     const newest = sigs[0]!.signature;
     const touched = new Set<string>();
+    const skippedTxs: SkippedSignature[] = [];
     // Oldest first, so a partially failed batch never leaves a gap behind the cursor.
     for (const s of [...sigs].reverse()) {
       if (s.failed) continue;
@@ -160,7 +162,11 @@ export class LpVaultIndexer {
         // X-1: a transaction this client cannot return (a v1 tx on an old reader, -32015) must not wedge the vault's
         // cursor forever. Skip and log it; any other error still aborts the sync so the batch is re-read.
         if (!isUnreadableTxError(err)) throw err;
-        logger.warn("LP-vault: skipping unreadable transaction (poison pill)", { registry: reg.registry, signature: s.signature.slice(0, 12), error: String(err instanceof Error ? err.message : err).slice(0, 160) });
+        skippedTxs.push({ signature: s.signature, source: "lp-vault", slab: reg.registry, error: String(err instanceof Error ? err.message : err) });
+        // Circuit breaker (same limits as the trade indexer): mass-unreadable = broken reader, hold the cursor.
+        if (skippedTxs.length > MAX_SKIPS_ABSOLUTE || skippedTxs.length / sigs.length > MAX_SKIP_FRACTION) {
+          throw new Error(`LP-vault ${reg.registry}: mass skip refused (${skippedTxs.length}/${sigs.length} unreadable); cursor held`);
+        }
         continue;
       }
       if (!tx) throw new Error(`getTransaction returned null for ${s.signature}`);
@@ -179,9 +185,22 @@ export class LpVaultIndexer {
     this.cursors.set(reg.registry, newest);
     result.users = [...touched];
 
+    if (skippedTxs.length > 0) {
+      // The folded positions are missing the skipped tx's events: never advance past it silently. The signatures are
+      // recorded durably (re-indexable) and every open position is reconciled against on-chain shares now.
+      await recordSkippedSignatures(skippedTxs);
+      logger.error("LP-vault cursor advanced past skipped transaction(s): reconciling every open position against on-chain shares", {
+        registry: reg.registry,
+        signatures: skippedTxs.map((t) => t.signature),
+      });
+      const rec = await this.reconcileOpenPositions(reg);
+      result.reconciled += rec.reconciled;
+      result.reconcileSkipped += rec.skipped;
+    }
+
     const rec = await this.reconcileUsers(reg, result.users, newest);
-    result.reconciled = rec.reconciled;
-    result.reconcileSkipped = rec.skipped;
+    result.reconciled += rec.reconciled;
+    result.reconcileSkipped += rec.skipped;
     return result;
   }
 

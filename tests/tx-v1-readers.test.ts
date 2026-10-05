@@ -66,38 +66,41 @@ describe("normalizeRpcTransaction on a v1 response", () => {
   });
 });
 
-import { fetchParsedTxsTolerant, isUnreadableTxError } from "../src/lib/tolerantTxFetch";
+import { fetchParsedTxsTolerant, isTransientRpcError, isUnreadableTxError } from "../src/lib/tolerantTxFetch";
 
-// X-1: one unreadable transaction in a batch must never wedge the cursor.
+// X-1: one unreadable transaction in a batch must never wedge the cursor, and must never be skipped silently.
 describe("poison-pill tolerant fetch (X-1)", () => {
   const retry = <R>(fn: () => Promise<R>): Promise<R> => fn();
-  const V1_ERR = new Error("failed to get transaction: Transaction version (1) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 1");
-  const mk = (bad: Set<string>, transient?: Set<string>) => {
+  const V2_ERR = Object.assign(new Error("failed to get transaction: Transaction version (2) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 2"), { code: -32015 });
+  const mk = (bad: Set<string>, transient?: Set<string>, batchError?: Error) => {
     const calls = { batch: 0, single: [] as string[] };
     return {
       calls,
       conn: {
         async getParsedTransactions(sigs: string[]) {
           calls.batch++;
-          if (sigs.some((s) => bad.has(s))) throw V1_ERR; // web3.js throws for the WHOLE batch
+          if (batchError) throw batchError;
+          if (sigs.some((s) => bad.has(s))) throw V2_ERR; // web3.js throws for the WHOLE batch
           return sigs.map((s) => ({ sig: s }));
         },
         async getParsedTransaction(sig: string) {
           calls.single.push(sig);
-          if (bad.has(sig)) throw V1_ERR;
+          if (bad.has(sig)) throw V2_ERR;
           if (transient?.has(sig)) throw new Error("429 Too Many Requests");
           return { sig };
         },
       },
     };
   };
+  const ten = Array.from({ length: 10 }, (_, i) => `s${i}`);
 
-  it("a batch containing an unreadable tx: the others are returned, the poison one is skipped and logged, the cursor may advance", async () => {
-    const { conn } = mk(new Set(["b"]));
-    const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
+  it("one unreadable tx in a batch of 10 (10%): the others are returned, it is skipped, the cursor may advance", async () => {
+    const { conn } = mk(new Set(["s3"]));
+    const r = await fetchParsedTxsTolerant(conn, ten, retry);
     expect(r.failed).toBe(false);
-    expect(r.txs).toEqual([{ sig: "a" }, null, { sig: "c" }]);
-    expect(r.skipped.map((s) => s.signature)).toEqual(["b"]);
+    expect(r.txs.filter(Boolean)).toHaveLength(9);
+    expect(r.txs[3]).toBeNull();
+    expect(r.skipped.map((s) => s.signature)).toEqual(["s3"]);
   });
   it("a healthy batch is one call, nothing skipped", async () => {
     const { conn, calls } = mk(new Set());
@@ -105,24 +108,82 @@ describe("poison-pill tolerant fetch (X-1)", () => {
     expect(r).toMatchObject({ failed: false, skipped: [] });
     expect(calls).toEqual({ batch: 1, single: [] });
   });
-  it("a single-signature batch that is unreadable is skipped too", async () => {
-    const { conn } = mk(new Set(["a"]));
-    const r = await fetchParsedTxsTolerant(conn, ["a"], retry);
-    expect(r).toMatchObject({ failed: false, txs: [null] });
-    expect(r.skipped).toHaveLength(1);
+
+  describe("(b) mass-skip circuit breaker", () => {
+    it("2 unreadable in 10 (>1 absolute): cursor held, NOTHING skipped", async () => {
+      const { conn } = mk(new Set(["s1", "s2"]));
+      const r = await fetchParsedTxsTolerant(conn, ten, retry);
+      expect(r.failed).toBe(true);
+      expect(r.skipped).toEqual([]);
+      expect(r.massSkip).toEqual({ skipped: 2, total: 10 });
+    });
+    it("a batch where EVERY signature is unreadable: held, not skipped", async () => {
+      const { conn } = mk(new Set(ten));
+      const r = await fetchParsedTxsTolerant(conn, ten, retry);
+      expect(r).toMatchObject({ failed: true, skipped: [] });
+      expect(r.massSkip).toEqual({ skipped: 10, total: 10 });
+    });
+    it("1 in a batch of 3 (33% > 20%) is held; a lone signature that is unreadable is held too", async () => {
+      expect((await fetchParsedTxsTolerant(mk(new Set(["s1"])).conn, ["s0", "s1", "s2"], retry)).failed).toBe(true);
+      expect((await fetchParsedTxsTolerant(mk(new Set(["a"])).conn, ["a"], retry)).failed).toBe(true);
+    });
+    it("exactly 1 in 5 (20%, not more than 20%) is still skipped", async () => {
+      const r = await fetchParsedTxsTolerant(mk(new Set(["s4"])).conn, ten.slice(0, 5), retry);
+      expect(r.failed).toBe(false);
+      expect(r.skipped).toHaveLength(1);
+    });
   });
-  it("negative control: a TRANSIENT failure still holds the cursor (#147 unchanged), it is never skipped", async () => {
-    const { conn } = mk(new Set(["b"]), new Set(["c"]));
-    const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
-    expect(r.failed).toBe(true);
-    expect(String((r.error as Error).message)).toContain("429");
-    expect(r.skipped.map((s) => s.signature)).toEqual(["b"]);
-    const whole = await fetchParsedTxsTolerant({ ...conn, getParsedTransactions: async () => { throw new Error("ECONNRESET"); } }, ["a"], retry);
-    expect(whole.failed).toBe(true);
-    expect(whole.skipped).toEqual([]);
+
+  describe("(e) no per-signature isolation on an unhealthy RPC", () => {
+    it("rate-limit / network / gateway errors on the batch: cursor held, ZERO single fetches, nothing skipped", async () => {
+      for (const m of ["429 Too Many Requests", "ECONNRESET", "fetch failed", "502 Bad Gateway", "503 Service Unavailable", "request timed out"]) {
+        const { conn, calls } = mk(new Set(), undefined, new Error(m));
+        const r = await fetchParsedTxsTolerant(conn, ten, retry);
+        expect(r).toMatchObject({ failed: true, skipped: [] });
+        expect(calls.single).toEqual([]);
+      }
+    });
+    it("a non-version batch error (anything unrecognised) also holds without fan-out", async () => {
+      const { conn, calls } = mk(new Set(), undefined, new Error("something unexpected"));
+      expect((await fetchParsedTxsTolerant(conn, ten, retry)).failed).toBe(true);
+      expect(calls.single).toEqual([]);
+    });
+    it("a TRANSIENT failure during isolation holds the cursor (#147), it is never skipped", async () => {
+      const { conn } = mk(new Set(["s3"]), new Set(["s5"]));
+      const r = await fetchParsedTxsTolerant(conn, ten, retry);
+      expect(r.failed).toBe(true);
+      expect(String((r.error as Error).message)).toContain("429");
+    });
   });
-  it("classifies unreadable-tx errors narrowly", () => {
-    for (const m of ["Transaction version (1) is not supported by the requesting client", "-32015 something", "At path: version -- Expected the value to satisfy a union of `literal | literal`, but received: 1"]) expect(isUnreadableTxError(new Error(m))).toBe(true);
-    for (const m of ["429 Too Many Requests", "ECONNRESET", "503 Service Unavailable", "Node is behind by 120 slots"]) expect(isUnreadableTxError(new Error(m))).toBe(false);
+
+  describe("(a) the classifier is narrow", () => {
+    it("ONLY the node's -32015 / exact 'Transaction version (N) is not supported' for N above what we asked", () => {
+      expect(isUnreadableTxError(V2_ERR)).toBe(true);
+      expect(isUnreadableTxError(Object.assign(new Error("anything"), { code: -32015 }))).toBe(true);
+      expect(isUnreadableTxError(new Error("Transaction version (2) is not supported by the requesting client"))).toBe(true);
+    });
+    it("probes that must NOT classify as unreadable", () => {
+      for (const m of [
+        "Invalid params: failed to deserialize request body",
+        "Invalid params: maxSupportedTransactionVersion must be 0",
+        "Transaction version (0) is not supported by the requesting client",
+        "Transaction version (1) is not supported by the requesting client", // we asked for 1: a node anomaly, not a poison pill
+        "At path: meta -- Expected an object, but received: undefined",
+        "<html><body>502 Bad Gateway: Expected the value to satisfy a union</body></html>",
+        "Reached end of buffer unexpectedly",
+        "At path: version -- Expected the value to satisfy a union of `literal | literal`, but received: 1",
+      ]) expect(isUnreadableTxError(new Error(m))).toBe(false);
+      expect(isUnreadableTxError(Object.assign(new Error("Transaction version (0) is not supported"), { code: -32015 }))).toBe(false);
+    });
+    it("(0)-version complaint on EVERY signature of a batch never skips anything", async () => {
+      const zero = new Error("Transaction version (0) is not supported by the requesting client");
+      const conn = { getParsedTransactions: async () => { throw zero; }, getParsedTransaction: async () => { throw zero; } };
+      const r = await fetchParsedTxsTolerant(conn, ten, retry);
+      expect(r).toMatchObject({ failed: true, skipped: [] });
+    });
+    it("transient classifier", () => {
+      for (const m of ["429 Too Many Requests", "ECONNRESET", "fetch failed", "502 Bad Gateway"]) expect(isTransientRpcError(new Error(m))).toBe(true);
+      expect(isTransientRpcError(V2_ERR)).toBe(false);
+    });
   });
 });
