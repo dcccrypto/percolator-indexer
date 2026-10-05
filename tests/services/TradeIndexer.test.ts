@@ -260,6 +260,19 @@ describe('TradeIndexerPolling', () => {
       expect(rec[0]).toMatchObject({ signature: SIGS[1], slab: SLAB, source: 'trade-indexer' });
     }, 12000);
 
+    it('a batch of 1 that is poisoned: skipped and recorded (full signature + slab), and the cursor advances', async () => {
+      setup([SIGS[0]]);
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rec[0]).toMatchObject({ signature: SIGS[0], slab: SLAB, source: 'trade-indexer' });
+      if (mockGetSignaturesForAddress.mock.calls.length > 1) {
+        expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until)).toContain(SIGS[0]);
+      }
+    }, 12000);
+
     it('negative control: 2 unreadable in 6 trips the circuit breaker: NOTHING is indexed or skipped, cursor held', async () => {
       setup([SIGS[1], SIGS[2]]);
       indexer.start();

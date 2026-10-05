@@ -94,7 +94,7 @@ describe("poison-pill tolerant fetch (X-1)", () => {
   };
   const ten = Array.from({ length: 10 }, (_, i) => `s${i}`);
 
-  it("one unreadable tx in a batch of 10 (10%): the others are returned, it is skipped, the cursor may advance", async () => {
+  it("one unreadable tx in a batch of 10: the others are returned, it is skipped, the cursor may advance", async () => {
     const { conn } = mk(new Set(["s3"]));
     const r = await fetchParsedTxsTolerant(conn, ten, retry);
     expect(r.failed).toBe(false);
@@ -110,7 +110,7 @@ describe("poison-pill tolerant fetch (X-1)", () => {
   });
 
   describe("(b) mass-skip circuit breaker", () => {
-    it("2 unreadable in 10 (>1 absolute): cursor held, NOTHING skipped", async () => {
+    it("2 unreadable in 10 (more than one): cursor held, NOTHING skipped", async () => {
       const { conn } = mk(new Set(["s1", "s2"]));
       const r = await fetchParsedTxsTolerant(conn, ten, retry);
       expect(r.failed).toBe(true);
@@ -123,14 +123,26 @@ describe("poison-pill tolerant fetch (X-1)", () => {
       expect(r).toMatchObject({ failed: true, skipped: [] });
       expect(r.massSkip).toEqual({ skipped: 10, total: 10 });
     });
-    it("1 in a batch of 3 (33% > 20%) is held; a lone signature that is unreadable is held too", async () => {
-      expect((await fetchParsedTxsTolerant(mk(new Set(["s1"])).conn, ["s0", "s1", "s2"], retry)).failed).toBe(true);
-      expect((await fetchParsedTxsTolerant(mk(new Set(["a"])).conn, ["a"], retry)).failed).toBe(true);
+    it("at most ONE skip per batch whatever its size: a lone poison tx in a batch of 1, 2, 3 or 4 is skipped and the cursor advances", async () => {
+      for (const n of [1, 2, 3, 4]) {
+        const sigs = ten.slice(0, n);
+        const r = await fetchParsedTxsTolerant(mk(new Set([sigs[0]!])).conn, sigs, retry);
+        expect(r.failed).toBe(false);
+        expect(r.skipped.map((x) => x.signature)).toEqual([sigs[0]]);
+        expect(r.txs[0]).toBeNull();
+        expect(r.txs.slice(1).every(Boolean)).toBe(true);
+      }
     });
-    it("exactly 1 in 5 (20%, not more than 20%) is still skipped", async () => {
-      const r = await fetchParsedTxsTolerant(mk(new Set(["s4"])).conn, ten.slice(0, 5), retry);
-      expect(r.failed).toBe(false);
-      expect(r.skipped).toHaveLength(1);
+    it("negative control: 2 poison in a batch of 3 is held (no skip, error logged by the caller)", async () => {
+      const r = await fetchParsedTxsTolerant(mk(new Set(["s0", "s2"])).conn, ["s0", "s1", "s2"], retry);
+      expect(r).toMatchObject({ failed: true, skipped: [] });
+      expect(r.massSkip).toEqual({ skipped: 2, total: 3 });
+    });
+    it("a signature is only skipped when it is unreadable on its OWN retry: a batch-level version error whose single retry succeeds skips nothing", async () => {
+      const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => ({ sig }) };
+      const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
+      expect(r).toMatchObject({ failed: false, skipped: [] });
+      expect(r.txs).toEqual([{ sig: "a" }, { sig: "b" }, { sig: "c" }]);
     });
   });
 

@@ -583,7 +583,7 @@ describe("X-1 LP vault: unreadable transactions", () => {
     expect(existsSync(FILE)).toBe(false);
     expect(r.reconciled).toBe(1);
   });
-  it("circuit breaker: 2 unreadable (or >20%) holds the vault cursor and records nothing", async () => {
+  it("circuit breaker: 2 unreadable holds the vault cursor and records nothing", async () => {
     const chain = withExtras(8, ["extra1", "extra2"]);
     const ix = mkIndexer(chain);
     await expect(ix.syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
@@ -592,8 +592,25 @@ describe("X-1 LP vault: unreadable transactions", () => {
     chain.getTransaction = (async (s: string) => (chain as unknown as { txs: Map<string, NormTx> }).txs.get(s) ?? null) as typeof chain.getTransaction;
     expect((await ix.syncRegistry(FXUC)).signatures).toBe(12);
   });
-  it("a small window (1 of 4 = 25% > 20%) is held, not skipped", async () => {
-    await expect(mkIndexer(withExtras(0, ["depositFxuc"].map(() => fxucSigOf(1)))).syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
+  it("one poison tx in a SMALL window (1 of 4) is skipped and recorded, not wedged; the cursor advances", async () => {
+    const chain = fxucChain();
+    const real = chain.getTransaction.bind(chain);
+    chain.getTransaction = async (sig: string) => { if (sig === fxucSigOf(1)) throw V2; return real(sig); };
+    const ix = mkIndexer(chain);
+    const r = await ix.syncRegistry(FXUC);
+    expect(r.signatures).toBe(4);
+    expect(getSkippedSignatureCount()).toBe(1);
+    const rec = readFile(FILE, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rec[0]).toMatchObject({ signature: fxucSigOf(1), slab: FXUC.registry, source: "lp-vault" });
+    chain.getTransaction = real; // fixed reader: nothing new to read, the cursor already advanced
+    expect((await ix.syncRegistry(FXUC)).signatures).toBe(0);
+  });
+  it("negative control: 2 poison in a window of 3+ is held", async () => {
+    const chain = fxucChain();
+    const real = chain.getTransaction.bind(chain);
+    chain.getTransaction = async (sig: string) => { if (sig === fxucSigOf(0) || sig === fxucSigOf(2)) throw V2; return real(sig); };
+    await expect(mkIndexer(chain).syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
+    expect(getSkippedSignatureCount()).toBe(0);
   });
 });
 const fxucSigOf = (i: number): string => [SIG.createFxuc, SIG.depositFxuc, SIG.requestFxuc, SIG.crankFxuc][i]!;

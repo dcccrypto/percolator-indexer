@@ -1,5 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
-import { isUnreadableTxError } from "../lib/tolerantTxFetch.js";
+import { isUnreadableTxError, MAX_SKIPS_ABSOLUTE } from "../lib/tolerantTxFetch.js";
+import { recordSkippedSignatures, type SkippedSignature } from "./../lib/skippedSignatures.js";
 import { V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
 import type {
   ConfirmedSignatureInfo,
@@ -198,13 +199,19 @@ export async function findSlabCreator(
     .filter((s) => s.err === null)
     .slice(-CREATOR_LOOKUP_MAX_TX)
     .reverse(); // oldest first
+  const skipped: SkippedSignature[] = [];
   for (const sig of candidates) {
     let tx;
     try {
       tx = await rpc.getTransaction(sig.signature);
     } catch (err) {
-      if (isUnreadableTxError(err)) continue; // X-1: skip a transaction this client cannot return
-      throw err;
+      if (!isUnreadableTxError(err)) throw err;
+      // X-1: skip a transaction this client cannot return, but only ONE per lookup (a second means a broken reader),
+      // and record it like the other two sites (full signature + slab, counter, table/file).
+      skipped.push({ signature: sig.signature, source: "creator-lookup", slab: slab.toBase58(), error: err instanceof Error ? err.message : String(err) });
+      if (skipped.length > MAX_SKIPS_ABSOLUTE) throw new Error(`creator lookup for ${slab.toBase58()}: mass skip refused (${skipped.length} unreadable signatures)`);
+      await recordSkippedSignatures([skipped[skipped.length - 1]!]);
+      continue;
     }
     if (!tx) continue;
     const creator = creatorFromCreationTx(tx, slab, programId);

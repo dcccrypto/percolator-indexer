@@ -20,7 +20,7 @@
  * transfer is exactly what survives the guard.
  */
 import { createLogger, captureException } from "@percolatorct/shared";
-import { isUnreadableTxError, MAX_SKIPS_ABSOLUTE, MAX_SKIP_FRACTION } from "../lib/tolerantTxFetch.js";
+import { isUnreadableTxError, MAX_SKIPS_ABSOLUTE } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures, type SkippedSignature } from "../lib/skippedSignatures.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
@@ -163,9 +163,9 @@ export class LpVaultIndexer {
         // cursor forever. Skip and log it; any other error still aborts the sync so the batch is re-read.
         if (!isUnreadableTxError(err)) throw err;
         skippedTxs.push({ signature: s.signature, source: "lp-vault", slab: reg.registry, error: String(err instanceof Error ? err.message : err) });
-        // Circuit breaker (same limits as the trade indexer): mass-unreadable = broken reader, hold the cursor.
-        if (skippedTxs.length > MAX_SKIPS_ABSOLUTE || skippedTxs.length / sigs.length > MAX_SKIP_FRACTION) {
-          throw new Error(`LP-vault ${reg.registry}: mass skip refused (${skippedTxs.length}/${sigs.length} unreadable); cursor held`);
+        // Circuit breaker (same rule as the trade indexer: at most one skip): mass-unreadable = broken reader, hold the cursor.
+        if (skippedTxs.length > MAX_SKIPS_ABSOLUTE) {
+          throw new Error(`LP-vault ${reg.registry}: mass skip refused (${skippedTxs.length} unreadable signatures in one window); cursor held`);
         }
         continue;
       }

@@ -39,9 +39,12 @@ export function isTransientRpcError(err: unknown): boolean {
   );
 }
 
-/** Mass-skip circuit breaker: skipping more than 1 signature, or more than 20% of the batch, means the RPC is broken, not poisoned. */
+/**
+ * Mass-skip circuit breaker: at most ONE signature may be skipped per batch, whatever the batch size (so a lone poison
+ * tx on a quiet slab cannot hold the cursor forever); a second unreadable signature means the RPC or reader is broken,
+ * not poisoned. A signature is only skipped when it is classified unreadable on its OWN per-signature retry.
+ */
 export const MAX_SKIPS_ABSOLUTE = 1;
-export const MAX_SKIP_FRACTION = 0.2;
 
 export interface TxFetcher<T> {
   getParsedTransactions(sigs: string[], opts: { maxSupportedTransactionVersion: number }): Promise<(T | null)[]>;
@@ -94,13 +97,13 @@ export async function fetchParsedTxsTolerant<T>(
         return { txs: [...txs, ...sigs.slice(txs.length).map(() => null)], skipped, failed: true, error: err };
       }
     }
-    if (skipped.length > MAX_SKIPS_ABSOLUTE || skipped.length / sigs.length > MAX_SKIP_FRACTION) {
+    if (skipped.length > MAX_SKIPS_ABSOLUTE) {
       // Circuit breaker: this is not a poison pill, it is a broken reader or RPC. Hold the cursor, skip nothing.
       return {
         txs: sigs.map(() => null),
         skipped: [],
         failed: true,
-        error: new Error(`mass skip refused: ${skipped.length}/${sigs.length} signatures unreadable (limit ${MAX_SKIPS_ABSOLUTE} and ${MAX_SKIP_FRACTION * 100}%); cursor held`),
+        error: new Error(`mass skip refused: ${skipped.length}/${sigs.length} signatures unreadable (limit ${MAX_SKIPS_ABSOLUTE} per batch); cursor held`),
         massSkip: { skipped: skipped.length, total: sigs.length },
       };
     }

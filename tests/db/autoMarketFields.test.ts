@@ -177,6 +177,37 @@ describe("findSlabCreator", () => {
     expect(vi.mocked(rpc.getTransaction).mock.calls[0][0]).toBe("sig1001");
   });
 
+  it("X-1: ONE unreadable tx is skipped and recorded like the other sites (full signature + slab); a second is refused", async () => {
+    const { existsSync, readFileSync, rmSync } = await import("node:fs");
+    const file = `/tmp/creator-skip-${process.pid}.jsonl`;
+    process.env.SKIPPED_SIGNATURES_FILE = file;
+    rmSync(file, { force: true });
+    try {
+      const V2 = Object.assign(new Error("Transaction version (2) is not supported by the requesting client"), { code: -32015 });
+      const page = [sig(1002), sig(1001), sig(1000)];
+      const mk = (bad: string[]): CreatorLookupRpc => ({
+        getSignaturesForAddress: vi.fn(async () => page),
+        getTransaction: vi.fn(async (s: string) => { if (bad.includes(s)) throw V2; return s === "sig1001" ? creationTx() : null; }),
+      });
+      // oldest-first scan: sig1000 is unreadable -> skipped and recorded, the lookup continues to the creation tx sig1001
+      await expect(findSlabCreator(mk(["sig1000"]), SLAB, WRAPPER)).resolves.toBe(CREATOR.toBase58());
+      const rec = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(rec).toHaveLength(1);
+      expect(rec[0]).toMatchObject({ signature: "sig1000", slab: SLAB.toBase58(), source: "creator-lookup" });
+      // two unreadable: refused (mass skip), nothing more recorded beyond the first
+      rmSync(file, { force: true });
+      await expect(findSlabCreator(mk(["sig1000", "sig1001"]), SLAB, WRAPPER)).rejects.toThrow(/mass skip refused/);
+      expect(existsSync(file)).toBe(true);
+      const rec2 = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(rec2).toHaveLength(1);
+      expect(rec2[0]).toMatchObject({ source: "creator-lookup", slab: SLAB.toBase58() });
+      expect(rec2[0].signature).toMatch(/^sig100[01]$/);
+    } finally {
+      delete process.env.SKIPPED_SIGNATURES_FILE;
+      rmSync(file, { force: true });
+    }
+  });
+
   it("returns NULL when the start of history is out of reach", async () => {
     const full = Array.from({ length: 1000 }, (_, i) => sig(i));
     const rpc: CreatorLookupRpc = {
