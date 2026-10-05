@@ -236,7 +236,7 @@ export class TradeIndexerPolling {
       let txs: (ParsedTransactionWithMeta | null)[];
       try {
         txs = await withRetry(
-          () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 0 }),
+          () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 1 }),
           {
             maxRetries: TX_FETCH_RETRIES,
             baseDelayMs: 1000,

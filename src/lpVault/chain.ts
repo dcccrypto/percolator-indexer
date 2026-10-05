@@ -102,7 +102,7 @@ export class RpcLpVaultChain implements LpVaultChain {
   async getTransaction(signature: string): Promise<NormTx | null> {
     const resp = await this.conn.getTransaction(signature, {
       commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: 1,
     });
     return resp ? normalizeRpcTransaction(signature, resp) : null;
   }

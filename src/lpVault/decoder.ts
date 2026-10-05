@@ -107,8 +107,9 @@ export interface NormTx {
 }
 
 /**
- * Normalize a web3.js `getTransaction(sig, { maxSupportedTransactionVersion: 0 })`
- * response (legacy or v0 with lookup tables).
+ * Normalize a web3.js `getTransaction(sig, { maxSupportedTransactionVersion: 1 })`
+ * response (legacy, v0 with lookup tables, or v1: no lookup tables, `meta.loadedAddresses` empty).
+ * Needs @solana/web3.js >= 1.99.0: older versions cannot parse a v1 response at all.
  */
 export function normalizeRpcTransaction(signature: string, resp: VersionedTransactionResponse): NormTx {
   const msg = resp.transaction.message;

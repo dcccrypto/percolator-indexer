@@ -77,7 +77,7 @@ export class EventStreamService {
         encoding: "jsonParsed",
         transactionDetails: "full",
         showRewards: false,
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
       },
     ]);
 
