@@ -12,14 +12,14 @@ vi.mock("@percolatorct/shared", () => ({
   getSupabase: () => ({ from: (t: string) => ({ upsert: (...a: unknown[]) => upsert(t, ...a) }) }),
 }));
 
-import { getSkippedSignatureCount, recordSkippedSignatures, resetSkippedSignatureCount } from "../src/lib/skippedSignatures.js";
+import { assertSkippedSignatureSinkReady, getSkippedSignatureCount, recordSkippedSignatures, resetSkippedSignatureCount, resetSkippedSignatureDedupe } from "../src/lib/skippedSignatures.js";
 
 const FULL = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
 const FILE = join(tmpdir(), `skipped-unit-${process.pid}.jsonl`);
 const row = { signature: FULL, source: "trade-indexer" as const, slab: "SLABfull111111111111111111111111111111111111", error: "Transaction version (2) is not supported" };
 
 describe("(c) durable skip record", () => {
-  beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = FILE; rmSync(FILE, { force: true }); resetSkippedSignatureCount(); upsert.mockReset(); logError.mockClear(); });
+  beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = FILE; rmSync(FILE, { force: true }); resetSkippedSignatureCount(); resetSkippedSignatureDedupe(); upsert.mockReset(); logError.mockClear(); });
   afterEach(() => { delete process.env.SKIPPED_SIGNATURES_FILE; rmSync(FILE, { force: true }); });
 
   it("upserts the FULL signature and slab into skipped_signatures and bumps the counter", async () => {
@@ -48,6 +48,32 @@ describe("(c) durable skip record", () => {
     await recordSkippedSignatures([row]);
     const ctx = logError.mock.calls.find((c) => String(c[0]).startsWith("SKIPPED"))![1];
     expect(ctx).toMatchObject({ signature: FULL, slab: row.slab, metric: "indexer_skipped_signatures_total" });
+  });
+  it("B: there is NO default file; without SKIPPED_SIGNATURES_FILE a failed table write only logs (the log + Sentry are the record)", async () => {
+    delete process.env.SKIPPED_SIGNATURES_FILE;
+    upsert.mockResolvedValue({ error: { message: "no table" } });
+    const unique = `${FULL}-nodefault-${process.pid}-${Date.now()}`;
+    await expect(recordSkippedSignatures([{ ...row, signature: unique }])).resolves.toBeUndefined();
+    expect(existsSync("/tmp/indexer-skipped-signatures.jsonl") && readFileSync("/tmp/indexer-skipped-signatures.jsonl", "utf8").includes(unique)).toBe(false);
+    const msgs = logError.mock.calls.map((c) => String(c[0]));
+    expect(msgs.some((m) => m.includes("no SKIPPED_SIGNATURES_FILE is set"))).toBe(true);
+    const last = logError.mock.calls.find((c) => String(c[0]).includes("no SKIPPED_SIGNATURES_FILE"))![1];
+    expect(last.signatures).toEqual([unique]);
+  });
+  it("B: an explicitly configured file is checked writable at startup and fails loudly otherwise; unset is fine", () => {
+    expect(() => assertSkippedSignatureSinkReady({})).not.toThrow();
+    expect(() => assertSkippedSignatureSinkReady({ SKIPPED_SIGNATURES_FILE: FILE })).not.toThrow();
+    expect(() => assertSkippedSignatureSinkReady({ SKIPPED_SIGNATURES_FILE: "/nonexistent-dir-xyz/skipped.jsonl" })).toThrow(/not writable/);
+  });
+  it("D: the same (source, signature) is recorded once per process (no repeated log, Sentry or table writes); a different source is separate", async () => {
+    upsert.mockResolvedValue({ error: null });
+    await recordSkippedSignatures([row]);
+    await recordSkippedSignatures([row, row]);
+    expect(getSkippedSignatureCount()).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(logError.mock.calls.filter((c) => String(c[0]).startsWith("SKIPPED"))).toHaveLength(1);
+    await recordSkippedSignatures([{ ...row, source: "lp-vault" }]);
+    expect(getSkippedSignatureCount()).toBe(2);
   });
   it("nothing to record is a no-op", async () => {
     await recordSkippedSignatures([]);

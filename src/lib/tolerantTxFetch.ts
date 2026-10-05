@@ -40,11 +40,56 @@ export function isTransientRpcError(err: unknown): boolean {
 }
 
 /**
- * Mass-skip circuit breaker: at most ONE signature may be skipped per batch, whatever the batch size (so a lone poison
- * tx on a quiet slab cannot hold the cursor forever); a second unreadable signature means the RPC or reader is broken,
- * not poisoned. A signature is only skipped when it is classified unreadable on its OWN per-signature retry.
+ * Mass-skip circuit breaker ("successful sibling" rule): up to MAX_SKIPS_ABSOLUTE signatures may be skipped per batch,
+ * but ONLY if at least one OTHER signature of the same batch was fetched successfully (non-null) by its own
+ * per-signature call, which proves the reader works and the unreadable ones really are individually poisoned. An
+ * all-unreadable batch, or more than MAX_SKIPS_ABSOLUTE unreadable, holds the cursor. A signature is only skipped when
+ * it is classified unreadable on its OWN per-signature retry.
  */
-export const MAX_SKIPS_ABSOLUTE = 1;
+export const MAX_SKIPS_ABSOLUTE = 5;
+
+/**
+ * A per-signature failure that is a genuine poison pill: the strict -32015 / version-N>requested classification AND not a
+ * rate-limit / network / gateway failure (a 502 page that echoes "version (2)", or a 429 body on a -32015, is the RPC being
+ * unhealthy, never a reason to skip a signature).
+ */
+export function isPoisonTxError(err: unknown): boolean {
+  return !isTransientRpcError(err) && isUnreadableTxError(err);
+}
+
+/** Decide whether a batch's skips are acceptable. */
+export function skipsAcceptable(skipped: number, readOk: number): boolean {
+  return skipped === 0 || (skipped <= MAX_SKIPS_ABSOLUTE && readOk >= 1);
+}
+
+/**
+ * Tracks consecutive polls a key (slab / vault) has been held by the mass-skip breaker, and fires `onAlert` when the count
+ * reaches K and at every further multiple of K. Any non-held poll resets it. The alert is the operator's signal that a
+ * cursor is stuck, not poisoned (default K = INDEXER_BREAKER_ALERT_POLLS or 10).
+ */
+export function createBreakerTracker(k: number, onAlert: (key: string, consecutive: number) => void): {
+  held(key: string): number;
+  clear(key: string): void;
+} {
+  const counts = new Map<string, number>();
+  return {
+    held(key) {
+      const n = (counts.get(key) ?? 0) + 1;
+      counts.set(key, n);
+      if (n >= k && n % k === 0) onAlert(key, n);
+      return n;
+    },
+    clear(key) {
+      counts.delete(key);
+    },
+  };
+}
+
+/** K from the environment (default 10). */
+export function breakerAlertPolls(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.INDEXER_BREAKER_ALERT_POLLS);
+  return Number.isInteger(n) && n >= 1 ? n : 10;
+}
 
 export interface TxFetcher<T> {
   getParsedTransactions(sigs: string[], opts: { maxSupportedTransactionVersion: number }): Promise<(T | null)[]>;
@@ -85,11 +130,14 @@ export async function fetchParsedTxsTolerant<T>(
     if (isTransientRpcError(batchErr) || !isUnreadableTxError(batchErr)) return { txs: sigs.map(() => null), skipped: [], failed: true, error: batchErr };
     const txs: (T | null)[] = [];
     const skipped: { signature: string; error: string }[] = [];
+    let readOk = 0;
     for (const sig of sigs) {
       try {
-        txs.push(await retry(() => connection.getParsedTransaction(sig, opts), `getParsedTransaction(${sig.slice(0, 8)})`));
+        const tx = await retry(() => connection.getParsedTransaction(sig, opts), `getParsedTransaction(${sig.slice(0, 8)})`);
+        if (tx) readOk++;
+        txs.push(tx);
       } catch (err) {
-        if (isUnreadableTxError(err)) {
+        if (isPoisonTxError(err)) {
           skipped.push({ signature: sig, error: err instanceof Error ? err.message : String(err) });
           txs.push(null);
           continue;
@@ -97,13 +145,13 @@ export async function fetchParsedTxsTolerant<T>(
         return { txs: [...txs, ...sigs.slice(txs.length).map(() => null)], skipped, failed: true, error: err };
       }
     }
-    if (skipped.length > MAX_SKIPS_ABSOLUTE) {
+    if (!skipsAcceptable(skipped.length, readOk)) {
       // Circuit breaker: this is not a poison pill, it is a broken reader or RPC. Hold the cursor, skip nothing.
       return {
         txs: sigs.map(() => null),
         skipped: [],
         failed: true,
-        error: new Error(`mass skip refused: ${skipped.length}/${sigs.length} signatures unreadable (limit ${MAX_SKIPS_ABSOLUTE} per batch); cursor held`),
+        error: new Error(`mass skip refused: ${skipped.length}/${sigs.length} signatures unreadable (limit ${MAX_SKIPS_ABSOLUTE} per batch and at least one successfully fetched sibling required); cursor held`),
         massSkip: { skipped: skipped.length, total: sigs.length },
       };
     }

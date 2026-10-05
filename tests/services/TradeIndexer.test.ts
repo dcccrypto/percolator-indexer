@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { PublicKey } from '@solana/web3.js';
 
+vi.hoisted(() => { process.env.INDEXER_BREAKER_ALERT_POLLS = '1'; }); // alert on the first held poll in tests
 const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
 const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
@@ -77,6 +78,7 @@ vi.mock('@percolatorct/shared', () => ({
   captureException: vi.fn(),
 }));
 
+import { resetSkippedSignatureDedupe } from '../../src/lib/skippedSignatures.js';
 import { TradeIndexerPolling } from '../../src/services/TradeIndexer.js';
 import * as shared from '@percolatorct/shared';
 import { insertTradeRow } from '../../src/db/insertTradeRow.js';
@@ -246,10 +248,10 @@ describe('TradeIndexerPolling', () => {
       });
     };
     const file = `/tmp/ti-skipped-${process.pid}.jsonl`;
-    beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = file; rmSync(file, { force: true }); });
+    beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = file; rmSync(file, { force: true }); resetSkippedSignatureDedupe(); });
     afterEach(() => { delete process.env.SKIPPED_SIGNATURES_FILE; mockGetParsedTransaction.mockReset(); });
 
-    it('1 unreadable in 6 (16%): the 5 readable trades are indexed, the poison one is recorded with its FULL signature + slab', async () => {
+    it('1 unreadable in 6: the 5 readable trades are indexed, the poison one is recorded with its FULL signature + slab', async () => {
       setup([SIGS[1]]);
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
@@ -260,27 +262,27 @@ describe('TradeIndexerPolling', () => {
       expect(rec[0]).toMatchObject({ signature: SIGS[1], slab: SLAB, source: 'trade-indexer' });
     }, 12000);
 
-    it('a batch of 1 that is poisoned: skipped and recorded (full signature + slab), and the cursor advances', async () => {
-      setup([SIGS[0]]);
-      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+    it('2 unreadable + 4 good (successful siblings): the 4 trades are indexed, both poison signatures recorded, cursor advances', async () => {
+      setup([SIGS[1], SIGS[2]]);
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
-      expect(insertTradeRow).not.toHaveBeenCalled();
+      const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
+      expect(inserted).toContain(SIGS[0]);
+      expect(inserted).not.toContain(SIGS[1]);
       const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-      expect(rec[0]).toMatchObject({ signature: SIGS[0], slab: SLAB, source: 'trade-indexer' });
-      if (mockGetSignaturesForAddress.mock.calls.length > 1) {
-        expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until)).toContain(SIGS[0]);
-      }
+      expect(rec.map((r) => r.signature).sort()).toEqual([SIGS[1], SIGS[2]].sort());
+      expect(rec[0]).toMatchObject({ slab: SLAB, source: 'trade-indexer' });
     }, 12000);
 
-    it('negative control: 2 unreadable in 6 trips the circuit breaker: NOTHING is indexed or skipped, cursor held', async () => {
-      setup([SIGS[1], SIGS[2]]);
+    it('negative control: an ALL-unreadable batch is held: nothing indexed, nothing recorded, cursor held', async () => {
+      setup(SIGS);
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(existsSync(file)).toBe(false);
-      const untils = mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean);
-      expect(untils).toEqual([]);
+      expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
+      // the K-consecutive-polls alert (K=1 here): error-level Sentry event
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(true);
     }, 12000);
   });
 

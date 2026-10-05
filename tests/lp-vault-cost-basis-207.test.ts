@@ -550,7 +550,7 @@ describe("GH#207 migration", () => {
 // X-1 (d): a transaction the reader cannot return must never be skipped silently by the LP-vault cursor.
 import { existsSync, readFileSync as readFile, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { getSkippedSignatureCount, resetSkippedSignatureCount } from "../src/lib/skippedSignatures.js";
+import { getSkippedSignatureCount, resetSkippedSignatureCount, resetSkippedSignatureDedupe } from "../src/lib/skippedSignatures.js";
 
 describe("X-1 LP vault: unreadable transactions", () => {
   const FILE = join(tmpdir(), `skipped-${process.pid}.jsonl`);
@@ -564,7 +564,7 @@ describe("X-1 LP vault: unreadable transactions", () => {
   };
   const claim = () => ({ heldShares: 4_999_999_000n - requestedShares(), pendingShares: requestedShares(), contextSlot: 505_500_000 });
   const mkIndexer = (chain: FakeChain) => { chain.claim = claim(); return new LpVaultIndexer({ chain, store: new MemoryLpVaultStore(), network: "devnet", programIds: [WRAPPER] }); };
-  beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = FILE; rmSync(FILE, { force: true }); resetSkippedSignatureCount(); });
+  beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = FILE; rmSync(FILE, { force: true }); resetSkippedSignatureCount(); resetSkippedSignatureDedupe(); });
   afterEach(() => { delete process.env.SKIPPED_SIGNATURES_FILE; rmSync(FILE, { force: true }); });
 
   it("one unreadable tx in a large enough window: recorded durably (FULL signature + registry), counter bumped, positions reconciled", async () => {
@@ -583,33 +583,42 @@ describe("X-1 LP vault: unreadable transactions", () => {
     expect(existsSync(FILE)).toBe(false);
     expect(r.reconciled).toBe(1);
   });
-  it("circuit breaker: 2 unreadable holds the vault cursor and records nothing", async () => {
-    const chain = withExtras(8, ["extra1", "extra2"]);
+  it("2 poison + good siblings: both skipped and recorded, the cursor advances (successful-sibling rule)", async () => {
+    const r = await mkIndexer(withExtras(8, ["extra1", "extra2"])).syncRegistry(FXUC);
+    expect(r.events).toBe(2);
+    expect(getSkippedSignatureCount()).toBe(2);
+  });
+  it("breaker: an ALL-unreadable window holds the vault cursor and records nothing; once the reader works the whole window is re-read", async () => {
+    const chain = fxucChain();
+    const real = chain.getTransaction.bind(chain);
+    chain.getTransaction = async () => { throw V2; };
     const ix = mkIndexer(chain);
     await expect(ix.syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
     expect(getSkippedSignatureCount()).toBe(0);
-    // cursor not advanced: a retry re-reads the whole window
-    chain.getTransaction = (async (s: string) => (chain as unknown as { txs: Map<string, NormTx> }).txs.get(s) ?? null) as typeof chain.getTransaction;
-    expect((await ix.syncRegistry(FXUC)).signatures).toBe(12);
+    chain.getTransaction = real;
+    expect((await ix.syncRegistry(FXUC)).signatures).toBe(4);
   });
-  it("one poison tx in a SMALL window (1 of 4) is skipped and recorded, not wedged; the cursor advances", async () => {
-    const chain = fxucChain();
-    const real = chain.getTransaction.bind(chain);
-    chain.getTransaction = async (sig: string) => { if (sig === fxucSigOf(1)) throw V2; return real(sig); };
+  it("breaker: more than 5 unreadable holds even with good siblings", async () => {
+    const bad = ["extra0", "extra1", "extra2", "extra3", "extra4", "extra5"];
+    await expect(mkIndexer(withExtras(8, bad)).syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
+    expect(getSkippedSignatureCount()).toBe(0);
+  });
+  it("C: the cursor moves only AFTER the skipped signatures are recorded and the reconcile ran (a failing reconcile leaves it unset)", async () => {
+    const chain = withExtras(8, ["extra3"]);
     const ix = mkIndexer(chain);
-    const r = await ix.syncRegistry(FXUC);
-    expect(r.signatures).toBe(4);
-    expect(getSkippedSignatureCount()).toBe(1);
-    const rec = readFile(FILE, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(rec[0]).toMatchObject({ signature: fxucSigOf(1), slab: FXUC.registry, source: "lp-vault" });
-    chain.getTransaction = real; // fixed reader: nothing new to read, the cursor already advanced
-    expect((await ix.syncRegistry(FXUC)).signatures).toBe(0);
+    const orig = chain.getClaim.bind(chain);
+    chain.getClaim = async () => { throw new Error("rpc down during reconcile"); };
+    await expect(ix.syncRegistry(FXUC)).rejects.toThrow(/rpc down/);
+    expect((ix as unknown as { cursors: Map<string, string> }).cursors.has(FXUC.registry)).toBe(false);
+    chain.getClaim = orig;
+    await ix.syncRegistry(FXUC); // retried from the same cursor, now completes
+    expect((ix as unknown as { cursors: Map<string, string> }).cursors.has(FXUC.registry)).toBe(true);
   });
-  it("negative control: 2 poison in a window of 3+ is held", async () => {
-    const chain = fxucChain();
+  it("E: a transient-looking error (-32015 with 429 text) is NOT skipped: the sync aborts", async () => {
+    const chain = withExtras(8, []);
     const real = chain.getTransaction.bind(chain);
-    chain.getTransaction = async (sig: string) => { if (sig === fxucSigOf(0) || sig === fxucSigOf(2)) throw V2; return real(sig); };
-    await expect(mkIndexer(chain).syncRegistry(FXUC)).rejects.toThrow(/mass skip refused/);
+    chain.getTransaction = async (sig: string) => { if (sig === "extra3") throw Object.assign(new Error("429 Too Many Requests: Transaction version (2) is not supported"), { code: -32015 }); return real(sig); };
+    await expect(mkIndexer(chain).syncRegistry(FXUC)).rejects.toThrow(/429/);
     expect(getSkippedSignatureCount()).toBe(0);
   });
 });

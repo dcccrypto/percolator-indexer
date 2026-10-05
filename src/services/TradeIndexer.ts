@@ -1,4 +1,4 @@
-import { fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
+import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
@@ -7,6 +7,12 @@ import { insertTradeRow } from "../db/insertTradeRow.js";
 import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 
 const logger = createLogger("indexer:trade-indexer");
+
+/** Alert (error log + Sentry) when a slab's cursor has been held by the mass-skip breaker for K consecutive polls. */
+const breakerTracker = createBreakerTracker(breakerAlertPolls(), (slab, polls) => {
+  logger.error("ALERT: cursor held by the mass-skip circuit breaker for consecutive polls: signatures are unreadable and are NOT being skipped; investigate the RPC / reader", { slab, consecutivePolls: polls });
+  captureException(new Error(`indexer cursor held by mass-skip breaker for ${polls} consecutive polls (slab ${slab})`), { tags: { context: "indexer-breaker-held" }, extra: { slab, polls } });
+});
 
 /**
  * v18 trade tags to index.
@@ -248,6 +254,8 @@ export class TradeIndexerPolling {
           fetched.skipped.map((sk) => ({ signature: sk.signature, source: "trade-indexer" as const, slab: slabAddress, error: sk.error })),
         );
       }
+      if (fetched.massSkip) breakerTracker.held(slabAddress);
+      else if (!fetched.failed) breakerTracker.clear(slabAddress);
       if (fetched.massSkip) {
         logger.error("Mass-skip circuit breaker tripped: cursor held, nothing skipped (RPC or reader is broken, not a poison pill)", {
           slabAddress,

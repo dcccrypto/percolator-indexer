@@ -20,13 +20,17 @@
  * transfer is exactly what survives the guard.
  */
 import { createLogger, captureException } from "@percolatorct/shared";
-import { isUnreadableTxError, MAX_SKIPS_ABSOLUTE } from "../lib/tolerantTxFetch.js";
+import { breakerAlertPolls, createBreakerTracker, isPoisonTxError, skipsAcceptable } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures, type SkippedSignature } from "../lib/skippedSignatures.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
 import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
 
 const logger = createLogger("indexer:lp-vault");
+const lpBreaker = createBreakerTracker(breakerAlertPolls(), (registry, polls) => {
+  logger.error("ALERT: LP-vault cursor held by the mass-skip circuit breaker for consecutive polls", { registry, consecutivePolls: polls });
+  captureException(new Error(`LP-vault cursor held by mass-skip breaker for ${polls} consecutive polls (${registry})`), { tags: { context: "lp-vault-breaker-held" }, extra: { registry, polls } });
+});
 
 export interface LpVaultIndexerOptions {
   chain: LpVaultChain;
@@ -152,6 +156,7 @@ export class LpVaultIndexer {
     const newest = sigs[0]!.signature;
     const touched = new Set<string>();
     const skippedTxs: SkippedSignature[] = [];
+    let readOk = 0;
     // Oldest first, so a partially failed batch never leaves a gap behind the cursor.
     for (const s of [...sigs].reverse()) {
       if (s.failed) continue;
@@ -161,15 +166,12 @@ export class LpVaultIndexer {
       } catch (err) {
         // X-1: a transaction this client cannot return (a v1 tx on an old reader, -32015) must not wedge the vault's
         // cursor forever. Skip and log it; any other error still aborts the sync so the batch is re-read.
-        if (!isUnreadableTxError(err)) throw err;
+        if (!isPoisonTxError(err)) throw err;
         skippedTxs.push({ signature: s.signature, source: "lp-vault", slab: reg.registry, error: String(err instanceof Error ? err.message : err) });
-        // Circuit breaker (same rule as the trade indexer: at most one skip): mass-unreadable = broken reader, hold the cursor.
-        if (skippedTxs.length > MAX_SKIPS_ABSOLUTE) {
-          throw new Error(`LP-vault ${reg.registry}: mass skip refused (${skippedTxs.length} unreadable signatures in one window); cursor held`);
-        }
         continue;
       }
       if (!tx) throw new Error(`getTransaction returned null for ${s.signature}`);
+      readOk++;
       const events = decodeLpVaultEvents(tx, this.wrapperIds)
         .filter((e) => e.registry === reg.registry)
         .map((e) => ({ ...e, market: e.market ?? reg.market, lpMint: e.lpMint ?? reg.lpMint }));
@@ -179,10 +181,17 @@ export class LpVaultIndexer {
       for (const e of events) touched.add(e.user);
     }
 
+    // Circuit breaker, "successful sibling" rule (same as the trade indexer): up to 5 skips and only if at least one other
+    // transaction of the window was read successfully; otherwise the reader is broken, hold the cursor.
+    if (!skipsAcceptable(skippedTxs.length, readOk)) {
+      const polls = lpBreaker.held(reg.registry);
+      throw new Error(`LP-vault ${reg.registry}: mass skip refused (${skippedTxs.length} unreadable, ${readOk} read ok in one window; ${polls} consecutive polls); cursor held`);
+    }
+    lpBreaker.clear(reg.registry);
+
     for (const user of touched) {
       await recomputePosition(store, network, reg.registry, user, { marketSlab: reg.market });
     }
-    this.cursors.set(reg.registry, newest);
     result.users = [...touched];
 
     if (skippedTxs.length > 0) {
@@ -193,7 +202,8 @@ export class LpVaultIndexer {
         registry: reg.registry,
         signatures: skippedTxs.map((t) => t.signature),
       });
-      const rec = await this.reconcileOpenPositions(reg);
+      const open = await store.listOpenPositions(network, reg.registry);
+      const rec = await this.reconcileUsers(reg, open.map((p) => p.user_wallet), newest);
       result.reconciled += rec.reconciled;
       result.reconcileSkipped += rec.skipped;
     }
@@ -201,6 +211,8 @@ export class LpVaultIndexer {
     const rec = await this.reconcileUsers(reg, result.users, newest);
     result.reconciled += rec.reconciled;
     result.reconcileSkipped += rec.skipped;
+    // Only after the skipped signatures are recorded durably AND the reconcile ran does the cursor move past them.
+    this.cursors.set(reg.registry, newest);
     return result;
   }
 

@@ -66,7 +66,7 @@ describe("normalizeRpcTransaction on a v1 response", () => {
   });
 });
 
-import { fetchParsedTxsTolerant, isTransientRpcError, isUnreadableTxError } from "../src/lib/tolerantTxFetch";
+import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, isPoisonTxError, isTransientRpcError, isUnreadableTxError } from "../src/lib/tolerantTxFetch";
 
 // X-1: one unreadable transaction in a batch must never wedge the cursor, and must never be skipped silently.
 describe("poison-pill tolerant fetch (X-1)", () => {
@@ -109,40 +109,71 @@ describe("poison-pill tolerant fetch (X-1)", () => {
     expect(calls).toEqual({ batch: 1, single: [] });
   });
 
-  describe("(b) mass-skip circuit breaker", () => {
-    it("2 unreadable in 10 (more than one): cursor held, NOTHING skipped", async () => {
-      const { conn } = mk(new Set(["s1", "s2"]));
-      const r = await fetchParsedTxsTolerant(conn, ten, retry);
-      expect(r.failed).toBe(true);
-      expect(r.skipped).toEqual([]);
-      expect(r.massSkip).toEqual({ skipped: 2, total: 10 });
+  describe("(b) mass-skip circuit breaker: successful-sibling rule", () => {
+    it("2 poison + 1 good: both poison skipped, the good one returned, the cursor advances", async () => {
+      const r = await fetchParsedTxsTolerant(mk(new Set(["p1", "p2"])).conn, ["p1", "good", "p2"], retry);
+      expect(r.failed).toBe(false);
+      expect(r.skipped.map((x) => x.signature)).toEqual(["p1", "p2"]);
+      expect(r.txs).toEqual([null, { sig: "good" }, null]);
     });
-    it("a batch where EVERY signature is unreadable: held, not skipped", async () => {
-      const { conn } = mk(new Set(ten));
-      const r = await fetchParsedTxsTolerant(conn, ten, retry);
-      expect(r).toMatchObject({ failed: true, skipped: [] });
-      expect(r.massSkip).toEqual({ skipped: 10, total: 10 });
+    it("up to 5 skips with a good sibling are allowed; a sixth holds the cursor and skips nothing", async () => {
+      const five = ["a", "b", "c", "d", "e"];
+      const ok = await fetchParsedTxsTolerant(mk(new Set(five)).conn, [...five, "good"], retry);
+      expect(ok.failed).toBe(false);
+      expect(ok.skipped).toHaveLength(5);
+      const six = [...five, "f"];
+      const held = await fetchParsedTxsTolerant(mk(new Set(six)).conn, [...six, "good"], retry);
+      expect(held).toMatchObject({ failed: true, skipped: [] });
+      expect(held.massSkip).toEqual({ skipped: 6, total: 7 });
     });
-    it("at most ONE skip per batch whatever its size: a lone poison tx in a batch of 1, 2, 3 or 4 is skipped and the cursor advances", async () => {
-      for (const n of [1, 2, 3, 4]) {
+    it("an ALL-unreadable batch is held, not skipped (any size, including 1)", async () => {
+      for (const n of [1, 3, 10]) {
         const sigs = ten.slice(0, n);
-        const r = await fetchParsedTxsTolerant(mk(new Set([sigs[0]!])).conn, sigs, retry);
-        expect(r.failed).toBe(false);
-        expect(r.skipped.map((x) => x.signature)).toEqual([sigs[0]]);
-        expect(r.txs[0]).toBeNull();
-        expect(r.txs.slice(1).every(Boolean)).toBe(true);
+        const r = await fetchParsedTxsTolerant(mk(new Set(sigs)).conn, sigs, retry);
+        expect(r).toMatchObject({ failed: true, skipped: [] });
+        expect(r.massSkip).toEqual({ skipped: n, total: n });
       }
     });
-    it("negative control: 2 poison in a batch of 3 is held (no skip, error logged by the caller)", async () => {
-      const r = await fetchParsedTxsTolerant(mk(new Set(["s0", "s2"])).conn, ["s0", "s1", "s2"], retry);
-      expect(r).toMatchObject({ failed: true, skipped: [] });
-      expect(r.massSkip).toEqual({ skipped: 2, total: 3 });
+    it("a sibling that returns null (not found) is NOT proof the reader works: still held", async () => {
+      const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => { if (sig === "p") throw V2_ERR; return null; } };
+      expect((await fetchParsedTxsTolerant(conn, ["p", "nullsig"], retry)).failed).toBe(true);
     });
-    it("a signature is only skipped when it is unreadable on its OWN retry: a batch-level version error whose single retry succeeds skips nothing", async () => {
+    it("a signature is only skipped when it is unreadable on its OWN retry: a batch-level version error whose single retries succeed skips nothing", async () => {
       const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => ({ sig }) };
       const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
       expect(r).toMatchObject({ failed: false, skipped: [] });
-      expect(r.txs).toEqual([{ sig: "a" }, { sig: "b" }, { sig: "c" }]);
+    });
+  });
+
+  describe("breaker-held alert after K consecutive polls", () => {
+    it("fires at K (and every K) consecutive holds; any clear resets the count", () => {
+      const alerts: Array<[string, number]> = [];
+      const t = createBreakerTracker(3, (k, n) => alerts.push([k, n]));
+      t.held("slabA"); t.held("slabA");
+      expect(alerts).toEqual([]);
+      t.held("slabA");
+      expect(alerts).toEqual([["slabA", 3]]);
+      t.clear("slabA");
+      t.held("slabA"); t.held("slabA");
+      expect(alerts).toHaveLength(1); // reset: 2 polls since the clear
+      t.held("slabA");
+      expect(alerts).toHaveLength(2);
+      t.held("slabB");
+      expect(alerts).toHaveLength(2); // keys are independent
+      for (let i = 0; i < 3; i++) t.held("slabA");
+      expect(alerts.at(-1)).toEqual(["slabA", 6]);
+    });
+    it("does not alert on every poll after K, only at multiples of K (no alert spam)", () => {
+      const alerts: number[] = [];
+      const t = createBreakerTracker(3, (_k, n) => alerts.push(n));
+      for (let i = 0; i < 5; i++) t.held("x");
+      expect(alerts).toEqual([3]);
+    });
+    it("K comes from INDEXER_BREAKER_ALERT_POLLS (default 10; junk falls back)", () => {
+      expect(breakerAlertPolls({})).toBe(10);
+      expect(breakerAlertPolls({ INDEXER_BREAKER_ALERT_POLLS: "4" })).toBe(4);
+      expect(breakerAlertPolls({ INDEXER_BREAKER_ALERT_POLLS: "0" })).toBe(10);
+      expect(breakerAlertPolls({ INDEXER_BREAKER_ALERT_POLLS: "x" })).toBe(10);
     });
   });
 
@@ -192,6 +223,19 @@ describe("poison-pill tolerant fetch (X-1)", () => {
       const conn = { getParsedTransactions: async () => { throw zero; }, getParsedTransaction: async () => { throw zero; } };
       const r = await fetchParsedTxsTolerant(conn, ten, retry);
       expect(r).toMatchObject({ failed: true, skipped: [] });
+    });
+    it("(E) transient wins on the per-signature path too: a 502 echoing 'version (2)', or -32015 with 429 text, is NOT a poison pill", async () => {
+      const bad502 = new Error("502 Bad Gateway: upstream said Transaction version (2) is not supported");
+      const code429 = Object.assign(new Error("429 Too Many Requests while reading: Transaction version (2) is not supported"), { code: -32015 });
+      expect(isPoisonTxError(bad502)).toBe(false);
+      expect(isPoisonTxError(code429)).toBe(false);
+      expect(isPoisonTxError(V2_ERR)).toBe(true);
+      for (const e of [bad502, code429]) {
+        // batch fails with a version error, then the per-signature retry of EVERY signature fails with the transient lookalike
+        const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => { if (sig === "p") throw e; return { sig }; } };
+        const r = await fetchParsedTxsTolerant(conn, ["good", "p"], retry);
+        expect(r).toMatchObject({ failed: true, skipped: [] });
+      }
     });
     it("transient classifier", () => {
       for (const m of ["429 Too Many Requests", "ECONNRESET", "fetch failed", "502 Bad Gateway"]) expect(isTransientRpcError(new Error(m))).toBe(true);

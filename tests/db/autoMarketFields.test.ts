@@ -177,8 +177,10 @@ describe("findSlabCreator", () => {
     expect(vi.mocked(rpc.getTransaction).mock.calls[0][0]).toBe("sig1001");
   });
 
-  it("X-1: ONE unreadable tx is skipped and recorded like the other sites (full signature + slab); a second is refused", async () => {
+  it("X-1: ONE unreadable tx is skipped and recorded like the other sites (full signature + slab); an all-unreadable lookup is refused", async () => {
     const { existsSync, readFileSync, rmSync } = await import("node:fs");
+    const { resetSkippedSignatureDedupe } = await import("../../src/lib/skippedSignatures.js");
+    resetSkippedSignatureDedupe();
     const file = `/tmp/creator-skip-${process.pid}.jsonl`;
     process.env.SKIPPED_SIGNATURES_FILE = file;
     rmSync(file, { force: true });
@@ -194,14 +196,16 @@ describe("findSlabCreator", () => {
       const rec = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
       expect(rec).toHaveLength(1);
       expect(rec[0]).toMatchObject({ signature: "sig1000", slab: SLAB.toBase58(), source: "creator-lookup" });
-      // two unreadable: refused (mass skip), nothing more recorded beyond the first
+      // EVERY candidate unreadable = broken reader: refused, nothing recorded
       rmSync(file, { force: true });
-      await expect(findSlabCreator(mk(["sig1000", "sig1001"]), SLAB, WRAPPER)).rejects.toThrow(/mass skip refused/);
-      expect(existsSync(file)).toBe(true);
-      const rec2 = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-      expect(rec2).toHaveLength(1);
-      expect(rec2[0]).toMatchObject({ source: "creator-lookup", slab: SLAB.toBase58() });
-      expect(rec2[0].signature).toMatch(/^sig100[01]$/);
+      resetSkippedSignatureDedupe();
+      const many = Array.from({ length: 6 }, (_, i) => sig(1000 + i));
+      const rpcMany: CreatorLookupRpc = {
+        getSignaturesForAddress: vi.fn(async () => many),
+        getTransaction: vi.fn(async () => { throw V2; }),
+      };
+      await expect(findSlabCreator(rpcMany, SLAB, WRAPPER)).rejects.toThrow(/mass skip refused/);
+      expect(existsSync(file)).toBe(false);
     } finally {
       delete process.env.SKIPPED_SIGNATURES_FILE;
       rmSync(file, { force: true });
