@@ -274,6 +274,28 @@ describe('TradeIndexerPolling', () => {
       expect(rec[0]).toMatchObject({ slab: SLAB, source: 'trade-indexer' });
     }, 12000);
 
+    it('a LONE poisoned signature (batch of 1) holds the cursor AND goes through the breaker alert', async () => {
+      setup([SIGS[0]]);
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+      vi.mocked(shared.captureException).mockClear();
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(existsSync(file)).toBe(false); // held, not skipped: nothing recorded
+      expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(true);
+    }, 12000);
+
+    it('negative control: a lone GOOD signature does not alert and is indexed', async () => {
+      setup([]);
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+      vi.mocked(shared.captureException).mockClear();
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ tx_signature: SIGS[0] }));
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(false);
+    }, 12000);
+
     it('negative control: an ALL-unreadable batch is held: nothing indexed, nothing recorded, cursor held', async () => {
       setup(SIGS);
       indexer.start();

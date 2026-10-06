@@ -13,3 +13,8 @@ CREATE TABLE IF NOT EXISTS skipped_signatures (
   UNIQUE (signature, source)
 );
 CREATE INDEX IF NOT EXISTS skipped_signatures_pending ON skipped_signatures (skipped_at) WHERE reindexed_at IS NULL;
+
+-- Server-side only: the indexer writes with the service role. No client role may read or write this table.
+ALTER TABLE skipped_signatures ENABLE ROW LEVEL SECURITY;  -- no policies: anon/authenticated get nothing
+REVOKE ALL ON TABLE skipped_signatures FROM anon, authenticated;
+REVOKE ALL ON SEQUENCE skipped_signatures_id_seq FROM anon, authenticated;

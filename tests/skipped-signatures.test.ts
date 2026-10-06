@@ -85,5 +85,10 @@ describe("(c) durable skip record", () => {
     expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS skipped_signatures/);
     expect(sql).toMatch(/UNIQUE \(signature, source\)/);
     expect(sql).toMatch(/NOT APPLIED/);
+    // the table must not be reachable by client roles
+    expect(sql).toMatch(/ALTER TABLE skipped_signatures ENABLE ROW LEVEL SECURITY/);
+    expect(sql).toMatch(/REVOKE ALL ON TABLE skipped_signatures FROM anon, authenticated/);
+    expect(sql).not.toMatch(/CREATE POLICY/);
+    expect(sql).not.toMatch(/GRANT /);
   });
 });
