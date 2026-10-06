@@ -6,7 +6,16 @@ import { config, eventBus, decodeBase58, withRetry, captureException, createLogg
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
-import { decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
+import {
+  decodeV18SingleFill,
+  decodeV18BatchLegs,
+  computeFeeUsd,
+  isRebalanceReduceTag,
+  decodeRebalanceReduce,
+  rebalanceReduceFill,
+  REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
+} from "../parsers/percolatorTxParser.js";
+import { fetchTraderNetPositionQ } from "../db/traderNetPosition.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -574,6 +583,40 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
       }
       continue;
     }
+
+    // RebalanceReduce (tag 44): the close used while the asset is ADL reduce-only.
+    // Not a TRADE_TAG (no side on the wire) — see the TradeIndexer twin of this block.
+    if (isRebalanceReduceTag(tag)) {
+      const accounts: string[] = ix.accounts ?? [];
+      const trader = accounts[0] ?? "";
+      const slabAddress = accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX] ?? "";
+      const reduce = decodeRebalanceReduce(data);
+      if (!reduce || !BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
+      if (discovery && !discovery.getMarkets().has(slabAddress)) continue;
+      const net = await fetchTraderNetPositionQ(trader, slabAddress, reduce.assetIndex, signature);
+      const fill = rebalanceReduceFill(reduce.reduceQ, net);
+      if (!fill) {
+        logger.warn("RebalanceReduce with no indexed open position — side unknown, not indexed", {
+          signature: signature.slice(0, 12),
+          slabAddress,
+        });
+        continue;
+      }
+      trades.push({
+        slab_address: slabAddress,
+        trader,
+        side: fill.side,
+        size: fill.sizeValue.toString(),
+        price: await extractPrice(tx, slabAddress),
+        fee: 0, // the engine charges no trading fee on tag 44
+        tx_signature: signature,
+        asset_index: reduce.assetIndex,
+        leg_index: 0,
+        is_liquidation: false,
+      });
+      continue;
+    }
+
     if (!TRADE_TAGS.has(tag)) continue;
 
     // v18 wire format — decode lives in percolatorTxParser.ts (decodeV18SingleFill /

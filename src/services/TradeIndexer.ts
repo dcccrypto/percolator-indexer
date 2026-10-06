@@ -4,7 +4,17 @@ import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/w
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
-import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
+import {
+  parsePercolatorLiquidations,
+  decodeV18SingleFill,
+  decodeV18BatchLegs,
+  computeFeeUsd,
+  isRebalanceReduceTag,
+  decodeRebalanceReduce,
+  rebalanceReduceFill,
+  REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
+} from "../parsers/percolatorTxParser.js";
+import { fetchTraderNetPositionQ } from "../db/traderNetPosition.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -380,6 +390,41 @@ export class TradeIndexerPolling {
       if (!data || data.length < 1) continue;
 
       const tag = data[0];
+
+      // RebalanceReduce (tag 44): how a position is closed while the asset is ADL
+      // reduce-only. Not a TRADE_TAG (no counterparty, no side on the wire), but it is
+      // the trader's close and must land in their history like a TradeCpi close.
+      if (isRebalanceReduceTag(tag)) {
+        if (ix.accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]?.toBase58() !== slabAddress) continue;
+        const reduce = decodeRebalanceReduce(data);
+        const trader = ix.accounts[0]?.toBase58();
+        if (!reduce || !trader) continue;
+        const net = await fetchTraderNetPositionQ(trader, slabAddress, reduce.assetIndex, signature);
+        const fill = rebalanceReduceFill(reduce.reduceQ, net);
+        if (!fill) {
+          logger.warn("RebalanceReduce with no indexed open position — side unknown, not indexed", {
+            signature: signature.slice(0, 12),
+            slabAddress: slabAddress.slice(0, 8),
+          });
+          continue;
+        }
+        const price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+        // leg_index 0, same as a single fill; the engine charges no trading fee on tag 44.
+        await insertTradeRow({
+          slab_address: slabAddress,
+          trader,
+          side: fill.side,
+          size: fill.sizeValue.toString(),
+          price,
+          fee: 0,
+          tx_signature: signature,
+          asset_index: reduce.assetIndex,
+          leg_index: 0,
+        });
+        eventBus.publish("trade.executed", slabAddress, { signature, trader, side: fill.side, size: fill.sizeValue.toString() });
+        return true;
+      }
+
       if (!TRADE_TAGS.has(tag)) continue;
 
       // v18 single-fill / batch-fill decode lives in percolatorTxParser.ts
