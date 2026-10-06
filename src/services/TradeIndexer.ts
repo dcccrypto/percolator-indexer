@@ -316,6 +316,20 @@ export class TradeIndexerPolling {
       }
     }
 
+    // leg_index is the fill's position among ALL fills in the tx (every trade
+    // instruction and every batch leg, 0-based) — the scheme webhook.ts (`fillSeq`)
+    // and EventStreamService (index into the flattened parsePercolatorFills result)
+    // already use. The dedup key (tx_signature, asset_index, leg_index) is shared
+    // by all three paths, so this path must walk EVERY trade instruction and number
+    // the same way: the playground sends an order larger than the matcher's
+    // per-fill cap as several single-leg TradeCpi instructions in ONE tx.
+    let fillSeq = 0;
+    let insertedAny = false;
+    // "Did another path already index this tx?" — asked once, before this pass
+    // writes anything. Asked after our own first insert it would always say yes
+    // and drop the remaining legs of a split order.
+    let alreadyIndexed: boolean | undefined;
+
     for (const ix of message.instructions) {
       // Skip parsed instructions (system, token, etc.)
       if ("parsed" in ix) continue;
@@ -345,7 +359,11 @@ export class TradeIndexerPolling {
       const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
       const marketAccountIdx = isNoCpiTag ? 2 : 1;
       const ixMarket = ix.accounts[marketAccountIdx]?.toBase58();
-      if (ixMarket && ixMarket !== slabAddress) continue;
+      if (ixMarket && ixMarket !== slabAddress) {
+        // Not ours to write, but the other paths still number these fills.
+        fillSeq += isBatch ? decodeV18BatchLegs(tag, data).length : decodeV18SingleFill(tag, data) ? 1 : 0;
+        continue;
+      }
 
       if (isBatch) {
         const legs = decodeV18BatchLegs(tag, data);
@@ -378,7 +396,6 @@ export class TradeIndexerPolling {
         };
 
         const i128Max = (1n << 127n) - 1n;
-        let insertedAny = false;
 
         for (const leg of legs) {
           if (leg.sizeValue > i128Max) continue;
@@ -394,12 +411,12 @@ export class TradeIndexerPolling {
             fee,
             tx_signature: signature,
             asset_index: leg.assetIndex,
-            leg_index: leg.legIndex, // unique within the (single) batch instruction of this tx
+            leg_index: fillSeq++,
           });
           eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: leg.sizeValue.toString() });
           insertedAny = true;
         }
-        return insertedAny;
+        continue;
       }
 
       // Single-fill (TradeNoCpi=6 / TradeCpi=10) — see decodeV18SingleFill for the
@@ -407,11 +424,18 @@ export class TradeIndexerPolling {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
       const { sizeValue, side } = decoded;
+      const legIndex = fillSeq++;
 
       // Determine trader from account keys
       const traderKey = ix.accounts[0];
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
+
+      // Check for duplicate
+      if (alreadyIndexed === undefined) {
+        alreadyIndexed = insertedAny ? false : await tradeExistsBySignature(signature);
+      }
+      if (alreadyIndexed) continue;
 
       // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
       // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the
@@ -426,10 +450,6 @@ export class TradeIndexerPolling {
         }
       }
       const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
-
-      // Check for duplicate
-      const exists = await tradeExistsBySignature(signature);
-      if (exists) return false;
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -452,7 +472,6 @@ export class TradeIndexerPolling {
         return false;
       }
 
-      // H2/H3: leg_index=0 since a single fill is the only leg of its tx.
       await insertTradeRow({
         slab_address: slabAddress,
         trader,
@@ -462,14 +481,14 @@ export class TradeIndexerPolling {
         fee,
         tx_signature: signature,
         asset_index: decoded.assetIndex,
-        leg_index: 0,
+        leg_index: legIndex,
       });
 
       eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
-      return true;
+      insertedAny = true;
     }
 
-    return false;
+    return insertedAny;
   }
 
   /**
