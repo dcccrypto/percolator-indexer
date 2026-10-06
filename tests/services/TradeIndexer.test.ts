@@ -610,4 +610,82 @@ describe('TradeIndexerPolling', () => {
       expect(call.price).not.toBe(1.5);
     }, 10000);
   });
+  describe('split order — several trade instructions in ONE tx', () => {
+    // The playground sends an order larger than the matcher's per-fill cap as
+    // several single-leg TradeCpi instructions in one transaction (percolator-launch
+    // app/lib/trade-ix.ts buildTradeIxs). Every one of them is a real fill, and the
+    // webhook (fillSeq) and event-stream paths number them 0, 1, 2, ... across the
+    // whole tx. The dedup key (tx_signature, asset_index, leg_index) is shared, so
+    // this backup path must index all of them and number them the same way.
+    const OTHER_SLAB = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+    /** v18 TradeCpi (tag 10 on-chain; 11 under this file's mocked IX_TAG), 85 bytes. */
+    function tradeCpiData(): Uint8Array {
+      const d = new Uint8Array(85);
+      d[0] = 11;       // IX_TAG.TradeCpi (mocked)
+      d[51] = 0x40;    // size_q @51 — any non-zero bytes; parseTradeSize is mocked
+      d[52] = 0x42;
+      d[53] = 0x0f;
+      return d;
+    }
+
+    function tradeCpiIx(market: string, data: string) {
+      // TradeCpi accounts: [0]=signer, [1]=market, ...
+      return {
+        programId: new PublicKey(PROGRAM_ID),
+        accounts: [new PublicKey(TRADER), new PublicKey(market)],
+        data,
+      };
+    }
+
+    async function pollOnce(instructions: unknown[]) {
+      // Like the real DB lookup: nothing indexed until this pass writes a row.
+      vi.mocked(shared.tradeExistsBySignature).mockImplementation(
+        async () => vi.mocked(insertTradeRow).mock.calls.length > 0,
+      );
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      vi.mocked(shared.decodeBase58).mockImplementation(() => tradeCpiData());
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
+      mockGetParsedTransaction.mockResolvedValue({
+        meta: { err: null, logMessages: [] },
+        transaction: { message: { instructions } },
+      });
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      return vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+    }
+
+    it('indexes every TradeCpi leg of a split order, numbered 0..N-1 like the webhook', async () => {
+      const rows = await pollOnce([
+        tradeCpiIx(SLAB, 'leg0'),
+        tradeCpiIx(SLAB, 'leg1'),
+        tradeCpiIx(SLAB, 'leg2'),
+      ]);
+
+      expect(rows).toHaveLength(3);
+      expect(rows.map((r) => r.leg_index)).toEqual([0, 1, 2]);
+      for (const r of rows) {
+        expect(r).toEqual(expect.objectContaining({
+          slab_address: SLAB, trader: TRADER, tx_signature: VALID_SIG, asset_index: 0,
+        }));
+      }
+      // The "already indexed by another path?" check runs once per tx, before this
+      // pass writes — not again after its own first insert.
+      expect(shared.tradeExistsBySignature).toHaveBeenCalledTimes(1);
+    }, 10000);
+
+    it('keeps the tx-wide leg number when an earlier fill in the tx is on another slab', async () => {
+      // The webhook numbers the OTHER_SLAB fill 0 and this slab's fill 1. Writing
+      // this one as leg 0 would collide with (and be swallowed by, or swallow) the
+      // other slab's row under the shared key.
+      const rows = await pollOnce([
+        tradeCpiIx(OTHER_SLAB, 'other'),
+        tradeCpiIx(SLAB, 'ours'),
+      ]);
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining({ slab_address: SLAB, leg_index: 1 }));
+    }, 10000);
+  });
 });
