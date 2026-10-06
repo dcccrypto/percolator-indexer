@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import { parseEngine, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
+import { parseEngine, detectSlabLayout } from "@percolatorct/sdk";
+import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { createLogger, withRetry } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:mark-price");
@@ -36,15 +37,15 @@ export async function readMarkPriceE6(
 
     // Desync fix 9: v17 account — detectSlabLayout returns null for v17 account sizes
     // (no v17 tier registered). Use parseWrapperConfigV17 to read mark_ewma_e6 directly.
-    if (isV17Account(data)) {
+    if (hasWrapperMagic(data)) {
       try {
-        const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
-        const markEwmaE6 = cfg.markEwmaE6;
+        const markEwmaE6 = readMarkEwmaE6(data, "readMarkPriceE6");
         if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
           return Number(markEwmaE6);
         }
-      } catch {
-        // parseWrapperConfigV17 failed — return null
+      } catch (err) {
+        // Unknown VERSION is loud (per market); any other parse failure — return null
+        reportUnknownLayout(slabAddress, err, "readMarkPriceE6");
       }
       return null;
     }

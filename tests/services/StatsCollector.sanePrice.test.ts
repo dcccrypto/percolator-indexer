@@ -21,7 +21,9 @@ vi.mock('@percolatorct/shared', () => ({
   decodeBase58: vi.fn(),
   parseTradeSize: vi.fn(),
 }));
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   parseEngine: vi.fn(), parseConfig: vi.fn(), parseParams: vi.fn(), parseAllAccounts: vi.fn(),
   isV17Account: vi.fn(), parseWrapperConfigV17: vi.fn(), parseAssetOracleProfileV17: vi.fn(),
   detectSlabLayout: vi.fn(),

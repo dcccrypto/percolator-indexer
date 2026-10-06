@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.11",
-    "@percolatorct/sdk": "^8.0.0",
+    "@percolatorct/sdk": "file:vendor/percolatorct-sdk-9.0.0-candidate.tgz",
     "@percolatorct/shared": "^1.1.0",
     "@solana/web3.js": "1.99.0",
     "@supabase/supabase-js": "^2.49.1",

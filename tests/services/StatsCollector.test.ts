@@ -16,7 +16,9 @@ vi.mock('../../src/db/insertMarketRow.js', () => ({
   insertMarketRow: insertMarketRowMock,
 }));
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   parseEngine: vi.fn(),
   // v17 desync additions — default to false so existing v12 test paths pass through.
   isV17Account: vi.fn(() => false),
@@ -367,6 +369,10 @@ describe('StatsCollector', () => {
       mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
       // The slab's engine config: initial_margin_bps = 1819 (9EPm8nB8 on chain), so 5x.
       const slabData = new Uint8Array(4096);
+      // Real wrapper header (magic, VERSION 18, KIND_MARKET): the offset is now chosen by VERSION.
+      new DataView(slabData.buffer).setBigUint64(0, 0x5045_5243_5631_3600n, true);
+      new DataView(slabData.buffer).setUint16(8, 18, true);
+      slabData[10] = 1;
       new DataView(slabData.buffer).setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 1819n, true);
       mockGetAccountInfo.mockResolvedValue({ data: slabData });
       setupParseMocks();

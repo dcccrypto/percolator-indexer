@@ -10,7 +10,9 @@ const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
   Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
 );
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
     TradeNoCpi: 10,

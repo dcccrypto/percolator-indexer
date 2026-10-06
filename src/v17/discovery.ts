@@ -19,12 +19,9 @@
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import {
-  isV17Account,
   parseWrapperConfigV17,
   parseAssetOracleProfileV17,
   V17_HEADER_LEN,
-  V17_WRAPPER_CONFIG_LEN,
-  V17_MARKET_GROUP_OFF,
   V17_ASSET_ORACLE_PROFILE_LEN,
   type DiscoveredMarket,
   type SlabHeader,
@@ -33,6 +30,9 @@ import {
   type RiskParams,
   type InsuranceFund,
 } from "@percolatorct/sdk";
+import { createLogger } from "@percolatorct/shared";
+import { encodeBase58 } from "../lib/base58.js";
+import { isWrapperKind, readMarketGroupFields, reportUnknownLayout, type MarketGroupFields } from "../layout/resolve.js";
 
 /**
  * V17 magic bytes in base58 for RPC memcmp filter.
@@ -41,31 +41,7 @@ import {
  */
 const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
 
-/** Tiny base58 encoder to programmatically verify magic bytes at module load (M-1/I-1) */
-function encodeBase58(bytes: Uint8Array): string {
-  const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let zeros = 0;
-  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
-
-  const digits: number[] = [];
-  for (let i = zeros; i < bytes.length; i++) {
-    let carry = bytes[i];
-    for (let j = 0; j < digits.length; j++) {
-      carry += digits[j] << 8;
-      digits[j] = carry % 58;
-      carry = (carry / 58) | 0;
-    }
-    while (carry > 0) {
-      digits.push(carry % 58);
-      carry = (carry / 58) | 0;
-    }
-  }
-
-  let out = "";
-  for (let i = 0; i < zeros; i++) out += "1";
-  for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]];
-  return out;
-}
+const logger = createLogger("indexer:v17-discovery");
 
 // Programmatic verification of the base58 magic string (M-1)
 const computedMagic = encodeBase58(V17_MAGIC_BYTES);
@@ -73,43 +49,14 @@ if (computedMagic !== "1347Wxtvn4w") {
   throw new Error(`v17 magic bytes base58 encoding mismatch: expected '1347Wxtvn4w', computed '${computedMagic}'`);
 }
 
-/**
- * V17 market group header layout at V17_MARKET_GROUP_OFF (448).
- * MarketGroupV16HeaderAccount on-chain serialization (dense / zero-copy).
- * Full struct in v16_program.rs:MarketGroupV16HeaderAccount.
- *
- * Offsets (relative to V17_MARKET_GROUP_OFF = 448), VERIFIED against the program's own
- * `cargo run --example dump_layout` for MarketGroupV16HeaderAccount (size=758, align=1):
- *   +0    market_group_id [u8;32]       → 32 bytes
- *   +32   config V16ConfigAccount       → 249 bytes (INLINE — engine config sits before vault)
- *   +281  asset_slot_capacity u32       → 4 bytes
- *   +285  vault u128                    → 16 bytes  (abs offset 733)
- *   +301  insurance u128                → 16 bytes  (abs offset 749)
- *   +317  c_tot u128                    → 16 bytes  (abs offset 765)
- *
- * NOTE: an earlier version used +32/+48/+64 on the false assumption that vault followed
- * market_group_id directly. That is wrong — the 249-byte V16ConfigAccount + 4-byte
- * asset_slot_capacity precede vault, so +32/48/64 read INSIDE the config block (garbage).
- * There is no separate "keeper wire format"; the program reads this same bytemuck cast.
+/*
+ * Market group geometry (header length, vault / insurance / c_tot offsets, slot stride) is NOT hard-coded here.
+ * It comes from the SDK layout table of the account's wrapper VERSION via readMarketGroupFields (layout/resolve.ts):
+ * v2.1 (VERSION 18) group header 758 B, v2.2 (VERSION 19) 806 B with different in-header offsets.
  */
-const MG_MARKET_GROUP_ID_OFF = 0;   // [u8;32] market_group_id
-const MG_VAULT_OFF = 285;           // u128 vault
-const MG_INSURANCE_OFF = 301;       // u128 insurance
-const MG_C_TOT_OFF = 317;           // u128 c_tot
-
-/** Minimum market group header length (must cover the c_tot read at +317). */
-const MG_MIN_HEADER_BYTES = 333;
 
 /** Zero pubkey sentinel. */
 const ZERO_PUBKEY = new PublicKey(new Uint8Array(32));
-
-/** Read u128 little-endian from a Uint8Array. Returns BigInt. */
-function readU128LE(data: Uint8Array, offset: number): bigint {
-  const dv = new DataView(data.buffer, data.byteOffset + offset, 16);
-  const lo = dv.getBigUint64(0, true);
-  const hi = dv.getBigUint64(8, true);
-  return lo | (hi << 64n);
-}
 
 /** Read u64 little-endian from a Uint8Array. Returns BigInt. */
 function readU64LE(data: Uint8Array, offset: number): bigint {
@@ -132,13 +79,8 @@ function readU64LE(data: Uint8Array, offset: number): bigint {
  * the open half of #166; guessing one would put plausible garbage into a
  * freshness column, which is worse than an honest zero.
  */
-function makeV17EngineStub(data: Uint8Array): EngineState {
-  const mgOff = V17_MARKET_GROUP_OFF;
-  const hasHeader = data.length >= mgOff + MG_MIN_HEADER_BYTES;
-
-  const vault = hasHeader ? readU128LE(data, mgOff + MG_VAULT_OFF) : 0n;
-  const insurance = hasHeader ? readU128LE(data, mgOff + MG_INSURANCE_OFF) : 0n;
-  const cTot = hasHeader ? readU128LE(data, mgOff + MG_C_TOT_OFF) : 0n;
+function makeV17EngineStub(fields: MarketGroupFields): EngineState {
+  const { vault, insurance, cTot } = fields;
 
   const insuranceFund: InsuranceFund = {
     balance: insurance,
@@ -243,20 +185,15 @@ function makeV17SlabHeader(data: Uint8Array, _programId: PublicKey): SlabHeader 
  *   - authorityPriceE6 → read from AssetOracleProfileV17.oracleTargetPriceE6
  *   - dexPool → null
  */
-function makeV17MarketConfig(data: Uint8Array): MarketConfig {
+function makeV17MarketConfig(data: Uint8Array, fields: MarketGroupFields): MarketConfig {
   const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
 
-  // Asset-0 oracle profile: at V17_MARKET_GROUP_OFF + market_group_header_len.
-  // The market group header has a fixed-size prefix before the per-asset oracle profiles.
-  // Based on the desync doc: asset-0 oracle_authority at absolute offset 1326 =
-  // 448 (V17_MARKET_GROUP_OFF) + 758 (market_group_header) + 120 (oracleAuthority within profile).
-  // V17_MARKET_GROUP_OFF=448, MARKET_GROUP_HDR=758, asset-0 profile starts at 448+758=1206.
-  const MARKET_GROUP_HDR_LEN = 758;
-  const asset0ProfileOff = V17_MARKET_GROUP_OFF + MARKET_GROUP_HDR_LEN;
+  // Asset-0 oracle profile: the start of slot 0 of THIS account's VERSION (group offset + group length).
+  const asset0ProfileOff = fields.asset0ProfileOff;
 
   let oracleAuthority = ZERO_PUBKEY;
   let authorityPriceE6 = 0n;
-  if (data.length >= asset0ProfileOff + V17_ASSET_ORACLE_PROFILE_LEN) {
+  if (asset0ProfileOff !== null && data.length >= asset0ProfileOff + V17_ASSET_ORACLE_PROFILE_LEN) {
     try {
       const oracleProfile = parseAssetOracleProfileV17(data, asset0ProfileOff);
       oracleAuthority = oracleProfile.oracleAuthority;
@@ -349,8 +286,7 @@ function makeV17RiskParamsStub(): RiskParams {
  *
  * The program discriminates account kinds at byte[10] (check_header @v16_program.rs:986):
  *   KIND_MARKET=1, KIND_PORTFOLIO=2, KIND_BACKING_DOMAIN_LEDGER=3, KIND_INSURANCE_LEDGER=4.
- * Without this guard, PORTFOLIO accounts (9347 bytes pre-v18; 9563 bytes as of
- * the v18 PortfolioAccountV16 growth) and other non-market v17 accounts (any
+ * Without this guard, PORTFOLIO accounts (9347 bytes pre-v18; 9563 bytes v2.1; 10,603 bytes v2.2) and other non-market v17 accounts (any
  * >=448-byte account with the v17 magic) would pass isV17Account and be parsed
  * as markets, producing bogus rows via StatsCollector.insertMarket. The guard
  * is size-independent (kind byte only), so it is unaffected by that growth.
@@ -360,18 +296,28 @@ function parseV17Account(
   programId: PublicKey,
   data: Uint8Array,
 ): DiscoveredMarket | null {
-  if (!isV17Account(data)) return null;
-  // KIND_MARKET = 1 at byte[10] (v16_program.rs:46, check_header @v16_program.rs:986)
-  if (data.length < 11 || data[10] !== 1) return null;
+  // Not a wrapper account (legacy v1 `PERCOLAT` slab, foreign data) or not a market: silently not ours.
+  // KIND_MARKET = 1 at byte[10] (v16_program.rs:46, check_header @v16_program.rs:986). Kind is checked for ANY
+  // VERSION so a future-VERSION portfolio is still not mistaken for a market.
+  if (!isWrapperKind(data, 1)) return null;
 
   try {
+    // VERSION-keyed geometry (v2.1 = 18, v2.2 = 19). An unknown VERSION throws UnknownLayoutError here: loud,
+    // and this ONE market is skipped; the caller's loop carries on with the others.
+    const fields = readMarketGroupFields(data, "discoverV17Markets");
     const header = makeV17SlabHeader(data, programId);
-    const config = makeV17MarketConfig(data);
-    const engine = makeV17EngineStub(data);
+    const config = makeV17MarketConfig(data, fields);
+    const engine = makeV17EngineStub(fields);
     const params = makeV17RiskParamsStub();
 
     return { slabAddress: pubkey, programId, header, config, engine, params };
-  } catch {
+  } catch (err) {
+    if (!reportUnknownLayout(pubkey.toBase58(), err, "discoverV17Markets")) {
+      logger.warn("v17 market account could not be parsed; skipped", {
+        slab: pubkey.toBase58(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     return null;
   }
 }

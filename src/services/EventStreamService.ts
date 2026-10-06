@@ -6,6 +6,8 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
+import { insertV22Events } from "../db/insertV22Events.js";
 
 const log = createLogger("indexer:event-stream");
 
@@ -110,6 +112,19 @@ export class EventStreamService {
 
     // REDUCTION (2026-07-26): oracle_prices is no longer indexed — the frontend reads
     // price live from chain. UpdateHyperpMark txs no longer trigger a DB write here.
+
+    // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
+    // a failure here must never cost the tx's fills below.
+    try {
+      const events = decodeV22Events(rawInstructionsFromParsedTx(tx, [this.deps.programId]), {
+        signature,
+        slot: typeof tx.slot === "number" ? tx.slot : null,
+        blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
+      }).filter((e) => !e.slab_address || (this.slabSet.has(e.slab_address) && !isBlockedSlab(e.slab_address)));
+      if (events.length > 0) await insertV22Events(events);
+    } catch (err) {
+      log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
+    }
 
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
 

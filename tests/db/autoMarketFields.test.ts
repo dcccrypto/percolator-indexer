@@ -18,6 +18,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import type { ConfirmedSignatureInfo, VersionedTransactionResponse } from "@solana/web3.js";
+import { LAYOUT_V21, LAYOUT_V22 } from "@percolatorct/sdk";
 import {
   CREATOR_LOOKUP_MAX_PAGES,
   creatorFromCreationTx,
@@ -25,6 +26,7 @@ import {
   resolveAutoMarketFields,
   v17InitialMarginBps,
   V17_INITIAL_MARGIN_BPS_OFF,
+  initialMarginBpsOffset,
   type CreatorLookupRpc,
 } from "../../src/db/autoMarketFields.js";
 
@@ -224,24 +226,35 @@ describe("findSlabCreator", () => {
   });
 });
 
-describe("v17InitialMarginBps (max_leverage source)", () => {
-  function slabWithIm(bps: bigint, len = 4096): Uint8Array {
+describe("v17InitialMarginBps (max_leverage source), VERSION-keyed", () => {
+  function slabWithIm(bps: bigint, len = 4096, version = 18): Uint8Array {
     const data = new Uint8Array(len);
-    new DataView(data.buffer).setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, bps, true);
+    const dv = new DataView(data.buffer);
+    dv.setBigUint64(0, 0x5045_5243_5631_3600n, true); // wrapper magic
+    dv.setUint16(8, version, true);
+    data[10] = 1; // KIND_MARKET
+    dv.setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, bps, true);
     return data;
   }
 
-  it("sits at market-group + 32 + 62 = 686 on the deployed layout", () => {
+  it("sits at market-group + 32 + 62 = 686 on the deployed (v2.1) layout and on v2.2 (band/rent words are appended at the config END)", () => {
     expect(V17_INITIAL_MARGIN_BPS_OFF).toBe(686);
+    expect(initialMarginBpsOffset(LAYOUT_V21)).toBe(686);
+    expect(initialMarginBpsOffset(LAYOUT_V22)).toBe(686);
   });
 
-  it("reads the engine's initial margin (9EPm8nB8: 1819 bps, so 5x not the 10x fallback)", () => {
+  it("reads the engine's initial margin on v2.1 and v2.2 (9EPm8nB8: 1819 bps, so 5x not the 10x fallback)", () => {
     expect(v17InitialMarginBps(slabWithIm(1819n))).toBe(1819n);
+    expect(v17InitialMarginBps(slabWithIm(1819n, 4096, 19))).toBe(1819n);
     expect(Math.floor(10_000 / Number(v17InitialMarginBps(slabWithIm(1819n))))).toBe(5);
   });
 
-  it("NULL for a short account or an unset (zero) margin", () => {
-    expect(v17InitialMarginBps(new Uint8Array(V17_INITIAL_MARGIN_BPS_OFF + 7))).toBeNull();
+  it("NULL for a short account, an unset (zero) margin, an UNKNOWN VERSION (never read with another layout), or a non-wrapper buffer", () => {
+    expect(v17InitialMarginBps(slabWithIm(1819n).subarray(0, V17_INITIAL_MARGIN_BPS_OFF + 7))).toBeNull();
     expect(v17InitialMarginBps(slabWithIm(0n))).toBeNull();
+    expect(v17InitialMarginBps(slabWithIm(1819n, 4096, 20))).toBeNull();
+    const raw = new Uint8Array(4096);
+    new DataView(raw.buffer).setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 1819n, true);
+    expect(v17InitialMarginBps(raw)).toBeNull();
   });
 });

@@ -8,6 +8,9 @@ WORKDIR /app
 # now, not a `file:../percolator-sdk` link, so nothing has to be staged into the
 # build context first — the install resolves it from the registry.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# v2.2 candidate: @percolatorct/sdk is a vendored tarball (file:vendor/...) until SDK 9.0.0 is published to npm.
+# Revert this COPY together with the package.json dependency when it is.
+COPY vendor ./vendor
 # The `pnpm ls` guard named `@percolator/sdk`, which is not a dependency of this
 # package (the scope is `@percolatorct`), so it matched nothing and exited 0 —
 # it never verified anything. Assert on the real name, and fail if it is absent.

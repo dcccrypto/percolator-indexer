@@ -1,8 +1,10 @@
 import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
-import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
+import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
+import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { insertTradeRow } from "../db/insertTradeRow.js";
 import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 
@@ -376,8 +378,11 @@ export class TradeIndexerPolling {
       if (!programIds.has(programId)) continue;
 
       // Decode instruction tag from data
-      const data = decodeBase58(ix.data);
-      if (!data || data.length < 1) continue;
+      const rawData = decodeBase58(ix.data);
+      if (!rawData || rawData.length < 1) continue;
+      // v2.2 EvictAndTradeCpi (119) = TradeCpi behind one prepended victim account. Normalise it to the TradeCpi it
+      // wraps so it takes the SAME per-tx leg number (fillSeq) and per-leg dedup as every other fill, on every path.
+      const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts);
 
       const tag = data[0];
       if (!TRADE_TAGS.has(tag)) continue;
@@ -395,7 +400,7 @@ export class TradeIndexerPolling {
       // fills under the wrong slab.
       const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
       const marketAccountIdx = isNoCpiTag ? 2 : 1;
-      const ixMarket = ix.accounts[marketAccountIdx]?.toBase58();
+      const ixMarket = ixAccounts[marketAccountIdx]?.toBase58();
       if (ixMarket && ixMarket !== slabAddress) {
         // Not ours to write, but the other paths still number these fills.
         fillSeq += isBatch ? decodeV18BatchLegs(tag, data).length : decodeV18SingleFill(tag, data) ? 1 : 0;
@@ -406,7 +411,7 @@ export class TradeIndexerPolling {
         const legs = decodeV18BatchLegs(tag, data);
         if (legs.length === 0) continue;
 
-        const traderKey = ix.accounts[0];
+        const traderKey = ixAccounts[0];
         if (!traderKey) continue;
         const trader = traderKey.toBase58();
 
@@ -456,7 +461,7 @@ export class TradeIndexerPolling {
       const legIndex = fillSeq++;
 
       // Determine trader from account keys
-      const traderKey = ix.accounts[0];
+      const traderKey = ixAccounts[0];
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
 
@@ -552,15 +557,15 @@ export class TradeIndexerPolling {
       const rawData = new Uint8Array(info.data);
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
-      if (isV17Account(rawData)) {
+      if (hasWrapperMagic(rawData)) {
         try {
-          const cfg = parseWrapperConfigV17(rawData, V17_HEADER_LEN);
-          const markEwmaE6 = cfg.markEwmaE6;
+          const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
             return Number(markEwmaE6) / 1_000_000;
           }
-        } catch {
-          // parseWrapperConfigV17 failed
+        } catch (err) {
+          // Unknown VERSION is loud (per market); the fill is skipped, never guessed.
+          reportUnknownLayout(slabAddress, err, "TradeIndexer.readMarkPriceFromSlab");
         }
         return 0;
       }

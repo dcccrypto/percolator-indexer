@@ -1,5 +1,6 @@
 import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
+import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
 
 /**
@@ -308,13 +309,17 @@ export function parsePercolatorFills(
     const programId = pubkeyToBase58(ix.programId);
     if (!programId || !programIdSet.has(programId)) continue;
 
-    const data = decodeBase58(ix.data);
-    if (!data || data.length < 1) continue;
+    const rawData = decodeBase58(ix.data);
+    if (!rawData || rawData.length < 1) continue;
+
+    // v2.2 EvictAndTradeCpi (119) is a TradeCpi behind one prepended victim account: normalise it to the TradeCpi
+    // it wraps so its fill is indexed like any other. Every other tag passes through unchanged.
+    const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts ?? []);
 
     const tag = data[0];
     if (!ALL_TRADE_TAGS.has(tag)) continue;
 
-    const trader = pubkeyToBase58(ix.accounts?.[0]);
+    const trader = pubkeyToBase58(ixAccounts[0]);
     if (!trader) continue;
 
     // #148: Derive slab per-instruction from the account list.
@@ -324,7 +329,7 @@ export function parsePercolatorFills(
     // correctly attribute each fill to its own slab, not the first known slab.
     const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
     const marketAccountIdx = isNoCpiTag ? 2 : 1;
-    const slabAddress = pubkeyToBase58(ix.accounts?.[marketAccountIdx]);
+    const slabAddress = pubkeyToBase58(ixAccounts[marketAccountIdx]);
 
     if (SINGLE_TRADE_TAGS.has(tag)) {
       const decoded = decodeV18SingleFill(tag, data);
