@@ -689,7 +689,7 @@ export class StatsCollector {
                 getSignaturesForAddress: (address, options) =>
                   connection.getSignaturesForAddress(address, options, "confirmed"),
                 getTransaction: (signature) =>
-                  connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }),
+                  connection.getTransaction(signature, { maxSupportedTransactionVersion: 1, commitment: "confirmed" }),
               },
               new PublicKey(slabAddress),
               market.programId,

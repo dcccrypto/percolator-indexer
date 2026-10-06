@@ -36,7 +36,7 @@ describe("EventStreamService", () => {
     expect(filter.failed).toBe(false);
     expect(opts.commitment).toBe("confirmed");
     expect(opts.encoding).toBe("jsonParsed");
-    expect(opts.maxSupportedTransactionVersion).toBe(0);
+    expect(opts.maxSupportedTransactionVersion).toBe(1);
   });
 
   it("invokes onTx callback when transactionNotification arrives", async () => {

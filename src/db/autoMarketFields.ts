@@ -1,4 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
+import { isPoisonTxError, MAX_SKIPS_ABSOLUTE } from "../lib/tolerantTxFetch.js";
+import { recordSkippedSignatures, type SkippedSignature } from "./../lib/skippedSignatures.js";
 import { V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
 import type {
   ConfirmedSignatureInfo,
@@ -197,11 +199,29 @@ export async function findSlabCreator(
     .filter((s) => s.err === null)
     .slice(-CREATOR_LOOKUP_MAX_TX)
     .reverse(); // oldest first
+  const skipped: SkippedSignature[] = [];
   for (const sig of candidates) {
-    const tx = await rpc.getTransaction(sig.signature);
+    let tx;
+    try {
+      tx = await rpc.getTransaction(sig.signature);
+    } catch (err) {
+      if (!isPoisonTxError(err)) throw err;
+      // X-1: skip a transaction this client cannot return (recorded below, once the lookup is known not to be broken).
+      skipped.push({ signature: sig.signature, source: "creator-lookup", slab: slab.toBase58(), error: err instanceof Error ? err.message : String(err) });
+      if (skipped.length > MAX_SKIPS_ABSOLUTE) throw new Error(`creator lookup for ${slab.toBase58()}: mass skip refused (${skipped.length} unreadable signatures)`);
+      continue;
+    }
     if (!tx) continue;
     const creator = creatorFromCreationTx(tx, slab, programId);
-    if (creator) return creator;
+    if (creator) {
+      await recordSkippedSignatures(skipped);
+      return creator;
+    }
   }
+  // Successful-sibling rule: skipping is only acceptable if at least one candidate was read; all unreadable = broken reader.
+  if (skipped.length > 0 && skipped.length === candidates.length) {
+    throw new Error(`creator lookup for ${slab.toBase58()}: mass skip refused (every candidate unreadable)`);
+  }
+  await recordSkippedSignatures(skipped);
   return null;
 }

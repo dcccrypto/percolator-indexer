@@ -1,3 +1,5 @@
+import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
@@ -5,6 +7,12 @@ import { insertTradeRow } from "../db/insertTradeRow.js";
 import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 
 const logger = createLogger("indexer:trade-indexer");
+
+/** Alert (error log + Sentry) when a slab's cursor has been held by the mass-skip breaker for K consecutive polls. */
+const breakerTracker = createBreakerTracker(breakerAlertPolls(), (slab, polls) => {
+  logger.error("ALERT: cursor held by the mass-skip circuit breaker for consecutive polls: signatures are unreadable and are NOT being skipped; investigate the RPC / reader", { slab, consecutivePolls: polls });
+  captureException(new Error(`indexer cursor held by mass-skip breaker for ${polls} consecutive polls (slab ${slab})`), { tags: { context: "indexer-breaker-held" }, extra: { slab, polls } });
+});
 
 /**
  * v18 trade tags to index.
@@ -233,26 +241,39 @@ export class TradeIndexerPolling {
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
     for (let i = 0; i < validSigs.length; i += TX_BATCH_SIZE) {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
-      let txs: (ParsedTransactionWithMeta | null)[];
-      try {
-        txs = await withRetry(
-          () => connection.getParsedTransactions(batch, { maxSupportedTransactionVersion: 0 }),
-          {
-            maxRetries: TX_FETCH_RETRIES,
-            baseDelayMs: 1000,
-            label: `getParsedTransactions(${batch.length})`,
-          },
+      // X-1: isolate an unreadable (e.g. v1-version) transaction instead of letting one poisoned signature
+      // hold this slab's cursor forever. Transient RPC failures still hold the cursor (#147).
+      const fetched = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(
+        connection,
+        batch,
+        (fn, label) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label }),
+      );
+      if (fetched.skipped.length > 0) {
+        // Durable + loud: FULL signature and slab, counter, DB table (or JSONL fallback). Re-index from there.
+        await recordSkippedSignatures(
+          fetched.skipped.map((sk) => ({ signature: sk.signature, source: "trade-indexer" as const, slab: slabAddress, error: sk.error })),
         );
-      } catch (err) {
+      }
+      if (fetched.massSkip) breakerTracker.held(slabAddress);
+      else if (!fetched.failed) breakerTracker.clear(slabAddress);
+      if (fetched.massSkip) {
+        logger.error("Mass-skip circuit breaker tripped: cursor held, nothing skipped (RPC or reader is broken, not a poison pill)", {
+          slabAddress,
+          skipped: fetched.massSkip.skipped,
+          batch: fetched.massSkip.total,
+        });
+      }
+      if (fetched.failed) {
         // #147: RPC failure — stop processing and do NOT advance the cursor.
         // The next poll will re-fetch from the same lastSignature and retry.
         logger.warn("getParsedTransactions failed — cursor not advanced, will retry next poll", {
           slabAddress: slabAddress.slice(0, 8),
-          error: err instanceof Error ? err.message : err,
+          error: fetched.error instanceof Error ? fetched.error.message : fetched.error,
         });
         batchFailed = true;
         break;
       }
+      const txs = fetched.txs;
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];

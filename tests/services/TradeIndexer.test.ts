@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { PublicKey } from '@solana/web3.js';
 
+vi.hoisted(() => { process.env.INDEXER_BREAKER_ALERT_POLLS = '1'; }); // alert on the first held poll in tests
 const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
 const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
@@ -76,6 +78,7 @@ vi.mock('@percolatorct/shared', () => ({
   captureException: vi.fn(),
 }));
 
+import { resetSkippedSignatureDedupe } from '../../src/lib/skippedSignatures.js';
 import { TradeIndexerPolling } from '../../src/services/TradeIndexer.js';
 import * as shared from '@percolatorct/shared';
 import { insertTradeRow } from '../../src/db/insertTradeRow.js';
@@ -221,6 +224,88 @@ describe('TradeIndexerPolling', () => {
         })
       );
     }, 10000);
+  });
+
+  describe('X-1 — an unreadable transaction in the batch does not wedge the slab, and is never skipped silently', () => {
+    const SIGS = ['A', 'B', 'C', 'D', 'E', 'F'].map((c) => c.repeat(88));
+    const V2 = Object.assign(new Error('failed to get transaction: Transaction version (2) is not supported by the requesting client'), { code: -32015 });
+    const setup = (badSigs: string[]) => {
+      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      mockGetSignaturesForAddress.mockResolvedValue(SIGS.map((signature) => ({ signature, err: null })));
+      const ixData = new Uint8Array(77);
+      ixData[0] = 10;
+      ixData[43] = 0x40;
+      ixData[44] = 0x42;
+      ixData[45] = 0x0f;
+      vi.mocked(shared.decodeBase58).mockReturnValue(ixData);
+      mockGetParsedTransaction.mockImplementation(async (sig: string) => {
+        if (badSigs.includes(sig)) throw V2;
+        return {
+          meta: { err: null, logMessages: [] },
+          transaction: { message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(TRADER)], data: 'x' }] } },
+        };
+      });
+    };
+    const file = `/tmp/ti-skipped-${process.pid}.jsonl`;
+    beforeEach(() => { process.env.SKIPPED_SIGNATURES_FILE = file; rmSync(file, { force: true }); resetSkippedSignatureDedupe(); });
+    afterEach(() => { delete process.env.SKIPPED_SIGNATURES_FILE; mockGetParsedTransaction.mockReset(); });
+
+    it('1 unreadable in 6: the 5 readable trades are indexed, the poison one is recorded with its FULL signature + slab', async () => {
+      setup([SIGS[1]]);
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
+      expect(inserted).toContain(SIGS[0]);
+      expect(inserted).not.toContain(SIGS[1]);
+      const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rec[0]).toMatchObject({ signature: SIGS[1], slab: SLAB, source: 'trade-indexer' });
+    }, 12000);
+
+    it('2 unreadable + 4 good (successful siblings): the 4 trades are indexed, both poison signatures recorded, cursor advances', async () => {
+      setup([SIGS[1], SIGS[2]]);
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
+      expect(inserted).toContain(SIGS[0]);
+      expect(inserted).not.toContain(SIGS[1]);
+      const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rec.map((r) => r.signature).sort()).toEqual([SIGS[1], SIGS[2]].sort());
+      expect(rec[0]).toMatchObject({ slab: SLAB, source: 'trade-indexer' });
+    }, 12000);
+
+    it('a LONE poisoned signature (batch of 1) holds the cursor AND goes through the breaker alert', async () => {
+      setup([SIGS[0]]);
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+      vi.mocked(shared.captureException).mockClear();
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(existsSync(file)).toBe(false); // held, not skipped: nothing recorded
+      expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(true);
+    }, 12000);
+
+    it('negative control: a lone GOOD signature does not alert and is indexed', async () => {
+      setup([]);
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
+      vi.mocked(shared.captureException).mockClear();
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ tx_signature: SIGS[0] }));
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(false);
+    }, 12000);
+
+    it('negative control: an ALL-unreadable batch is held: nothing indexed, nothing recorded, cursor held', async () => {
+      setup(SIGS);
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(existsSync(file)).toBe(false);
+      expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
+      // the K-consecutive-polls alert (K=1 here): error-level Sentry event
+      expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(true);
+    }, 12000);
   });
 
   describe('error handling', () => {

@@ -10,6 +10,7 @@ import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
+import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
 import { RpcLpVaultChain } from "./lpVault/chain.js";
 import { SupabaseLpVaultStore } from "./lpVault/store.js";
@@ -17,6 +18,8 @@ import { CURRENT_NETWORK } from "./network.js";
 
 // Initialize Sentry first
 initSentry("indexer");
+// X-1: if the optional skipped-signature JSONL sink is configured it must be writable; fail loudly at boot, not at the first skip.
+assertSkippedSignatureSinkReady();
 
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
