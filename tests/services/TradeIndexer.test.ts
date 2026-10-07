@@ -10,6 +10,14 @@ const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
   Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
 );
 
+// These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
+// (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
+// wire size at a fixed price here.
+vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/parsers/matcherFill.js')>()),
+  resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
+}));
+
 vi.mock('@percolatorct/sdk', () => ({
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
@@ -761,14 +769,14 @@ describe('TradeIndexerPolling', () => {
       expect(shared.tradeExistsBySignature).not.toHaveBeenCalled();
     });
 
-    it('an already fully indexed tx costs one slab read in total, not one per leg, and publishes nothing', async () => {
+    it('an already fully indexed tx reads no slab (CPI fills are priced from the matcher call) and publishes nothing', async () => {
       for (const l of [0, 1, 2]) db.add(`${VALID_SIG}|0|${l}`);
       const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
 
       const didIndex = await (indexer as any).processTransaction(threeLegTx(), VALID_SIG, SLAB, programIds);
 
       expect(didIndex).toBe(false);
-      expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
+      expect(mockGetAccountInfo).not.toHaveBeenCalled();
       expect(shared.eventBus.publish).not.toHaveBeenCalled();
     });
   });

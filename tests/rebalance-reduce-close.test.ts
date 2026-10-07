@@ -75,6 +75,14 @@ function fakeSupabase() {
   };
 }
 
+// These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
+// (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
+// wire size at a fixed price here.
+vi.mock('../src/parsers/matcherFill.js', async (orig) => ({
+  ...(await orig<typeof import('../src/parsers/matcherFill.js')>()),
+  resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
+}));
+
 vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB'],

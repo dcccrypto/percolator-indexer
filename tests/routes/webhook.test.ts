@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as nodeCrypto from 'node:crypto';
 
+// These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
+// (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
+// wire size at a fixed price here.
+vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/parsers/matcherFill.js')>()),
+  resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
+}));
+
 vi.mock('@percolatorct/sdk', () => ({
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
@@ -624,58 +632,21 @@ describe('POST /webhook/trades — #205 wire price/fee + fresh-RPC price fallbac
     expect(vi.mocked(getConnection)).not.toHaveBeenCalled();
   });
 
-  it('TradeCpi: no wire price (only limit_price) — falls back to a fresh RPC read when accountData is absent', async () => {
+  it('TradeCpi: price is the booked price from the matcher call; the slab (mark EWMA) is never read (#221)', async () => {
     const { decodeBase58, getConnection } = await import('@percolatorct/shared') as any;
-    // TradeCpi mocked tag = 11. execPriceE6 arg here lands at TradeCpi's
-    // fee_bps offset too (both tags share offset 67), so pass 0n for the
-    // "exec_price" slot (TradeCpi never reads offset 59 — it's inert) and a
-    // real fee_bps at 67.
     vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(11, 0n, 40n));
-
-    // Fresh-RPC slab read returns a V1-layout buffer with mark_price_e6 =
-    // $90.25 at ENGINE_OFF(640)+ENGINE_MARK_PRICE_OFF(400) = 1040, matching
-    // this file's global detectSlabLayout mock.
     const slabBuf = new Uint8Array(1048);
     new DataView(slabBuf.buffer).setBigUint64(1040, 90_250_000n, true);
-    vi.mocked(getConnection).mockReturnValueOnce({
-      getAccountInfo: vi.fn(async () => ({ data: Buffer.from(slabBuf) })),
-    } as any);
-
     const tx = {
       signature: SIG,
       instructions: makeCpiInstructions(),
-      innerInstructions: [],
-      accountData: [], // no post-state — forces the NEW RPC fallback
+      accountData: [{ account: SLAB, data: Buffer.from(slabBuf).toString('base64') }], // mark 90.25 must be ignored
       logs: [],
     };
     await app.fetch(makeRequest([tx]));
-
-    // notional = 1.0 * 90.25 = $90.25; fee = 90.25 * 40 / 10_000 = $0.361
-    expect(insertTradeRow).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 90.25, fee: expect.closeTo(0.361, 10) }),
-    );
-    expect(vi.mocked(getConnection)).toHaveBeenCalled();
-  });
-
-  it('TradeCpi: accountData present takes priority over the RPC fallback (no extra RPC read)', async () => {
-    const { decodeBase58, getConnection } = await import('@percolatorct/shared') as any;
-    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(11, 0n, 40n));
-
-    const slabBuf = new Uint8Array(1048);
-    new DataView(slabBuf.buffer).setBigUint64(1040, 77_000_000n, true);
-
-    const tx = {
-      signature: SIG,
-      instructions: makeCpiInstructions(),
-      innerInstructions: [],
-      accountData: [{ account: SLAB, data: Buffer.from(slabBuf).toString('base64') }],
-      logs: [],
-    };
-    await app.fetch(makeRequest([tx]));
-
-    expect(insertTradeRow).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 77, fee: expect.closeTo(0.308, 10) }),
-    );
+    // resolveCpiLeg is mocked at the top of this file to book 1.5; the real resolution is
+    // covered against real transactions in tests/matcher-fill.test.ts.
+    expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ price: 1.5, fee: expect.closeTo(0.006, 10) }));
     expect(vi.mocked(getConnection)).not.toHaveBeenCalled();
   });
 });

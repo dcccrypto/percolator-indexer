@@ -15,6 +15,9 @@ import {
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
+
+import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
@@ -107,6 +110,8 @@ interface ValidatedInstruction {
   programId?: string;
   data?: string;
   accounts?: string[];
+  /** Helius enhanced format nests the CPIs of an instruction here. */
+  innerInstructions?: ValidatedInstruction[];
 }
 interface ValidatedInnerGroup {
   instructions?: ValidatedInstruction[];
@@ -147,6 +152,15 @@ function isValidTransactionArray(parsed: unknown): parsed is ValidatedTransactio
           // Each account entry must be a string (pubkey) in the Helius enhanced format.
           for (const acc of ix.accounts) {
             if (typeof acc !== "string") return false;
+          }
+        }
+        if (ix.innerInstructions !== undefined) {
+          if (!Array.isArray(ix.innerInstructions)) return false;
+          for (const sub of ix.innerInstructions) {
+            if (sub === null || typeof sub !== "object") return false;
+            if (hasPoisonKey(sub as object)) return false;
+            if (sub.programId !== undefined && typeof sub.programId !== "string") return false;
+            if (sub.data !== undefined && typeof sub.data !== "string") return false;
           }
         }
       }
@@ -778,25 +792,50 @@ async function extractTradesFromEnhancedTx(
     // #205: resolve the account/RPC fallback price at most once per instruction
     // (not once per leg) — only legs without a wire execPriceE6 need it.
     let fallbackPrice: number | null = null;
+    // #213/#221: TradeCpi/BatchTradeCpi carry the REQUESTED size on the wire. Executed size and
+    // the booked price come from the matcher call nested under this instruction.
+    const isCpiTag = tag === IX_TAG.TradeCpi || tag === IX_TAG.BatchTradeCpi;
+    const cpi = isCpiTag
+      ? cpiEvidence(
+          accounts,
+          Array.isArray(ix.innerInstructions)
+            ? ix.innerInstructions.filter((i) => typeof i.programId === "string" && typeof i.data === "string").map((i) => ({ programId: i.programId as string, data: i.data as string }))
+            : null,
+        )
+      : null;
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null);
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
       touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
 
       let price: number;
-      if (leg.execPriceE6 !== undefined) {
+      let legSize = leg.sizeValue;
+      if (cpi) {
+        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
+        if (r.kind === "skip") {
+          if (r.reason === "size-unverified") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi size unverified: ${r.detail}`.slice(0, 480) }]);
+          }
+          // Hold the leg number (renumbered below) so the other paths' numbering still lines up.
+          trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+          continue;
+        }
+        legSize = r.sizeValue;
+        price = Number(r.priceE6) / 1_000_000;
+      } else if (leg.execPriceE6 !== undefined) {
         price = Number(leg.execPriceE6) / 1_000_000;
       } else {
         if (fallbackPrice === null) fallbackPrice = await extractPrice(tx, slabAddress);
         price = fallbackPrice;
       }
-      const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
+      const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
       trades.push({
         slab_address: slabAddress,
         trader,
         side: leg.side,
-        size: leg.sizeValue.toString(),
+        size: legSize.toString(),
         price,
         fee,
         tx_signature: signature,

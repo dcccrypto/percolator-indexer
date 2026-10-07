@@ -6,6 +6,9 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 
 const log = createLogger("indexer:event-stream");
 
@@ -122,6 +125,7 @@ export class EventStreamService {
     // so the fallback slab read is memoized per slab (it was previously repeated
     // once per fill). null = the read failed or returned nothing for that slab.
     const priceBySlab = new Map<string, number | null>();
+    const readMatcherContext = makeMatcherContextReader(() => this.deps.connection, typeof tx.slot === "number" ? tx.slot : null);
 
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
@@ -143,6 +147,22 @@ export class EventStreamService {
       if (isBlockedSlab(slab)) continue;
 
       let priceE6Value = fill.priceE6 ?? 0;
+      let sizeAbs = fill.sizeAbs;
+      if (fill.cpi) {
+        // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
+        const r = await resolveCpiLeg({
+          evidence: fill.cpi, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs,
+          legPos: fill.legPos ?? 0, readContext: readMatcherContext,
+        });
+        if (r.kind === "skip") {
+          if (r.reason === "size-unverified") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: `TradeCpi size unverified: ${r.detail}`.slice(0, 480) }]);
+          }
+          continue; // zero fill / unprovable size: no row (the leg number is already consumed)
+        }
+        sizeAbs = r.sizeValue;
+        priceE6Value = Number(r.priceE6);
+      }
       if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
         // hit the slab for the authoritative post-tx mark price.
@@ -176,7 +196,7 @@ export class EventStreamService {
         slab_address: slab,
         trader: fill.trader,
         side: fill.side,
-        size: fill.sizeAbs.toString(),
+        size: sizeAbs.toString(),
         price,
         fee: 0,
         tx_signature: signature,
@@ -186,7 +206,7 @@ export class EventStreamService {
       emits.push({
         slab,
         side: fill.side,
-        size: fill.sizeAbs.toString(),
+        size: sizeAbs.toString(),
         price,
         trader: fill.trader,
         key: tradeKey({ tx_signature: signature, asset_index: fill.assetIndex, leg_index: legIndex }),

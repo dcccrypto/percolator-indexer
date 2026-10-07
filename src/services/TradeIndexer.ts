@@ -15,6 +15,9 @@ import {
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
+import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -426,7 +429,17 @@ export class TradeIndexerPolling {
       return fallbackPrice;
     };
 
-    for (const ix of message.instructions) {
+    // TradeCpi / BatchTradeCpi: the instruction carries the REQUESTED size; the executed size and
+    // the booked price come from the matcher call (see parsers/matcherFill.ts). Reader is only
+    // used when a fill needs the matcher context account.
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), tx.slot);
+    const returnDataRaw = (tx.meta as { returnData?: unknown }).returnData as { programId?: unknown; data?: unknown } | null | undefined;
+    const returnData = returnDataRaw && Array.isArray(returnDataRaw.data) && typeof returnDataRaw.data[0] === "string"
+      ? { programId: String(returnDataRaw.programId), data: Uint8Array.from(Buffer.from(returnDataRaw.data[0], "base64")) }
+      : null;
+    const unverified: string[] = [];
+
+    for (const [ixIdx, ix] of message.instructions.entries()) {
       // Skip parsed instructions (system, token, etc.)
       if ("parsed" in ix) continue;
 
@@ -536,6 +549,8 @@ export class TradeIndexerPolling {
 
         const i128Max = (1n << 127n) - 1n;
 
+        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData) : null;
+
         for (const leg of legs) {
           // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
           const legIndex = fillSeq++;
@@ -545,14 +560,26 @@ export class TradeIndexerPolling {
           // before any price read; the insert's own dedup stays the backstop if this lookup failed.
           const ordinal = ordinalOf(slabAddress, leg.assetIndex, trader, leg.side, leg.sizeValue.toString());
           if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal }, reduceLegs)) continue;
-          const price = await resolvePrice(leg);
-          const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
+          let legSize = leg.sizeValue;
+          let price: number;
+          if (batchCpi) {
+            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
+            if (r.kind === "skip") {
+              if (r.reason === "size-unverified") unverified.push(r.detail);
+              continue;
+            }
+            legSize = r.sizeValue;
+            price = Number(r.priceE6) / 1_000_000;
+          } else {
+            price = await resolvePrice(leg);
+          }
+          const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
           const inserted = await insertTradeRow({
             slab_address: slabAddress,
             trader,
             side: leg.side,
-            size: leg.sizeValue.toString(),
+            size: legSize.toString(),
             price,
             fee,
             tx_signature: signature,
@@ -560,7 +587,7 @@ export class TradeIndexerPolling {
             leg_index: legIndex,
           });
           if (!inserted) continue; // duplicate leg: already indexed, no event, no count
-          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: leg.sizeValue.toString() });
+          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: legSize.toString() });
           insertedAny = true;
         }
         continue;
@@ -570,7 +597,8 @@ export class TradeIndexerPolling {
       // v18 byte layout (the two tags have DIFFERENT offsets in v18).
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
-      const { sizeValue, side } = decoded;
+      let { sizeValue } = decoded;
+      const { side } = decoded;
       const legIndex = fillSeq++;
 
       // Determine trader from account keys
@@ -589,6 +617,18 @@ export class TradeIndexerPolling {
       let price: number;
       if (decoded.execPriceE6 !== undefined) {
         price = Number(decoded.execPriceE6) / 1_000_000;
+      } else if (tag === IX_TAG.TradeCpi) {
+        // #213/#221: executed size + booked price from the matcher call, never the request/mark.
+        const r = await resolveCpiLeg({
+          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData),
+          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext,
+        });
+        if (r.kind === "skip") {
+          if (r.reason === "size-unverified") unverified.push(r.detail);
+          continue; // zero fill: no row (the leg number is already consumed)
+        }
+        sizeValue = r.sizeValue;
+        price = Number(r.priceE6) / 1_000_000;
       } else {
         price = await resolveFallbackPrice();
       }
@@ -632,6 +672,10 @@ export class TradeIndexerPolling {
       insertedAny = true;
     }
 
+    if (unverified.length > 0) {
+      // Executed size unprovable: write nothing rather than a requested size (phantom volume).
+      await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi size unverified: ${unverified[0]}`.slice(0, 480) }]);
+    }
     return insertedAny;
   }
 
