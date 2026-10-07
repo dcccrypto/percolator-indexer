@@ -330,6 +330,15 @@ const SWEEP_BATCH_SIZE = 25;
 /** Pause between sweep batches, to stay clear of RPC rate limits. */
 const SWEEP_BATCH_DELAY_MS = 250;
 
+/**
+ * #223: how long a newly discovered market whose identity resolves ONLY to the placeholder is
+ * held back from registration. Discovery runs every minute, so it can see a market mid-launch,
+ * before the wizard has set its price pool; inserting then would write the placeholder name,
+ * which syncMarkets never refreshes. Waiting lets the launch finish so the real name resolves.
+ * After the grace the placeholder is written as before (admin-oracle markets never resolve).
+ */
+export const PLACEHOLDER_REGISTRATION_GRACE_MS = 5 * 60_000;
+
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
@@ -337,6 +346,10 @@ export class StatsCollector {
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  /** #223: one shared in-flight registration pass (the sweep and the discovery hook never overlap). */
+  private syncInFlight: Promise<DbMarketRow[] | null> | null = null;
+  /** #223: when each still-unregistered slab was first seen missing (placeholder grace). */
+  private firstSeenMissingAt = new Map<string, number>();
   private _refreshingMetadata = false;
   /**
    * When the on-chain janitorial sweep last ran. 0 means "never", so the first
@@ -621,8 +634,29 @@ export class StatsCollector {
    * indexer_excluded pass instead of issuing a second full-table read in the
    * same cycle. Returns null when no read happened (or it failed), in which
    * case the caller falls back to fetching them itself.
+   *
+   * #223: concurrent callers (the collect sweep and the post-discovery hook) share one
+   * in-flight pass, so a market is never inserted twice by overlapping runs.
    */
-  private async syncMarkets(): Promise<DbMarketRow[] | null> {
+  private syncMarkets(): Promise<DbMarketRow[] | null> {
+    if (!this.syncInFlight) {
+      this.syncInFlight = this.doSyncMarkets().finally(() => {
+        this.syncInFlight = null;
+      });
+    }
+    return this.syncInFlight;
+  }
+
+  /**
+   * #223: register newly discovered markets right away. Wired to MarketDiscovery.onDiscovered,
+   * so a new market gets its `markets` row as soon as discovery sees it instead of on the next
+   * stats sweep (up to another COLLECT_INTERVAL_MS).
+   */
+  async registerNewMarkets(): Promise<void> {
+    await this.syncMarkets();
+  }
+
+  private async doSyncMarkets(): Promise<DbMarketRow[] | null> {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
@@ -659,6 +693,16 @@ export class StatsCollector {
       }
       if (blockedSkipped > 0) {
         logger.debug("Skipped blocked slabs during registration", { count: blockedSkipped });
+      }
+
+      // #223: placeholder grace bookkeeping — forget slabs that now have a row (or left the
+      // on-chain set), and stamp the first time each still-missing slab was seen.
+      const nowMs = Date.now();
+      for (const slab of [...this.firstSeenMissingAt.keys()]) {
+        if (dbSlabAddresses.has(slab) || !onChainMarkets.has(slab)) this.firstSeenMissingAt.delete(slab);
+      }
+      for (const [slab] of missingMarkets) {
+        if (!this.firstSeenMissingAt.has(slab)) this.firstSeenMissingAt.set(slab, nowMs);
       }
 
       if (missingMarkets.length === 0) return dbMarkets;
@@ -840,6 +884,14 @@ export class StatsCollector {
               symbol = baseSymbol;
               name = `${baseSymbol}/${collateralLabel} Perpetual`;
             } else {
+              // #223: a market seen mid-launch has no price pool yet, so only the placeholder
+              // is available — and this row is never refreshed. Hold it back for a grace
+              // window so the launch can finish and the real name resolve on a later pass.
+              const firstSeen = this.firstSeenMissingAt.get(slabAddress) ?? Date.now();
+              if (Date.now() - firstSeen < PLACEHOLDER_REGISTRATION_GRACE_MS) {
+                logger.info("Deferring market registration: identity not resolvable yet", { slabAddress });
+                continue;
+              }
               // Nothing on-chain identifies this market. Do NOT guess, and do NOT
               // keep the collateral's identity (that would label every market
               // "USDC"). A human sets the real values via PATCH /api/markets/[slab],
@@ -891,6 +943,7 @@ export class StatsCollector {
             logo_url: logoUrl,
           });
 
+          this.firstSeenMissingAt.delete(slabAddress);
           logger.info("Market registered", { slabAddress, symbol, name, hasLogo: logoUrl != null });
         } catch (err) {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });

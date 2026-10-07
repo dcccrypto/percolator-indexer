@@ -28,11 +28,34 @@ function isRateLimitError(err: unknown): boolean {
   return msg.includes("429") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("too many requests");
 }
 
+/**
+ * #223: how often the market set is refreshed when DISCOVERY_INTERVAL_MS is unset. A new
+ * market is only listed once it has a `markets` row, and when keeper-register doesn't write
+ * one (enrollment ceiling full, no DEX pool, creator left the page) this timer is what lets
+ * the indexer insert it — at 300s that meant up to ~6 minutes of "market not found".
+ */
+export const DEFAULT_DISCOVERY_INTERVAL_MS = 60_000;
+
+type DiscoveredListener = (markets: DiscoveredMarket[]) => void | Promise<void>;
+
 export class MarketDiscovery {
   private markets = new Map<string, { market: DiscoveredMarket }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private consecutiveFailures = 0;
   private _discovering = false;
+  private discoveredListeners: DiscoveredListener[] = [];
+
+  /**
+   * #223: run `fn` after every pass that refreshed the market set (so a just-discovered
+   * market can be registered right away instead of on the next stats sweep). Listener
+   * errors are logged and never affect discovery. Returns an unsubscribe function.
+   */
+  onDiscovered(fn: DiscoveredListener): () => void {
+    this.discoveredListeners.push(fn);
+    return () => {
+      this.discoveredListeners = this.discoveredListeners.filter((l) => l !== fn);
+    };
+  }
 
   async discover(): Promise<DiscoveredMarket[]> {
     if (this._discovering) {
@@ -40,10 +63,21 @@ export class MarketDiscovery {
       return [];
     }
     this._discovering = true;
+    let found: DiscoveredMarket[] = [];
     try {
-      return await this._doDiscover();
+      found = await this._doDiscover();
     } finally {
       this._discovering = false;
+    }
+    if (found.length > 0) this.notifyDiscovered(found);
+    return found;
+  }
+
+  private notifyDiscovered(markets: DiscoveredMarket[]): void {
+    for (const fn of this.discoveredListeners) {
+      Promise.resolve()
+        .then(() => fn(markets))
+        .catch((err) => logger.warn("onDiscovered listener failed", { error: err instanceof Error ? err.message : String(err) }));
     }
   }
 
@@ -217,7 +251,7 @@ export class MarketDiscovery {
     return this.markets;
   }
   
-  async start(intervalMs = 300_000) {
+  async start(intervalMs = DEFAULT_DISCOVERY_INTERVAL_MS) {
     // Initial discovery with retry + backoff
     let initialSuccess = false;
     for (let attempt = 0; attempt <= INITIAL_RETRY_DELAYS.length; attempt++) {
