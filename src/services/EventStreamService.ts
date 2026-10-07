@@ -6,6 +6,9 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 
 const log = createLogger("indexer:event-stream");
 
@@ -121,7 +124,9 @@ export class EventStreamService {
     // Fills on the same slab within one tx resolve to the same post-tx mark price,
     // so the fallback slab read is memoized per slab (it was previously repeated
     // once per fill). null = the read failed or returned nothing for that slab.
-    const priceBySlab = new Map<string, number | null>();
+    const priceBySlabAsset = new Map<string, number | null>(); // #221: per (slab, asset)
+    // 2 s per read, retried briefly (2 x 300 ms) on a transport error, then the post-clip request size.
+    const readMatcherContext = makeMatcherContextReader(() => this.deps.connection, typeof tx.slot === "number" ? tx.slot : null, { retries: 2, retryDelayMs: 300 });
 
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
@@ -143,20 +148,40 @@ export class EventStreamService {
       if (isBlockedSlab(slab)) continue;
 
       let priceE6Value = fill.priceE6 ?? 0;
+      let sizeAbs = fill.sizeAbs;
+      if (fill.cpi) {
+        // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
+        const r = await resolveCpiLeg({
+          evidence: fill.cpi, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs,
+          legPos: fill.legPos ?? 0, readContext: readMatcherContext, signature,
+        });
+        if (r.kind === "skip") {
+          if (r.reason !== "zero-fill") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
+          }
+          continue; // zero fill / strict skip: no row (the leg number is already consumed)
+        }
+        if (r.kind === "fill") {
+          sizeAbs = r.sizeValue;
+          priceE6Value = Number(r.priceE6);
+          if (!r.exact) log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature });
+        } // "legacy": wire size + the slab-read price below, exactly as before this parser
+      }
       if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
         // hit the slab for the authoritative post-tx mark price.
         // #170: isolate the fallback read — one failed slab read skips only THIS fill
         // instead of aborting the whole tx handler and losing every later fill.
-        if (!priceBySlab.has(slab)) {
+        const priceKey = `${slab}:${fill.assetIndex}`;
+        if (!priceBySlabAsset.has(priceKey)) {
           try {
-            priceBySlab.set(slab, await readMarkPriceE6(this.deps.connection, slab));
+            priceBySlabAsset.set(priceKey, await readMarkPriceE6(this.deps.connection, slab, fill.assetIndex));
           } catch (err) {
             log.warn("slab price fallback failed", { sig: signature, slab, err: String(err) });
-            priceBySlab.set(slab, null);
+            priceBySlabAsset.set(priceKey, null);
           }
         }
-        const fallback = priceBySlab.get(slab) ?? null;
+        const fallback = priceBySlabAsset.get(priceKey) ?? null;
         if (fallback == null) {
           log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
           continue;
@@ -176,7 +201,7 @@ export class EventStreamService {
         slab_address: slab,
         trader: fill.trader,
         side: fill.side,
-        size: fill.sizeAbs.toString(),
+        size: sizeAbs.toString(),
         price,
         fee: 0,
         tx_signature: signature,
@@ -186,7 +211,7 @@ export class EventStreamService {
       emits.push({
         slab,
         side: fill.side,
-        size: fill.sizeAbs.toString(),
+        size: sizeAbs.toString(),
         price,
         trader: fill.trader,
         key: tradeKey({ tx_signature: signature, asset_index: fill.assetIndex, leg_index: legIndex }),

@@ -1,6 +1,7 @@
 import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
+import { cpiEvidence, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
 
 /**
  * v17 single-fill trade tags (TradeNoCpi=6, TradeCpi=10).
@@ -337,6 +338,16 @@ export interface ParsedFill {
    * write a row from it (the poll and webhook paths resolve tag 44 against indexed history).
    */
   rebalanceReduce?: true;
+  /**
+   * TradeCpi / BatchTradeCpi only. What the transaction proves about the matcher call (booked
+   * price, zero fill, size handed to the matcher). `sizeAbs` above is the REQUESTED size and must
+   * not be written for these fills: pass this through `resolveCpiLeg` (parsers/matcherFill.ts).
+   */
+  cpi?: CpiEvidence;
+  /** Position of this fill inside its instruction (0 for single fills). */
+  legPos?: number;
+  /** The taker's fee CAP off the wire (not the fee charged). */
+  feeBps?: number;
 }
 
 /**
@@ -357,7 +368,12 @@ export interface ParsedFill {
 export function parsePercolatorFills(
   tx: {
     transaction?: { message?: { instructions?: any[] } };
-    meta?: { err?: unknown; logMessages?: string[] } | null;
+    meta?: {
+      err?: unknown;
+      logMessages?: string[];
+      innerInstructions?: Array<{ index: number; instructions?: any[] }> | null;
+      returnData?: { programId?: unknown; data?: unknown } | null;
+    } | null;
   },
   signature: string,
   programIds: string[],
@@ -370,7 +386,10 @@ export function parsePercolatorFills(
   const programIdSet = new Set(programIds);
   const fills: ParsedFill[] = [];
 
-  for (const ix of ixs) {
+  const innerGroups = tx.meta.innerInstructions;
+  const returnData = parseReturnData(tx.meta.returnData);
+
+  for (const [ixIdx, ix] of ixs.entries()) {
     // Skip parsed instructions (system, token, etc.) — same guard as TradeIndexer.
     if (ix && typeof ix === "object" && "parsed" in ix) continue;
 
@@ -416,6 +435,7 @@ export function parsePercolatorFills(
     if (SINGLE_TRADE_TAGS.has(tag)) {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
+      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, false) : undefined;
 
       fills.push({
         signature,
@@ -426,8 +446,11 @@ export function parsePercolatorFills(
         side: decoded.side,
         slabAddress,
         priceE6: undefined,
+        feeBps: decoded.feeBps,
+        ...(cpi ? { cpi, legPos: 0 } : {}),
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
+      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, true) : undefined;
       for (const leg of decodeV18BatchLegs(tag, data)) {
         fills.push({
           signature,
@@ -438,12 +461,49 @@ export function parsePercolatorFills(
           side: leg.side,
           slabAddress,
           priceE6: undefined,
+          feeBps: leg.feeBps,
+          ...(cpi ? { cpi, legPos: leg.legIndex } : {}),
         });
       }
     }
   }
 
   return fills;
+}
+
+function parseReturnData(rd: { programId?: unknown; data?: unknown } | null | undefined): { programId: string; data: Uint8Array } | null {
+  if (!rd) return null;
+  const programId = pubkeyToBase58(rd.programId);
+  const raw = Array.isArray(rd.data) ? rd.data[0] : rd.data;
+  if (!programId || typeof raw !== "string") return null;
+  try {
+    return { programId, data: Uint8Array.from(Buffer.from(raw, "base64")) };
+  } catch {
+    return null;
+  }
+}
+
+/** Evidence for one wrapper instruction from a `getTransaction`/`transactionSubscribe` (jsonParsed) shape. */
+export function cpiEvidenceFromParsed(
+  ix: { accounts?: unknown[] },
+  ixIdx: number,
+  innerGroups: Array<{ index: number; instructions?: any[] }> | null | undefined,
+  returnData: { programId: string; data: Uint8Array } | null,
+  isBatch: boolean,
+): CpiEvidence {
+  const accounts = (ix.accounts ?? []).map((a) => pubkeyToBase58(a) ?? "");
+  let inner: InnerIxLike[] | null = null;
+  if (Array.isArray(innerGroups)) {
+    inner = [];
+    for (const g of innerGroups) {
+      if (g.index !== ixIdx) continue;
+      for (const i of g.instructions ?? []) {
+        const pid = pubkeyToBase58(i?.programId);
+        if (pid && typeof i.data === "string") inner.push({ programId: pid, data: i.data });
+      }
+    }
+  }
+  return cpiEvidence(accounts, inner, returnData, isBatch);
 }
 
 /**

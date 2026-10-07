@@ -1,0 +1,100 @@
+{
+ "sig": "5fooxSGfJpwV2gCHjHfqy4zY15oCijPCTv8q23tbVGh8bWit3EUvExxGheD1uAW9WVq8JV6MPYLzzVF9d3ph14Kj",
+ "program": "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+ "note": "the ONLY TradeCpi (tag 10) among 1241 successful txs on the mainnet wrapper since 2026-05-07 (read-only, mainnet RPC). 29-byte wire, 8 accounts, matcher GDK8wx...: the pre-v18 layout.",
+ "tx": {
+  "signature": "x",
+  "slot": 418530632,
+  "transaction": {
+   "message": {
+    "instructions": [
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "KpqCST",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "3gJqkocMWaMm",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+      "accounts": [
+       "Af5bTkfT7wW8UTEcaJHWB9vmkBmpPB8P9UGzwifBci7H",
+       "J51cB2AdMNykW4X5KxALY82762stPCG57AXd7rsPnWYx",
+       "SysvarC1ock11111111111111111111111111111111",
+       "J51cB2AdMNykW4X5KxALY82762stPCG57AXd7rsPnWYx"
+      ],
+      "data": "9tvcg",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+      "accounts": [
+       "Af5bTkfT7wW8UTEcaJHWB9vmkBmpPB8P9UGzwifBci7H",
+       "7JVQvrAfzj3aasLxCkoLYX5KQcrb5nEZhUe5Qa8PvV5G",
+       "J51cB2AdMNykW4X5KxALY82762stPCG57AXd7rsPnWYx",
+       "SysvarC1ock11111111111111111111111111111111",
+       "J51cB2AdMNykW4X5KxALY82762stPCG57AXd7rsPnWYx",
+       "GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi",
+       "C9VLQQy3x9LtWscJmvT9s9urM9NeVKQVvjubPamPdxXU",
+       "C2DG2XauJsR5efEDrQLaTsUo9NVcgZzg4k2Qoj8ca2PS"
+      ],
+      "data": "TLA2GZwbPWC8ew3chB31eVsXXuM4Rjy9x6UfuUK",
+      "stackHeight": 1
+     },
+     {
+      "programId": "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95",
+      "accounts": [
+       "Af5bTkfT7wW8UTEcaJHWB9vmkBmpPB8P9UGzwifBci7H"
+      ],
+      "data": "Bh57NidTBHcbvyVjxVEFy2ppXmKbC3eqfDZ",
+      "stackHeight": 1
+     }
+    ]
+   }
+  },
+  "meta": {
+   "err": null,
+   "logMessages": [
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv invoke [1]",
+    "Program log: 0xc8a4c5, 0x0, 0x100, 0x13bc70d, 0x0",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv consumed 24811 of 619700 compute units",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv success",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv invoke [1]",
+    "Program GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi invoke [2]",
+    "Program GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi consumed 2299 of 580725 compute units",
+    "Program GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi success",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv consumed 47734 of 594889 compute units",
+    "Program ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv success",
+    "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 invoke [1]",
+    "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 consumed 1819 of 547155 compute units",
+    "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 success"
+   ],
+   "innerInstructions": [
+    {
+     "index": 3,
+     "instructions": [
+      {
+       "programId": "GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi",
+       "accounts": [
+        "C2DG2XauJsR5efEDrQLaTsUo9NVcgZzg4k2Qoj8ca2PS",
+        "C9VLQQy3x9LtWscJmvT9s9urM9NeVKQVvjubPamPdxXU"
+       ],
+       "data": "16TGqwAHkaxKEfcxaxSsMyFvzBq42An1VfNgPqr9M2saxhU5FiQS3MWvu9utwZUn8bHxUkcn5MMjc44nWWkb2YH9GTZ",
+       "stackHeight": 2
+      }
+     ]
+    }
+   ],
+   "returnData": null
+  }
+ }
+}

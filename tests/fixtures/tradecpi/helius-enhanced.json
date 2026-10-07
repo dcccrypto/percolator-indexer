@@ -1,0 +1,280 @@
+{
+ "note": "real Helius enhanced-transaction payloads (api-devnet.helius.xyz/v0/transactions), same shape as the webhook delivery; accountData stripped",
+ "txs": {
+  "373MgA5r7DQ4mwjExjMxZkQttwLxbnqzRfbWprbwEnEzKhPUVWU4XNh2PMFg7rhXUNTfpKLiaKpkP4vZF4FQkAPd": {
+   "signature": "373MgA5r7DQ4mwjExjMxZkQttwLxbnqzRfbWprbwEnEzKhPUVWU4XNh2PMFg7rhXUNTfpKLiaKpkP4vZF4FQkAPd",
+   "slot": 508208802,
+   "timestamp": 1791317394,
+   "transactionError": null,
+   "instructions": [
+    {
+     "accounts": [],
+     "data": "7YXqJ7",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "EAME71",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "3gJqkocMWaMm",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "DYvC67UeMeKkLiufhHxpAH8eyso3ZmPD3Y2jTo6PXZbf",
+      "C6vwNbvHRm4h8QbXcf2dxksjgb1jud9H3eTADXN6G9ev"
+     ],
+     "data": "11118Lw3mSx8z5nDDEeWgSiiWeNvE9T5otYij7jRFJo9xSF1X1WWx5Aj9mcT8ymVwS4hhy",
+     "programId": "11111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "DYvC67UeMeKkLiufhHxpAH8eyso3ZmPD3Y2jTo6PXZbf",
+      "A1btg95jvzhdV94ipio3DaddAdwUb6HhDqCxu8JjDZCr",
+      "C6vwNbvHRm4h8QbXcf2dxksjgb1jud9H3eTADXN6G9ev"
+     ],
+     "data": "2",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "DYvC67UeMeKkLiufhHxpAH8eyso3ZmPD3Y2jTo6PXZbf",
+      "A1btg95jvzhdV94ipio3DaddAdwUb6HhDqCxu8JjDZCr",
+      "C6vwNbvHRm4h8QbXcf2dxksjgb1jud9H3eTADXN6G9ev",
+      "9V7B96awjMUPURSgodVipxH9CGhyEu35q32JfSFGcSwK",
+      "944i3AYDAugKKLxizoRbet5zaUsHNhHTfTZ7rHDAPkTF",
+      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+     ],
+     "data": "uAGy1qLPdzgJa6C5F4Q1r9u4KBHi1XExngMgDMGpBQJB",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": [
+      {
+       "accounts": [
+        "9V7B96awjMUPURSgodVipxH9CGhyEu35q32JfSFGcSwK",
+        "944i3AYDAugKKLxizoRbet5zaUsHNhHTfTZ7rHDAPkTF",
+        "DYvC67UeMeKkLiufhHxpAH8eyso3ZmPD3Y2jTo6PXZbf"
+       ],
+       "data": "3az6uZhfFhSf",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+      }
+     ]
+    },
+    {
+     "accounts": [
+      "DYvC67UeMeKkLiufhHxpAH8eyso3ZmPD3Y2jTo6PXZbf",
+      "A1btg95jvzhdV94ipio3DaddAdwUb6HhDqCxu8JjDZCr",
+      "C6vwNbvHRm4h8QbXcf2dxksjgb1jud9H3eTADXN6G9ev",
+      "6sREhdWcb2hQjgQ3kC4wVG1jHb3NRNYGAgeXp17dd7N5",
+      "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+      "FkREnuYhzvmmeprXom3Fgsg2LPgoLd3ii5c8EcJcWdeQ",
+      "AGQwJFrxo1ug5SXezPZsU4GVgo7CTndFyEhcP73oXFAw"
+     ],
+     "data": "4A3TfYoonQhhFapPHYo4y3hN7njcAdciNBKo3rYykRRst2BAcimDZuY9KeESyM4D8o65E94QyFwuKY9cMyyeE1wsBRWSwuHwjMNucgBvxMv3xdqh6Rps",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": [
+      {
+       "accounts": [
+        "AGQwJFrxo1ug5SXezPZsU4GVgo7CTndFyEhcP73oXFAw",
+        "FkREnuYhzvmmeprXom3Fgsg2LPgoLd3ii5c8EcJcWdeQ"
+       ],
+       "data": "15tCKKJzSXSXqineiFjGfMtQLJgZCS2X4N2M8V5FCXLWFQDFKJMWEjnPMSshko3d3cnYpjqcGWCfrP1Th3SZsBftEtFZ9xYU8BtZmtPb8NSGm7TVq",
+       "programId": "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX"
+      }
+     ]
+    }
+   ],
+   "accountData": []
+  },
+  "D8wHdvXXPR5TXS599viThQNdsJY3qsxSNV4X6tMG193QCvkdu1de2Mv9KWdjjfVz2KfkWhyMaHjsW4eAufEdmva": {
+   "signature": "D8wHdvXXPR5TXS599viThQNdsJY3qsxSNV4X6tMG193QCvkdu1de2Mv9KWdjjfVz2KfkWhyMaHjsW4eAufEdmva",
+   "slot": 507800847,
+   "timestamp": 1791219856,
+   "transactionError": null,
+   "instructions": [
+    {
+     "accounts": [],
+     "data": "7YXqJ7",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "HbZp6b",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "3gJqkocMWaMm",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "GfADs9d2Fm1TGWVbbk1P7KtMpzkaRL3faZervnCs857i",
+      "Ar6khqrJVfPDx1KGmSP6Q4hxre6NNm66GpDJPHG1oF6N",
+      "7k6fSndC68L7FWVhxKwyAEA39EWiKbGqWDPvq7DooQgY",
+      "9VSQXq93QMq85heeMYhcePUCPABm1Rpf96fzq5aGVwDM",
+      "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+      "FKyHS7cj7yZDhfqGnEoPeBZBw7mhrW4cGfLfZ8qxnHWS",
+      "68nJKSHUMe5LdFrZDD4XNQ674MbufjVCmvJjghY1HRFW"
+     ],
+     "data": "4ApxGh1Z57wy74TeFPAqvaNMZ12n1EhSkA4PnpmmTXJXf1pVqySGyFSHcrPxq9UT8aSRWXhFizTnbAsohoGAJxUaySRauyb4T5WyqGzzYYNiLGY2NL71",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": [
+      {
+       "accounts": [
+        "68nJKSHUMe5LdFrZDD4XNQ674MbufjVCmvJjghY1HRFW",
+        "FKyHS7cj7yZDhfqGnEoPeBZBw7mhrW4cGfLfZ8qxnHWS"
+       ],
+       "data": "1DXTWLENG3S9W9mvt785Uv8UCZNnfXiqaijnx5vZyTv4aTw6QsY982cQPe6B7UQxRwpAd28puoV8N1b88fRAfQuAWi8br39htfGVXD9k2krtVzqNw",
+       "programId": "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX"
+      }
+     ]
+    }
+   ],
+   "accountData": []
+  },
+  "2HpztiA8DN5jWftCQ3LUCP3CcDWJ4SjX8tyA89gRG6z7iJMqoHkR1wAg2DgVR9pasmZ7fL2UrhZ9yA4Yo4CSKUAp": {
+   "signature": "2HpztiA8DN5jWftCQ3LUCP3CcDWJ4SjX8tyA89gRG6z7iJMqoHkR1wAg2DgVR9pasmZ7fL2UrhZ9yA4Yo4CSKUAp",
+   "slot": 507253634,
+   "timestamp": 1791090982,
+   "transactionError": null,
+   "instructions": [
+    {
+     "accounts": [],
+     "data": "7YXqJ7",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "L7Npg7",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "3gJqkocMWaMm",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "3d2Fi3eTFZG3z2u1nvsbHv5naCMojsu6kJeVL6Tu3sud",
+      "6Y4bfYLWrhabgzU4p3onx9CeW1jCKjGjjSCaoCHf2Q9R",
+      "66xQz2PXbpgMKU7YrEvfAhifPhk4FSfdy5YR3GjDmrzF",
+      "4rEz9NbcPPB6cKgsG2A5WhPD4R1CLxRLYfUYjVXuJHmj",
+      "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+      "5krGCmiseWfghg1Pijgea9WDU369pNsmat2XsPycZ5Qt",
+      "H5vTxZ45KzgTk4DQvQdaHFpeXRJNKTA6sVSKVZM42GnX"
+     ],
+     "data": "4A7bYCTnSqYSsibxHMNgh1DGnzQ5RbXsVT2aPaa9BFRD8f41pUH8c2ctFwA3Kh6QxEJUAMsc2qArPmNZs9tbDjSDwjUPhyLKp1e9neQo5Jt3frVh5AJ3",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": []
+    }
+   ],
+   "accountData": []
+  },
+  "5Jy8aZEdzzjy3cKHzrZmv9kroSiaxcJh7fbYhVXudBSxGRRf6Lt22g2i7KUh9AHVQcuVPDgyG5nvn5t1Er4DhqRz": {
+   "signature": "5Jy8aZEdzzjy3cKHzrZmv9kroSiaxcJh7fbYhVXudBSxGRRf6Lt22g2i7KUh9AHVQcuVPDgyG5nvn5t1Er4DhqRz",
+   "slot": 507467779,
+   "timestamp": 1791141195,
+   "transactionError": null,
+   "instructions": [
+    {
+     "accounts": [],
+     "data": "7YXqJ7",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "KFkG5d",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [],
+     "data": "3gJqkocMWaMm",
+     "programId": "ComputeBudget111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "9fie3RtdBTLnhWXDWmiVe9XGVVmJykFNwD38rnoiRDJW",
+      "2xowUgZuRS3KXvfkJnKRh6rcMpWr5FNxpb69q17QULFy"
+     ],
+     "data": "11118Lw3mSx8z5nDDEeWgSiiWeNvE9T5otYij7jRFJo9xSF1X1WWx5Aj9mcT8ymVwS4hhy",
+     "programId": "11111111111111111111111111111111",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "9fie3RtdBTLnhWXDWmiVe9XGVVmJykFNwD38rnoiRDJW",
+      "9efj3hdgb2qQvkHKYP9DjZYJQZqC1XiY5XgCiZkvss7u",
+      "2xowUgZuRS3KXvfkJnKRh6rcMpWr5FNxpb69q17QULFy"
+     ],
+     "data": "2",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": []
+    },
+    {
+     "accounts": [
+      "9fie3RtdBTLnhWXDWmiVe9XGVVmJykFNwD38rnoiRDJW",
+      "9efj3hdgb2qQvkHKYP9DjZYJQZqC1XiY5XgCiZkvss7u",
+      "2xowUgZuRS3KXvfkJnKRh6rcMpWr5FNxpb69q17QULFy",
+      "DJR45xMxWiMTPguC9RHiALvJH2yUmXG8H3PaFkpXP31j",
+      "GtpJUXdTGfDQsYLksJH72DArZye3jb7jcxVr2WxiD5sR",
+      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+     ],
+     "data": "u6NZNLcJkABbAQ56jZ8ZxDwuZVWUch1c8Ny7ivhL4eVD",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": [
+      {
+       "accounts": [
+        "DJR45xMxWiMTPguC9RHiALvJH2yUmXG8H3PaFkpXP31j",
+        "GtpJUXdTGfDQsYLksJH72DArZye3jb7jcxVr2WxiD5sR",
+        "9fie3RtdBTLnhWXDWmiVe9XGVVmJykFNwD38rnoiRDJW"
+       ],
+       "data": "3JqTGFiTABJP",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+      }
+     ]
+    },
+    {
+     "accounts": [
+      "9fie3RtdBTLnhWXDWmiVe9XGVVmJykFNwD38rnoiRDJW",
+      "9efj3hdgb2qQvkHKYP9DjZYJQZqC1XiY5XgCiZkvss7u",
+      "2xowUgZuRS3KXvfkJnKRh6rcMpWr5FNxpb69q17QULFy",
+      "CVKBrZ5QnB6iyzXrbYEyJGC3UNBk4EbpBWGVzHEfko55",
+      "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+      "D2zGsGDyzEv7cb8Zf65e13hYsY88KmGT4NrpF8zaTKMw",
+      "BW1VP9bdFocddNPctczAmFHjbKKqvo6mdXpFWc4SCdK8"
+     ],
+     "data": "49yKnu9q7yrwdT2pHkDTF6BTSb58ufhZEud1i8XpKbSYdPJKQyFJXnTQPMJrd121KMsgHvvqhzD8418LjaAafk1vibFFk945b2uEhG4Q2etZn9Qm3zmM",
+     "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+     "innerInstructions": [
+      {
+       "accounts": [
+        "BW1VP9bdFocddNPctczAmFHjbKKqvo6mdXpFWc4SCdK8",
+        "D2zGsGDyzEv7cb8Zf65e13hYsY88KmGT4NrpF8zaTKMw"
+       ],
+       "data": "12hW9tm5rE7MpD3LwoMTo5C7FJkZrQ39twHgCNsVFPZdSy1bAxZjPoeJkfYNCsyejhnuv7z2Zg8GCSjUCEjcTdhJHW3sg1tc9znjiHaa4Dvdzr7Ae",
+       "programId": "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX"
+      }
+     ]
+    }
+   ],
+   "accountData": []
+  }
+ }
+}

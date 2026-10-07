@@ -14,9 +14,19 @@ import {
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
-import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
+import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 
 const logger = createLogger("indexer:trade-indexer");
+
+/** The matcher-context read failed in transport; this signature is retried once before falling back. */
+class CtxReadRetry extends Error {
+  constructor(readonly signature: string) { super("matcher context read failed; signature will be retried"); }
+}
 
 /** Alert (error log + Sentry) when a slab's cursor has been held by the mass-skip breaker for K consecutive polls. */
 const breakerTracker = createBreakerTracker(breakerAlertPolls(), (slab, polls) => {
@@ -72,6 +82,8 @@ export class TradeIndexerPolling {
   private lastSignature = new Map<string, string>();
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
+  private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   private hasBackfilled = false;
   private backfillAttempts = 0;
 
@@ -252,10 +264,12 @@ export class TradeIndexerPolling {
 
     let indexed = 0;
     let batchFailed = false;
+    let holdCursor = false;
     const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
+    windowLoop:
     for (let i = 0; i < validSigs.length; i += TX_BATCH_SIZE) {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
       // X-1: isolate an unreadable (e.g. v1-version) transaction instead of letting one poisoned signature
@@ -305,6 +319,16 @@ export class TradeIndexerPolling {
           if (didIndex) indexed++;
           pass.earlier.add(sig);
         } catch (err) {
+          if (err instanceof CtxReadRetry) {
+            // Transient matcher-context read failure: this signature must be retried, so the cursor
+            // must not pass it, and NOTHING after it may be processed ahead of it (oldest-first
+            // order: a tag 44 resolves against earlier fills). The next poll re-fetches the window,
+            // skips stored legs, and (attempt recorded) falls back to the request size, which
+            // cannot throw again, so the hold lasts at most one poll.
+            holdCursor = true;
+            logger.warn("matcher context read failed; holding the cursor, this signature is retried once on the next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8) });
+            break windowLoop;
+          }
           pass.incomplete = true;
           // Non-fatal: skip this tx, continue with others
           logger.warn("Failed to process transaction", {
@@ -317,7 +341,7 @@ export class TradeIndexerPolling {
 
     // #147: Only commit the cursor after the full batch is fetched and processed.
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
-    if (!batchFailed) {
+    if (!batchFailed && !holdCursor) {
       this.lastSignature.set(slabAddress, signatures[0].signature);
     }
 
@@ -405,6 +429,14 @@ export class TradeIndexerPolling {
       identSeen.set(k, n);
       return n;
     };
+    // Rank among this tx's TradeCpi legs of the same (slab, asset, trader, side), size-independent.
+    const cpiSeen = new Map<string, number>();
+    const cpiOrdinalOf = (slab: string, asset: number, trader: string, side: string): number => {
+      const k = `${slab}|${asset}|${trader}|${side}`;
+      const n = (cpiSeen.get(k) ?? 0) + 1;
+      cpiSeen.set(k, n);
+      return n;
+    };
     // No transaction-level "already indexed?" gate: tradeExistsBySignature filters on
     // (signature, network) only, so after ONE leg is written (by any path, or by an
     // earlier pass that then threw on a later leg) it would hide every remaining leg
@@ -415,18 +447,38 @@ export class TradeIndexerPolling {
     // Fallback price (slab read) resolved lazily, ONCE per transaction, shared by
     // every leg and instruction that lacks a wire exec_price. A tx that is already
     // fully indexed therefore costs at most one slab read, not one per leg.
-    let fallbackPrice: number | null = null;
-    const resolveFallbackPrice = async (): Promise<number> => {
-      if (fallbackPrice === null) {
-        fallbackPrice = this.extractPriceFromLogs(tx);
-        if (fallbackPrice === 0) {
-          fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+    // #221: per ASSET. This is a LATEST-state read of the asset's booked effective_price (the poll
+    // path has no tx post-state), so it is APPROXIMATE: it drifts with oracle pushes. Used only
+    // where there is no matcher CPI to read the exact price from (tag 44, TradeNoCpi without a price).
+    const fallbackPriceByAsset = new Map<number, number>();
+    const resolveFallbackPrice = async (assetIndex: number): Promise<number> => {
+      let price = fallbackPriceByAsset.get(assetIndex);
+      if (price === undefined) {
+        price = this.extractPriceFromLogs(tx);
+        if (price === 0) {
+          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress, assetIndex);
         }
+        fallbackPriceByAsset.set(assetIndex, price);
       }
-      return fallbackPrice;
+      return price;
     };
 
-    for (const ix of message.instructions) {
+    // TradeCpi / BatchTradeCpi: the instruction carries the REQUESTED size; the executed size and
+    // the booked price come from the matcher call (see parsers/matcherFill.ts). Reader is only
+    // used when a fill needs the matcher context account.
+    // Context reads: 2 s per call. A transport error is REPORTED the first time (the signature is
+    // retried on the next pass, cursor held) because a size written after a transient failure is
+    // permanent (unique index); the retry then falls back to the post-clip request size.
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), tx.slot);
+    const onReadError: "report" | "fallback" = (this.ctxReadAttempts.get(signature) ?? 0) >= 1 ? "fallback" : "report";
+    let retryNeeded = false;
+    const returnDataRaw = (tx.meta as { returnData?: unknown }).returnData as { programId?: unknown; data?: unknown } | null | undefined;
+    const returnData = returnDataRaw && Array.isArray(returnDataRaw.data) && typeof returnDataRaw.data[0] === "string"
+      ? { programId: String(returnDataRaw.programId), data: Uint8Array.from(Buffer.from(returnDataRaw.data[0], "base64")) }
+      : null;
+    const unverified: string[] = [];
+
+    for (const [ixIdx, ix] of message.instructions.entries()) {
       // Skip parsed instructions (system, token, etc.)
       if ("parsed" in ix) continue;
 
@@ -474,7 +526,7 @@ export class TradeIndexerPolling {
           await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
           continue;
         }
-        const price = await resolveFallbackPrice();
+        const price = await resolveFallbackPrice(reduce.assetIndex); // tag 44: no matcher CPI, effective_price is its only exact source
         // The engine charges no trading fee on tag 44.
         const inserted = await insertTradeRow({
           slab_address: slabAddress,
@@ -532,9 +584,11 @@ export class TradeIndexerPolling {
         // #205: fall back to the slab read only when the leg itself doesn't carry
         // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
         const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> =>
-          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice();
+          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice(leg.assetIndex);
 
         const i128Max = (1n << 127n) - 1n;
+
+        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, true) : null;
 
         for (const leg of legs) {
           // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
@@ -543,16 +597,38 @@ export class TradeIndexerPolling {
           touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
           // Already stored (same leg, or this fill under the old per-instruction numbering)? Skip it
           // before any price read; the insert's own dedup stays the backstop if this lookup failed.
-          const ordinal = ordinalOf(slabAddress, leg.assetIndex, trader, leg.side, leg.sizeValue.toString());
-          if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal }, reduceLegs)) continue;
-          const price = await resolvePrice(leg);
-          const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
+          if (batchCpi) {
+            if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, ordinal: cpiOrdinalOf(slabAddress, leg.assetIndex, trader, leg.side) }, reduceLegs)) continue;
+          } else {
+            const ordinal = ordinalOf(slabAddress, leg.assetIndex, trader, leg.side, leg.sizeValue.toString());
+            if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal }, reduceLegs)) continue;
+          }
+          let legSize = leg.sizeValue;
+          let price: number | undefined;
+          if (batchCpi) {
+            // All-or-nothing per transaction: once one leg needs a retry, write none of its later
+            // legs in this pass (their stored-leg rank would make the retry drop the unwritten leg).
+            if (retryNeeded) continue;
+            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError, signature });
+            if (r.kind === "read-error") { retryNeeded = true; continue; }
+            if (r.kind === "skip") {
+              if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
+              continue;
+            }
+            if (r.kind === "fill") {
+              legSize = r.sizeValue;
+              price = Number(r.priceE6) / 1_000_000;
+              if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
+            } // "legacy": wire size + the existing price logic, exactly as before this parser
+          }
+          if (price === undefined) price = await resolvePrice(leg);
+          const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
           const inserted = await insertTradeRow({
             slab_address: slabAddress,
             trader,
             side: leg.side,
-            size: leg.sizeValue.toString(),
+            size: legSize.toString(),
             price,
             fee,
             tx_signature: signature,
@@ -560,7 +636,7 @@ export class TradeIndexerPolling {
             leg_index: legIndex,
           });
           if (!inserted) continue; // duplicate leg: already indexed, no event, no count
-          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: leg.sizeValue.toString() });
+          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: legSize.toString() });
           insertedAny = true;
         }
         continue;
@@ -570,7 +646,8 @@ export class TradeIndexerPolling {
       // v18 byte layout (the two tags have DIFFERENT offsets in v18).
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
-      const { sizeValue, side } = decoded;
+      let { sizeValue } = decoded;
+      const { side } = decoded;
       const legIndex = fillSeq++;
 
       // Determine trader from account keys
@@ -579,19 +656,39 @@ export class TradeIndexerPolling {
       const trader = traderKey.toBase58();
       touched.add(`${trader}|${slabAddress}|${decoded.assetIndex}`);
       {
-        const ordinal = ordinalOf(slabAddress, decoded.assetIndex, trader, side, sizeValue.toString());
-        if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, size: sizeValue.toString(), ordinal }, reduceLegs)) continue;
+        if (tag === IX_TAG.TradeCpi) {
+          if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, ordinal: cpiOrdinalOf(slabAddress, decoded.assetIndex, trader, side) }, reduceLegs)) continue;
+        } else {
+          const ordinal = ordinalOf(slabAddress, decoded.assetIndex, trader, side, sizeValue.toString());
+          if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, size: sizeValue.toString(), ordinal }, reduceLegs)) continue;
+        }
       }
 
       // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
       // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the
       // requested cap), so it still falls back to the slab read.
-      let price: number;
+      let price: number | undefined;
       if (decoded.execPriceE6 !== undefined) {
         price = Number(decoded.execPriceE6) / 1_000_000;
-      } else {
-        price = await resolveFallbackPrice();
+      } else if (tag === IX_TAG.TradeCpi) {
+        if (retryNeeded) continue; // all-or-nothing per transaction (see the batch branch)
+        // #213/#221: executed size + booked price from the matcher call, never the request/mark.
+        const r = await resolveCpiLeg({
+          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false),
+          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature,
+        });
+        if (r.kind === "read-error") { retryNeeded = true; continue; }
+        if (r.kind === "skip") {
+          if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
+          continue; // zero fill: no row (the leg number is already consumed)
+        }
+        if (r.kind === "fill") {
+          sizeValue = r.sizeValue;
+          price = Number(r.priceE6) / 1_000_000;
+          if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
+        } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
+      if (price === undefined) price = await resolveFallbackPrice(decoded.assetIndex);
       const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
 
       // Validate inputs
@@ -632,6 +729,17 @@ export class TradeIndexerPolling {
       insertedAny = true;
     }
 
+    if (unverified.length > 0) {
+      // Fill not decodable (or strict policy): nothing written, signature kept for re-index.
+      await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi ${unverified[0]}`.slice(0, 480) }]);
+    }
+    if (retryNeeded) {
+      // Transport failure reading the matcher context: do not write a size that can never be
+      // corrected. Hold the cursor; the next pass re-reads (stored legs are skipped), then falls back.
+      this.ctxReadAttempts.set(signature, 1);
+      throw new CtxReadRetry(signature);
+    }
+    this.ctxReadAttempts.delete(signature);
     return insertedAny;
   }
 
@@ -660,7 +768,7 @@ export class TradeIndexerPolling {
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
-  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string): Promise<number> {
+  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
         () => connection.getAccountInfo(new PublicKey(slabAddress)),
@@ -673,6 +781,10 @@ export class TradeIndexerPolling {
       if (!info?.data) return 0;
 
       const rawData = new Uint8Array(info.data);
+
+      // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
+      const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
+      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (isV17Account(rawData)) {

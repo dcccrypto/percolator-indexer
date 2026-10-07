@@ -10,6 +10,14 @@ const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
   Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
 );
 
+// These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
+// (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
+// wire size at a fixed price here.
+vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/parsers/matcherFill.js')>()),
+  resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
+}));
+
 vi.mock('@percolatorct/sdk', () => ({
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
@@ -30,6 +38,10 @@ vi.mock('@percolatorct/sdk', () => ({
 // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
 // Resolves true = row written, false = duplicate leg (23505 swallowed).
 vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn(async () => true) }));
+
+// #221: the fill-price reader. Default null = "not a readable v18 slot", which keeps
+// every existing test on its legacy mark path; the #221 tests below set a price.
+vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: vi.fn(() => null) }));
 
 vi.mock('@percolatorct/shared', () => ({
   config: {
@@ -87,6 +99,7 @@ import { resetSkippedSignatureDedupe } from '../../src/lib/skippedSignatures.js'
 import { TradeIndexerPolling } from '../../src/services/TradeIndexer.js';
 import * as shared from '@percolatorct/shared';
 import { insertTradeRow } from '../../src/db/insertTradeRow.js';
+import { readAssetEffectivePriceE6 } from '../../src/parsers/markPrice.js';
 
 const SLAB = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
@@ -680,6 +693,53 @@ describe('TradeIndexerPolling', () => {
       expect(rows[0]).toEqual(expect.objectContaining({ slab_address: SLAB, leg_index: 1 }));
     }, 10000);
   });
+  describe('#221 — fills with no matcher CPI to read the price from use the asset\'s booked effective_price', () => {
+    // TradeCpi is priced from its matcher CPI (tests/matcher-fill*.test.ts); the slab read is the
+    // fallback for TradeNoCpi without a wire price and for tag 44. TradeNoCpi (mocked tag 10) here.
+    function tradeCpiData(): Uint8Array {
+      const d = new Uint8Array(77);
+      d[0] = 10; // IX_TAG.TradeNoCpi (mocked); exec_price @59 left 0 = absent
+      d[43] = 0x40; d[44] = 0x42; d[45] = 0x0f;
+      return d;
+    }
+    const ix = (data: string) => ({
+      programId: new PublicKey(PROGRAM_ID),
+      accounts: [new PublicKey(TRADER), new PublicKey(TRADER), new PublicKey(SLAB)],
+      data,
+    });
+
+    afterEach(() => {
+      vi.mocked(readAssetEffectivePriceE6).mockReset();
+      vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => null);
+      mockGetAccountInfo.mockReset();
+      mockGetAccountInfo.mockImplementation(async () => null);
+    });
+
+    it('stores the booked price (not the mark), reading the slab once per asset', async () => {
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      vi.mocked(shared.decodeBase58).mockImplementation(() => tradeCpiData());
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
+      mockGetParsedTransaction.mockResolvedValue({
+        meta: { err: null, logMessages: [] },
+        transaction: { message: { instructions: [ix('l0'), ix('l1'), ix('l2')] } },
+      });
+      mockGetAccountInfo.mockImplementation(async () => ({ data: Buffer.alloc(64) }) as any);
+      vi.mocked(readAssetEffectivePriceE6).mockImplementation((_raw, assetIndex) =>
+        assetIndex === 0 ? 13_614_586 : null,
+      );
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+
+      const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+      expect(rows).toHaveLength(3);
+      for (const r of rows) expect(r.price).toBe(13.614586);
+      // Three legs on the same asset share ONE slab read, and it is asked for asset 0.
+      expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(readAssetEffectivePriceE6).mock.calls.map((c) => c[1])).toEqual([0]);
+    }, 10000);
+  });
+
   describe('split order — per-leg dedup, no transaction-level gate', () => {
     // A fake `trades` table keyed like the unique index (tx_signature, asset_index, leg_index).
     // insertTradeRow resolves true for a new row and false for a duplicate (23505 swallowed);
@@ -761,14 +821,14 @@ describe('TradeIndexerPolling', () => {
       expect(shared.tradeExistsBySignature).not.toHaveBeenCalled();
     });
 
-    it('an already fully indexed tx costs one slab read in total, not one per leg, and publishes nothing', async () => {
+    it('an already fully indexed tx reads no slab (CPI fills are priced from the matcher call) and publishes nothing', async () => {
       for (const l of [0, 1, 2]) db.add(`${VALID_SIG}|0|${l}`);
       const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
 
       const didIndex = await (indexer as any).processTransaction(threeLegTx(), VALID_SIG, SLAB, programIds);
 
       expect(didIndex).toBe(false);
-      expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
+      expect(mockGetAccountInfo).not.toHaveBeenCalled();
       expect(shared.eventBus.publish).not.toHaveBeenCalled();
     });
   });

@@ -128,3 +128,24 @@ export function reduceAlreadyStored(
     return /^\d+$/.test(sz) && BigInt(sz) <= r.reduceQ;
   });
 }
+
+/**
+ * TradeCpi / BatchTradeCpi legs: is this fill already stored, whatever SIZE it was stored with?
+ * A TradeCpi row's size is the executed (or post-clip) size, not the wire size, and a transaction
+ * indexed before the executed size was read holds the wire size, so identity by size no longer
+ * works. True when a row exists at exactly (slab, asset, leg_index), or the stored non-liquidation,
+ * non-tag-44 rows hold at least `ordinal` fills of the same (slab, asset, trader, side) at other
+ * leg numbers (the same fill under the old per-instruction numbering; `ordinal` is the 1-based rank
+ * of this leg among the transaction's TradeCpi legs with that key, so a split order's legs are not
+ * all dropped because one is stored).
+ */
+export function cpiFillAlreadyStored(
+  stored: StoredLeg[] | null,
+  f: { slab: string; assetIndex: number; legIndex: number; trader: string; side: "long" | "short"; ordinal: number },
+  reduceLegs?: ReadonlySet<number>,
+): boolean {
+  if (!stored) return false;
+  const fills = stored.filter((r) => !r.is_liquidation && r.slab_address === f.slab && r.asset_index === f.assetIndex && !reduceLegs?.has(r.leg_index));
+  if (fills.some((r) => r.leg_index === f.legIndex)) return true;
+  return fills.filter((r) => r.trader === f.trader && r.side === f.side).length >= f.ordinal;
+}
