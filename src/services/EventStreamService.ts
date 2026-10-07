@@ -118,10 +118,11 @@ export class EventStreamService {
     const rows: IndexerTradeRow[] = [];
     const emits: Array<{ slab: string; side: "long" | "short"; size: string; price: number; trader: string; key: string }> = [];
 
-    // Fills on the same slab within one tx resolve to the same post-tx mark price,
-    // so the fallback slab read is memoized per slab (it was previously repeated
-    // once per fill). null = the read failed or returned nothing for that slab.
-    const priceBySlab = new Map<string, number | null>();
+    // #221: a fill is priced at its asset's effective_price (the price the engine
+    // booked it at), so the fallback slab read is memoized per (slab, asset) — fills
+    // on the same asset in one tx share it; a batch spanning assets reads each once.
+    // null = the read failed or returned nothing for that slab/asset.
+    const priceBySlabAsset = new Map<string, number | null>();
 
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
@@ -142,18 +143,19 @@ export class EventStreamService {
       let priceE6Value = fill.priceE6 ?? 0;
       if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always
-        // hit the slab for the authoritative post-tx mark price.
+        // hit the slab: the asset's effective_price is the fill's booked price (#221).
         // #170: isolate the fallback read — one failed slab read skips only THIS fill
         // instead of aborting the whole tx handler and losing every later fill.
-        if (!priceBySlab.has(slab)) {
+        const priceKey = `${slab}:${fill.assetIndex}`;
+        if (!priceBySlabAsset.has(priceKey)) {
           try {
-            priceBySlab.set(slab, await readMarkPriceE6(this.deps.connection, slab));
+            priceBySlabAsset.set(priceKey, await readMarkPriceE6(this.deps.connection, slab, fill.assetIndex));
           } catch (err) {
             log.warn("slab price fallback failed", { sig: signature, slab, err: String(err) });
-            priceBySlab.set(slab, null);
+            priceBySlabAsset.set(priceKey, null);
           }
         }
-        const fallback = priceBySlab.get(slab) ?? null;
+        const fallback = priceBySlabAsset.get(priceKey) ?? null;
         if (fallback == null) {
           log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
           continue;

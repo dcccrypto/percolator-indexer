@@ -5,6 +5,7 @@ import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEAD
 import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
 import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -353,18 +354,22 @@ export class TradeIndexerPolling {
     // unique index (tx_signature, asset_index, leg_index): insertTradeRow swallows
     // 23505 and reports whether the row was new. Same model as the webhook batch path.
     //
-    // Fallback price (slab read) resolved lazily, ONCE per transaction, shared by
-    // every leg and instruction that lacks a wire exec_price. A tx that is already
-    // fully indexed therefore costs at most one slab read, not one per leg.
-    let fallbackPrice: number | null = null;
-    const resolveFallbackPrice = async (): Promise<number> => {
-      if (fallbackPrice === null) {
-        fallbackPrice = this.extractPriceFromLogs(tx);
-        if (fallbackPrice === 0) {
-          fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+    // Fallback price (slab read) resolved lazily, ONCE per transaction per ASSET, shared
+    // by every leg and instruction on that asset that lacks a wire exec_price. A tx that
+    // is already fully indexed therefore costs at most one slab read per asset, not one
+    // per leg. #221: the fallback is that asset's booked effective_price, and one tx can
+    // carry legs on different assets.
+    const fallbackPriceByAsset = new Map<number, number>();
+    const resolveFallbackPrice = async (assetIndex: number): Promise<number> => {
+      let price = fallbackPriceByAsset.get(assetIndex);
+      if (price === undefined) {
+        price = this.extractPriceFromLogs(tx);
+        if (price === 0) {
+          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress, assetIndex);
         }
+        fallbackPriceByAsset.set(assetIndex, price);
       }
-      return fallbackPrice;
+      return price;
     };
 
     for (const ix of message.instructions) {
@@ -419,7 +424,7 @@ export class TradeIndexerPolling {
         // #205: fall back to the slab read only when the leg itself doesn't carry
         // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
         const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> =>
-          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice();
+          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice(leg.assetIndex);
 
         const i128Max = (1n << 127n) - 1n;
 
@@ -467,7 +472,7 @@ export class TradeIndexerPolling {
       if (decoded.execPriceE6 !== undefined) {
         price = Number(decoded.execPriceE6) / 1_000_000;
       } else {
-        price = await resolveFallbackPrice();
+        price = await resolveFallbackPrice(decoded.assetIndex);
       }
       const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
 
@@ -530,14 +535,18 @@ export class TradeIndexerPolling {
   }
 
   /**
-   * Fallback: read mark_price_e6 from the slab account's on-chain state.
-   * This gives the current mark price (close to execution price for recent trades).
+   * Fallback: the fill's price from the slab account's on-chain state.
+   *
+   * #221: on a v18 market this is `asset[assetIndex].effective_price` — the exact price
+   * the engine books a fill at, which the trade itself never moves. The mark EWMA below
+   * is only the fallback (non-v18 layout / unreadable slot): a matcher fill nudges it
+   * toward the matcher's quote, so it reads high after a long and low after a short.
    *
    * Desync fix (finding 9 / TradeIndexer path): v17 accounts use parseWrapperConfigV17
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
-  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string): Promise<number> {
+  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
         () => connection.getAccountInfo(new PublicKey(slabAddress)),
@@ -550,6 +559,9 @@ export class TradeIndexerPolling {
       if (!info?.data) return 0;
 
       const rawData = new Uint8Array(info.data);
+
+      const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
+      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (isV17Account(rawData)) {

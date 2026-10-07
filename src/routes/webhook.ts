@@ -7,6 +7,7 @@ import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
 import { decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -618,7 +619,9 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
 
     // #205: resolve the account/RPC fallback price at most once per instruction
     // (not once per leg) — only legs without a wire execPriceE6 need it.
-    let fallbackPrice: number | null = null;
+    // #221: once per ASSET — the fallback is that asset's booked effective_price,
+    // and a batch instruction can carry legs on different assets.
+    const fallbackPriceByAsset = new Map<number, number>();
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
@@ -627,8 +630,12 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
       if (leg.execPriceE6 !== undefined) {
         price = Number(leg.execPriceE6) / 1_000_000;
       } else {
-        if (fallbackPrice === null) fallbackPrice = await extractPrice(tx, slabAddress);
-        price = fallbackPrice;
+        let fallback = fallbackPriceByAsset.get(leg.assetIndex);
+        if (fallback === undefined) {
+          fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
+          fallbackPriceByAsset.set(leg.assetIndex, fallback);
+        }
+        price = fallback;
       }
       const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
@@ -687,7 +694,8 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
         continue;
       }
 
-      let fallbackPriceInner: number | null = null;
+      // #221: per asset, same as the outer path.
+      const fallbackPriceInnerByAsset = new Map<number, number>();
 
       for (const leg of legs) {
         if (leg.sizeValue > I128_MAX) continue;
@@ -699,8 +707,12 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
         if (leg.execPriceE6 !== undefined) {
           price = Number(leg.execPriceE6) / 1_000_000;
         } else {
-          if (fallbackPriceInner === null) fallbackPriceInner = await extractPrice(tx, slabAddress);
-          price = fallbackPriceInner;
+          let fallback = fallbackPriceInnerByAsset.get(leg.assetIndex);
+          if (fallback === undefined) {
+            fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
+            fallbackPriceInnerByAsset.set(leg.assetIndex, fallback);
+          }
+          price = fallback;
         }
         const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
@@ -765,19 +777,21 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
  * strategy alone left every such trade at price=0 forever — nothing else in
  * the pipeline ever re-visits an already-written row. Added strategy 2: a
  * live RPC re-read of the slab, same source `readMarkPriceFromSlab` (the
- * polling path, `TradeIndexer.ts`) already uses as its ONLY strategy. This is
- * the current mark at webhook-processing time, not the fill's exact price —
- * the same approximation the poll path has always made, and the best
- * available source for TradeCpi/BatchTradeCpi fills, which don't carry a fill
- * price on the wire at all (see decodeV18SingleFill/decodeV18BatchLegs).
+ * polling path, `TradeIndexer.ts`) already uses as its ONLY strategy.
+ * TradeCpi/BatchTradeCpi fills carry no fill price on the wire (see
+ * decodeV18SingleFill/decodeV18BatchLegs), so both strategies read it from the
+ * slab: since #221 that is the leg's asset `effective_price` — the exact price
+ * the engine booked the fill at, which the trade itself never moves — not the
+ * mark EWMA the trade skews toward the matcher's quote.
  */
-async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Promise<number> {
-  // Strategy 1: read mark_price_e6 from slab post-state account data (no RPC).
-  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
+async function extractPrice(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): Promise<number> {
+  // Strategy 1: the fill's booked price from the slab's post-state account data
+  // (no RPC) — asset effective_price on v18, else the legacy mark (#221).
+  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress, assetIndex);
   if (priceFromAccount > 0) return priceFromAccount;
 
-  // Strategy 2: fresh RPC read of the slab's current mark.
-  const priceFromRpc = await readFreshMarkPriceE6(slabAddress);
+  // Strategy 2: fresh RPC read of the slab (same parser).
+  const priceFromRpc = await readFreshMarkPriceE6(slabAddress, assetIndex);
   if (priceFromRpc > 0) return priceFromRpc;
 
   // Strategy 3: parse program logs (neutered — see extractPriceFromLogs).
@@ -789,8 +803,17 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Prom
  * slab account buffer. Shared by both the post-state path (bytes embedded in
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
+ *
+ * #221: on a v18 market this first returns `asset[assetIndex].effective_price`, the
+ * exact price the engine booked the fill at. The mark EWMA below is NOT a fill price
+ * for a matcher fill: the trade itself nudges it toward the matcher's quote, so it
+ * reads high after a long and low after a short. It stays only as the fallback for
+ * non-v18 layouts or an unreadable slot.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array): number {
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number): number {
+  const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
+  if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
   if (isV17Account(raw)) {
@@ -847,7 +870,7 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array): number {
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
-function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string): number {
+function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
     if (acc.account !== slabAddress) continue;
@@ -860,7 +883,7 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
     }
     if (!raw) continue;
 
-    const price = parseMarkPriceE6FromAccountBytes(raw);
+    const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex);
     if (price > 0) return price;
   }
   return 0;
@@ -873,14 +896,14 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
  * fail the whole batch because one RPC read timed out; the trade is still
  * indexed, just with price=0 (unchanged from before this fix in that case).
  */
-async function readFreshMarkPriceE6(slabAddress: string): Promise<number> {
+async function readFreshMarkPriceE6(slabAddress: string, assetIndex: number): Promise<number> {
   try {
     const info = await withRetry(
       () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
       { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
     );
     if (!info?.data) return 0;
-    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data));
+    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), assetIndex);
   } catch (err) {
     logger.warn("Failed to read fresh mark price from slab", {
       slabAddress: slabAddress.slice(0, 8),
