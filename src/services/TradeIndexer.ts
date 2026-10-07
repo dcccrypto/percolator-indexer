@@ -17,6 +17,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 
 const logger = createLogger("indexer:trade-indexer");
@@ -418,15 +419,20 @@ export class TradeIndexerPolling {
     // Fallback price (slab read) resolved lazily, ONCE per transaction, shared by
     // every leg and instruction that lacks a wire exec_price. A tx that is already
     // fully indexed therefore costs at most one slab read, not one per leg.
-    let fallbackPrice: number | null = null;
-    const resolveFallbackPrice = async (): Promise<number> => {
-      if (fallbackPrice === null) {
-        fallbackPrice = this.extractPriceFromLogs(tx);
-        if (fallbackPrice === 0) {
-          fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+    // #221: per ASSET. This is a LATEST-state read of the asset's booked effective_price (the poll
+    // path has no tx post-state), so it is APPROXIMATE: it drifts with oracle pushes. Used only
+    // where there is no matcher CPI to read the exact price from (tag 44, TradeNoCpi without a price).
+    const fallbackPriceByAsset = new Map<number, number>();
+    const resolveFallbackPrice = async (assetIndex: number): Promise<number> => {
+      let price = fallbackPriceByAsset.get(assetIndex);
+      if (price === undefined) {
+        price = this.extractPriceFromLogs(tx);
+        if (price === 0) {
+          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress, assetIndex);
         }
+        fallbackPriceByAsset.set(assetIndex, price);
       }
-      return fallbackPrice;
+      return price;
     };
 
     // TradeCpi / BatchTradeCpi: the instruction carries the REQUESTED size; the executed size and
@@ -487,7 +493,7 @@ export class TradeIndexerPolling {
           await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
           continue;
         }
-        const price = await resolveFallbackPrice();
+        const price = await resolveFallbackPrice(reduce.assetIndex); // tag 44: no matcher CPI, effective_price is its only exact source
         // The engine charges no trading fee on tag 44.
         const inserted = await insertTradeRow({
           slab_address: slabAddress,
@@ -545,7 +551,7 @@ export class TradeIndexerPolling {
         // #205: fall back to the slab read only when the leg itself doesn't carry
         // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
         const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> =>
-          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice();
+          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice(leg.assetIndex);
 
         const i128Max = (1n << 127n) - 1n;
 
@@ -632,7 +638,7 @@ export class TradeIndexerPolling {
         price = Number(r.priceE6) / 1_000_000;
         if (!r.exact) { noteUnverifiedSize(); logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) }); }
       } else {
-        price = await resolveFallbackPrice();
+        price = await resolveFallbackPrice(decoded.assetIndex);
       }
       const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
 
@@ -706,7 +712,7 @@ export class TradeIndexerPolling {
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
-  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string): Promise<number> {
+  private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
         () => connection.getAccountInfo(new PublicKey(slabAddress)),
@@ -719,6 +725,10 @@ export class TradeIndexerPolling {
       if (!info?.data) return 0;
 
       const rawData = new Uint8Array(info.data);
+
+      // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
+      const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
+      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (isV17Account(rawData)) {

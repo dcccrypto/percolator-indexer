@@ -17,6 +17,7 @@ import {
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
 import { cpiEvidence, resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
@@ -736,7 +737,7 @@ async function extractTradesFromEnhancedTx(
         trader,
         side: resolution.side,
         size: resolution.sizeValue.toString(),
-        price: await extractPrice(tx, slabAddress),
+        price: await extractPrice(tx, slabAddress, reduce.assetIndex), // tag 44 has no matcher CPI: effective_price is its only exact source
         fee: 0, // the engine charges no trading fee on tag 44
         tx_signature: signature,
         asset_index: reduce.assetIndex,
@@ -791,7 +792,9 @@ async function extractTradesFromEnhancedTx(
 
     // #205: resolve the account/RPC fallback price at most once per instruction
     // (not once per leg) — only legs without a wire execPriceE6 need it.
-    let fallbackPrice: number | null = null;
+    // #221: per ASSET (a batch can carry legs on different assets); the fallback is that asset's
+    // booked effective_price.
+    const fallbackPriceByAsset = new Map<number, number>();
     // #213/#221: TradeCpi/BatchTradeCpi carry the REQUESTED size on the wire. Executed size and
     // the booked price come from the matcher call nested under this instruction.
     const isCpiTag = tag === IX_TAG.TradeCpi || tag === IX_TAG.BatchTradeCpi;
@@ -836,8 +839,12 @@ async function extractTradesFromEnhancedTx(
       } else if (leg.execPriceE6 !== undefined) {
         price = Number(leg.execPriceE6) / 1_000_000;
       } else {
-        if (fallbackPrice === null) fallbackPrice = await extractPrice(tx, slabAddress);
-        price = fallbackPrice;
+        let fallback = fallbackPriceByAsset.get(leg.assetIndex);
+        if (fallback === undefined) {
+          fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
+          fallbackPriceByAsset.set(leg.assetIndex, fallback);
+        }
+        price = fallback;
       }
       const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
@@ -934,13 +941,16 @@ async function extractTradesFromEnhancedTx(
  * available source for TradeCpi/BatchTradeCpi fills, which don't carry a fill
  * price on the wire at all (see decodeV18SingleFill/decodeV18BatchLegs).
  */
-async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Promise<number> {
+async function extractPrice(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): Promise<number> {
+  // #221: the asset's booked effective_price. Exact when it comes from the slab POST-STATE in this
+  // payload (strategy 1); the fresh-RPC read (strategy 2) is the LATEST value, which drifts with
+  // oracle pushes, so it is APPROXIMATE. Prefer the matcher CPI's oracle_price_e6 wherever there is one.
   // Strategy 1: read mark_price_e6 from slab post-state account data (no RPC).
-  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
+  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress, assetIndex);
   if (priceFromAccount > 0) return priceFromAccount;
 
   // Strategy 2: fresh RPC read of the slab's current mark.
-  const priceFromRpc = await readFreshMarkPriceE6(slabAddress);
+  const priceFromRpc = await readFreshMarkPriceE6(slabAddress, assetIndex);
   if (priceFromRpc > 0) return priceFromRpc;
 
   // Strategy 3: parse program logs (neutered — see extractPriceFromLogs).
@@ -953,7 +963,12 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Prom
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array): number {
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number): number {
+  // #221: on a v18 market the asset's effective_price is the price the engine books a fill at; the
+  // mark EWMA below is skewed by the trade itself and stays only for non-v18 layouts / unreadable slots.
+  const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
+  if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
   if (isV17Account(raw)) {
@@ -1010,7 +1025,7 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array): number {
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
-function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string): number {
+function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
     if (acc.account !== slabAddress) continue;
@@ -1023,7 +1038,7 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
     }
     if (!raw) continue;
 
-    const price = parseMarkPriceE6FromAccountBytes(raw);
+    const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex);
     if (price > 0) return price;
   }
   return 0;
@@ -1036,14 +1051,14 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
  * fail the whole batch because one RPC read timed out; the trade is still
  * indexed, just with price=0 (unchanged from before this fix in that case).
  */
-async function readFreshMarkPriceE6(slabAddress: string): Promise<number> {
+async function readFreshMarkPriceE6(slabAddress: string, assetIndex: number): Promise<number> {
   try {
     const info = await withRetry(
       () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
       { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
     );
     if (!info?.data) return 0;
-    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data));
+    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), assetIndex);
   } catch (err) {
     logger.warn("Failed to read fresh mark price from slab", {
       slabAddress: slabAddress.slice(0, 8),

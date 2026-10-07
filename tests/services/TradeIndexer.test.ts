@@ -693,16 +693,18 @@ describe('TradeIndexerPolling', () => {
       expect(rows[0]).toEqual(expect.objectContaining({ slab_address: SLAB, leg_index: 1 }));
     }, 10000);
   });
-  describe('#221 — a matcher fill is priced at its asset\'s booked effective_price', () => {
+  describe('#221 — fills with no matcher CPI to read the price from use the asset\'s booked effective_price', () => {
+    // TradeCpi is priced from its matcher CPI (tests/matcher-fill*.test.ts); the slab read is the
+    // fallback for TradeNoCpi without a wire price and for tag 44. TradeNoCpi (mocked tag 10) here.
     function tradeCpiData(): Uint8Array {
-      const d = new Uint8Array(85);
-      d[0] = 11; // IX_TAG.TradeCpi (mocked)
-      d[51] = 0x40; d[52] = 0x42; d[53] = 0x0f;
+      const d = new Uint8Array(77);
+      d[0] = 10; // IX_TAG.TradeNoCpi (mocked); exec_price @59 left 0 = absent
+      d[43] = 0x40; d[44] = 0x42; d[45] = 0x0f;
       return d;
     }
     const ix = (data: string) => ({
       programId: new PublicKey(PROGRAM_ID),
-      accounts: [new PublicKey(TRADER), new PublicKey(SLAB)],
+      accounts: [new PublicKey(TRADER), new PublicKey(TRADER), new PublicKey(SLAB)],
       data,
     });
 

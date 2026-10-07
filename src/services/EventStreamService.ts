@@ -124,7 +124,7 @@ export class EventStreamService {
     // Fills on the same slab within one tx resolve to the same post-tx mark price,
     // so the fallback slab read is memoized per slab (it was previously repeated
     // once per fill). null = the read failed or returned nothing for that slab.
-    const priceBySlab = new Map<string, number | null>();
+    const priceBySlabAsset = new Map<string, number | null>(); // #221: per (slab, asset)
     const readMatcherContext = makeMatcherContextReader(() => this.deps.connection, typeof tx.slot === "number" ? tx.slot : null);
 
     // legIndex is the fill's position within the whole tx (fills are flattened across
@@ -169,15 +169,16 @@ export class EventStreamService {
         // hit the slab for the authoritative post-tx mark price.
         // #170: isolate the fallback read — one failed slab read skips only THIS fill
         // instead of aborting the whole tx handler and losing every later fill.
-        if (!priceBySlab.has(slab)) {
+        const priceKey = `${slab}:${fill.assetIndex}`;
+        if (!priceBySlabAsset.has(priceKey)) {
           try {
-            priceBySlab.set(slab, await readMarkPriceE6(this.deps.connection, slab));
+            priceBySlabAsset.set(priceKey, await readMarkPriceE6(this.deps.connection, slab, fill.assetIndex));
           } catch (err) {
             log.warn("slab price fallback failed", { sig: signature, slab, err: String(err) });
-            priceBySlab.set(slab, null);
+            priceBySlabAsset.set(priceKey, null);
           }
         }
-        const fallback = priceBySlab.get(slab) ?? null;
+        const fallback = priceBySlabAsset.get(priceKey) ?? null;
         if (fallback == null) {
           log.warn("skipping fill — no slab-resolved price", { sig: signature, slab });
           continue;
