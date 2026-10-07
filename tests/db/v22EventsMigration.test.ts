@@ -15,7 +15,10 @@ describe("supabase/migrations/20261007120000_v22_events.sql (NOT applied)", () =
     expect(live).toMatch(/ALTER TABLE v22_events ENABLE ROW LEVEL SECURITY/);
     expect(live).toMatch(/REVOKE ALL ON TABLE v22_events FROM anon, authenticated/);
     expect(live).toMatch(/REVOKE ALL ON SEQUENCE v22_events_id_seq FROM anon, authenticated/);
-    expect(live).not.toMatch(/GRANT /i);
+    // Only service_role is granted (table + sequence); never anon/authenticated.
+    expect(live).toMatch(/GRANT ALL ON TABLE v22_events TO service_role/);
+    expect(live).toMatch(/GRANT ALL ON SEQUENCE v22_events_id_seq TO service_role/);
+    expect([...live.matchAll(/GRANT [^;]*? TO ([a-z_, ]+);/gi)].map((m) => m[1].trim())).toEqual(["service_role", "service_role"]);
     expect(live).not.toMatch(/CREATE POLICY/i);
   });
 

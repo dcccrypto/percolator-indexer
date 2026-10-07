@@ -32,3 +32,6 @@ CREATE INDEX IF NOT EXISTS v22_events_actor ON v22_events (actor) WHERE actor IS
 ALTER TABLE v22_events ENABLE ROW LEVEL SECURITY;  -- no policies: anon/authenticated get nothing
 REVOKE ALL ON TABLE v22_events FROM anon, authenticated;
 REVOKE ALL ON SEQUENCE v22_events_id_seq FROM anon, authenticated;
+-- The indexer writes with the service role (pattern of 20260726120000_v17_baseline.sql): explicit grants on the table and its sequence.
+GRANT ALL ON TABLE v22_events TO service_role;
+GRANT ALL ON SEQUENCE v22_events_id_seq TO service_role;
