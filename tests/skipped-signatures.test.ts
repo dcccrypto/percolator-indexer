@@ -81,7 +81,7 @@ describe("(c) durable skip record", () => {
     expect(upsert).not.toHaveBeenCalled();
   });
   it("the migration file exists, is not applied by code, and defines the table", () => {
-    const sql = readFileSync(join(__dirname, "..", "migrations", "20261005120000_skipped_signatures.sql"), "utf8");
+    const sql = readFileSync(join(__dirname, "..", "supabase", "migrations", "20261005120000_skipped_signatures.sql"), "utf8");
     expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS skipped_signatures/);
     expect(sql).toMatch(/UNIQUE \(signature, source\)/);
     expect(sql).toMatch(/NOT APPLIED/);

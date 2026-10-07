@@ -14,7 +14,7 @@ import {
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
-import { fetchStoredLegs, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -252,7 +252,7 @@ export class TradeIndexerPolling {
 
     let indexed = 0;
     let batchFailed = false;
-    const pass = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
+    const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -292,6 +292,8 @@ export class TradeIndexerPolling {
         break;
       }
       const txs = fetched.txs;
+      // One stored-legs query for the whole fetched batch (not one per transaction).
+      pass.stored = await fetchStoredLegsMany(batch);
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
@@ -333,7 +335,7 @@ export class TradeIndexerPolling {
      * Oldest-first pass state: signatures of this slab's window already indexed before this one, and
      * whether any earlier one could not be (failed / unreadable / skipped), which makes a tag 44 unresolvable.
      */
-    pass: { earlier: Set<string>; incomplete: boolean } = { earlier: new Set(), incomplete: false },
+    pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set(), incomplete: false },
   ): Promise<boolean> {
     if (!tx.meta || tx.meta.err) return false;
 
@@ -377,7 +379,24 @@ export class TradeIndexerPolling {
     const touched = new Set<string>();
     // Rows already stored for this tx, read once and only if a fill needs it (F2 + old-numbering check).
     let stored: StoredLeg[] | null | undefined;
-    const getStored = async (): Promise<StoredLeg[] | null> => (stored === undefined ? (stored = await fetchStoredLegs(signature)) : stored);
+    const getStored = async (): Promise<StoredLeg[] | null> => {
+      if (stored === undefined) stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
+      return stored;
+    };
+    // Leg numbers of this tx's tag 44s (their own inferred rows are not TradeCpi fills), by a dry walk
+    // of the same numbering the loop below uses.
+    const reduceLegs = new Set<number>();
+    {
+      let seq = 0;
+      for (const ix of message.instructions) {
+        if ("parsed" in ix || !programIds.has(ix.programId.toBase58())) continue;
+        const d = decodeBase58(ix.data);
+        if (!d || d.length < 1) continue;
+        if (isRebalanceReduceTag(d[0])) { if (decodeRebalanceReduce(d)) reduceLegs.add(seq++); continue; }
+        if (!TRADE_TAGS.has(d[0])) continue;
+        seq += (d[0] === IX_TAG.BatchTradeNoCpi || d[0] === IX_TAG.BatchTradeCpi) ? decodeV18BatchLegs(d[0], d).length : decodeV18SingleFill(d[0], d) ? 1 : 0;
+      }
+    }
     // Occurrence rank of identical fills in this tx (a split order is identical legs).
     const identSeen = new Map<string, number>();
     const ordinalOf = (slab: string, asset: number, trader: string, side: string, size: string): number => {
@@ -525,7 +544,7 @@ export class TradeIndexerPolling {
           // Already stored (same leg, or this fill under the old per-instruction numbering)? Skip it
           // before any price read; the insert's own dedup stays the backstop if this lookup failed.
           const ordinal = ordinalOf(slabAddress, leg.assetIndex, trader, leg.side, leg.sizeValue.toString());
-          if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal })) continue;
+          if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal }, reduceLegs)) continue;
           const price = await resolvePrice(leg);
           const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
@@ -561,7 +580,7 @@ export class TradeIndexerPolling {
       touched.add(`${trader}|${slabAddress}|${decoded.assetIndex}`);
       {
         const ordinal = ordinalOf(slabAddress, decoded.assetIndex, trader, side, sizeValue.toString());
-        if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, size: sizeValue.toString(), ordinal })) continue;
+        if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, size: sizeValue.toString(), ordinal }, reduceLegs)) continue;
       }
 
       // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —

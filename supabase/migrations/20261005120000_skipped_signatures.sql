@@ -8,9 +8,10 @@
 -- id bigserial PK, signature text NOT NULL, source text NOT NULL, slab text, network text,
 -- error text, skipped_at timestamptz NOT NULL DEFAULT now(), reindexed_at timestamptz,
 -- UNIQUE (signature, source). RLS on, no policies, no anon/authenticated grants.
--- Same content as migrations/20261005120000_skipped_signatures.sql (kept for history).
+-- Lives here, with the repo's other applied migrations (supabase/migrations/); the earlier copy under
+-- migrations/ (added by #212) was removed so there is exactly one.
 -- ============================================================================================
--- NOT APPLIED. Durable record of transaction signatures the indexer skipped because the RPC client could not
+-- NOT APPLIED by code. Durable record of transaction signatures the indexer skipped because the RPC client could not
 -- return them (X-1). Lets an operator re-index them once the reader is fixed, and alert on a non-zero count.
 -- Apply by hand against the indexer database; the indexer writes here best-effort and falls back to a JSONL file.
 CREATE TABLE IF NOT EXISTS skipped_signatures (

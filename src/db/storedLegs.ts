@@ -37,6 +37,36 @@ export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | 
   }
 }
 
+const IN_CHUNK = 100;
+
+/**
+ * Stored rows for MANY transactions in as few queries as possible (`in(tx_signature, [...])`, chunked
+ * at 100). Every requested signature gets an entry (empty = nothing stored), so a caller can tell
+ * "looked, none" from "not looked". Returns null if any chunk failed (callers then fall back to
+ * the per-transaction read or to the insert's own dedup).
+ */
+export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<string, StoredLeg[]> | null> {
+  const out = new Map<string, StoredLeg[]>();
+  for (const sig of signatures) out.set(sig, []);
+  const unique = [...out.keys()];
+  try {
+    for (let i = 0; i < unique.length; i += IN_CHUNK) {
+      const chunk = unique.slice(i, i + IN_CHUNK);
+      const { data, error } = await getSupabase()
+        .from("trades")
+        .select("tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
+        .in("tx_signature", chunk)
+        .eq("network", getNetwork());
+      if (error) throw new Error(error.message);
+      for (const r of (data ?? []) as Array<StoredLeg & { tx_signature: string }>) out.get(r.tx_signature)?.push(r);
+    }
+    return out;
+  } catch (err) {
+    logger.warn("batched stored-leg lookup failed; falling back", { error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
+}
+
 const sizeStr = (v: unknown): string => {
   if (typeof v === "bigint") return v.toString();
   if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v).toString();
@@ -65,11 +95,20 @@ export interface FillIdentity {
  * cap), so "an identical row exists elsewhere" alone would drop real legs 1..N. A leg is only
  * treated as a duplicate when the stored rows already account for it.
  */
-export function fillAlreadyStored(stored: StoredLeg[] | null, f: FillIdentity): boolean {
+export function fillAlreadyStored(
+  stored: StoredLeg[] | null,
+  f: FillIdentity,
+  /**
+   * Leg numbers of this transaction's RebalanceReduce (tag 44) instructions. A tag 44's own row
+   * (an inferred fill) is not a TradeCpi fill: it must not count towards "an identical fill is
+   * already stored", or a real TradeCpi identical to the inferred close would be dropped.
+   */
+  reduceLegs: ReadonlySet<number> = new Set(),
+): boolean {
   if (!stored) return false;
   const fills = stored.filter((r) => !r.is_liquidation && r.slab_address === f.slab && r.asset_index === f.assetIndex);
   if (fills.some((r) => r.leg_index === f.legIndex)) return true;
-  const identical = fills.filter((r) => r.trader === f.trader && r.side === f.side && sizeStr(r.size) === f.size).length;
+  const identical = fills.filter((r) => !reduceLegs.has(r.leg_index) && r.trader === f.trader && r.side === f.side && sizeStr(r.size) === f.size).length;
   return identical >= f.ordinal;
 }
 
