@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { V22_EVENT_KINDS } from "../../src/parsers/v22Events.js";
 
-const sql = readFileSync(new URL("../../migrations/20261007120000_v22_events.sql", import.meta.url), "utf8");
+const sql = readFileSync(new URL("../../supabase/migrations/20261007120000_v22_events.sql", import.meta.url), "utf8");
 const live = sql.split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
 
-describe("migrations/20261007120000_v22_events.sql (NOT applied)", () => {
+describe("supabase/migrations/20261007120000_v22_events.sql (NOT applied)", () => {
   it("is marked NOT APPLIED and creates the table idempotently", () => {
     expect(sql.split("\n")[0]).toMatch(/NOT APPLIED/);
     expect(live).toMatch(/CREATE TABLE IF NOT EXISTS v22_events/);

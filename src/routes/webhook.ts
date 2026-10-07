@@ -10,7 +10,22 @@ import { config, eventBus, decodeBase58, withRetry, captureException, createLogg
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
-import { decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
+import {
+  decodeV18SingleFill,
+  decodeV18BatchLegs,
+  computeFeeUsd,
+  isRebalanceReduceTag,
+  decodeRebalanceReduce,
+  REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
+} from "../parsers/percolatorTxParser.js";
+import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
+
+import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
+import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
+import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -101,6 +116,8 @@ interface ValidatedInstruction {
   programId?: string;
   data?: string;
   accounts?: string[];
+  /** Helius enhanced format nests the CPIs of an instruction here. */
+  innerInstructions?: ValidatedInstruction[];
 }
 interface ValidatedInnerGroup {
   instructions?: ValidatedInstruction[];
@@ -141,6 +158,15 @@ function isValidTransactionArray(parsed: unknown): parsed is ValidatedTransactio
           // Each account entry must be a string (pubkey) in the Helius enhanced format.
           for (const acc of ix.accounts) {
             if (typeof acc !== "string") return false;
+          }
+        }
+        if (ix.innerInstructions !== undefined) {
+          if (!Array.isArray(ix.innerInstructions)) return false;
+          for (const sub of ix.innerInstructions) {
+            if (sub === null || typeof sub !== "object") return false;
+            if (hasPoisonKey(sub as object)) return false;
+            if (sub.programId !== undefined && typeof sub.programId !== "string") return false;
+            if (sub.data !== undefined && typeof sub.data !== "string") return false;
           }
         }
       }
@@ -393,6 +419,9 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authDigest, secretDigest);
 }
 
+/** Time one delivery may spend on matcher-context reads (Helius gives ~15 s in total). */
+const CTX_DELIVERY_BUDGET_MS = 8000;
+
 async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
@@ -404,10 +433,82 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   let blockedFills = 0;
   // #160: extraction failures are COUNTED, not swallowed. See the throw at the end.
   let extractionFailures = 0;
+  let ctxRetries = 0;
   let firstExtractionError: unknown = null;
-  for (const tx of transactions) {
+  // Writes everything extracted so far and publishes what was newly written. Called once at the end,
+  // and also right before a RebalanceReduce (tag 44) is resolved: a close is inferred from the
+  // trader's indexed fills, so the earlier transactions of this delivery must already be stored.
+  // Returns false when the write failed (the failure is counted and surfaces as a 500 below).
+  const flush = async (): Promise<boolean> => {
+    if (pending.length === 0) return true;
+    const batch = pending.splice(0, pending.length);
     try {
-      for (const trade of await extractTradesFromEnhancedTx(tx, discovery)) {
+      // insertTradeRows upserts with ignoreDuplicates, so already-indexed legs are
+      // skipped without failing the batch — no separate duplicate branch needed.
+      // GH#42: retry so transient DB failures don't silently lose trades.
+      // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
+      const inserted = await withRetry(() => insertTradeRows(batch), {
+        maxRetries: 2,
+        baseDelayMs: 100,
+        label: `insertTradeRows(${batch.length})`,
+      });
+      indexed += inserted.length;
+      // Keep the delivery-wide stored-legs snapshot in step with what THIS flush wrote (a signature
+      // repeated later in the delivery must see it); nothing else changes those rows.
+      for (const t of batch) {
+        if (!inserted.some((k) => tradeKey(k) === tradeKey(t))) continue;
+        delivery.stored?.get(t.tx_signature)?.push({ slab_address: t.slab_address, asset_index: t.asset_index, leg_index: t.leg_index, trader: t.trader, side: t.side, size: t.size, is_liquidation: t.is_liquidation });
+      }
+
+      // Publish only what was actually written, so a re-delivery of already-indexed
+      // trades doesn't re-emit events to subscribers.
+      const written = new Set(inserted.map(tradeKey));
+      for (const trade of batch) {
+        if (!written.has(tradeKey(trade))) continue;
+        eventBus.publish("trade.executed", trade.slab_address, {
+          signature: trade.tx_signature,
+          trader: trade.trader,
+          side: trade.side,
+          size: trade.size,
+          price: trade.price,
+          fee: trade.fee,
+        });
+      }
+      return true;
+    } catch (err) {
+      // All retries exhausted — capture to Sentry so we know this happened
+      insertFailures += batch.length;
+      logger.error("Trade batch insert failed after retries", {
+        count: batch.length,
+        slabAddress: batch[0]?.slab_address.slice(0, 8),
+        error: err instanceof Error ? err.message : err,
+      });
+      captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { context: "webhook-insert-failure" },
+        extra: {
+          count: batch.length,
+          firstSignature: batch[0]?.tx_signature?.slice(0, 16),
+          slabAddress: batch[0]?.slab_address.slice(0, 16),
+        },
+      });
+      return false;
+    }
+  };
+
+  // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
+  // before it. Stable, so transactions without a slot keep their delivery order.
+  const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + (Number(process.env.TRADECPI_DELIVERY_BUDGET_MS) || CTX_DELIVERY_BUDGET_MS) };
+  const ordered = [...transactions].sort((x, y) => {
+    const sx = slotOf(x), sy = slotOf(y);
+    return sx === sy ? 0 : sx < sy ? -1 : 1;
+  });
+  // ONE stored-legs query for the whole delivery (chunked), not one per transaction inside Helius's window.
+  delivery.stored = await fetchStoredLegsMany(ordered.map((t) => t.signature).filter((x): x is string => typeof x === "string" && x.length > 0));
+  delivery.peersOf = (tx) => ordered.filter((o) => o !== tx && (typeof o.slot !== "number" || typeof tx.slot !== "number" || o.slot === tx.slot));
+  for (const tx of ordered) {
+    try {
+      for (const trade of await extractTradesFromEnhancedTx(tx, discovery, flush, delivery)) {
         // Retired markets are deleted from `markets`, and trades carry an FK to
         // it — so a fill here would fail the insert and burn the batch's retries.
         // Skip cleanly instead. See src/blocklist.ts.
@@ -417,7 +518,17 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
         pending.push(trade);
       }
+      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); }
     } catch (err) {
+      if (err instanceof MatcherContextRetry) {
+        // Not an extraction bug: a transient RPC failure. Everything else in the delivery is still
+        // written; this transaction is redelivered (its stored legs are skipped, then it falls back).
+        ctxRetries++;
+        ctxReadAttempts.set(err.signature, 1);
+        delivery.incomplete = true;
+        logger.warn("matcher context read failed; answering 500 so the delivery is retried", { signature: err.signature.slice(0, 16) });
+        continue;
+      }
       // #160: this used to warn and continue, so processTransactions resolved and
       // the route answered 200. Helius does not retry a 2xx, so a transaction that
       // threw during EXTRACTION was silently and permanently dropped — no insert
@@ -427,6 +538,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
       // This is the near side: a parse/extraction throw before insertTradeRows is
       // reached. Same failure, earlier in the pipeline, and still silent.
       extractionFailures++;
+      delivery.incomplete = true; // a later tag 44 must not be resolved past a transaction we could not read
       if (firstExtractionError === null) firstExtractionError = err;
       logger.error("Trade extraction failed — will 500 so Helius redelivers", {
         signature: tx.signature?.slice(0, 16),
@@ -464,51 +576,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
     logger.warn("v22 event extraction failed (trades unaffected)", { error: err instanceof Error ? err.message : String(err) });
   }
 
-  if (pending.length > 0) {
-    try {
-      // insertTradeRows upserts with ignoreDuplicates, so already-indexed legs are
-      // skipped without failing the batch — no separate duplicate branch needed.
-      // GH#42: retry so transient DB failures don't silently lose trades.
-      // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
-      const inserted = await withRetry(() => insertTradeRows(pending), {
-        maxRetries: 2,
-        baseDelayMs: 100,
-        label: `insertTradeRows(${pending.length})`,
-      });
-      indexed = inserted.length;
-
-      // Publish only what was actually written, so a re-delivery of already-indexed
-      // trades doesn't re-emit events to subscribers.
-      const written = new Set(inserted.map(tradeKey));
-      for (const trade of pending) {
-        if (!written.has(tradeKey(trade))) continue;
-        eventBus.publish("trade.executed", trade.slab_address, {
-          signature: trade.tx_signature,
-          trader: trade.trader,
-          side: trade.side,
-          size: trade.size,
-          price: trade.price,
-          fee: trade.fee,
-        });
-      }
-    } catch (err) {
-      // All retries exhausted — capture to Sentry so we know this happened
-      insertFailures = pending.length;
-      logger.error("Trade batch insert failed after retries", {
-        count: pending.length,
-        slabAddress: pending[0]?.slab_address.slice(0, 8),
-        error: err instanceof Error ? err.message : err,
-      });
-      captureException(err instanceof Error ? err : new Error(String(err)), {
-        tags: { context: "webhook-insert-failure" },
-        extra: {
-          count: pending.length,
-          firstSignature: pending[0]?.tx_signature?.slice(0, 16),
-          slabAddress: pending[0]?.slab_address.slice(0, 16),
-        },
-      });
-    }
-  }
+  await flush();
 
   if (indexed > 0) {
     logger.info("Trades indexed", { count: indexed });
@@ -530,6 +598,9 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // gives up. That is the correct trade: a bounded number of idempotent retries plus
   // a loud Sentry trail beats silently losing a fill. If a payload shape appears that
   // can never parse, that is a parser bug — and this is how we find out about it.
+  if (ctxRetries > 0) {
+    throw new Error(`${ctxRetries} transaction(s) need a matcher-context re-read (transient RPC failure)`);
+  }
   if (extractionFailures > 0) {
     throw new Error(
       `${extractionFailures} transaction(s) failed trade extraction` +
@@ -549,9 +620,45 @@ interface TradeData {
   asset_index: number;   // H2/H3
   leg_index: number;     // H2/H3 — reassigned tx-globally before return
   is_liquidation: boolean;
+  /** Holds a tx-wide leg number for a tag 44 that could not be written; dropped after renumbering. */
+  placeholder?: boolean;
+  /** This entry is a RebalanceReduce (tag 44), written or held; its leg number is not a TradeCpi fill's. */
+  reduce?: boolean;
+  /** A TradeCpi / BatchTradeCpi leg: its size is the executed (or post-clip) size, not the wire size. */
+  cpi?: boolean;
 }
 
-async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): Promise<TradeData[]> {
+interface DeliveryState {
+  earlier: Set<string>;
+  incomplete: boolean;
+  /** Stored rows for the whole delivery, read in one query; refreshed with our own flushes. null/absent = read lazily per tx. */
+  stored?: Map<string, StoredLeg[]> | null;
+  /** Other transactions of this delivery whose order relative to `tx` is not known from the payload (same slot, or no slot). */
+  peersOf?: (tx: ValidatedTransaction) => ValidatedTransaction[];
+  /** ms-epoch deadline for this delivery's matcher-context reads. */
+  ctxDeadlineAt?: number;
+}
+
+/** signature -> 1: its matcher-context read already failed once and the delivery was answered 500. Bounded. */
+const ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+
+/** The matcher-context read failed in transport; the delivery is answered 500 so Helius redelivers. */
+class MatcherContextRetry extends Error {
+  constructor(readonly signature: string) { super("matcher context read failed; delivery will be retried"); }
+}
+
+async function extractTradesFromEnhancedTx(
+  tx: ValidatedTransaction,
+  discovery: any,
+  /**
+   * Writes everything extracted from EARLIER transactions of this delivery and reports whether that
+   * succeeded. Called right before a RebalanceReduce (tag 44) is resolved, so the close sees the
+   * fills that precede it. Omitted = nothing earlier to flush.
+   */
+  flush: () => Promise<boolean> = async () => true,
+  /** Delivery state: signatures already extracted before this tx (chain order), and whether an earlier one failed. */
+  delivery: DeliveryState = { earlier: new Set(), incomplete: false },
+): Promise<TradeData[]> {
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -570,6 +677,17 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
   if (!BASE58_SIGNATURE.test(signature)) return trades;
 
   const instructions = tx.instructions ?? [];
+  // (trader|slab|asset) positions already touched by an earlier fill or tag 44 in THIS tx: a tag 44
+  // after one of them starts from a position that is not in the table yet, so it is not resolved.
+  const touched = new Set<string>();
+  // Rank of this tx's TradeCpi legs per (slab, asset, trader, side), size-independent.
+  const cpiSeen = new Map<string, number>();
+  // Rows already stored for this tx, read once and only when a fill needs it.
+  let stored: StoredLeg[] | null | undefined;
+  const getStored = async (): Promise<StoredLeg[] | null> => {
+    if (stored === undefined) stored = delivery.stored?.get(signature) ?? (await fetchStoredLegs(signature));
+    return stored;
+  };
 
   for (const ix of instructions) {
     const programId = ix.programId ?? "";
@@ -602,6 +720,93 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
       }
       continue;
     }
+
+    // RebalanceReduce (tag 44): the close used while the asset is ADL reduce-only.
+    // Not a TRADE_TAG (no side on the wire) — see the TradeIndexer twin of this block.
+    // It holds a slot in the tx-wide fill numbering (renumbered below, same as every other
+    // fill) even when it cannot be written, so a TradeCpi after it keeps the leg_index the
+    // poll path and EventStreamService give it.
+    if (isRebalanceReduceTag(tag)) {
+      const accounts: string[] = ix.accounts ?? [];
+      const trader = accounts[0] ?? "";
+      const slabAddress = accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX] ?? "";
+      const reduce = decodeRebalanceReduce(data);
+      if (!reduce) continue;
+      const placeholder = (): void => {
+        trades.push({
+          slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0,
+          tx_signature: signature, asset_index: reduce.assetIndex, leg_index: 0,
+          is_liquidation: false, placeholder: true, reduce: true,
+        });
+      };
+      // Every path out of here that writes nothing still holds the leg number (placeholder), so a
+      // fill after this tag 44 keeps the number the poll path gives it.
+      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) {
+        logger.warn("RebalanceReduce with an invalid account key: not indexed, leg number held", { signature: signature.slice(0, 12) });
+        placeholder();
+        continue;
+      }
+      if (discovery && !discovery.getMarkets().has(slabAddress)) {
+        logger.debug("RebalanceReduce on a market this indexer does not track: leg number held", { signature: signature.slice(0, 12), slabAddress });
+        placeholder();
+        continue;
+      }
+      // This tag 44's final leg number: the count of fills (written or held) before it in the tx.
+      const legIndex = trades.filter((t) => !t.is_liquidation).length;
+      // F2: already stored (redelivery / backfill)? Do not resolve it again.
+      if (reduceAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: reduce.assetIndex, legIndex, trader, reduceQ: reduce.reduceQ })) {
+        placeholder();
+        continue;
+      }
+      const reduceKey = `${trader}|${slabAddress}|${reduce.assetIndex}`;
+      // F1: earlier transactions of this delivery must be in the table before this close is resolved.
+      // If that write failed, the position is not known: do not guess.
+      const earlierWritten = await flush();
+      // Same slot (or no slot): the order of transactions that share this position is not in the payload,
+      // so a later fill could be counted as earlier. Do not resolve.
+      const ambiguousPeer = (delivery.peersOf?.(tx) ?? []).some((peer) =>
+        peer.transactionError == null &&
+        (peer.instructions ?? []).some((pi) => {
+          const a = pi.accounts ?? [];
+          return a.includes(trader) && a.includes(slabAddress);
+        }),
+      );
+      const resolution = ambiguousPeer
+        ? { ok: false as const, reason: "RebalanceReduce (tag 44): another transaction in this delivery shares its slot (or has no slot) and touches the same trader and market, so the order is unknown" }
+        : earlierWritten ? await resolveRebalanceReduce({
+        trader,
+        slabAddress,
+        assetIndex: reduce.assetIndex,
+        reduceQ: reduce.reduceQ,
+        signature,
+        txTimeSec: typeof tx.timestamp === "number" ? tx.timestamp : null,
+        repeatInTx: touched.has(reduceKey),
+        earlierSignatures: delivery.earlier,
+        earlierIncomplete: delivery.incomplete,
+      }) : { ok: false as const, reason: "RebalanceReduce (tag 44): the write of earlier transactions in this delivery failed, so the position before this close is not known" };
+      touched.add(reduceKey);
+      if (!resolution.ok) {
+        // Never a warn-only miss: recorded durably and loudly in skipped_signatures (recorded, NOT retried).
+        await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
+        placeholder();
+        continue;
+      }
+      trades.push({
+        slab_address: slabAddress,
+        trader,
+        side: resolution.side,
+        size: resolution.sizeValue.toString(),
+        price: await extractPriceWithinDeadline(tx, slabAddress, reduce.assetIndex, delivery.ctxDeadlineAt, signature), // tag 44 has no matcher CPI: effective_price is its only exact source
+        fee: 0, // the engine charges no trading fee on tag 44
+        tx_signature: signature,
+        asset_index: reduce.assetIndex,
+        leg_index: 0, // renumbered tx-wide below
+        is_liquidation: false,
+        reduce: true,
+      });
+      continue;
+    }
+
     if (!TRADE_TAGS.has(tag)) continue;
 
     // v18 wire format — decode lives in percolatorTxParser.ts (decodeV18SingleFill /
@@ -646,108 +851,103 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
 
     // #205: resolve the account/RPC fallback price at most once per instruction
     // (not once per leg) — only legs without a wire execPriceE6 need it.
-    let fallbackPrice: number | null = null;
+    // #221: per ASSET (a batch can carry legs on different assets); the fallback is that asset's
+    // booked effective_price.
+    const fallbackPriceByAsset = new Map<number, number>();
+    // #213/#221: TradeCpi/BatchTradeCpi carry the REQUESTED size on the wire. Executed size and
+    // the booked price come from the matcher call nested under this instruction.
+    const isCpiTag = tag === IX_TAG.TradeCpi || tag === IX_TAG.BatchTradeCpi;
+    const cpi = isCpiTag
+      ? cpiEvidence(
+          accounts,
+          Array.isArray(ix.innerInstructions)
+            ? ix.innerInstructions.filter((i) => typeof i.programId === "string" && typeof i.data === "string").map((i) => ({ programId: i.programId as string, data: i.data as string }))
+            : null,
+          null,
+          tag === IX_TAG.BatchTradeCpi,
+        )
+      : null;
+    // 2 s per read, and a per-delivery deadline so a slow RPC cannot eat Helius's ~15 s window.
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null, { deadlineAt: delivery.ctxDeadlineAt });
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
+      touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
 
-      let price: number;
-      if (leg.execPriceE6 !== undefined) {
-        price = Number(leg.execPriceE6) / 1_000_000;
-      } else {
-        if (fallbackPrice === null) fallbackPrice = await extractPrice(tx, slabAddress);
-        price = fallbackPrice;
+      let price: number | undefined;
+      let legSize = leg.sizeValue;
+      let cpiLeg = false;
+      if (cpi) {
+        cpiLeg = true;
+        // Already stored (redelivery / backfill)? Do NOT spend an RPC read on the matcher context:
+        // hold the number and move on. Final leg number = fills (written or held) before this one in
+        // the tx; the stored-legs snapshot is the delivery-wide batched one. A TradeCpi row's size is
+        // the executed size, so identity ignores size (exact leg number, or the same (slab, asset,
+        // trader, side) already stored as many times as this leg's rank).
+        const provisionalLeg = trades.filter((t) => !t.is_liquidation).length;
+        const cpiKey = `${slabAddress}|${leg.assetIndex}|${trader}|${leg.side}`;
+        const cpiOrdinal = (cpiSeen.get(cpiKey) ?? 0) + 1;
+        cpiSeen.set(cpiKey, cpiOrdinal);
+        const reduceNow = new Set(trades.filter((t) => t.reduce).map((t) => t.leg_index));
+        if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex: provisionalLeg, trader, side: leg.side, ordinal: cpiOrdinal }, reduceNow)) {
+          trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+          continue;
+        }
+        const attempted = ctxReadAttempts.get(signature) ?? 0;
+        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError: attempted >= 1 ? "fallback" : "report", signature });
+        if (r.kind === "read-error") {
+          // Transport failure: a size written now would be permanent (unique index). Fail this
+          // transaction so the delivery answers 500 and Helius redelivers; the redelivery falls back.
+          throw new MatcherContextRetry(signature);
+        }
+        if (r.kind === "skip") {
+          if (r.reason !== "zero-fill") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
+          }
+          // Hold the leg number (renumbered below) so the other paths' numbering still lines up.
+          trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+          continue;
+        }
+        if (r.kind === "fill") {
+          legSize = r.sizeValue;
+          price = Number(r.priceE6) / 1_000_000;
+          if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
+        } // "legacy": wire size + the existing price logic below, exactly as before this parser
       }
-      const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
+      if (price === undefined) {
+        if (leg.execPriceE6 !== undefined) {
+          price = Number(leg.execPriceE6) / 1_000_000;
+        } else {
+          let fallback = fallbackPriceByAsset.get(leg.assetIndex);
+          if (fallback === undefined) {
+            fallback = await extractPriceWithinDeadline(tx, slabAddress, leg.assetIndex, delivery.ctxDeadlineAt, signature);
+            fallbackPriceByAsset.set(leg.assetIndex, fallback);
+          }
+          price = fallback;
+        }
+      }
+      const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
       trades.push({
         slab_address: slabAddress,
         trader,
         side: leg.side,
-        size: leg.sizeValue.toString(),
+        size: legSize.toString(),
         price,
         fee,
         tx_signature: signature,
         asset_index: leg.assetIndex,
         leg_index: leg.legIndex,
         is_liquidation: false,
+        ...(cpiLeg ? { cpi: true } : {}),
       });
     }
   }
 
-  // Also check inner instructions (for TradeCpi routed through matcher)
-  const innerInstructions = tx.innerInstructions ?? [];
-  for (const inner of innerInstructions) {
-    const innerIxs = inner.instructions ?? [];
-    for (const ix of innerIxs) {
-      const programId = ix.programId ?? "";
-      if (!PROGRAM_IDS.has(programId)) continue;
-
-      const rawData = ix.data ? decodeBase58(ix.data) : null;
-      if (!rawData || rawData.length < 2) continue;
-      const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts ?? []);
-
-      const tag = data[0];
-      if (!TRADE_TAGS.has(tag)) continue;
-
-      const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number; feeBps?: number; execPriceE6?: bigint }[] = isBatchInner
-        ? decodeV18BatchLegs(tag, data)
-        : (() => {
-            const decoded = decodeV18SingleFill(tag, data);
-            return decoded ? [{ ...decoded, legIndex: 0 }] : [];
-          })();
-
-      if (legs.length === 0) continue;
-
-      // Same account layout with CPI dispatch fix (desync fix 5) — unchanged by v18
-      const accounts: string[] = ixAccounts;
-      const trader = accounts[0] ?? "";
-      const isNoCpiInner = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
-      const innerMarketIdx = isNoCpiInner ? 2 : 1;
-      const slabAddress = accounts.length > innerMarketIdx ? accounts[innerMarketIdx] : "";
-      if (!trader || !slabAddress) continue;
-
-      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
-
-      // L-5: Validate slabAddress against live known-slab set
-      if (discovery && !discovery.getMarkets().has(slabAddress)) {
-        logger.warn("Skipping inner trade: slab address not in known-slab set", { slabAddress, signature });
-        continue;
-      }
-
-      let fallbackPriceInner: number | null = null;
-
-      for (const leg of legs) {
-        if (leg.sizeValue > I128_MAX) continue;
-
-        // Avoid duplicates within same tx (match on trader + side + size + slab)
-        if (trades.some((t) => t.tx_signature === signature && t.trader === trader && t.slab_address === slabAddress && t.side === leg.side && t.size === leg.sizeValue.toString())) continue;
-
-        let price: number;
-        if (leg.execPriceE6 !== undefined) {
-          price = Number(leg.execPriceE6) / 1_000_000;
-        } else {
-          if (fallbackPriceInner === null) fallbackPriceInner = await extractPrice(tx, slabAddress);
-          price = fallbackPriceInner;
-        }
-        const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
-
-        trades.push({
-          slab_address: slabAddress,
-          trader,
-          side: leg.side,
-          size: leg.sizeValue.toString(),
-          price,
-          fee,
-          tx_signature: signature,
-          asset_index: leg.assetIndex,
-          leg_index: leg.legIndex,
-          is_liquidation: false,
-        });
-      }
-    }
-  }
+  // (Removed: a loop over `tx.innerInstructions` groups. The Helius enhanced format has no
+  // tx-level `innerInstructions`; CPIs are nested under each `instructions[i].innerInstructions`,
+  // so that loop matched nothing on real payloads. The only CPI that matters for trades is the
+  // matcher call under a TradeCpi, read above through `cpiEvidence`.)
 
   // H2/H3: reassign leg_index so (tx_signature, asset_index, leg_index) is unique
   // across outer + inner instructions. Parsing is deterministic, so the same tx
@@ -775,7 +975,33 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
     t.leg_index = t.is_liquidation ? 1000 + markerSeq++ : fillSeq++;
   }
 
-  return trades;
+  // Placeholders (tag 44s that could not be written) only held their number.
+  const reduceLegs = new Set(trades.filter((t) => t.reduce).map((t) => t.leg_index));
+  const fills = trades.filter((t) => !t.placeholder);
+
+  // A fill already stored under another leg number (this tx indexed under the old per-instruction
+  // numbering) is the SAME fill: drop it here instead of storing it twice. The rank among identical
+  // fills matters, because a split order is several identical legs.
+  if (fills.some((t) => !t.is_liquidation)) {
+    const storedLegs = await getStored();
+    if (storedLegs && storedLegs.length > 0) {
+      const rank = new Map<string, number>();
+      return fills.filter((t) => {
+        if (t.is_liquidation || t.side === null || t.size === null) return true;
+        // A TradeCpi leg already went through the size-independent check (cpiFillAlreadyStored) before
+        // its matcher-context read; its size is the executed size, so a size-rank filter would only
+        // double-count (and could drop a genuinely new leg).
+        if (t.cpi) return true;
+        const k = `${t.slab_address}|${t.asset_index}|${t.trader}|${t.side}|${t.size}`;
+        const ordinal = (rank.get(k) ?? 0) + 1;
+        rank.set(k, ordinal);
+        return !fillAlreadyStored(storedLegs, {
+          slab: t.slab_address, assetIndex: t.asset_index, legIndex: t.leg_index, trader: t.trader, side: t.side, size: t.size, ordinal,
+        }, reduceLegs);
+      });
+    }
+  }
+  return fills;
 }
 
 /**
@@ -800,13 +1026,39 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
  * available source for TradeCpi/BatchTradeCpi fills, which don't carry a fill
  * price on the wire at all (see decodeV18SingleFill/decodeV18BatchLegs).
  */
-async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Promise<number> {
+/**
+ * `extractPrice` under the delivery's deadline: its fresh-RPC strategy uses `withRetry` (several
+ * seconds), which must not push a webhook delivery past Helius's window. When the deadline passes
+ * before a price is found, the FIRST attempt fails the transaction (500, redelivered); the redelivery
+ * (attempt recorded) lets it run without the deadline, as before.
+ */
+async function extractPriceWithinDeadline(tx: ValidatedTransaction, slabAddress: string, assetIndex: number, deadlineAt: number | undefined, signature: string): Promise<number> {
+  if (deadlineAt === undefined || (ctxReadAttempts.get(signature) ?? 0) >= 1) return extractPrice(tx, slabAddress, assetIndex);
+  const fromAccount = extractPriceFromAccountData(tx, slabAddress, assetIndex);
+  if (fromAccount > 0) return fromAccount;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw new MatcherContextRetry(signature);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"deadline">((resolve) => { timer = setTimeout(() => resolve("deadline"), remaining); });
+  try {
+    const r = await Promise.race([extractPrice(tx, slabAddress, assetIndex), timeout]);
+    if (r === "deadline") throw new MatcherContextRetry(signature);
+    return r;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function extractPrice(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): Promise<number> {
+  // #221: the asset's booked effective_price. Exact when it comes from the slab POST-STATE in this
+  // payload (strategy 1); the fresh-RPC read (strategy 2) is the LATEST value, which drifts with
+  // oracle pushes, so it is APPROXIMATE. Prefer the matcher CPI's oracle_price_e6 wherever there is one.
   // Strategy 1: read mark_price_e6 from slab post-state account data (no RPC).
-  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress);
+  const priceFromAccount = extractPriceFromAccountData(tx, slabAddress, assetIndex);
   if (priceFromAccount > 0) return priceFromAccount;
 
   // Strategy 2: fresh RPC read of the slab's current mark.
-  const priceFromRpc = await readFreshMarkPriceE6(slabAddress);
+  const priceFromRpc = await readFreshMarkPriceE6(slabAddress, assetIndex);
   if (priceFromRpc > 0) return priceFromRpc;
 
   // Strategy 3: parse program logs (neutered — see extractPriceFromLogs).
@@ -819,7 +1071,12 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string): Prom
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, account = "unknown"): number {
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
+  // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
+  // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
+  const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
+  if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
   if (hasWrapperMagic(raw)) {
@@ -876,7 +1133,7 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, account = "unknown"):
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
-function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string): number {
+function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
     if (acc.account !== slabAddress) continue;
@@ -889,7 +1146,7 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
     }
     if (!raw) continue;
 
-    const price = parseMarkPriceE6FromAccountBytes(raw, slabAddress);
+    const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex, slabAddress);
     if (price > 0) return price;
   }
   return 0;
@@ -902,14 +1159,14 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
  * fail the whole batch because one RPC read timed out; the trade is still
  * indexed, just with price=0 (unchanged from before this fix in that case).
  */
-async function readFreshMarkPriceE6(slabAddress: string): Promise<number> {
+async function readFreshMarkPriceE6(slabAddress: string, assetIndex: number): Promise<number> {
   try {
     const info = await withRetry(
       () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
       { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
     );
     if (!info?.data) return 0;
-    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), slabAddress);
+    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), assetIndex, slabAddress);
   } catch (err) {
     logger.warn("Failed to read fresh mark price from slab", {
       slabAddress: slabAddress.slice(0, 8),

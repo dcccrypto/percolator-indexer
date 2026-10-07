@@ -1,0 +1,63 @@
+{
+ "sig": "2HpztiA8DN5jWftCQ3LUCP3CcDWJ4SjX8tyA89gRG6z7iJMqoHkR1wAg2DgVR9pasmZ7fL2UrhZ9yA4Yo4CSKUAp",
+ "note": "real devnet tx; no ctx captured (overwritten by later trades)",
+ "tx": {
+  "signature": "2HpztiA8DN5jWftCQ3LUCP3CcDWJ4SjX8tyA89gRG6z7iJMqoHkR1wAg2DgVR9pasmZ7fL2UrhZ9yA4Yo4CSKUAp",
+  "slot": 507253634,
+  "blockTime": 1791090982,
+  "transaction": {
+   "message": {
+    "instructions": [
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "7YXqJ7",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "L7Npg7",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "3gJqkocMWaMm",
+      "stackHeight": 1
+     },
+     {
+      "programId": "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB",
+      "accounts": [
+       "3d2Fi3eTFZG3z2u1nvsbHv5naCMojsu6kJeVL6Tu3sud",
+       "6Y4bfYLWrhabgzU4p3onx9CeW1jCKjGjjSCaoCHf2Q9R",
+       "66xQz2PXbpgMKU7YrEvfAhifPhk4FSfdy5YR3GjDmrzF",
+       "4rEz9NbcPPB6cKgsG2A5WhPD4R1CLxRLYfUYjVXuJHmj",
+       "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX",
+       "5krGCmiseWfghg1Pijgea9WDU369pNsmat2XsPycZ5Qt",
+       "H5vTxZ45KzgTk4DQvQdaHFpeXRJNKTA6sVSKVZM42GnX"
+      ],
+      "data": "4A7bYCTnSqYSsibxHMNgh1DGnzQ5RbXsVT2aPaa9BFRD8f41pUH8c2ctFwA3Kh6QxEJUAMsc2qArPmNZs9tbDjSDwjUPhyLKp1e9neQo5Jt3frVh5AJ3",
+      "stackHeight": 1
+     }
+    ]
+   }
+  },
+  "meta": {
+   "err": null,
+   "logMessages": [
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB invoke [1]",
+    "Program ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB consumed 42921 of 105769 compute units",
+    "Program ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB success"
+   ],
+   "innerInstructions": [],
+   "returnData": null
+  }
+ }
+}

@@ -2,6 +2,7 @@ import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
 import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
+import { cpiEvidence, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
 
 /**
  * v17 single-fill trade tags (TradeNoCpi=6, TradeCpi=10).
@@ -232,6 +233,68 @@ export function decodeV18BatchLegs(
   return out;
 }
 
+/**
+ * RebalanceReduce (tag 44) — the owner-signed unilateral exit. While an asset is
+ * ADL reduce-only ("close-only"), the app closes positions with this instruction
+ * instead of TradeCpi (launch `app/lib/limits/rebalance-close.ts`), so it is the
+ * ONLY record of those closes. v18 wire (byte-exact vs the SDK's
+ * `encodeRebalanceReduce`), 35 bytes:
+ *
+ *   tag(1) + portfolio_id(u64=8) + position_epoch(u64=8)
+ *   + asset_index(u16=2) @17 + reduce_q(u128=16) @19
+ *
+ * Accounts (`ACCOUNTS_REBALANCE_REDUCE`): [0]=owner (signer), [1]=market, [2]=portfolio.
+ *
+ * Unlike a trade, the wire carries only the MAGNITUDE (`reduce_q` is unsigned): the
+ * engine reduces whichever side the leg is on (`rebalance_reduce_position_not_atomic`),
+ * so the fill's side is NOT on the wire — see {@link rebalanceReduceFill}.
+ */
+export const REBALANCE_REDUCE_MARKET_ACCOUNT_IDX = 1;
+const REBALANCE_REDUCE_ASSET_OFF = 17;
+const REBALANCE_REDUCE_Q_OFF = 19;
+const REBALANCE_REDUCE_LEN = REBALANCE_REDUCE_Q_OFF + 16; // 35
+
+export function isRebalanceReduceTag(tag: number): boolean {
+  return tag === IX_TAG.RebalanceReduce;
+}
+
+/** Decode a RebalanceReduce (tag 44). `null` for another tag, undersized data, or reduce_q == 0. */
+export function decodeRebalanceReduce(data: Uint8Array): { assetIndex: number; reduceQ: bigint } | null {
+  if (data.length < REBALANCE_REDUCE_LEN || !isRebalanceReduceTag(data[0])) return null;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const assetIndex = dv.getUint16(REBALANCE_REDUCE_ASSET_OFF, true);
+  const lo = dv.getBigUint64(REBALANCE_REDUCE_Q_OFF, true);
+  const hi = dv.getBigUint64(REBALANCE_REDUCE_Q_OFF + 8, true);
+  const reduceQ = (hi << 64n) | lo;
+  if (reduceQ === 0n) return null;
+  return { assetIndex, reduceQ };
+}
+
+/**
+ * Turn a decoded RebalanceReduce into a fill, given the trader's signed net position
+ * on that (slab, asset) BEFORE this instruction (sum of their indexed fills: long > 0,
+ * short < 0 — see `fetchTraderNetPositionQ`).
+ *
+ * A reduce never opens or flips, so the fill is the opposite side of the position
+ * (closing a short buys = "long", the same side a TradeCpi close of that short is
+ * recorded with), and its size is capped at the position: the engine clamps
+ * `reduce_q` to |position| (`reduce_q.min(leg.basis_pos_q.unsigned_abs())`).
+ *
+ * Returns `null` when the trader has no indexed open position there — the side
+ * cannot be known, and a guessed side would corrupt history and volume.
+ */
+export function rebalanceReduceFill(
+  reduceQ: bigint,
+  netPositionQ: bigint,
+): { side: "long" | "short"; sizeValue: bigint } | null {
+  if (reduceQ <= 0n || netPositionQ === 0n) return null;
+  const abs = netPositionQ < 0n ? -netPositionQ : netPositionQ;
+  return {
+    side: netPositionQ < 0n ? "long" : "short",
+    sizeValue: reduceQ < abs ? reduceQ : abs,
+  };
+}
+
 export interface ParsedFill {
   signature: string;
   trader: string;
@@ -269,6 +332,23 @@ export interface ParsedFill {
    * existing callers that branch on `priceE6 ?? 0`.
    */
   priceE6?: number;
+  /**
+   * True for a RebalanceReduce (tag 44) slot. It occupies a position in the transaction-wide
+   * fill numbering (so a TradeCpi after it gets the same leg_index on every ingestion path) but
+   * carries no side or exact size: `side`/`sizeAbs` are placeholders and the consumer MUST NOT
+   * write a row from it (the poll and webhook paths resolve tag 44 against indexed history).
+   */
+  rebalanceReduce?: true;
+  /**
+   * TradeCpi / BatchTradeCpi only. What the transaction proves about the matcher call (booked
+   * price, zero fill, size handed to the matcher). `sizeAbs` above is the REQUESTED size and must
+   * not be written for these fills: pass this through `resolveCpiLeg` (parsers/matcherFill.ts).
+   */
+  cpi?: CpiEvidence;
+  /** Position of this fill inside its instruction (0 for single fills). */
+  legPos?: number;
+  /** The taker's fee CAP off the wire (not the fee charged). */
+  feeBps?: number;
 }
 
 /**
@@ -289,7 +369,12 @@ export interface ParsedFill {
 export function parsePercolatorFills(
   tx: {
     transaction?: { message?: { instructions?: any[] } };
-    meta?: { err?: unknown; logMessages?: string[] } | null;
+    meta?: {
+      err?: unknown;
+      logMessages?: string[];
+      innerInstructions?: Array<{ index: number; instructions?: any[] }> | null;
+      returnData?: { programId?: unknown; data?: unknown } | null;
+    } | null;
   },
   signature: string,
   programIds: string[],
@@ -302,7 +387,10 @@ export function parsePercolatorFills(
   const programIdSet = new Set(programIds);
   const fills: ParsedFill[] = [];
 
-  for (const ix of ixs) {
+  const innerGroups = tx.meta.innerInstructions;
+  const returnData = parseReturnData(tx.meta.returnData);
+
+  for (const [ixIdx, ix] of ixs.entries()) {
     // Skip parsed instructions (system, token, etc.) — same guard as TradeIndexer.
     if (ix && typeof ix === "object" && "parsed" in ix) continue;
 
@@ -317,6 +405,24 @@ export function parsePercolatorFills(
     const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts ?? []);
 
     const tag = data[0];
+    if (isRebalanceReduceTag(tag)) {
+      const reduce = decodeRebalanceReduce(data);
+      const owner = pubkeyToBase58(ix.accounts?.[0]);
+      if (reduce && owner) {
+        fills.push({
+          signature,
+          trader: owner,
+          programId,
+          assetIndex: reduce.assetIndex,
+          sizeAbs: reduce.reduceQ,
+          side: "long",
+          slabAddress: pubkeyToBase58(ix.accounts?.[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]),
+          priceE6: undefined,
+          rebalanceReduce: true,
+        });
+      }
+      continue;
+    }
     if (!ALL_TRADE_TAGS.has(tag)) continue;
 
     const trader = pubkeyToBase58(ixAccounts[0]);
@@ -334,6 +440,7 @@ export function parsePercolatorFills(
     if (SINGLE_TRADE_TAGS.has(tag)) {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
+      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, false) : undefined;
 
       fills.push({
         signature,
@@ -344,8 +451,11 @@ export function parsePercolatorFills(
         side: decoded.side,
         slabAddress,
         priceE6: undefined,
+        feeBps: decoded.feeBps,
+        ...(cpi ? { cpi, legPos: 0 } : {}),
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
+      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, true) : undefined;
       for (const leg of decodeV18BatchLegs(tag, data)) {
         fills.push({
           signature,
@@ -356,12 +466,49 @@ export function parsePercolatorFills(
           side: leg.side,
           slabAddress,
           priceE6: undefined,
+          feeBps: leg.feeBps,
+          ...(cpi ? { cpi, legPos: leg.legIndex } : {}),
         });
       }
     }
   }
 
   return fills;
+}
+
+function parseReturnData(rd: { programId?: unknown; data?: unknown } | null | undefined): { programId: string; data: Uint8Array } | null {
+  if (!rd) return null;
+  const programId = pubkeyToBase58(rd.programId);
+  const raw = Array.isArray(rd.data) ? rd.data[0] : rd.data;
+  if (!programId || typeof raw !== "string") return null;
+  try {
+    return { programId, data: Uint8Array.from(Buffer.from(raw, "base64")) };
+  } catch {
+    return null;
+  }
+}
+
+/** Evidence for one wrapper instruction from a `getTransaction`/`transactionSubscribe` (jsonParsed) shape. */
+export function cpiEvidenceFromParsed(
+  ix: { accounts?: unknown[] },
+  ixIdx: number,
+  innerGroups: Array<{ index: number; instructions?: any[] }> | null | undefined,
+  returnData: { programId: string; data: Uint8Array } | null,
+  isBatch: boolean,
+): CpiEvidence {
+  const accounts = (ix.accounts ?? []).map((a) => pubkeyToBase58(a) ?? "");
+  let inner: InnerIxLike[] | null = null;
+  if (Array.isArray(innerGroups)) {
+    inner = [];
+    for (const g of innerGroups) {
+      if (g.index !== ixIdx) continue;
+      for (const i of g.instructions ?? []) {
+        const pid = pubkeyToBase58(i?.programId);
+        if (pid && typeof i.data === "string") inner.push({ programId: pid, data: i.data });
+      }
+    }
+  }
+  return cpiEvidence(accounts, inner, returnData, isBatch);
 }
 
 /**

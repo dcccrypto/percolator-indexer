@@ -11,6 +11,7 @@ import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
 import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
+import { getTradecpiCounters } from "./parsers/matcherFill.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
 import { RpcLpVaultChain } from "./lpVault/chain.js";
 import { SupabaseLpVaultStore } from "./lpVault/store.js";
@@ -189,7 +190,8 @@ app.get("/health", async (c) => {
   const statusCode = status === "ok" ? 200 : 503;
   
   // I-3: Mask checks and service name from unauthenticated callers
-  return c.json({ status }, statusCode);
+  // Counters only (no checks / no service detail): how TradeCpi fills were resolved since boot.
+  return c.json({ status, tradecpi: getTradecpiCounters() }, statusCode);
 });
 
 app.route("/", webhookRoutes(discovery));

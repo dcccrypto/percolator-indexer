@@ -48,7 +48,7 @@ export async function insertV22Events(rows: readonly V22EventRow[]): Promise<num
         const now = Date.now();
         if (now - lastMissingLog >= TABLE_MISSING_RELOG_MS) {
           lastMissingLog = now;
-          logger.error("v22_events table is missing: v2.2 events are NOT being recorded (apply migrations/20261007120000_v22_events.sql)", {
+          logger.error("v22_events table is missing: v2.2 events are NOT being recorded (apply supabase/migrations/20261007120000_v22_events.sql)", {
             metric: "indexer_v22_events_dropped_total",
             dropped: missingTotal,
             code: error.code,
