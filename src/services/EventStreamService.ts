@@ -126,6 +126,9 @@ export class EventStreamService {
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
     for (const [legIndex, fill] of fills.entries()) {
+      // RebalanceReduce (tag 44) holds a leg number but has no side/exact size here; the
+      // poll and webhook paths index it (resolved against history). Never write a placeholder.
+      if (fill.rebalanceReduce) continue;
       // #148: Use the per-fill slab derived from instruction accounts (fill.slabAddress),
       // not the tx-wide resolveSlab() result. resolveSlab returns the *first* known slab
       // in accountKeys and applies it to every fill in the tx — mis-attributing fills in

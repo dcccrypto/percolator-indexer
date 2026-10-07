@@ -231,6 +231,68 @@ export function decodeV18BatchLegs(
   return out;
 }
 
+/**
+ * RebalanceReduce (tag 44) — the owner-signed unilateral exit. While an asset is
+ * ADL reduce-only ("close-only"), the app closes positions with this instruction
+ * instead of TradeCpi (launch `app/lib/limits/rebalance-close.ts`), so it is the
+ * ONLY record of those closes. v18 wire (byte-exact vs the SDK's
+ * `encodeRebalanceReduce`), 35 bytes:
+ *
+ *   tag(1) + portfolio_id(u64=8) + position_epoch(u64=8)
+ *   + asset_index(u16=2) @17 + reduce_q(u128=16) @19
+ *
+ * Accounts (`ACCOUNTS_REBALANCE_REDUCE`): [0]=owner (signer), [1]=market, [2]=portfolio.
+ *
+ * Unlike a trade, the wire carries only the MAGNITUDE (`reduce_q` is unsigned): the
+ * engine reduces whichever side the leg is on (`rebalance_reduce_position_not_atomic`),
+ * so the fill's side is NOT on the wire — see {@link rebalanceReduceFill}.
+ */
+export const REBALANCE_REDUCE_MARKET_ACCOUNT_IDX = 1;
+const REBALANCE_REDUCE_ASSET_OFF = 17;
+const REBALANCE_REDUCE_Q_OFF = 19;
+const REBALANCE_REDUCE_LEN = REBALANCE_REDUCE_Q_OFF + 16; // 35
+
+export function isRebalanceReduceTag(tag: number): boolean {
+  return tag === IX_TAG.RebalanceReduce;
+}
+
+/** Decode a RebalanceReduce (tag 44). `null` for another tag, undersized data, or reduce_q == 0. */
+export function decodeRebalanceReduce(data: Uint8Array): { assetIndex: number; reduceQ: bigint } | null {
+  if (data.length < REBALANCE_REDUCE_LEN || !isRebalanceReduceTag(data[0])) return null;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const assetIndex = dv.getUint16(REBALANCE_REDUCE_ASSET_OFF, true);
+  const lo = dv.getBigUint64(REBALANCE_REDUCE_Q_OFF, true);
+  const hi = dv.getBigUint64(REBALANCE_REDUCE_Q_OFF + 8, true);
+  const reduceQ = (hi << 64n) | lo;
+  if (reduceQ === 0n) return null;
+  return { assetIndex, reduceQ };
+}
+
+/**
+ * Turn a decoded RebalanceReduce into a fill, given the trader's signed net position
+ * on that (slab, asset) BEFORE this instruction (sum of their indexed fills: long > 0,
+ * short < 0 — see `fetchTraderNetPositionQ`).
+ *
+ * A reduce never opens or flips, so the fill is the opposite side of the position
+ * (closing a short buys = "long", the same side a TradeCpi close of that short is
+ * recorded with), and its size is capped at the position: the engine clamps
+ * `reduce_q` to |position| (`reduce_q.min(leg.basis_pos_q.unsigned_abs())`).
+ *
+ * Returns `null` when the trader has no indexed open position there — the side
+ * cannot be known, and a guessed side would corrupt history and volume.
+ */
+export function rebalanceReduceFill(
+  reduceQ: bigint,
+  netPositionQ: bigint,
+): { side: "long" | "short"; sizeValue: bigint } | null {
+  if (reduceQ <= 0n || netPositionQ === 0n) return null;
+  const abs = netPositionQ < 0n ? -netPositionQ : netPositionQ;
+  return {
+    side: netPositionQ < 0n ? "long" : "short",
+    sizeValue: reduceQ < abs ? reduceQ : abs,
+  };
+}
+
 export interface ParsedFill {
   signature: string;
   trader: string;
@@ -268,6 +330,13 @@ export interface ParsedFill {
    * existing callers that branch on `priceE6 ?? 0`.
    */
   priceE6?: number;
+  /**
+   * True for a RebalanceReduce (tag 44) slot. It occupies a position in the transaction-wide
+   * fill numbering (so a TradeCpi after it gets the same leg_index on every ingestion path) but
+   * carries no side or exact size: `side`/`sizeAbs` are placeholders and the consumer MUST NOT
+   * write a row from it (the poll and webhook paths resolve tag 44 against indexed history).
+   */
+  rebalanceReduce?: true;
 }
 
 /**
@@ -312,6 +381,24 @@ export function parsePercolatorFills(
     if (!data || data.length < 1) continue;
 
     const tag = data[0];
+    if (isRebalanceReduceTag(tag)) {
+      const reduce = decodeRebalanceReduce(data);
+      const owner = pubkeyToBase58(ix.accounts?.[0]);
+      if (reduce && owner) {
+        fills.push({
+          signature,
+          trader: owner,
+          programId,
+          assetIndex: reduce.assetIndex,
+          sizeAbs: reduce.reduceQ,
+          side: "long",
+          slabAddress: pubkeyToBase58(ix.accounts?.[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]),
+          priceE6: undefined,
+          rebalanceReduce: true,
+        });
+      }
+      continue;
+    }
     if (!ALL_TRADE_TAGS.has(tag)) continue;
 
     const trader = pubkeyToBase58(ix.accounts?.[0]);

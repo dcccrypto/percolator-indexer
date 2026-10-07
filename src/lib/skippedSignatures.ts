@@ -26,7 +26,7 @@ export function resetSkippedSignatureCount(): void {
 /**
  * Make skipped signatures durable and loud. Never throws (it runs inside an ingestion loop):
  * 1. counter metric incremented and the FULL signature + slab logged at error level (+ Sentry),
- * 2. upserted into `skipped_signatures` (migration 20261005120000, applied by hand),
+ * 2. upserted into `skipped_signatures` (supabase/migrations/20261005120000_skipped_signatures.sql, applied by hand; if the table is absent this logs + reports to Sentry instead of failing),
  * 3. ONLY if SKIPPED_SIGNATURES_FILE is set explicitly (checked writable at startup by
  *    {@link assertSkippedSignatureSinkReady}), a failed table write is appended there as JSONL. There is NO default
  *    file: the durable record is the error log + the Sentry event + the table (apply the migration before deploy).
