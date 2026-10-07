@@ -27,6 +27,12 @@ vi.mock("../src/db/insertTradeRow.js", () => ({
   insertTradeRows: vi.fn(async (rows: any[]) => rows),
 }));
 
+const storedLegs: { rows: any[] | null } = { rows: [] };
+vi.mock("../src/db/storedLegs.js", async (orig) => ({
+  ...(await orig<typeof import("../src/db/storedLegs.js")>()),
+  fetchStoredLegs: vi.fn(async () => storedLegs.rows),
+  fetchStoredLegsMany: vi.fn(async () => null),
+}));
 import { insertTradeRows } from "../src/db/insertTradeRow.js";
 import { webhookRoutes } from "../src/routes/webhook.js";
 
@@ -42,7 +48,7 @@ async function deliver(tx: unknown) {
 const ctxReturnBytes = (hex: string) => Buffer.from(hex.padEnd(640, "0"), "hex"); // 320-byte account
 
 describe("webhook: TradeCpi rows carry the executed size and the booked price", () => {
-  beforeEach(() => { vi.mocked(insertTradeRows).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRows).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
 
   it("matcher partial fill: row is the executed 483, priced at the booked price, NOT the 29.041225 request", async () => {
     const f = classic("partial");
@@ -67,6 +73,19 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     const rows = await deliver(enhanced[f.sig]);
     expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, side: "long", leg_index: 0 })]);
     expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("an already stored leg costs NO matcher-context RPC read and writes nothing", async () => {
+    const f = classic("partial");
+    const wire = enhanced[f.sig].instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
+    storedLegs.rows = [{ slab_address: wire.accounts[1], asset_index: 0, leg_index: 0, trader: wire.accounts[0], side: "short", size: "483", is_liquidation: false }];
+    getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(f.ctxReturnHex) });
+    expect(await deliver(enhanced[f.sig])).toEqual([]);
+    expect(getAccountInfo).not.toHaveBeenCalled();
+    // negative control: the same leg number but another asset is NOT stored -> read and written
+    storedLegs.rows = [{ slab_address: wire.accounts[1], asset_index: 1, leg_index: 0, trader: wire.accounts[0], side: "short", size: "483", is_liquidation: false }];
+    expect((await deliver(enhanced[f.sig])).filter((r) => !r.is_liquidation)).toHaveLength(1);
+    expect(getAccountInfo).toHaveBeenCalledTimes(1);
   });
 
   it("strict mode: no row, signature recorded", async () => {

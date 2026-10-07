@@ -12,6 +12,11 @@ vi.mock("@percolatorct/shared", async (orig) => {
 const recordSkipped = vi.fn(async () => undefined);
 vi.mock("../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: (...a: unknown[]) => recordSkipped(...(a as [])), assertSkippedSignatureSinkReady: vi.fn() }));
 vi.mock("../src/db/insertTradeRow.js", () => ({ insertTradeRow: vi.fn(async () => true) }));
+const storedLegs: { rows: any[] | null } = { rows: [] };
+vi.mock("../src/db/storedLegs.js", async (orig) => ({
+  ...(await orig<typeof import("../src/db/storedLegs.js")>()),
+  fetchStoredLegs: vi.fn(async () => storedLegs.rows),
+}));
 import { insertTradeRow } from "../src/db/insertTradeRow.js";
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
 
@@ -33,7 +38,7 @@ async function poll(f: any) {
 }
 
 describe("poll path: TradeCpi rows", () => {
-  beforeEach(() => { vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
 
   it("partial fill: executed size, booked price, fee on the executed notional", async () => {
     const f = fx("partial");
@@ -56,6 +61,18 @@ describe("poll path: TradeCpi rows", () => {
     expect(await poll(f)).toBe(true);
     expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "822500", price: 121.580511 })]);
     expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("an already stored leg costs NO matcher-context RPC read and writes nothing", async () => {
+    const f = fx("partial");
+    storedLegs.rows = [{ slab_address: market(f), asset_index: 0, leg_index: 0, trader: f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100).accounts[0], side: "short", size: "483", is_liquidation: false }];
+    getAccountInfo.mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
+    expect(await poll(f)).toBe(false);
+    expect(getAccountInfo).not.toHaveBeenCalled();
+    expect(insertTradeRow).not.toHaveBeenCalled();
+    storedLegs.rows = []; // negative control: not stored -> read + written
+    expect(await poll(f)).toBe(true);
+    expect(getAccountInfo).toHaveBeenCalledTimes(1);
   });
 
   it("strict mode: no row, signature recorded", async () => {

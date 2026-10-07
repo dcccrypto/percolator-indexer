@@ -812,6 +812,15 @@ async function extractTradesFromEnhancedTx(
       let price: number;
       let legSize = leg.sizeValue;
       if (cpi) {
+        // Already stored at this leg number (redelivery / backfill)? Do NOT spend an RPC read on the
+        // matcher context: hold the number and move on. Final leg number = fills (written or held)
+        // before this one in the tx; the stored-legs snapshot is the delivery-wide batched one.
+        const provisionalLeg = trades.filter((t) => !t.is_liquidation).length;
+        const storedNow = await getStored();
+        if (storedNow?.some((r) => !r.is_liquidation && r.slab_address === slabAddress && r.asset_index === leg.assetIndex && r.leg_index === provisionalLeg)) {
+          trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+          continue;
+        }
         const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
         if (r.kind === "skip") {
           if (r.reason !== "zero-fill") {
