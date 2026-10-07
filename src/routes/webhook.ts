@@ -16,11 +16,11 @@ import {
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
-import { cpiEvidence, resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
+import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
-import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -414,6 +414,9 @@ export function verifyWebhookSignature(
   return timingSafeEqual(authDigest, secretDigest);
 }
 
+/** Time one delivery may spend on matcher-context reads (Helius gives ~15 s in total). */
+const CTX_DELIVERY_BUDGET_MS = 8000;
+
 async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
   let indexed = 0;
   let insertFailures = 0;
@@ -425,6 +428,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   let blockedFills = 0;
   // #160: extraction failures are COUNTED, not swallowed. See the throw at the end.
   let extractionFailures = 0;
+  let ctxRetries = 0;
   let firstExtractionError: unknown = null;
   // Writes everything extracted so far and publishes what was newly written. Called once at the end,
   // and also right before a RebalanceReduce (tag 44) is resolved: a close is inferred from the
@@ -489,7 +493,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
   // before it. Stable, so transactions without a slot keep their delivery order.
   const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
-  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false };
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + CTX_DELIVERY_BUDGET_MS };
   const ordered = [...transactions].sort((x, y) => {
     const sx = slotOf(x), sy = slotOf(y);
     return sx === sy ? 0 : sx < sy ? -1 : 1;
@@ -509,8 +513,18 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
         pending.push(trade);
       }
-      if (tx.signature) delivery.earlier.add(tx.signature);
+      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); }
     } catch (err) {
+      if (err instanceof MatcherContextRetry) {
+        // Not an extraction bug: a transient RPC failure. Everything else in the delivery is still
+        // written; this transaction is redelivered (its stored legs are skipped, then it falls back).
+        ctxRetries++;
+        if (ctxReadAttempts.size > 2000) ctxReadAttempts.clear();
+        ctxReadAttempts.set(err.signature, 1);
+        delivery.incomplete = true;
+        logger.warn("matcher context read failed; answering 500 so the delivery is retried", { signature: err.signature.slice(0, 16) });
+        continue;
+      }
       // #160: this used to warn and continue, so processTransactions resolved and
       // the route answered 200. Helius does not retry a 2xx, so a transaction that
       // threw during EXTRACTION was silently and permanently dropped — no insert
@@ -558,6 +572,9 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // gives up. That is the correct trade: a bounded number of idempotent retries plus
   // a loud Sentry trail beats silently losing a fill. If a payload shape appears that
   // can never parse, that is a parser bug — and this is how we find out about it.
+  if (ctxRetries > 0) {
+    throw new Error(`${ctxRetries} transaction(s) need a matcher-context re-read (transient RPC failure)`);
+  }
   if (extractionFailures > 0) {
     throw new Error(
       `${extractionFailures} transaction(s) failed trade extraction` +
@@ -581,6 +598,8 @@ interface TradeData {
   placeholder?: boolean;
   /** This entry is a RebalanceReduce (tag 44), written or held; its leg number is not a TradeCpi fill's. */
   reduce?: boolean;
+  /** A TradeCpi / BatchTradeCpi leg: its size is the executed (or post-clip) size, not the wire size. */
+  cpi?: boolean;
 }
 
 interface DeliveryState {
@@ -590,6 +609,16 @@ interface DeliveryState {
   stored?: Map<string, StoredLeg[]> | null;
   /** Other transactions of this delivery whose order relative to `tx` is not known from the payload (same slot, or no slot). */
   peersOf?: (tx: ValidatedTransaction) => ValidatedTransaction[];
+  /** ms-epoch deadline for this delivery's matcher-context reads. */
+  ctxDeadlineAt?: number;
+}
+
+/** signature -> 1: its matcher-context read already failed once and the delivery was answered 500. Bounded. */
+const ctxReadAttempts = new Map<string, number>();
+
+/** The matcher-context read failed in transport; the delivery is answered 500 so Helius redelivers. */
+class MatcherContextRetry extends Error {
+  constructor(readonly signature: string) { super("matcher context read failed; delivery will be retried"); }
 }
 
 async function extractTradesFromEnhancedTx(
@@ -625,6 +654,8 @@ async function extractTradesFromEnhancedTx(
   // (trader|slab|asset) positions already touched by an earlier fill or tag 44 in THIS tx: a tag 44
   // after one of them starts from a position that is not in the table yet, so it is not resolved.
   const touched = new Set<string>();
+  // Rank of this tx's TradeCpi legs per (slab, asset, trader, side), size-independent.
+  const cpiSeen = new Map<string, number>();
   // Rows already stored for this tx, read once and only when a fill needs it.
   let stored: StoredLeg[] | null | undefined;
   const getStored = async (): Promise<StoredLeg[] | null> => {
@@ -804,27 +835,43 @@ async function extractTradesFromEnhancedTx(
           Array.isArray(ix.innerInstructions)
             ? ix.innerInstructions.filter((i) => typeof i.programId === "string" && typeof i.data === "string").map((i) => ({ programId: i.programId as string, data: i.data as string }))
             : null,
+          null,
+          tag === IX_TAG.BatchTradeCpi,
         )
       : null;
-    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null);
+    // 2 s per read, and a per-delivery deadline so a slow RPC cannot eat Helius's ~15 s window.
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null, { deadlineAt: delivery.ctxDeadlineAt });
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
       touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
 
-      let price: number;
+      let price: number | undefined;
       let legSize = leg.sizeValue;
+      let cpiLeg = false;
       if (cpi) {
-        // Already stored at this leg number (redelivery / backfill)? Do NOT spend an RPC read on the
-        // matcher context: hold the number and move on. Final leg number = fills (written or held)
-        // before this one in the tx; the stored-legs snapshot is the delivery-wide batched one.
+        cpiLeg = true;
+        // Already stored (redelivery / backfill)? Do NOT spend an RPC read on the matcher context:
+        // hold the number and move on. Final leg number = fills (written or held) before this one in
+        // the tx; the stored-legs snapshot is the delivery-wide batched one. A TradeCpi row's size is
+        // the executed size, so identity ignores size (exact leg number, or the same (slab, asset,
+        // trader, side) already stored as many times as this leg's rank).
         const provisionalLeg = trades.filter((t) => !t.is_liquidation).length;
-        const storedNow = await getStored();
-        if (storedNow?.some((r) => !r.is_liquidation && r.slab_address === slabAddress && r.asset_index === leg.assetIndex && r.leg_index === provisionalLeg)) {
+        const cpiKey = `${slabAddress}|${leg.assetIndex}|${trader}|${leg.side}`;
+        const cpiOrdinal = (cpiSeen.get(cpiKey) ?? 0) + 1;
+        cpiSeen.set(cpiKey, cpiOrdinal);
+        const reduceNow = new Set(trades.filter((t) => t.reduce).map((t) => t.leg_index));
+        if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex: provisionalLeg, trader, side: leg.side, ordinal: cpiOrdinal }, reduceNow)) {
           trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
           continue;
         }
-        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
+        const attempted = ctxReadAttempts.get(signature) ?? 0;
+        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError: attempted >= 1 ? "fallback" : "report" });
+        if (r.kind === "read-error") {
+          // Transport failure: a size written now would be permanent (unique index). Fail this
+          // transaction so the delivery answers 500 and Helius redelivers; the redelivery falls back.
+          throw new MatcherContextRetry(signature);
+        }
         if (r.kind === "skip") {
           if (r.reason !== "zero-fill") {
             await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
@@ -833,18 +880,23 @@ async function extractTradesFromEnhancedTx(
           trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
           continue;
         }
-        legSize = r.sizeValue;
-        price = Number(r.priceE6) / 1_000_000;
-        if (!r.exact) { noteUnverifiedSize(); logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) }); }
-      } else if (leg.execPriceE6 !== undefined) {
-        price = Number(leg.execPriceE6) / 1_000_000;
-      } else {
-        let fallback = fallbackPriceByAsset.get(leg.assetIndex);
-        if (fallback === undefined) {
-          fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
-          fallbackPriceByAsset.set(leg.assetIndex, fallback);
+        if (r.kind === "fill") {
+          legSize = r.sizeValue;
+          price = Number(r.priceE6) / 1_000_000;
+          if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
+        } // "legacy": wire size + the existing price logic below, exactly as before this parser
+      }
+      if (price === undefined) {
+        if (leg.execPriceE6 !== undefined) {
+          price = Number(leg.execPriceE6) / 1_000_000;
+        } else {
+          let fallback = fallbackPriceByAsset.get(leg.assetIndex);
+          if (fallback === undefined) {
+            fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
+            fallbackPriceByAsset.set(leg.assetIndex, fallback);
+          }
+          price = fallback;
         }
-        price = fallback;
       }
       const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
@@ -859,6 +911,7 @@ async function extractTradesFromEnhancedTx(
         asset_index: leg.assetIndex,
         leg_index: leg.legIndex,
         is_liquidation: false,
+        ...(cpiLeg ? { cpi: true } : {}),
       });
     }
   }
@@ -907,6 +960,10 @@ async function extractTradesFromEnhancedTx(
       const rank = new Map<string, number>();
       return fills.filter((t) => {
         if (t.is_liquidation || t.side === null || t.size === null) return true;
+        // A TradeCpi leg already went through the size-independent check (cpiFillAlreadyStored) before
+        // its matcher-context read; its size is the executed size, so a size-rank filter would only
+        // double-count (and could drop a genuinely new leg).
+        if (t.cpi) return true;
         const k = `${t.slab_address}|${t.asset_index}|${t.trader}|${t.side}|${t.size}`;
         const ordinal = (rank.get(k) ?? 0) + 1;
         rank.set(k, ordinal);

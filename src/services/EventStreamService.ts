@@ -6,7 +6,7 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
-import { resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
+import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 
@@ -125,7 +125,8 @@ export class EventStreamService {
     // so the fallback slab read is memoized per slab (it was previously repeated
     // once per fill). null = the read failed or returned nothing for that slab.
     const priceBySlabAsset = new Map<string, number | null>(); // #221: per (slab, asset)
-    const readMatcherContext = makeMatcherContextReader(() => this.deps.connection, typeof tx.slot === "number" ? tx.slot : null);
+    // 2 s per read, retried briefly (2 x 300 ms) on a transport error, then the post-clip request size.
+    const readMatcherContext = makeMatcherContextReader(() => this.deps.connection, typeof tx.slot === "number" ? tx.slot : null, { retries: 2, retryDelayMs: 300 });
 
     // legIndex is the fill's position within the whole tx (fills are flattened across
     // instructions), so (tx_signature, asset_index, legIndex) is unique per tx. (H2/H3)
@@ -158,11 +159,13 @@ export class EventStreamService {
           if (r.reason !== "zero-fill") {
             await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
           }
-          continue; // zero fill / unprovable size: no row (the leg number is already consumed)
+          continue; // zero fill / strict skip: no row (the leg number is already consumed)
         }
-        sizeAbs = r.sizeValue;
-        priceE6Value = Number(r.priceE6);
-        if (!r.exact) { noteUnverifiedSize(); log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature }); }
+        if (r.kind === "fill") {
+          sizeAbs = r.sizeValue;
+          priceE6Value = Number(r.priceE6);
+          if (!r.exact) log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature });
+        } // "legacy": wire size + the slab-read price below, exactly as before this parser
       }
       if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always

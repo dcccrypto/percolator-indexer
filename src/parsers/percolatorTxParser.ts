@@ -435,7 +435,7 @@ export function parsePercolatorFills(
     if (SINGLE_TRADE_TAGS.has(tag)) {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
-      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData) : undefined;
+      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, false) : undefined;
 
       fills.push({
         signature,
@@ -450,7 +450,7 @@ export function parsePercolatorFills(
         ...(cpi ? { cpi, legPos: 0 } : {}),
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
-      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData) : undefined;
+      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, true) : undefined;
       for (const leg of decodeV18BatchLegs(tag, data)) {
         fills.push({
           signature,
@@ -489,6 +489,7 @@ export function cpiEvidenceFromParsed(
   ixIdx: number,
   innerGroups: Array<{ index: number; instructions?: any[] }> | null | undefined,
   returnData: { programId: string; data: Uint8Array } | null,
+  isBatch: boolean,
 ): CpiEvidence {
   const accounts = (ix.accounts ?? []).map((a) => pubkeyToBase58(a) ?? "");
   let inner: InnerIxLike[] | null = null;
@@ -502,7 +503,7 @@ export function cpiEvidenceFromParsed(
       }
     }
   }
-  return cpiEvidence(accounts, inner, returnData);
+  return cpiEvidence(accounts, inner, returnData, isBatch);
 }
 
 /**

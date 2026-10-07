@@ -98,12 +98,65 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
   });
 
-  it("a payload without nested innerInstructions (unrecognised layout) writes nothing and is recorded", async () => {
+  it("a payload without nested innerInstructions (unrecognised layout) writes what main writes today: wire size, existing price logic; not dropped, not recorded as skipped", async () => {
     const f = classic("partial");
     const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
     for (const i of tx.instructions) delete i.innerInstructions;
-    expect(await deliver(tx)).toEqual([]);
-    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ error: expect.stringContaining("unrecognised") })]);
+    const slab = JSON.parse(readFileSync(new URL("./fixtures/v18-market-link.json", import.meta.url), "utf8"));
+    getAccountInfo.mockResolvedValue({ data: Buffer.from(slab.dataBase64, "base64") });
+    const rows = (await deliver(tx)).filter((r) => !r.is_liquidation);
+    expect(rows).toEqual([expect.objectContaining({ size: "29041225", side: "short", price: 13.614586 })]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("N3: context overwritten and the post-clip request (189226154805) is smaller than the wire size (378397480755): the REQUEST size is written", async () => {
+    const f = classic("clipFull");
+    getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(classic("full").ctxReturnHex) }); // another trade's answer
+    const rows = (await deliver(enhanced[f.sig])).filter((r) => !r.is_liquidation);
+    expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
+  });
+
+  it("F2: a transport error on the context read answers 500 and writes no size; the redelivery falls back to the post-clip request", async () => {
+    const f = classic("clipFull");
+    getAccountInfo.mockRejectedValue(new Error("429 Too Many Requests"));
+    const app = webhookRoutes();
+    const post = () => app.fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body: JSON.stringify([enhanced[f.sig]]) }));
+    expect((await post()).status).toBe(500);
+    expect(vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[])).toEqual([]);
+    expect((await post()).status).toBe(200); // second delivery of the same signature: fallback
+    expect(vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[]).map((r) => r.size)).toEqual(["189226154805"]);
+  });
+
+  it("F2: rows of the OTHER transactions in the same delivery are written (not lost) when one needs a retry, and are not doubled on the redelivery", async () => {
+    const good = classic("partial"), flaky = classic("clipFull");
+    getAccountInfo.mockImplementation(async (pk: any) => {
+      if (pk.toBase58() === good.ctx) return { data: ctxReturnBytes(good.ctxReturnHex) };
+      throw new Error("timeout after 2000 ms");
+    });
+    const app = webhookRoutes();
+    const body = JSON.stringify([enhanced[good.sig], enhanced[flaky.sig]]);
+    const post = () => app.fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body }));
+    expect((await post()).status).toBe(500);
+    const first = vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[]);
+    expect(first.map((r) => r.tx_signature)).toEqual([good.sig]);
+    // redelivery: the good leg is already stored (pre-check, no RPC), the flaky one now falls back
+    storedLegs.rows = first.map((r) => ({ slab_address: r.slab_address, asset_index: r.asset_index, leg_index: r.leg_index, trader: r.trader, side: r.side, size: r.size, is_liquidation: false }));
+    getAccountInfo.mockClear();
+    expect((await post()).status).toBe(200);
+    const all = vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[]);
+    expect(all.filter((r) => r.tx_signature === good.sig)).toHaveLength(1); // not doubled
+    expect(all.filter((r) => r.tx_signature === flaky.sig).map((r) => r.size)).toEqual(["189226154805"]);
+  });
+
+  it("residual duplicate: a leg stored before the executed size was read (wire size, other leg number) is the same fill even though the new size differs", async () => {
+    const f = classic("clipFull");
+    const wire = enhanced[f.sig].instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
+    storedLegs.rows = [{ slab_address: wire.accounts[1], asset_index: 0, leg_index: 5, trader: wire.accounts[0], side: "short", size: "378397480755", is_liquidation: false }];
+    getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(classic("full").ctxReturnHex) });
+    expect(await deliver(enhanced[f.sig])).toEqual([]);
+    // negative control: another trader's row is not this fill
+    storedLegs.rows = [{ slab_address: wire.accounts[1], asset_index: 0, leg_index: 5, trader: "11111111111111111111111111111111", side: "short", size: "378397480755", is_liquidation: false }];
+    expect((await deliver(enhanced[f.sig])).filter((r) => !r.is_liquidation)).toHaveLength(1);
   });
 
   it("real payload yields exactly one row; the matcher program's own instruction is not mistaken for a trade", async () => {

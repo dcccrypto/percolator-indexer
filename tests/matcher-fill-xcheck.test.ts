@@ -17,7 +17,7 @@ describe("matcher-call oracle price == slab effective_price", () => {
   it("same value, same asset", async () => {
     const [fill] = parsePercolatorFills(f.tx, f.sig, [PROGRAM]);
     expect(fill.slabAddress).toBe(f.slab);
-    const r = await resolveCpiLeg({ evidence: fill.cpi!, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: async () => null, policy: "request" });
+    const r = await resolveCpiLeg({ evidence: fill.cpi!, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: async () => ({ kind: "ok", ret: null }), policy: "request" });
     const slab = new Uint8Array(Buffer.from(f.slabDataBase64, "base64"));
     const eff = readAssetEffectivePriceE6(slab, fill.assetIndex);
     expect(eff).toBe(Number(f.slabEffectivePriceE6));

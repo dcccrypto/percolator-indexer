@@ -14,14 +14,14 @@ import { EventStreamService } from "../src/services/EventStreamService.js";
 
 const fx = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
 
-async function run(f: any, getAccountInfo: any) {
+async function run(f: any, getAccountInfo: any, waitMs = 50) {
   let cb: (m: any) => void = () => {};
   const ws: any = { sub: () => {}, onNotification: (c: any) => { cb = c; }, close: () => {}, isOpen: true };
   const wrapperIx = f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
   const svc = new EventStreamService({ ws, programId: PROGRAM, connection: { getAccountInfo } as any, autoIndex: true, knownSlabs: [wrapperIx.accounts[1]] });
   await svc.start();
   cb({ method: "transactionNotification", params: { result: f.tx } });
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((r) => setTimeout(r, waitMs));
   return rowsOut.splice(0);
 }
 
@@ -56,5 +56,30 @@ describe("event stream: TradeCpi rows", () => {
       expect(await run(fx("issue213Partial"), vi.fn(async () => null))).toEqual([]);
       expect(recordSkipped).toHaveBeenCalledTimes(1);
     } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
+  });
+
+  it("N3: context overwritten and the post-clip request (189226154805) is smaller than the wire size (378397480755): the REQUEST size is written", async () => {
+    const f = fx("clipFull");
+    const other = fx("full");
+    const rows = await run(f, vi.fn(async () => ({ data: Buffer.from(other.ctxReturnHex.padEnd(640, "0"), "hex") })));
+    expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
+  });
+
+  it("F2: a transport error is retried briefly (2 x 300 ms) and then the exact size is used when a retry succeeds", async () => {
+    const f = fx("partial");
+    const get = vi.fn()
+      .mockRejectedValueOnce(new Error("429"))
+      .mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
+    const rows = await run(f, get, 1500);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(rows.map((r) => r.size)).toEqual(["483"]);
+  });
+
+  it("F2: persistent failures fall back to the post-clip request after the retries", async () => {
+    const f = fx("clipFull");
+    const get = vi.fn(async () => { throw new Error("timeout"); });
+    const rows = await run(f, get, 1500);
+    expect(get).toHaveBeenCalledTimes(3);
+    expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
   });
 });

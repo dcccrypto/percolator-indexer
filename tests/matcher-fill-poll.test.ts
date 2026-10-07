@@ -84,4 +84,42 @@ describe("poll path: TradeCpi rows", () => {
       expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: fx("issue213Partial").sig })]);
     } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
   });
+
+  it("N3: context overwritten and the post-clip request (189226154805) is smaller than the wire size (378397480755): the REQUEST size is written", async () => {
+    const f = fx("clipFull");
+    getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") });
+    expect(await poll(f)).toBe(true);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).size)).toEqual(["189226154805"]);
+  });
+
+  it("F2: a transport error is retried once (the signature throws so the cursor is held), then falls back to the request size", async () => {
+    const f = fx("clipFull");
+    getAccountInfo.mockRejectedValue(new Error("429"));
+    const idx: any = new TradeIndexerPolling();
+    await expect(idx.processTransaction(asWeb3(f), f.sig, market(f), new Set([PROGRAM]))).rejects.toThrow(/will be retried/);
+    expect(insertTradeRow).not.toHaveBeenCalled();
+    expect(await idx.processTransaction(asWeb3(f), f.sig, market(f), new Set([PROGRAM]))).toBe(true); // retry: fallback
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).size)).toEqual(["189226154805"]);
+  });
+
+  it("F2: a retry that finds the context readable writes the exact size", async () => {
+    const f = fx("partial");
+    const idx: any = new TradeIndexerPolling();
+    getAccountInfo.mockRejectedValueOnce(new Error("timeout"));
+    await expect(idx.processTransaction(asWeb3(f), f.sig, market(f), new Set([PROGRAM]))).rejects.toThrow();
+    getAccountInfo.mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
+    expect(await idx.processTransaction(asWeb3(f), f.sig, market(f), new Set([PROGRAM]))).toBe(true);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).size)).toEqual(["483"]);
+  });
+
+  it("unrecognised evidence (no inner instructions): the wire size, as main writes today", async () => {
+    const f = fx("clipFull");
+    const w = asWeb3(f);
+    w.meta.innerInstructions = undefined as any;
+    getAccountInfo.mockResolvedValue(null);
+    const idx: any = new TradeIndexerPolling();
+    expect(await idx.processTransaction(w, f.sig, market(f), new Set([PROGRAM]))).toBe(true);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).size)).toEqual(["378397480755"]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+  });
 });

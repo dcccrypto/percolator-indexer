@@ -28,7 +28,10 @@
  *    from `meta.returnData` when present.
  */
 
-import { decodeBase58 } from "@percolatorct/shared";
+import { decodeBase58, createLogger } from "@percolatorct/shared";
+
+let _logger: ReturnType<typeof createLogger> | null = null;
+const summaryLogger = () => (_logger ??= createLogger("indexer:tradecpi-fill"));
 
 export const MATCHER_RETURN_BYTES = 64;
 /** Account index of the matcher program in TradeCpi / BatchTradeCpi (`[5]` is its context). */
@@ -141,11 +144,15 @@ export type CpiEvidence =
  * @param outerAccounts the wrapper instruction's account list (`[4]` matcher program, `[5]` context)
  * @param inner         that instruction's inner instructions; `null`/`undefined` = not provided by the source
  * @param returnData    transaction-level return data, if the source has it
+ * @param isBatch       the wrapper instruction is a BatchTradeCpi. A batch ALWAYS calls the matcher
+ *                      (no headroom clip, a zero-size leg reverts), so a missing call there means
+ *                      incomplete inner-instruction data, NOT a zero fill: `unknown`.
  */
 export function cpiEvidence(
   outerAccounts: readonly string[],
   inner: readonly InnerIxLike[] | null | undefined,
-  returnData?: { programId: string; data: Uint8Array } | null,
+  returnData: { programId: string; data: Uint8Array } | null | undefined,
+  isBatch: boolean,
 ): CpiEvidence {
   if (!inner) return { kind: "unknown" };
   const matcherProgram = outerAccounts[CPI_MATCHER_PROGRAM_ACCOUNT_IDX];
@@ -154,49 +161,89 @@ export function cpiEvidence(
     if (ix.programId !== matcherProgram) continue;
     const bytes = decodeBase58(ix.data);
     const call = bytes ? decodeMatcherCall(bytes) : null;
-    if (!call) return { kind: "unknown" };
+    if (!call || call.batch !== isBatch) return { kind: "unknown" };
     let batchReturns: MatcherReturn[] | null = null;
     if (call.batch && returnData && returnData.programId === matcherProgram && returnData.data.length === call.legs.length * MATCHER_RETURN_BYTES) {
       batchReturns = call.legs.map((_, i) => decodeMatcherReturn(returnData.data.subarray(i * MATCHER_RETURN_BYTES, (i + 1) * MATCHER_RETURN_BYTES))!);
     }
     return { kind: "call", call, matcherContext: outerAccounts[CPI_MATCHER_CONTEXT_ACCOUNT_IDX], batchReturns };
   }
-  return { kind: "no-matcher-call" };
+  return isBatch ? { kind: "unknown" } : { kind: "no-matcher-call" };
 }
 
 /**
  * - `zero-fill`: provably nothing changed on chain. No row, nothing to report.
- * - `unrecognised`: the matcher call could not be decoded / does not line up with the instruction
- *   (a wrapper layout this parser does not know). No row; callers record the signature as skipped.
  * - `size-unverified`: only under the strict policy (`TRADECPI_UNVERIFIED_SIZE=skip`). No row;
  *   callers record the signature as skipped.
  */
-export type CpiSkipReason = "zero-fill" | "unrecognised" | "size-unverified";
+export type CpiSkipReason = "zero-fill" | "size-unverified";
 
 export type CpiLegResolution =
   | { kind: "skip"; reason: CpiSkipReason; detail: string }
   /**
+   * The matcher call could not be decoded, or does not line up with the instruction (a wrapper
+   * layout this parser does not know, inner instructions absent from the source). The caller must
+   * do exactly what the indexer did before this parser existed: the wire size and its existing
+   * price logic. Counted as `legacy`.
+   */
+  | { kind: "legacy"; detail: string }
+  /** Only with `onReadError: "report"`: the context read failed in transport; the caller decides (retry). */
+  | { kind: "read-error"; detail: string }
+  /**
    * `exact: true`: the matcher's own answer. `exact: false`: the executed size could not be proven;
    * `sizeValue` is the matcher-requested (post headroom clip) size, an UPPER BOUND of what was
-   * executed, at the exact booked price. Callers count it with {@link noteUnverifiedSize}.
+   * executed, at the exact booked price.
    */
   | { kind: "fill"; sizeValue: bigint; priceE6: bigint; exact: boolean };
 
-let unverifiedSizeTotal = 0;
-/** Counter metric `tradecpi_size_unverified_total` (process lifetime). */
-export function getTradecpiSizeUnverifiedCount(): number {
-  return unverifiedSizeTotal;
+/** Result of reading the matcher context: `ok` (the read worked; `ret` may be anything) or a transport error. */
+export type ContextRead = { kind: "ok"; ret: MatcherReturn | null } | { kind: "error"; detail: string };
+export type ReadMatcherContext = (address: string) => Promise<ContextRead>;
+
+// ---- counters + summary log (visibility) -------------------------------------------------------
+export interface TradecpiCounters {
+  /** executed size proven by the matcher's own answer */
+  exact: number;
+  /** written with the matcher-requested size (an upper bound) */
+  unverified: number;
+  /** provably nothing executed: no row */
+  zeroFill: number;
+  /** strict policy: not written */
+  skipped: number;
+  /** context reads that failed in transport and ended as a fallback (subset of `unverified`/`skipped`) */
+  readError: number;
+  /** undecodable evidence: written as the indexer did before this parser (wire size, legacy price) */
+  legacy: number;
 }
-/** Count one row written with an unproven (upper bound) size. */
-export function noteUnverifiedSize(): void {
-  unverifiedSizeTotal++;
+const zero = (): TradecpiCounters => ({ exact: 0, unverified: 0, zeroFill: 0, skipped: 0, readError: 0, legacy: 0 });
+let counters = zero();
+let lastSummary = { at: Date.now(), total: 0 };
+const SUMMARY_EVERY_MS = 60_000;
+const SUMMARY_EVERY_FILLS = 500;
+const totalOf = (c: TradecpiCounters): number => c.exact + c.unverified + c.zeroFill + c.skipped + c.legacy;
+
+/** Process-lifetime counters (`tradecpi_size_unverified_total` is `unverified`). */
+export function getTradecpiCounters(): TradecpiCounters {
+  return { ...counters };
+}
+export function getTradecpiSizeUnverifiedCount(): number {
+  return counters.unverified;
 }
 /** Test hook. */
-export function resetTradecpiSizeUnverifiedCount(): void {
-  unverifiedSizeTotal = 0;
+export function resetTradecpiCounters(): void {
+  counters = zero();
+  lastSummary = { at: Date.now(), total: 0 };
 }
-
-export type ReadMatcherContext = (address: string) => Promise<MatcherReturn | null>;
+/** Info-level summary every 60 s or 500 fills, whichever comes first. */
+function note(kind: keyof TradecpiCounters, alsoReadError = false): void {
+  counters[kind]++;
+  if (alsoReadError) counters.readError++;
+  const total = totalOf(counters);
+  if (total - lastSummary.total >= SUMMARY_EVERY_FILLS || Date.now() - lastSummary.at >= SUMMARY_EVERY_MS) {
+    summaryLogger().info("TradeCpi fill summary (process lifetime)", { ...counters, sinceLast: total - lastSummary.total });
+    lastSummary = { at: Date.now(), total };
+  }
+}
 
 /**
  * What to do when the executed size cannot be proven (matcher context overwritten or unreadable).
@@ -241,14 +288,22 @@ export async function resolveCpiLeg(args: {
   legPos: number;
   readContext: ReadMatcherContext;
   policy?: UnverifiedSizePolicy;
+  /**
+   * `fallback` (default): a transport error on the context read is treated like "not matched" and
+   * the policy applies (and the failure is counted as `readError`). `report`: return `read-error`
+   * so the caller can retry once the read may succeed (the unique index makes a written size permanent).
+   */
+  onReadError?: "fallback" | "report";
 }): Promise<CpiLegResolution> {
   const { evidence } = args;
   const policy = args.policy ?? unverifiedSizePolicy();
   if (evidence.kind === "no-matcher-call") {
+    note("zeroFill");
     return { kind: "skip", reason: "zero-fill", detail: "the wrapper clipped the request to zero LP headroom and never called the matcher: no position change" };
   }
   if (evidence.kind === "unknown") {
-    return { kind: "skip", reason: "unrecognised", detail: "no inner instructions in this source (or an undecodable matcher call): booked price and executed size cannot be read" };
+    note("legacy");
+    return { kind: "legacy", detail: "no inner instructions in this source (or an undecodable / mismatched matcher call): booked price and executed size cannot be read" };
   }
   const { call } = evidence;
   const leg = call.legs[args.legPos];
@@ -261,23 +316,37 @@ export async function resolveCpiLeg(args: {
     (leg.reqSize > 0n) !== (wireSigned > 0n) ||
     abs(leg.reqSize) > args.wireSizeAbs
   ) {
-    return { kind: "skip", reason: "unrecognised", detail: "the matcher call does not line up with the instruction's leg" };
+    note("legacy");
+    return { kind: "legacy", detail: "the matcher call does not line up with the instruction's leg" };
   }
 
   let ret: MatcherReturn | null = null;
+  let readFailed: string | null = null;
   if (evidence.batchReturns) ret = evidence.batchReturns[args.legPos] ?? null;
-  else if (!call.batch && evidence.matcherContext) ret = await args.readContext(evidence.matcherContext);
+  else if (!call.batch && evidence.matcherContext) {
+    const read = await args.readContext(evidence.matcherContext);
+    if (read.kind === "error") readFailed = read.detail;
+    else ret = read.ret;
+  }
   if (ret && returnMatches(ret, call, leg)) {
     if (ret.execSize === 0n) {
+      note("zeroFill");
       return { kind: "skip", reason: "zero-fill", detail: "the matcher returned exec_size 0 for this request: no position change" };
     }
+    note("exact");
     return { kind: "fill", sizeValue: abs(ret.execSize), priceE6: leg.oraclePriceE6, exact: true };
+  }
+  if (readFailed !== null && args.onReadError === "report") {
+    return { kind: "read-error", detail: readFailed };
   }
 
   if (policy === "request") {
     // Upper bound only (the matcher may have filled less); price is still the booked one.
+    // The size is the POST-CLIP request (`reqSize`), never the instruction's wire size.
+    note("unverified", readFailed !== null);
     return { kind: "fill", sizeValue: abs(leg.reqSize), priceE6: leg.oraclePriceE6, exact: false };
   }
+  note("skipped", readFailed !== null);
   return {
     kind: "skip",
     reason: "size-unverified",
