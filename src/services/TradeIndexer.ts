@@ -11,10 +11,9 @@ import {
   computeFeeUsd,
   isRebalanceReduceTag,
   decodeRebalanceReduce,
-  rebalanceReduceFill,
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
-import { fetchTraderNetPositionQ } from "../db/traderNetPosition.js";
+import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -356,6 +355,8 @@ export class TradeIndexerPolling {
     // per-fill cap as several single-leg TradeCpi instructions in ONE tx.
     let fillSeq = 0;
     let insertedAny = false;
+    // (trader|asset) already reduced by an earlier tag 44 in this tx.
+    const reduceKeysSeen = new Set<string>();
     // No transaction-level "already indexed?" gate: tradeExistsBySignature filters on
     // (signature, network) only, so after ONE leg is written (by any path, or by an
     // earlier pass that then threw on a later leg) it would hide every remaining leg
@@ -394,35 +395,49 @@ export class TradeIndexerPolling {
       // RebalanceReduce (tag 44): how a position is closed while the asset is ADL
       // reduce-only. Not a TRADE_TAG (no counterparty, no side on the wire), but it is
       // the trader's close and must land in their history like a TradeCpi close.
+      // It takes a slot in the tx-wide fill numbering (same counter as every other fill,
+      // and the same slot webhook.ts / parsePercolatorFills give it), so a tag 44 and a
+      // TradeCpi in one transaction can never share (tx_signature, asset_index, leg_index).
       if (isRebalanceReduceTag(tag)) {
-        if (ix.accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]?.toBase58() !== slabAddress) continue;
         const reduce = decodeRebalanceReduce(data);
+        if (!reduce) continue; // malformed / reduce_q 0: the program rejects it, no fill
+        const legIndex = fillSeq++;
         const trader = ix.accounts[0]?.toBase58();
-        if (!reduce || !trader) continue;
-        const net = await fetchTraderNetPositionQ(trader, slabAddress, reduce.assetIndex, signature);
-        const fill = rebalanceReduceFill(reduce.reduceQ, net);
-        if (!fill) {
-          logger.warn("RebalanceReduce with no indexed open position — side unknown, not indexed", {
-            signature: signature.slice(0, 12),
-            slabAddress: slabAddress.slice(0, 8),
-          });
+        if (ix.accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]?.toBase58() !== slabAddress || !trader) continue;
+        // NOT `return`: later instructions (other trades, a second tag 44 on another asset) still count.
+        const reduceKey = `${trader}|${reduce.assetIndex}`;
+        const resolution = await resolveRebalanceReduce({
+          trader,
+          slabAddress,
+          assetIndex: reduce.assetIndex,
+          reduceQ: reduce.reduceQ,
+          signature,
+          txTimeSec: tx.blockTime ?? null,
+          repeatInTx: reduceKeysSeen.has(reduceKey),
+        });
+        reduceKeysSeen.add(reduceKey);
+        if (!resolution.ok) {
+          // Never a warn-only miss: durable + loud + retryable (skipped_signatures, #212).
+          await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
           continue;
         }
-        const price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
-        // leg_index 0, same as a single fill; the engine charges no trading fee on tag 44.
-        await insertTradeRow({
+        const price = await resolveFallbackPrice();
+        // The engine charges no trading fee on tag 44.
+        const inserted = await insertTradeRow({
           slab_address: slabAddress,
           trader,
-          side: fill.side,
-          size: fill.sizeValue.toString(),
+          side: resolution.side,
+          size: resolution.sizeValue.toString(),
           price,
           fee: 0,
           tx_signature: signature,
           asset_index: reduce.assetIndex,
-          leg_index: 0,
+          leg_index: legIndex,
         });
-        eventBus.publish("trade.executed", slabAddress, { signature, trader, side: fill.side, size: fill.sizeValue.toString() });
-        return true;
+        if (!inserted) continue; // duplicate leg: already indexed, no event, no count
+        eventBus.publish("trade.executed", slabAddress, { signature, trader, side: resolution.side, size: resolution.sizeValue.toString() });
+        insertedAny = true;
+        continue;
       }
 
       if (!TRADE_TAGS.has(tag)) continue;

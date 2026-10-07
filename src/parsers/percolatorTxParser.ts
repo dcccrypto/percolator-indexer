@@ -330,6 +330,13 @@ export interface ParsedFill {
    * existing callers that branch on `priceE6 ?? 0`.
    */
   priceE6?: number;
+  /**
+   * True for a RebalanceReduce (tag 44) slot. It occupies a position in the transaction-wide
+   * fill numbering (so a TradeCpi after it gets the same leg_index on every ingestion path) but
+   * carries no side or exact size: `side`/`sizeAbs` are placeholders and the consumer MUST NOT
+   * write a row from it (the poll and webhook paths resolve tag 44 against indexed history).
+   */
+  rebalanceReduce?: true;
 }
 
 /**
@@ -374,6 +381,24 @@ export function parsePercolatorFills(
     if (!data || data.length < 1) continue;
 
     const tag = data[0];
+    if (isRebalanceReduceTag(tag)) {
+      const reduce = decodeRebalanceReduce(data);
+      const owner = pubkeyToBase58(ix.accounts?.[0]);
+      if (reduce && owner) {
+        fills.push({
+          signature,
+          trader: owner,
+          programId,
+          assetIndex: reduce.assetIndex,
+          sizeAbs: reduce.reduceQ,
+          side: "long",
+          slabAddress: pubkeyToBase58(ix.accounts?.[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]),
+          priceE6: undefined,
+          rebalanceReduce: true,
+        });
+      }
+      continue;
+    }
     if (!ALL_TRADE_TAGS.has(tag)) continue;
 
     const trader = pubkeyToBase58(ix.accounts?.[0]);

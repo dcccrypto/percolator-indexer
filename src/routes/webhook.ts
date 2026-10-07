@@ -12,10 +12,10 @@ import {
   computeFeeUsd,
   isRebalanceReduceTag,
   decodeRebalanceReduce,
-  rebalanceReduceFill,
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
-import { fetchTraderNetPositionQ } from "../db/traderNetPosition.js";
+import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
+import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -532,6 +532,8 @@ interface TradeData {
   asset_index: number;   // H2/H3
   leg_index: number;     // H2/H3 — reassigned tx-globally before return
   is_liquidation: boolean;
+  /** Holds a tx-wide leg number for a tag 44 that could not be written; dropped after renumbering. */
+  placeholder?: boolean;
 }
 
 async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): Promise<TradeData[]> {
@@ -553,6 +555,7 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
   if (!BASE58_SIGNATURE.test(signature)) return trades;
 
   const instructions = tx.instructions ?? [];
+  const reduceKeysSeen = new Set<string>(); // (trader|slab|asset) already reduced by an earlier tag 44
 
   for (const ix of instructions) {
     const programId = ix.programId ?? "";
@@ -586,32 +589,51 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
 
     // RebalanceReduce (tag 44): the close used while the asset is ADL reduce-only.
     // Not a TRADE_TAG (no side on the wire) — see the TradeIndexer twin of this block.
+    // It holds a slot in the tx-wide fill numbering (renumbered below, same as every other
+    // fill) even when it cannot be written, so a TradeCpi after it keeps the leg_index the
+    // poll path and EventStreamService give it.
     if (isRebalanceReduceTag(tag)) {
       const accounts: string[] = ix.accounts ?? [];
       const trader = accounts[0] ?? "";
       const slabAddress = accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX] ?? "";
       const reduce = decodeRebalanceReduce(data);
-      if (!reduce || !BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
-      if (discovery && !discovery.getMarkets().has(slabAddress)) continue;
-      const net = await fetchTraderNetPositionQ(trader, slabAddress, reduce.assetIndex, signature);
-      const fill = rebalanceReduceFill(reduce.reduceQ, net);
-      if (!fill) {
-        logger.warn("RebalanceReduce with no indexed open position — side unknown, not indexed", {
-          signature: signature.slice(0, 12),
-          slabAddress,
+      if (!reduce) continue;
+      const placeholder = (): void => {
+        trades.push({
+          slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0,
+          tx_signature: signature, asset_index: reduce.assetIndex, leg_index: 0,
+          is_liquidation: false, placeholder: true,
         });
+      };
+      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) { placeholder(); continue; }
+      if (discovery && !discovery.getMarkets().has(slabAddress)) { placeholder(); continue; }
+      const reduceKey = `${trader}|${slabAddress}|${reduce.assetIndex}`;
+      const resolution = await resolveRebalanceReduce({
+        trader,
+        slabAddress,
+        assetIndex: reduce.assetIndex,
+        reduceQ: reduce.reduceQ,
+        signature,
+        txTimeSec: typeof tx.timestamp === "number" ? tx.timestamp : null,
+        repeatInTx: reduceKeysSeen.has(reduceKey),
+      });
+      reduceKeysSeen.add(reduceKey);
+      if (!resolution.ok) {
+        // Never a warn-only miss: durable + loud + retryable (skipped_signatures, #212).
+        await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
+        placeholder();
         continue;
       }
       trades.push({
         slab_address: slabAddress,
         trader,
-        side: fill.side,
-        size: fill.sizeValue.toString(),
+        side: resolution.side,
+        size: resolution.sizeValue.toString(),
         price: await extractPrice(tx, slabAddress),
         fee: 0, // the engine charges no trading fee on tag 44
         tx_signature: signature,
         asset_index: reduce.assetIndex,
-        leg_index: 0,
+        leg_index: 0, // renumbered tx-wide below
         is_liquidation: false,
       });
       continue;
@@ -789,7 +811,8 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
     t.leg_index = t.is_liquidation ? 1000 + markerSeq++ : fillSeq++;
   }
 
-  return trades;
+  // Placeholders (tag 44s that could not be written) only held their number.
+  return trades.filter((t) => !t.placeholder);
 }
 
 /**
