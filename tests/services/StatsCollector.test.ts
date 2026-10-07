@@ -58,7 +58,7 @@ vi.mock('@percolatorct/shared', () => ({
   captureException: vi.fn(),
 }));
 
-import { StatsCollector, COLLECT_INTERVAL_MS } from '../../src/services/StatsCollector.js';
+import { StatsCollector, COLLECT_INTERVAL_MS, PLACEHOLDER_REGISTRATION_GRACE_MS } from '../../src/services/StatsCollector.js';
 import type { MarketProvider } from '../../src/services/StatsCollector.js';
 import * as core from '@percolatorct/sdk';
 import { V17_INITIAL_MARGIN_BPS_OFF } from '../../src/db/autoMarketFields.js';
@@ -373,6 +373,11 @@ describe('StatsCollector', () => {
 
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
+      // #223: no price pool resolves, so only the placeholder identity is available — the
+      // first pass defers (it may be a launch still in progress)…
+      expect(insertMarketRowMock).not.toHaveBeenCalled();
+      // …and the row is written once the placeholder grace has passed.
+      await vi.advanceTimersByTimeAsync(PLACEHOLDER_REGISTRATION_GRACE_MS + COLLECT_INTERVAL_MS);
 
       expect(insertMarketRowMock).toHaveBeenCalledWith(expect.objectContaining({
         slab_address: SLAB.toBase58(),
@@ -395,10 +400,62 @@ describe('StatsCollector', () => {
 
       statsCollector.start();
       await vi.advanceTimersByTimeAsync(10_500);
+      expect(insertMarketRowMock).not.toHaveBeenCalled(); // #223: placeholder grace
+      await vi.advanceTimersByTimeAsync(PLACEHOLDER_REGISTRATION_GRACE_MS + COLLECT_INTERVAL_MS);
 
       expect(insertMarketRowMock).toHaveBeenCalledWith(expect.objectContaining({
         deployer: MARKETAUTH.toBase58(),
       }));
+    });
+
+    it('#223: a market whose identity resolves registers on the FIRST pass (no grace)', async () => {
+      const DEX_POOL = new PublicKey('8WC8vALsDJhNCUVRmqZBDSg5xgFAhDrgy7zWqF512pDx');
+      const BASE = new PublicKey('So11111111111111111111111111111111111111112');
+      mockGetSignaturesForAddress.mockRejectedValue(new Error('429'));
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(new Map([[SLAB.toBase58(), {
+        market: { ...v17().market, configV17: { ...v17().market.configV17, dexPool: DEX_POOL } },
+      }]]) as never);
+      mockGetMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(2048) }]);
+      mockGetAccountInfo.mockResolvedValue({ data: new Uint8Array(4096), owner: WRAPPER });
+      setupParseMocks();
+      const sdk = await import('@percolatorct/sdk');
+      vi.mocked(sdk.detectDexType).mockReturnValue('pumpswap' as never);
+      vi.mocked(sdk.parseDexPool).mockReturnValue({ baseMint: BASE } as never);
+      // DAS only runs against a Helius endpoint; answer it with a real identity.
+      const realGetConnection = vi.mocked(shared.getConnection).getMockImplementation();
+      vi.mocked(shared.getConnection).mockImplementation(() => ({
+        ...(realGetConnection as () => object)(),
+        rpcEndpoint: 'https://devnet.helius-rpc.com/?api-key=test',
+      }) as never);
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ result: { content: { metadata: { symbol: 'WSOL', name: 'Wrapped SOL' }, links: {} }, token_info: {} } }),
+      })));
+
+      try {
+        statsCollector.start();
+        await vi.advanceTimersByTimeAsync(10_500);
+        expect(insertMarketRowMock).toHaveBeenCalledWith(expect.objectContaining({
+          slab_address: SLAB.toBase58(),
+          symbol: 'WSOL',
+        }));
+      } finally {
+        vi.mocked(shared.getConnection).mockImplementation(realGetConnection as never);
+        vi.mocked(sdk.detectDexType).mockReturnValue(null as never);
+      }
+    });
+
+    it('#223: concurrent registration calls share one pass (no double insert)', async () => {
+      vi.mocked(mockMarketProvider.getMarkets).mockReturnValue(new Map([[SLAB.toBase58(), v17()]]) as never);
+      let release!: (rows: never[]) => void;
+      vi.mocked(shared.getMarkets).mockImplementationOnce(() => new Promise((r) => { release = r as never; }));
+
+      const a = statsCollector.registerNewMarkets();
+      const b = statsCollector.registerNewMarkets();
+      release([]);
+      await Promise.all([a, b]);
+
+      expect(shared.getMarkets).toHaveBeenCalledTimes(1);
     });
   });
 

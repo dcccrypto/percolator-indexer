@@ -518,3 +518,63 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
     }
   });
 });
+
+describe('MarketDiscovery.onDiscovered (#223)', () => {
+  const market = {
+    slabAddress: { toBase58: () => 'Market111111111111111111111111111111111' },
+    programId: { toBase58: () => '11111111111111111111111111111111' },
+    config: {},
+    params: {},
+    header: {},
+  };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.MARKETS_FILTER; // set by an earlier test in this file
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // ditto (persists past clearAllMocks)
+  });
+
+  it('notifies listeners after a pass that found markets', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([market] as any);
+    const d = new MarketDiscovery();
+    const seen: number[] = [];
+    d.onDiscovered((ms) => { seen.push(ms.length); });
+    await d.discover();
+    await flush();
+    expect(seen).toEqual([2]); // one market from each of the two program IDs
+  });
+
+  it('does not notify when a pass found nothing', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([] as any);
+    const d = new MarketDiscovery();
+    const fn = vi.fn();
+    d.onDiscovered(fn);
+    await d.discover();
+    await flush();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('a failing listener never breaks discovery', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([market] as any);
+    const d = new MarketDiscovery();
+    d.onDiscovered(() => { throw new Error('boom'); });
+    d.onDiscovered(async () => { throw new Error('async boom'); });
+    const ok = vi.fn();
+    d.onDiscovered(ok);
+    await expect(d.discover()).resolves.toHaveLength(2);
+    await flush();
+    expect(ok).toHaveBeenCalledTimes(1);
+  });
+
+  it('unsubscribe stops notifications', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([market] as any);
+    const d = new MarketDiscovery();
+    const fn = vi.fn();
+    const off = d.onDiscovered(fn);
+    off();
+    await d.discover();
+    await flush();
+    expect(fn).not.toHaveBeenCalled();
+  });
+});
