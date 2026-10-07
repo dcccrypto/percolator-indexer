@@ -419,8 +419,9 @@ export class TradeIndexerPolling {
         const d = decodeBase58(ix.data);
         if (!d || d.length < 1) continue;
         if (isRebalanceReduceTag(d[0])) { if (decodeRebalanceReduce(d)) reduceLegs.add(seq++); continue; }
-        if (!TRADE_TAGS.has(d[0])) continue;
-        seq += (d[0] === IX_TAG.BatchTradeNoCpi || d[0] === IX_TAG.BatchTradeCpi) ? decodeV18BatchLegs(d[0], d).length : decodeV18SingleFill(d[0], d) ? 1 : 0;
+        const { data: dd } = unwrapEvictAndTradeIx(d, ix.accounts); // v2.2 tag 119 holds a TradeCpi's slot in the numbering
+        if (!TRADE_TAGS.has(dd[0])) continue;
+        seq += (dd[0] === IX_TAG.BatchTradeNoCpi || dd[0] === IX_TAG.BatchTradeCpi) ? decodeV18BatchLegs(dd[0], dd).length : decodeV18SingleFill(dd[0], dd) ? 1 : 0;
       }
     }
     // Occurrence rank of identical fills in this tx (a split order is identical legs).
@@ -593,7 +594,7 @@ export class TradeIndexerPolling {
 
         const i128Max = (1n << 127n) - 1n;
 
-        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, true) : null;
+        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, true, ixAccounts) : null;
 
         for (const leg of legs) {
           // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
@@ -679,7 +680,7 @@ export class TradeIndexerPolling {
         if (retryNeeded) continue; // all-or-nothing per transaction (see the batch branch)
         // #213/#221: executed size + booked price from the matcher call, never the request/mark.
         const r = await resolveCpiLeg({
-          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false),
+          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false, ixAccounts),
           assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature,
         });
         if (r.kind === "read-error") { retryNeeded = true; continue; }
