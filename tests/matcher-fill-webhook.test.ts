@@ -61,12 +61,40 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     expect(recordSkipped).not.toHaveBeenCalled();
   });
 
-  it("#213 transaction after its context was overwritten: no row, signature recorded in skipped_signatures", async () => {
+  it("#213 transaction after its context was overwritten: row at the matcher-requested size and booked price, NOT recorded as skipped", async () => {
     const f = classic("issue213Partial");
     getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(classic("full").ctxReturnHex) });
     const rows = await deliver(enhanced[f.sig]);
-    expect(rows).toEqual([]);
-    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("size unverified") })]);
+    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, side: "long", leg_index: 0 })]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("strict mode: no row, signature recorded", async () => {
+    const f = classic("issue213Partial");
+    process.env.TRADECPI_UNVERIFIED_SIZE = "skip";
+    try {
+      getAccountInfo.mockResolvedValue(null);
+      expect(await deliver(enhanced[f.sig])).toEqual([]);
+      expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("size-unverified") })]);
+    } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
+  });
+
+  it("a payload without nested innerInstructions (unrecognised layout) writes nothing and is recorded", async () => {
+    const f = classic("partial");
+    const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
+    for (const i of tx.instructions) delete i.innerInstructions;
+    expect(await deliver(tx)).toEqual([]);
+    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ error: expect.stringContaining("unrecognised") })]);
+  });
+
+  it("real payload yields exactly one row; the matcher program's own instruction is not mistaken for a trade", async () => {
+    const f = classic("partial");
+    getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(f.ctxReturnHex) });
+    const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
+    // the dead tx-level loop used to scan this shape; the real format never has it
+    tx.innerInstructions = [{ instructions: tx.instructions.flatMap((i: any) => i.innerInstructions ?? []) }];
+    const rows = (await deliver(tx)).filter((r) => !r.is_liquidation);
+    expect(rows).toHaveLength(1);
   });
 
   it("negative control (old behaviour): the wire request would have been written at full size", async () => {

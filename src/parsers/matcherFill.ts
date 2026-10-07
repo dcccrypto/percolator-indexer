@@ -164,18 +164,51 @@ export function cpiEvidence(
   return { kind: "no-matcher-call" };
 }
 
+/**
+ * - `zero-fill`: provably nothing changed on chain. No row, nothing to report.
+ * - `unrecognised`: the matcher call could not be decoded / does not line up with the instruction
+ *   (a wrapper layout this parser does not know). No row; callers record the signature as skipped.
+ * - `size-unverified`: only under the strict policy (`TRADECPI_UNVERIFIED_SIZE=skip`). No row;
+ *   callers record the signature as skipped.
+ */
+export type CpiSkipReason = "zero-fill" | "unrecognised" | "size-unverified";
+
 export type CpiLegResolution =
-  /** Nothing changed on chain (or nothing can be proven): write NO row. */
-  | { kind: "skip"; reason: "zero-fill" | "size-unverified"; detail: string }
+  | { kind: "skip"; reason: CpiSkipReason; detail: string }
+  /**
+   * `exact: true`: the matcher's own answer. `exact: false`: the executed size could not be proven;
+   * `sizeValue` is the matcher-requested (post headroom clip) size, an UPPER BOUND of what was
+   * executed, at the exact booked price. Callers count it with {@link noteUnverifiedSize}.
+   */
   | { kind: "fill"; sizeValue: bigint; priceE6: bigint; exact: boolean };
+
+let unverifiedSizeTotal = 0;
+/** Counter metric `tradecpi_size_unverified_total` (process lifetime). */
+export function getTradecpiSizeUnverifiedCount(): number {
+  return unverifiedSizeTotal;
+}
+/** Count one row written with an unproven (upper bound) size. */
+export function noteUnverifiedSize(): void {
+  unverifiedSizeTotal++;
+}
+/** Test hook. */
+export function resetTradecpiSizeUnverifiedCount(): void {
+  unverifiedSizeTotal = 0;
+}
 
 export type ReadMatcherContext = (address: string) => Promise<MatcherReturn | null>;
 
-/** `request` writes the matcher-requested (post-clip) size when the executed size is unprovable. */
+/**
+ * What to do when the executed size cannot be proven (matcher context overwritten or unreadable).
+ * `request` (DEFAULT): write the matcher-requested (post-clip) size at the booked price: an upper
+ * bound, but strictly closer to the truth than the wire size at the mark EWMA the indexer used to
+ * write, and the user's trade stays in their history. `skip` (opt-in strict): write nothing and
+ * record the signature in skipped_signatures.
+ */
 export type UnverifiedSizePolicy = "skip" | "request";
 
 export function unverifiedSizePolicy(env: Record<string, string | undefined> = process.env): UnverifiedSizePolicy {
-  return env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase() === "request" ? "request" : "skip";
+  return env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase() === "skip" ? "skip" : "request";
 }
 
 function abs(n: bigint): bigint {
@@ -215,7 +248,7 @@ export async function resolveCpiLeg(args: {
     return { kind: "skip", reason: "zero-fill", detail: "the wrapper clipped the request to zero LP headroom and never called the matcher: no position change" };
   }
   if (evidence.kind === "unknown") {
-    return { kind: "skip", reason: "size-unverified", detail: "no inner instructions in this source: booked price and executed size cannot be read" };
+    return { kind: "skip", reason: "unrecognised", detail: "no inner instructions in this source (or an undecodable matcher call): booked price and executed size cannot be read" };
   }
   const { call } = evidence;
   const leg = call.legs[args.legPos];
@@ -228,7 +261,7 @@ export async function resolveCpiLeg(args: {
     (leg.reqSize > 0n) !== (wireSigned > 0n) ||
     abs(leg.reqSize) > args.wireSizeAbs
   ) {
-    return { kind: "skip", reason: "size-unverified", detail: "the matcher call does not line up with the instruction's leg" };
+    return { kind: "skip", reason: "unrecognised", detail: "the matcher call does not line up with the instruction's leg" };
   }
 
   let ret: MatcherReturn | null = null;

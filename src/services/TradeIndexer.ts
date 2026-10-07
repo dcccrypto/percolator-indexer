@@ -16,7 +16,7 @@ import {
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
-import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 
 const logger = createLogger("indexer:trade-indexer");
@@ -565,11 +565,12 @@ export class TradeIndexerPolling {
           if (batchCpi) {
             const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
             if (r.kind === "skip") {
-              if (r.reason === "size-unverified") unverified.push(r.detail);
+              if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
               continue;
             }
             legSize = r.sizeValue;
             price = Number(r.priceE6) / 1_000_000;
+            if (!r.exact) { noteUnverifiedSize(); logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) }); }
           } else {
             price = await resolvePrice(leg);
           }
@@ -624,11 +625,12 @@ export class TradeIndexerPolling {
           assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext,
         });
         if (r.kind === "skip") {
-          if (r.reason === "size-unverified") unverified.push(r.detail);
+          if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
           continue; // zero fill: no row (the leg number is already consumed)
         }
         sizeValue = r.sizeValue;
         price = Number(r.priceE6) / 1_000_000;
+        if (!r.exact) { noteUnverifiedSize(); logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) }); }
       } else {
         price = await resolveFallbackPrice();
       }
@@ -673,8 +675,8 @@ export class TradeIndexerPolling {
     }
 
     if (unverified.length > 0) {
-      // Executed size unprovable: write nothing rather than a requested size (phantom volume).
-      await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi size unverified: ${unverified[0]}`.slice(0, 480) }]);
+      // Fill not decodable (or strict policy): nothing written, signature kept for re-index.
+      await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi ${unverified[0]}`.slice(0, 480) }]);
     }
     return insertedAny;
   }

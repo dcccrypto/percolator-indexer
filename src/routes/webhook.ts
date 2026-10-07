@@ -16,7 +16,7 @@ import {
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
-import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
+import { cpiEvidence, resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
@@ -814,8 +814,8 @@ async function extractTradesFromEnhancedTx(
       if (cpi) {
         const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext });
         if (r.kind === "skip") {
-          if (r.reason === "size-unverified") {
-            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi size unverified: ${r.detail}`.slice(0, 480) }]);
+          if (r.reason !== "zero-fill") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
           }
           // Hold the leg number (renumbered below) so the other paths' numbering still lines up.
           trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
@@ -823,6 +823,7 @@ async function extractTradesFromEnhancedTx(
         }
         legSize = r.sizeValue;
         price = Number(r.priceE6) / 1_000_000;
+        if (!r.exact) { noteUnverifiedSize(); logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) }); }
       } else if (leg.execPriceE6 !== undefined) {
         price = Number(leg.execPriceE6) / 1_000_000;
       } else {
@@ -846,78 +847,10 @@ async function extractTradesFromEnhancedTx(
     }
   }
 
-  // Also check inner instructions (for TradeCpi routed through matcher)
-  const innerInstructions = tx.innerInstructions ?? [];
-  for (const inner of innerInstructions) {
-    const innerIxs = inner.instructions ?? [];
-    for (const ix of innerIxs) {
-      const programId = ix.programId ?? "";
-      if (!PROGRAM_IDS.has(programId)) continue;
-
-      const data = ix.data ? decodeBase58(ix.data) : null;
-      if (!data || data.length < 2) continue;
-
-      const tag = data[0];
-      if (!TRADE_TAGS.has(tag)) continue;
-
-      const isBatchInner = (tag === IX_TAG.BatchTradeNoCpi || tag === IX_TAG.BatchTradeCpi);
-      const legs: { sizeValue: bigint; side: "long" | "short"; assetIndex: number; legIndex: number; feeBps?: number; execPriceE6?: bigint }[] = isBatchInner
-        ? decodeV18BatchLegs(tag, data)
-        : (() => {
-            const decoded = decodeV18SingleFill(tag, data);
-            return decoded ? [{ ...decoded, legIndex: 0 }] : [];
-          })();
-
-      if (legs.length === 0) continue;
-
-      // Same account layout with CPI dispatch fix (desync fix 5) — unchanged by v18
-      const accounts: string[] = ix.accounts ?? [];
-      const trader = accounts[0] ?? "";
-      const isNoCpiInner = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
-      const innerMarketIdx = isNoCpiInner ? 2 : 1;
-      const slabAddress = accounts.length > innerMarketIdx ? accounts[innerMarketIdx] : "";
-      if (!trader || !slabAddress) continue;
-
-      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) continue;
-
-      // L-5: Validate slabAddress against live known-slab set
-      if (discovery && !discovery.getMarkets().has(slabAddress)) {
-        logger.warn("Skipping inner trade: slab address not in known-slab set", { slabAddress, signature });
-        continue;
-      }
-
-      let fallbackPriceInner: number | null = null;
-
-      for (const leg of legs) {
-        if (leg.sizeValue > I128_MAX) continue;
-
-        // Avoid duplicates within same tx (match on trader + side + size + slab)
-        if (trades.some((t) => t.tx_signature === signature && t.trader === trader && t.slab_address === slabAddress && t.side === leg.side && t.size === leg.sizeValue.toString())) continue;
-
-        let price: number;
-        if (leg.execPriceE6 !== undefined) {
-          price = Number(leg.execPriceE6) / 1_000_000;
-        } else {
-          if (fallbackPriceInner === null) fallbackPriceInner = await extractPrice(tx, slabAddress);
-          price = fallbackPriceInner;
-        }
-        const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
-
-        trades.push({
-          slab_address: slabAddress,
-          trader,
-          side: leg.side,
-          size: leg.sizeValue.toString(),
-          price,
-          fee,
-          tx_signature: signature,
-          asset_index: leg.assetIndex,
-          leg_index: leg.legIndex,
-          is_liquidation: false,
-        });
-      }
-    }
-  }
+  // (Removed: a loop over `tx.innerInstructions` groups. The Helius enhanced format has no
+  // tx-level `innerInstructions`; CPIs are nested under each `instructions[i].innerInstructions`,
+  // so that loop matched nothing on real payloads. The only CPI that matters for trades is the
+  // matcher call under a TradeCpi, read above through `cpiEvidence`.)
 
   // H2/H3: reassign leg_index so (tx_signature, asset_index, leg_index) is unique
   // across outer + inner instructions. Parsing is deterministic, so the same tx

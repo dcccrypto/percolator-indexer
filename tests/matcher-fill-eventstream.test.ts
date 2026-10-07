@@ -42,11 +42,19 @@ describe("event stream: TradeCpi rows", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it("context overwritten: no row, signature recorded", async () => {
+  it("context overwritten: matcher-requested size at the booked price, nothing recorded as skipped", async () => {
     const f = fx("issue213Partial");
     const other = fx("full");
     const rows = await run(f, vi.fn(async () => ({ data: Buffer.from(other.ctxReturnHex.padEnd(640, "0"), "hex") })));
-    expect(rows).toEqual([]);
-    expect(recordSkipped).toHaveBeenCalledTimes(1);
+    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511 })]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("strict mode: no row, signature recorded", async () => {
+    process.env.TRADECPI_UNVERIFIED_SIZE = "skip";
+    try {
+      expect(await run(fx("issue213Partial"), vi.fn(async () => null))).toEqual([]);
+      expect(recordSkipped).toHaveBeenCalledTimes(1);
+    } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
   });
 });

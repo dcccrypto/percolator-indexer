@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { parsePercolatorFills } from "../src/parsers/percolatorTxParser.js";
 import {
   decodeMatcherCall, decodeMatcherReturn, cpiEvidence, resolveCpiLeg, unverifiedSizePolicy,
+  noteUnverifiedSize, getTradecpiSizeUnverifiedCount, resetTradecpiSizeUnverifiedCount,
   type MatcherReturn, type CpiEvidence,
 } from "../src/parsers/matcherFill.js";
 
@@ -18,7 +19,7 @@ const ctxOf = (f: { ctxReturnHex: string }): MatcherReturn => decodeMatcherRetur
 function fillsOf(f: { sig: string; tx: any }) {
   return parsePercolatorFills(f.tx, f.sig, [PROGRAM]);
 }
-async function resolve(f: { sig: string; tx: any }, ctx: MatcherReturn | null, policy: "skip" | "request" = "skip") {
+async function resolve(f: { sig: string; tx: any }, ctx: MatcherReturn | null, policy: "skip" | "request" = "request") {
   const [fill] = fillsOf(f);
   const read = vi.fn(async () => ctx);
   const r = await resolveCpiLeg({ evidence: fill.cpi!, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: fill.legPos ?? 0, readContext: read, policy });
@@ -56,25 +57,33 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
     expect(read).not.toHaveBeenCalled();
   });
 
-  it("#213 transaction (matcher filled 72 of 822500; its context was overwritten since): nothing is written by default", async () => {
+  it("#213 transaction (matcher filled 72 of 822500; its context was overwritten since): DEFAULT writes the matcher-requested size at the booked price, flagged inexact", async () => {
     const f = fx("issue213Partial");
     const later = { ...ctxOf(fx("full")) }; // another trade's answer: req_id differs
     const { r } = await resolve(f, later);
-    expect(r).toMatchObject({ kind: "skip", reason: "size-unverified" });
-  });
-
-  it("... and with TRADECPI_UNVERIFIED_SIZE=request the booked price and the matcher-requested size are used, flagged inexact", async () => {
-    const f = fx("issue213Partial");
-    const { r } = await resolve(f, null, "request");
     expect(r).toEqual({ kind: "fill", sizeValue: 822_500n, priceE6: 121_580_511n, exact: false });
-    expect(unverifiedSizePolicy({ TRADECPI_UNVERIFIED_SIZE: "request" })).toBe("request");
-    expect(unverifiedSizePolicy({})).toBe("skip");
+    // the other trade's exec_size (121618497109) is never used
   });
 
-  it("an unreadable context (RPC failure) is unverified, never a guess", async () => {
-    const f = fx("partial");
-    const { r } = await resolve(f, null);
+  it("... strict mode (TRADECPI_UNVERIFIED_SIZE=skip) writes nothing", async () => {
+    const { r } = await resolve(fx("issue213Partial"), null, "skip");
     expect(r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+    expect(unverifiedSizePolicy({ TRADECPI_UNVERIFIED_SIZE: "skip" })).toBe("skip");
+    expect(unverifiedSizePolicy({})).toBe("request");
+    expect(unverifiedSizePolicy({ TRADECPI_UNVERIFIED_SIZE: "bogus" })).toBe("request");
+  });
+
+  it("an unreadable context (RPC failure): request size at the booked price by default, skip when strict, never the wire size", async () => {
+    const f = fx("partial");
+    expect((await resolve(f, null)).r).toEqual({ kind: "fill", sizeValue: 29_041_225n, priceE6: 13_861_751n, exact: false });
+    expect((await resolve(f, null, "skip")).r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+  });
+
+  it("the unverified counter is a separate metric", () => {
+    resetTradecpiSizeUnverifiedCount();
+    noteUnverifiedSize(); noteUnverifiedSize();
+    expect(getTradecpiSizeUnverifiedCount()).toBe(2);
+    resetTradecpiSizeUnverifiedCount();
   });
 
   describe("negative controls: a context answer is trusted only if it is THIS call's answer", () => {
@@ -88,9 +97,9 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
       ["exec_size on the other side", (c: MatcherReturn) => ({ ...c, execSize: 483n })],
       ["rejected flag", (c: MatcherReturn) => ({ ...c, flags: 5 })],
       ["invalid flag unset", (c: MatcherReturn) => ({ ...c, flags: 2 })],
-    ])("%s -> skip", async (_n, mutate) => {
-      const { r } = await resolve(fx("partial"), mutate(base()));
-      expect(r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+    ])("%s -> not trusted: strict skips, default writes the REQUESTED size (never the context's)", async (_n, mutate) => {
+      expect((await resolve(fx("partial"), mutate(base()), "skip")).r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+      expect((await resolve(fx("partial"), mutate(base()))).r).toEqual({ kind: "fill", sizeValue: 29_041_225n, priceE6: 13_861_751n, exact: false });
     });
     it("matcher answered exec_size 0 for this req_id -> zero fill, no row", async () => {
       const { r } = await resolve(fx("partial"), { ...base(), execSize: 0n });
@@ -98,14 +107,14 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
     });
   });
 
-  it("wire/leg mismatches are not written: matcher size larger than the instruction's, other side, other asset", async () => {
+  it("wire/leg mismatches are not written (unrecognised layout): matcher size larger than the instruction's, other side, other asset", async () => {
     const f = fx("partial");
     const [fill] = fillsOf(f);
     const ev = fill.cpi as Extract<CpiEvidence, { kind: "call" }>;
     const mk = (leg: Partial<(typeof ev.call.legs)[0]>): CpiEvidence => ({ ...ev, call: { ...ev.call, legs: [{ ...ev.call.legs[0], ...leg }] } });
     for (const evidence of [mk({ reqSize: -30_000_000n }), mk({ reqSize: 29_041_225n }), mk({ assetIndex: 3 }), mk({ oraclePriceE6: 0n })]) {
       const r = await resolveCpiLeg({ evidence, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: async () => ctxOf(f) });
-      expect(r.kind).toBe("skip");
+      expect(r).toMatchObject({ kind: "skip", reason: "unrecognised" });
     }
   });
 
@@ -115,7 +124,9 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
     const [fill] = parsePercolatorFills(tx, f.sig, [PROGRAM]);
     expect(fill.cpi).toEqual({ kind: "unknown" });
     const r = await resolveCpiLeg({ evidence: fill.cpi!, assetIndex: 0, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: async () => ctxOf(f) });
-    expect(r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+    expect(r).toMatchObject({ kind: "skip", reason: "unrecognised" }); // any policy: nothing is known
+    const strict = await resolveCpiLeg({ evidence: fill.cpi!, assetIndex: 0, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: async () => ctxOf(f), policy: "skip" });
+    expect(strict).toMatchObject({ kind: "skip", reason: "unrecognised" });
   });
 
   it("leg numbering is unchanged: a zero fill still occupies its slot among the tx's fills", () => {
@@ -167,10 +178,11 @@ describe("BatchTradeCpi (SYNTHETIC: no BatchTradeCpi transaction exists on the l
     expect(r1).toEqual({ kind: "fill", sizeValue: 3_000_000n, priceE6: 2_000_000n, exact: true });
   });
 
-  it("without return data the sizes are unverified (the batch never writes to the context), prices still known", async () => {
+  it("without return data the batch sizes are unverified (the batch never writes to the context): requested size at the per-leg booked price; strict skips", async () => {
     const ev = cpiEvidence(accounts, [{ programId: MATCHER, data: batchCall([[0, 100_000_000n, 5_000_000n]]) }], null);
-    const r = await resolveCpiLeg({ evidence: ev, assetIndex: 0, side: "long", wireSizeAbs: 5_000_000n, legPos: 0, readContext: async () => ret(0, 100_000_000n, 5_000_000n) as unknown as MatcherReturn });
-    expect(r).toMatchObject({ kind: "skip", reason: "size-unverified" });
+    const args = { evidence: ev, assetIndex: 0, side: "long" as const, wireSizeAbs: 5_000_000n, legPos: 0, readContext: async () => ret(0, 100_000_000n, 1n) as unknown as MatcherReturn };
+    expect(await resolveCpiLeg(args)).toEqual({ kind: "fill", sizeValue: 5_000_000n, priceE6: 100_000_000n, exact: false });
+    expect(await resolveCpiLeg({ ...args, policy: "skip" })).toMatchObject({ kind: "skip", reason: "size-unverified" });
   });
 });
 

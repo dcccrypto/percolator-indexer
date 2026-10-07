@@ -6,7 +6,7 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
-import { resolveCpiLeg } from "../parsers/matcherFill.js";
+import { resolveCpiLeg, noteUnverifiedSize } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 
@@ -155,13 +155,14 @@ export class EventStreamService {
           legPos: fill.legPos ?? 0, readContext: readMatcherContext,
         });
         if (r.kind === "skip") {
-          if (r.reason === "size-unverified") {
-            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: `TradeCpi size unverified: ${r.detail}`.slice(0, 480) }]);
+          if (r.reason !== "zero-fill") {
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: `TradeCpi ${r.reason}: ${r.detail}`.slice(0, 480) }]);
           }
           continue; // zero fill / unprovable size: no row (the leg number is already consumed)
         }
         sizeAbs = r.sizeValue;
         priceE6Value = Number(r.priceE6);
+        if (!r.exact) { noteUnverifiedSize(); log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature }); }
       }
       if (!priceE6Value) {
         // Log-derived parser is neutralized (see percolatorTxParser.ts). Always

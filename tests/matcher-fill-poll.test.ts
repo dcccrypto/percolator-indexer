@@ -50,11 +50,21 @@ describe("poll path: TradeCpi rows", () => {
     expect(recordSkipped).not.toHaveBeenCalled();
   });
 
-  it("#213 tx, context since overwritten: no row; signature recorded", async () => {
+  it("#213 tx, context since overwritten: matcher-requested size at the booked price, not recorded as skipped", async () => {
     const f = fx("issue213Partial");
     getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") });
-    expect(await poll(f)).toBe(false);
-    expect(insertTradeRow).not.toHaveBeenCalled();
-    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig })]);
+    expect(await poll(f)).toBe(true);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "822500", price: 121.580511 })]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  it("strict mode: no row, signature recorded", async () => {
+    process.env.TRADECPI_UNVERIFIED_SIZE = "skip";
+    try {
+      getAccountInfo.mockResolvedValue(null);
+      expect(await poll(fx("issue213Partial"))).toBe(false);
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: fx("issue213Partial").sig })]);
+    } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
   });
 });
