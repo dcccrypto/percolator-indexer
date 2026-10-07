@@ -1,6 +1,22 @@
 import { getSupabase, getNetwork } from "@percolatorct/shared";
 import { rebalanceReduceFill } from "../parsers/percolatorTxParser.js";
 
+/**
+ * KNOWN LIMITS of resolving a RebalanceReduce (tag 44) from indexed history. The transaction carries
+ * no executed size (the wrapper emits no log or return data, and a transaction has no post-state
+ * account data), so the fill is inferred. Read these before relying on the rows:
+ *
+ *  1. SIZE IS AN UPPER BOUND. The written size is min(reduce_q, indexed net position). The engine
+ *     executes min(reduce_q, unilateral close capacity, |position|), where capacity depends on matched
+ *     OI and the ADL scale at that slot. When it clipped the close by OI or ADL (likely on the
+ *     close-only markets where tag 44 is used) the true size is smaller than the one written.
+ *  2. THE NET IS PER OWNER WALLET, not per portfolio: fills are keyed by (trader, slab, asset), and
+ *     one wallet can own several portfolios.
+ *  3. THE LIQUIDATION-MARKER GUARD CANNOT FIRE ON v18: no liquidation markers are emitted there, so a
+ *     forced close is invisible to this inference. The guard only protects older data.
+ *  4. A SKIPPED SIGNATURE IS RECORDED, NOT RETRIED. It lands in `skipped_signatures` (loud, durable),
+ *     but nothing re-indexes it automatically.
+ */
 const PAGE = 1000;
 
 function toBigInt(v: unknown): bigint | null {
@@ -42,6 +58,13 @@ export async function fetchTraderPositionEvidence(
   assetIndex: number,
   excludeSignature: string,
   txTimeSec: number | null,
+  /**
+   * Signatures this pass/delivery has ALREADY indexed, in chain order, before this transaction.
+   * Rows of those are provably earlier even though they were indexed (created_at) after this
+   * transaction's block time, which is exactly the real-time case: two transactions seconds apart
+   * are both indexed after the second one happened.
+   */
+  knownEarlier: ReadonlySet<string> = new Set(),
 ): Promise<TraderPositionEvidence> {
   let net = 0n;
   let sawLiquidation = false;
@@ -50,7 +73,7 @@ export async function fetchTraderPositionEvidence(
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await getSupabase()
       .from("trades")
-      .select("side, size, is_liquidation, created_at")
+      .select("side, size, is_liquidation, created_at, tx_signature")
       .eq("trader", trader)
       .eq("slab_address", slabAddress)
       .eq("asset_index", assetIndex)
@@ -59,7 +82,7 @@ export async function fetchTraderPositionEvidence(
       .order("id", { ascending: true })
       .range(from, from + PAGE - 1);
     if (error) throw new Error(`fetchTraderPositionEvidence failed: ${error.message}`);
-    const rows = (data ?? []) as Array<{ side: string | null; size: unknown; is_liquidation?: boolean | null; created_at?: string | null }>;
+    const rows = (data ?? []) as Array<{ side: string | null; size: unknown; is_liquidation?: boolean | null; created_at?: string | null; tx_signature?: string | null }>;
     for (const r of rows) {
       if (r.is_liquidation) { sawLiquidation = true; continue; }
       const size = toBigInt(r.size);
@@ -67,7 +90,7 @@ export async function fetchTraderPositionEvidence(
       if (r.side === "long") net += size;
       else if (r.side === "short") net -= size;
       const created = r.created_at ? Date.parse(r.created_at) : NaN;
-      if (cutoffMs !== null && !(Number.isFinite(created) && created < cutoffMs)) sawNotProvablyEarlier = true;
+      if (cutoffMs !== null && !(Number.isFinite(created) && created < cutoffMs) && !(r.tx_signature && knownEarlier.has(r.tx_signature))) sawNotProvablyEarlier = true;
     }
     if (rows.length < PAGE) break;
   }
@@ -84,8 +107,9 @@ export type RebalanceReduceResolution =
 
 /**
  * Turn a decoded RebalanceReduce into a fill, or say why that cannot be done with certainty.
- * `repeatInTx` = an earlier tag 44 on the same (trader, slab, asset) in the same transaction:
- * its executed size is not known, so the position this one started from is not either.
+ * `repeatInTx` = an earlier fill or tag 44 on the same (trader, slab, asset) in the same transaction:
+ * it is not in the table yet (or, for a clipped reduce, its executed size is unknown), so the
+ * position this close started from is not known either.
  */
 export async function resolveRebalanceReduce(args: {
   trader: string;
@@ -95,13 +119,20 @@ export async function resolveRebalanceReduce(args: {
   signature: string;
   txTimeSec: number | null;
   repeatInTx: boolean;
+  /** Signatures already indexed earlier in this pass/delivery (chain order); see fetchTraderPositionEvidence. */
+  earlierSignatures?: ReadonlySet<string>;
+  /** An earlier transaction of this pass/delivery failed, was unreadable or was skipped: the position may have changed unseen. */
+  earlierIncomplete?: boolean;
 }): Promise<RebalanceReduceResolution> {
   if (args.repeatInTx) {
-    return { ok: false, reason: "RebalanceReduce (tag 44): a second reduce on the same position in one transaction, executed size of the first is unknown" };
+    return { ok: false, reason: "RebalanceReduce (tag 44): an earlier fill on the same position in this transaction, so the position before this close is not known" };
+  }
+  if (args.earlierIncomplete) {
+    return { ok: false, reason: "RebalanceReduce (tag 44): an earlier transaction in this window could not be indexed, so the position before this close is not known" };
   }
   let ev: TraderPositionEvidence;
   try {
-    ev = await fetchTraderPositionEvidence(args.trader, args.slabAddress, args.assetIndex, args.signature, args.txTimeSec);
+    ev = await fetchTraderPositionEvidence(args.trader, args.slabAddress, args.assetIndex, args.signature, args.txTimeSec, args.earlierSignatures);
   } catch (err) {
     // A lookup failure must not abort the rest of the transaction or vanish in a log line.
     return { ok: false, reason: `RebalanceReduce (tag 44): position lookup failed (${err instanceof Error ? err.message : String(err)})` };

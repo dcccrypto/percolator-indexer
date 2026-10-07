@@ -14,6 +14,7 @@ import {
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
+import { fetchStoredLegs, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -236,7 +237,13 @@ export class TradeIndexerPolling {
     // (the cursor is already past them on the next poll).
 
     // Filter out errored transactions
-    const validSigs = signatures.filter(s => !s.err).map(s => s.signature);
+    // getSignaturesForAddress is newest-first. Process OLDEST-first: a RebalanceReduce (tag 44) is
+    // resolved against the trader's indexed fills, so every earlier transaction in this window must
+    // be indexed before a later close is looked at (otherwise [sell 30, close 10] resolves the close
+    // against the pre-sell position and writes the wrong side). The cursor still commits the newest
+    // signature only after the whole window succeeded, and per-leg dedup makes a re-pass idempotent,
+    // so the order does not change what is retried.
+    const validSigs = signatures.filter(s => !s.err).map(s => s.signature).reverse();
     if (validSigs.length === 0) {
       // No valid txs in this window but signatures were fetched — safe to advance.
       this.lastSignature.set(slabAddress, signatures[0].signature);
@@ -245,6 +252,7 @@ export class TradeIndexerPolling {
 
     let indexed = 0;
     let batchFailed = false;
+    const pass = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -258,6 +266,7 @@ export class TradeIndexerPolling {
         (fn, label) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label }),
       );
       if (fetched.skipped.length > 0) {
+        pass.incomplete = true; // an unreadable earlier tx may have changed a position unseen
         // Durable + loud: FULL signature and slab, counter, DB table (or JSONL fallback). Re-index from there.
         await recordSkippedSignatures(
           fetched.skipped.map((sk) => ({ signature: sk.signature, source: "trade-indexer" as const, slab: slabAddress, error: sk.error })),
@@ -286,13 +295,15 @@ export class TradeIndexerPolling {
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
-        if (!tx) continue;
+        if (!tx) { pass.incomplete = true; continue; }
         const sig = batch[j];
 
         try {
-          const didIndex = await this.processTransaction(tx, sig, slabAddress, programIds);
+          const didIndex = await this.processTransaction(tx, sig, slabAddress, programIds, pass);
           if (didIndex) indexed++;
+          pass.earlier.add(sig);
         } catch (err) {
+          pass.incomplete = true;
           // Non-fatal: skip this tx, continue with others
           logger.warn("Failed to process transaction", {
             signature: sig.slice(0, 12),
@@ -318,6 +329,11 @@ export class TradeIndexerPolling {
     signature: string,
     slabAddress: string,
     programIds: Set<string>,
+    /**
+     * Oldest-first pass state: signatures of this slab's window already indexed before this one, and
+     * whether any earlier one could not be (failed / unreadable / skipped), which makes a tag 44 unresolvable.
+     */
+    pass: { earlier: Set<string>; incomplete: boolean } = { earlier: new Set(), incomplete: false },
   ): Promise<boolean> {
     if (!tx.meta || tx.meta.err) return false;
 
@@ -355,8 +371,21 @@ export class TradeIndexerPolling {
     // per-fill cap as several single-leg TradeCpi instructions in ONE tx.
     let fillSeq = 0;
     let insertedAny = false;
-    // (trader|asset) already reduced by an earlier tag 44 in this tx.
-    const reduceKeysSeen = new Set<string>();
+    // (trader|slab|asset) positions already touched by an earlier fill or tag 44 in this tx: a tag 44
+    // after one of them starts from a position this indexer cannot see (the earlier fill is not in the
+    // table yet, and a clipped earlier reduce has an unknown size), so it is not resolved.
+    const touched = new Set<string>();
+    // Rows already stored for this tx, read once and only if a fill needs it (F2 + old-numbering check).
+    let stored: StoredLeg[] | null | undefined;
+    const getStored = async (): Promise<StoredLeg[] | null> => (stored === undefined ? (stored = await fetchStoredLegs(signature)) : stored);
+    // Occurrence rank of identical fills in this tx (a split order is identical legs).
+    const identSeen = new Map<string, number>();
+    const ordinalOf = (slab: string, asset: number, trader: string, side: string, size: string): number => {
+      const k = `${slab}|${asset}|${trader}|${side}|${size}`;
+      const n = (identSeen.get(k) ?? 0) + 1;
+      identSeen.set(k, n);
+      return n;
+    };
     // No transaction-level "already indexed?" gate: tradeExistsBySignature filters on
     // (signature, network) only, so after ONE leg is written (by any path, or by an
     // earlier pass that then threw on a later leg) it would hide every remaining leg
@@ -405,7 +434,10 @@ export class TradeIndexerPolling {
         const trader = ix.accounts[0]?.toBase58();
         if (ix.accounts[REBALANCE_REDUCE_MARKET_ACCOUNT_IDX]?.toBase58() !== slabAddress || !trader) continue;
         // NOT `return`: later instructions (other trades, a second tag 44 on another asset) still count.
-        const reduceKey = `${trader}|${reduce.assetIndex}`;
+        // F2: already stored (webhook redelivery, startup backfill)? Then do not resolve it again:
+        // later rows would make it look "not provably earlier" and it would be reported as missing.
+        if (reduceAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: reduce.assetIndex, legIndex, trader, reduceQ: reduce.reduceQ })) continue;
+        const reduceKey = `${trader}|${slabAddress}|${reduce.assetIndex}`;
         const resolution = await resolveRebalanceReduce({
           trader,
           slabAddress,
@@ -413,9 +445,11 @@ export class TradeIndexerPolling {
           reduceQ: reduce.reduceQ,
           signature,
           txTimeSec: tx.blockTime ?? null,
-          repeatInTx: reduceKeysSeen.has(reduceKey),
+          repeatInTx: touched.has(reduceKey),
+          earlierSignatures: pass.earlier,
+          earlierIncomplete: pass.incomplete,
         });
-        reduceKeysSeen.add(reduceKey);
+        touched.add(reduceKey);
         if (!resolution.ok) {
           // Never a warn-only miss: durable + loud + retryable (skipped_signatures, #212).
           await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
@@ -487,6 +521,11 @@ export class TradeIndexerPolling {
           // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
           const legIndex = fillSeq++;
           if (leg.sizeValue > i128Max) continue;
+          touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
+          // Already stored (same leg, or this fill under the old per-instruction numbering)? Skip it
+          // before any price read; the insert's own dedup stays the backstop if this lookup failed.
+          const ordinal = ordinalOf(slabAddress, leg.assetIndex, trader, leg.side, leg.sizeValue.toString());
+          if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal })) continue;
           const price = await resolvePrice(leg);
           const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
@@ -519,6 +558,11 @@ export class TradeIndexerPolling {
       const traderKey = ix.accounts[0];
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
+      touched.add(`${trader}|${slabAddress}|${decoded.assetIndex}`);
+      {
+        const ordinal = ordinalOf(slabAddress, decoded.assetIndex, trader, side, sizeValue.toString());
+        if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, size: sizeValue.toString(), ordinal })) continue;
+      }
 
       // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
       // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the

@@ -50,6 +50,8 @@ const h = vi.hoisted(() => ({
   skipped: [] as Array<Record<string, unknown>>,
   /** base58-string -> bytes overrides for synthetic instructions. */
   data: new Map<string, Uint8Array>(),
+  sigs: [] as Array<{ signature: string; err: null }>,
+  txs: new Map<string, unknown>(),
 }));
 
 function fakeSupabase() {
@@ -59,7 +61,11 @@ function fakeSupabase() {
         return { upsert: async (rows: Array<Record<string, unknown>>) => { h.skipped.push(...rows); return { error: null }; } };
       }
       const q: any = {};
-      for (const m of ['select', 'eq', 'neq', 'order']) q[m] = () => q;
+      let sig: string | null = null;
+      for (const m of ['select', 'neq', 'order']) q[m] = () => q;
+      q.eq = (col: string, val: unknown) => { if (col === 'tx_signature') sig = String(val); return q; };
+      // Awaiting the chain without .range() is the per-transaction stored-legs read.
+      q.then = (res: (v: unknown) => unknown) => res({ data: h.rows.filter((r) => r.tx_signature === sig), error: null });
       q.range = async () => ({ data: h.rows, error: null });
       return q;
     },
@@ -81,7 +87,11 @@ vi.mock('@percolatorct/shared', () => ({
   addBreadcrumb: vi.fn(),
   tradeExistsBySignature: vi.fn(async () => false),
   getMarkets: vi.fn(async () => []),
-  getConnection: vi.fn(() => ({ getAccountInfo: vi.fn(async () => null) })),
+  getConnection: vi.fn(() => ({
+    getAccountInfo: vi.fn(async () => null),
+    getSignaturesForAddress: vi.fn(async () => h.sigs),
+    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((x) => h.txs.get(x) ?? null)),
+  })),
   getSupabase: vi.fn(() => fakeSupabase()),
   getNetwork: vi.fn(() => 'devnet'),
 }));
@@ -131,8 +141,8 @@ const parsedTxOf = (ixs: unknown[], blockTime: number | null = BLOCK_TIME) => ({
 const parsedTx = () => parsedTxOf([ixOf(CRANK_DATA), ixOf(REBALANCE_DATA)]);
 
 const enhIx = (data: string, accts: string[] = accounts) => ({ programId: PROGRAM_ID, data, accounts: accts });
-const enhancedTxOf = (ixs: unknown[], timestamp: number | null = BLOCK_TIME) => ({
-  signature: SIG, ...(timestamp === null ? {} : { timestamp }), instructions: ixs, innerInstructions: [], accountData: [], logs: [],
+const enhancedTxOf = (ixs: unknown[], timestamp: number | null = BLOCK_TIME, signature: string = SIG, slot?: number) => ({
+  signature, ...(slot === undefined ? {} : { slot }), ...(timestamp === null ? {} : { timestamp }), instructions: ixs, innerInstructions: [], accountData: [], logs: [],
 });
 const enhancedTx = () => enhancedTxOf([enhIx(CRANK_DATA), enhIx(REBALANCE_DATA)]);
 
@@ -205,6 +215,8 @@ describe('a close-only (tag 44) close reaches the trades table', () => {
     h.rows = [shortOpenRow()];
     h.skipped = [];
     h.data.clear();
+    h.sigs = [];
+    h.txs.clear();
     dbRows.clear();
     resetSkippedSignatureDedupe();
     // Like the unique index: a repeated (sig, asset, leg) reports false (23505 swallowed).
@@ -244,9 +256,15 @@ describe('a close-only (tag 44) close reaches the trades table', () => {
       expect(written().map((r) => [r.leg_index, r.size, r.side])).toEqual([[0, REDUCE_Q.toString(), 'long'], [1, '777', 'short']]);
     });
 
-    it('TradeCpi then tag 44: the close is leg 1', async () => {
+    it('TradeCpi then tag 44 on the SAME position in one tx: the close holds leg 1 but is not resolved (the earlier fill is not in the table yet)', async () => {
       await poll(parsedTxOf([ixOf(tradeCpiData('cpi')), ixOf(REBALANCE_DATA)]));
-      expect(written().map((r) => r.leg_index)).toEqual([0, 1]);
+      expect(written().map((r) => r.leg_index)).toEqual([0]);
+      expect(h.skipped).toEqual([expect.objectContaining({ signature: SIG, error: expect.stringContaining('earlier fill on the same position') })]);
+    });
+
+    it('TradeCpi on another asset, then tag 44: the close is leg 1 and is resolved', async () => {
+      await poll(parsedTxOf([ixOf(tradeCpiData('cpi')), ixOf(reduceData('other-asset', 1, 100n))]));
+      expect(written().map((r) => [r.asset_index, r.leg_index])).toEqual([[0, 0], [1, 1]]);
     });
 
     it('webhook numbers the same way (tag 44 = 0, TradeCpi = 1)', async () => {
@@ -336,6 +354,101 @@ describe('a close-only (tag 44) close reaches the trades table', () => {
       expect((await postWebhook([enhancedTx()])).status).toBe(200);
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(h.skipped).toEqual([expect.objectContaining({ signature: SIG, source: 'trade-indexer' })]);
+    });
+  });
+
+  // F1/F2 + old numbering: a table-backed insert, so rows written in this test are visible to later reads.
+  describe('ordering, redelivery and old numbering (table-backed)', () => {
+    const SIG_A = '4VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW'; // earlier tx
+    const NOW = () => new Date().toISOString();
+    const tableBacked = () => vi.mocked(insertTradeRow).mockImplementation(async (r: any) => {
+      if (h.rows.some((x) => x.tx_signature === r.tx_signature && x.asset_index === r.asset_index && x.leg_index === r.leg_index)) return false;
+      h.rows.push({ ...r, is_liquidation: false, created_at: NOW() });
+      return true;
+    });
+    const sell = (size: bigint) => vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: size, side: 'short' });
+    const longOpen = (size: string) => ({ side: 'long', size, is_liquidation: false, created_at: OPEN_ROW_AT, tx_signature: 'OPEN' });
+    const closeData = () => reduceData('close10', 0, 10n);
+
+    // Indexed net +20 long. Unindexed tx A sells 30 (now short 10). Tx B (tag 44, reduce 10) must be
+    // a "long" 10, not a "short" 10 (what resolving it against the pre-A position gives).
+    it('F1 poll: a window is processed oldest-first, so a close sees the unindexed fill before it', async () => {
+      h.rows = [longOpen('20')];
+      tableBacked();
+      sell(30n);
+      const A = parsedTxOf([ixOf(tradeCpiData('A'))]);
+      const B = parsedTxOf([ixOf(closeData())]);
+      h.txs.set(SIG_A, A); h.txs.set(SIG, B);
+      h.sigs = [{ signature: SIG, err: null }, { signature: SIG_A, err: null }]; // newest first, as RPC returns
+      await (new TradeIndexerPolling() as any).indexTradesForSlab(SLAB, 100);
+      expect(written().map((r) => [r.tx_signature === SIG_A ? 'A' : 'B', r.side, r.size])).toEqual([['A', 'short', '30'], ['B', 'long', '10']]);
+      expect(h.skipped).toHaveLength(0);
+    });
+
+    it('F1 poll: an earlier tx that could not be indexed makes the close unresolvable (recorded, no guess)', async () => {
+      h.rows = [longOpen('20')];
+      tableBacked();
+      h.txs.set(SIG, parsedTxOf([ixOf(closeData())]));
+      // A is in the window but the RPC returns null for it.
+      h.sigs = [{ signature: SIG, err: null }, { signature: SIG_A, err: null }];
+      await (new TradeIndexerPolling() as any).indexTradesForSlab(SLAB, 100);
+      expect(written()).toHaveLength(0);
+      expect(h.skipped).toEqual([expect.objectContaining({ signature: SIG, error: expect.stringContaining('earlier transaction') })]);
+    });
+
+    it.each([['delivered oldest-first', false], ['delivered newest-first (sorted by slot)', true]])('F1 webhook: %s, the close sees the earlier transaction of the same delivery', async (_n, reversed) => {
+      h.rows = [longOpen('20')];
+      tableBacked();
+      sell(30n);
+      const txA = enhancedTxOf([enhIx(tradeCpiData('A'))], BLOCK_TIME, SIG_A, 100);
+      const txB = enhancedTxOf([enhIx(closeData())], BLOCK_TIME, SIG, 101);
+      expect((await postWebhook(reversed ? [txB, txA] : [txA, txB])).status).toBe(200);
+      expect(written().map((r) => [r.tx_signature === SIG_A ? 'A' : 'B', r.side, r.size])).toEqual([['A', 'short', '30'], ['B', 'long', '10']]);
+      expect(h.skipped).toHaveLength(0);
+    });
+
+    // F2: a tag 44 that is already stored is not resolved again, so a redelivery / backfill does not
+    // find later rows "not provably earlier" and report a missing trade that is in fact there.
+    it('F2 poll: an already stored tag 44 is neither re-resolved nor recorded as skipped', async () => {
+      h.rows = [shortOpenRow(), { side: 'long', size: '100', is_liquidation: false, created_at: NOW(), tx_signature: SIG, slab_address: SLAB, asset_index: 0, leg_index: 0, trader: OWNER }, shortOpenRow({ created_at: NOW() })];
+      tableBacked();
+      expect(await poll(parsedTx())).toBe(false);
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(h.skipped).toHaveLength(0);
+    });
+
+    it('F2 webhook: a redelivered tag 44 is neither re-resolved nor recorded as skipped', async () => {
+      h.rows = [shortOpenRow(), { side: 'long', size: '100', is_liquidation: false, created_at: NOW(), tx_signature: SIG, slab_address: SLAB, asset_index: 0, leg_index: 0, trader: OWNER }, shortOpenRow({ created_at: NOW() })];
+      tableBacked();
+      expect((await postWebhook([enhancedTx()])).status).toBe(200);
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(h.skipped).toHaveLength(0);
+    });
+
+    // A tx indexed under the old per-instruction numbering must not be stored a second time. A split
+    // order is IDENTICAL legs, so only fills the stored rows do not already account for are written.
+    it('old numbering poll: one identical row stored at another leg number accounts for exactly one of the identical fills', async () => {
+      sell(777n);
+      h.rows = [{ side: 'short', size: '777', is_liquidation: false, created_at: NOW(), tx_signature: SIG, slab_address: SLAB, asset_index: 0, leg_index: 7, trader: OWNER }];
+      tableBacked();
+      await poll(parsedTxOf([ixOf(tradeCpiData('x0')), ixOf(tradeCpiData('x1'))]));
+      expect(written().map((r) => r.leg_index)).toEqual([1]); // leg 0 is the stored one (at leg 7); leg 1 is genuinely new
+    });
+
+    it('old numbering webhook: same', async () => {
+      sell(777n);
+      h.rows = [{ side: 'short', size: '777', is_liquidation: false, created_at: NOW(), tx_signature: SIG, slab_address: SLAB, asset_index: 0, leg_index: 7, trader: OWNER }];
+      tableBacked();
+      await postWebhook([enhancedTxOf([enhIx(tradeCpiData('x0')), enhIx(tradeCpiData('x1'))])]);
+      expect(written().map((r) => r.leg_index)).toEqual([1]);
+    });
+
+    it('a split order of identical legs with nothing stored is still written in full', async () => {
+      sell(777n);
+      h.rows = [];
+      tableBacked();
+      await poll(parsedTxOf([ixOf(tradeCpiData('x0')), ixOf(tradeCpiData('x1')), ixOf(tradeCpiData('x2'))]));
+      expect(written().map((r) => r.leg_index)).toEqual([0, 1, 2]);
     });
   });
 

@@ -16,6 +16,7 @@ import {
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
+import { fetchStoredLegs, fillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:webhook");
@@ -410,9 +411,71 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // #160: extraction failures are COUNTED, not swallowed. See the throw at the end.
   let extractionFailures = 0;
   let firstExtractionError: unknown = null;
-  for (const tx of transactions) {
+  // Writes everything extracted so far and publishes what was newly written. Called once at the end,
+  // and also right before a RebalanceReduce (tag 44) is resolved: a close is inferred from the
+  // trader's indexed fills, so the earlier transactions of this delivery must already be stored.
+  // Returns false when the write failed (the failure is counted and surfaces as a 500 below).
+  const flush = async (): Promise<boolean> => {
+    if (pending.length === 0) return true;
+    const batch = pending.splice(0, pending.length);
     try {
-      for (const trade of await extractTradesFromEnhancedTx(tx, discovery)) {
+      // insertTradeRows upserts with ignoreDuplicates, so already-indexed legs are
+      // skipped without failing the batch — no separate duplicate branch needed.
+      // GH#42: retry so transient DB failures don't silently lose trades.
+      // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
+      const inserted = await withRetry(() => insertTradeRows(batch), {
+        maxRetries: 2,
+        baseDelayMs: 100,
+        label: `insertTradeRows(${batch.length})`,
+      });
+      indexed += inserted.length;
+
+      // Publish only what was actually written, so a re-delivery of already-indexed
+      // trades doesn't re-emit events to subscribers.
+      const written = new Set(inserted.map(tradeKey));
+      for (const trade of batch) {
+        if (!written.has(tradeKey(trade))) continue;
+        eventBus.publish("trade.executed", trade.slab_address, {
+          signature: trade.tx_signature,
+          trader: trade.trader,
+          side: trade.side,
+          size: trade.size,
+          price: trade.price,
+          fee: trade.fee,
+        });
+      }
+      return true;
+    } catch (err) {
+      // All retries exhausted — capture to Sentry so we know this happened
+      insertFailures += batch.length;
+      logger.error("Trade batch insert failed after retries", {
+        count: batch.length,
+        slabAddress: batch[0]?.slab_address.slice(0, 8),
+        error: err instanceof Error ? err.message : err,
+      });
+      captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { context: "webhook-insert-failure" },
+        extra: {
+          count: batch.length,
+          firstSignature: batch[0]?.tx_signature?.slice(0, 16),
+          slabAddress: batch[0]?.slab_address.slice(0, 16),
+        },
+      });
+      return false;
+    }
+  };
+
+  // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
+  // before it. Stable, so transactions without a slot keep their delivery order.
+  const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
+  const delivery = { earlier: new Set<string>(), incomplete: false };
+  const ordered = [...transactions].sort((x, y) => {
+    const sx = slotOf(x), sy = slotOf(y);
+    return sx === sy ? 0 : sx < sy ? -1 : 1;
+  });
+  for (const tx of ordered) {
+    try {
+      for (const trade of await extractTradesFromEnhancedTx(tx, discovery, flush, delivery)) {
         // Retired markets are deleted from `markets`, and trades carry an FK to
         // it — so a fill here would fail the insert and burn the batch's retries.
         // Skip cleanly instead. See src/blocklist.ts.
@@ -422,6 +485,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
         pending.push(trade);
       }
+      if (tx.signature) delivery.earlier.add(tx.signature);
     } catch (err) {
       // #160: this used to warn and continue, so processTransactions resolved and
       // the route answered 200. Helius does not retry a 2xx, so a transaction that
@@ -432,6 +496,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
       // This is the near side: a parse/extraction throw before insertTradeRows is
       // reached. Same failure, earlier in the pipeline, and still silent.
       extractionFailures++;
+      delivery.incomplete = true; // a later tag 44 must not be resolved past a transaction we could not read
       if (firstExtractionError === null) firstExtractionError = err;
       logger.error("Trade extraction failed — will 500 so Helius redelivers", {
         signature: tx.signature?.slice(0, 16),
@@ -447,51 +512,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
     logger.debug("Skipped fills on blocked slabs", { count: blockedFills });
   }
 
-  if (pending.length > 0) {
-    try {
-      // insertTradeRows upserts with ignoreDuplicates, so already-indexed legs are
-      // skipped without failing the batch — no separate duplicate branch needed.
-      // GH#42: retry so transient DB failures don't silently lose trades.
-      // Short base delay (100ms) to avoid blocking the 15s Helius webhook window.
-      const inserted = await withRetry(() => insertTradeRows(pending), {
-        maxRetries: 2,
-        baseDelayMs: 100,
-        label: `insertTradeRows(${pending.length})`,
-      });
-      indexed = inserted.length;
-
-      // Publish only what was actually written, so a re-delivery of already-indexed
-      // trades doesn't re-emit events to subscribers.
-      const written = new Set(inserted.map(tradeKey));
-      for (const trade of pending) {
-        if (!written.has(tradeKey(trade))) continue;
-        eventBus.publish("trade.executed", trade.slab_address, {
-          signature: trade.tx_signature,
-          trader: trade.trader,
-          side: trade.side,
-          size: trade.size,
-          price: trade.price,
-          fee: trade.fee,
-        });
-      }
-    } catch (err) {
-      // All retries exhausted — capture to Sentry so we know this happened
-      insertFailures = pending.length;
-      logger.error("Trade batch insert failed after retries", {
-        count: pending.length,
-        slabAddress: pending[0]?.slab_address.slice(0, 8),
-        error: err instanceof Error ? err.message : err,
-      });
-      captureException(err instanceof Error ? err : new Error(String(err)), {
-        tags: { context: "webhook-insert-failure" },
-        extra: {
-          count: pending.length,
-          firstSignature: pending[0]?.tx_signature?.slice(0, 16),
-          slabAddress: pending[0]?.slab_address.slice(0, 16),
-        },
-      });
-    }
-  }
+  await flush();
 
   if (indexed > 0) {
     logger.info("Trades indexed", { count: indexed });
@@ -536,7 +557,18 @@ interface TradeData {
   placeholder?: boolean;
 }
 
-async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: any): Promise<TradeData[]> {
+async function extractTradesFromEnhancedTx(
+  tx: ValidatedTransaction,
+  discovery: any,
+  /**
+   * Writes everything extracted from EARLIER transactions of this delivery and reports whether that
+   * succeeded. Called right before a RebalanceReduce (tag 44) is resolved, so the close sees the
+   * fills that precede it. Omitted = nothing earlier to flush.
+   */
+  flush: () => Promise<boolean> = async () => true,
+  /** Delivery state: signatures already extracted before this tx (chain order), and whether an earlier one failed. */
+  delivery: { earlier: Set<string>; incomplete: boolean } = { earlier: new Set(), incomplete: false },
+): Promise<TradeData[]> {
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -555,7 +587,12 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
   if (!BASE58_SIGNATURE.test(signature)) return trades;
 
   const instructions = tx.instructions ?? [];
-  const reduceKeysSeen = new Set<string>(); // (trader|slab|asset) already reduced by an earlier tag 44
+  // (trader|slab|asset) positions already touched by an earlier fill or tag 44 in THIS tx: a tag 44
+  // after one of them starts from a position that is not in the table yet, so it is not resolved.
+  const touched = new Set<string>();
+  // Rows already stored for this tx, read once and only when a fill needs it.
+  let stored: StoredLeg[] | null | undefined;
+  const getStored = async (): Promise<StoredLeg[] | null> => (stored === undefined ? (stored = await fetchStoredLegs(signature)) : stored);
 
   for (const ix of instructions) {
     const programId = ix.programId ?? "";
@@ -605,21 +642,43 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
           is_liquidation: false, placeholder: true,
         });
       };
-      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) { placeholder(); continue; }
-      if (discovery && !discovery.getMarkets().has(slabAddress)) { placeholder(); continue; }
+      // Every path out of here that writes nothing still holds the leg number (placeholder), so a
+      // fill after this tag 44 keeps the number the poll path gives it.
+      if (!BASE58_PUBKEY.test(trader) || !BASE58_PUBKEY.test(slabAddress)) {
+        logger.warn("RebalanceReduce with an invalid account key: not indexed, leg number held", { signature: signature.slice(0, 12) });
+        placeholder();
+        continue;
+      }
+      if (discovery && !discovery.getMarkets().has(slabAddress)) {
+        logger.debug("RebalanceReduce on a market this indexer does not track: leg number held", { signature: signature.slice(0, 12), slabAddress });
+        placeholder();
+        continue;
+      }
+      // This tag 44's final leg number: the count of fills (written or held) before it in the tx.
+      const legIndex = trades.filter((t) => !t.is_liquidation).length;
+      // F2: already stored (redelivery / backfill)? Do not resolve it again.
+      if (reduceAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: reduce.assetIndex, legIndex, trader, reduceQ: reduce.reduceQ })) {
+        placeholder();
+        continue;
+      }
       const reduceKey = `${trader}|${slabAddress}|${reduce.assetIndex}`;
-      const resolution = await resolveRebalanceReduce({
+      // F1: earlier transactions of this delivery must be in the table before this close is resolved.
+      // If that write failed, the position is not known: do not guess.
+      const earlierWritten = await flush();
+      const resolution = earlierWritten ? await resolveRebalanceReduce({
         trader,
         slabAddress,
         assetIndex: reduce.assetIndex,
         reduceQ: reduce.reduceQ,
         signature,
         txTimeSec: typeof tx.timestamp === "number" ? tx.timestamp : null,
-        repeatInTx: reduceKeysSeen.has(reduceKey),
-      });
-      reduceKeysSeen.add(reduceKey);
+        repeatInTx: touched.has(reduceKey),
+        earlierSignatures: delivery.earlier,
+        earlierIncomplete: delivery.incomplete,
+      }) : { ok: false as const, reason: "RebalanceReduce (tag 44): the write of earlier transactions in this delivery failed, so the position before this close is not known" };
+      touched.add(reduceKey);
       if (!resolution.ok) {
-        // Never a warn-only miss: durable + loud + retryable (skipped_signatures, #212).
+        // Never a warn-only miss: recorded durably and loudly in skipped_signatures (recorded, NOT retried).
         await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: resolution.reason }]);
         placeholder();
         continue;
@@ -687,6 +746,7 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
+      touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
 
       let price: number;
       if (leg.execPriceE6 !== undefined) {
@@ -812,7 +872,27 @@ async function extractTradesFromEnhancedTx(tx: ValidatedTransaction, discovery: 
   }
 
   // Placeholders (tag 44s that could not be written) only held their number.
-  return trades.filter((t) => !t.placeholder);
+  const fills = trades.filter((t) => !t.placeholder);
+
+  // A fill already stored under another leg number (this tx indexed under the old per-instruction
+  // numbering) is the SAME fill: drop it here instead of storing it twice. The rank among identical
+  // fills matters, because a split order is several identical legs.
+  if (fills.some((t) => !t.is_liquidation)) {
+    const storedLegs = await getStored();
+    if (storedLegs && storedLegs.length > 0) {
+      const rank = new Map<string, number>();
+      return fills.filter((t) => {
+        if (t.is_liquidation || t.side === null || t.size === null) return true;
+        const k = `${t.slab_address}|${t.asset_index}|${t.trader}|${t.side}|${t.size}`;
+        const ordinal = (rank.get(k) ?? 0) + 1;
+        rank.set(k, ordinal);
+        return !fillAlreadyStored(storedLegs, {
+          slab: t.slab_address, assetIndex: t.asset_index, legIndex: t.leg_index, trader: t.trader, side: t.side, size: t.size, ordinal,
+        });
+      });
+    }
+  }
+  return fills;
 }
 
 /**
