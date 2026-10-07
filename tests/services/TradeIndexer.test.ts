@@ -773,5 +773,48 @@ describe('TradeIndexerPolling', () => {
       expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
       expect(shared.eventBus.publish).not.toHaveBeenCalled();
     });
+
+    describe('v2.2 EvictAndTradeCpi (119): same leg counter and per-leg dedup as every other fill', () => {
+      const VICTIM = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+      const evictData = (): Uint8Array => { const d = tradeCpiData(); d[0] = 119; return d; };
+      const evictIx = () => ({
+        programId: new PublicKey(PROGRAM_ID),
+        accounts: [new PublicKey(VICTIM), new PublicKey(TRADER), new PublicKey(SLAB)], // [victim] + TradeCpi accounts
+        data: 'evict',
+      });
+      const tx = () => ({
+        meta: { err: null, logMessages: [] },
+        transaction: { message: { instructions: [ix('l0'), evictIx(), ix('l2')] } },
+      });
+      const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
+
+      beforeEach(() => {
+        vi.mocked(shared.decodeBase58).mockImplementation(((d: string) => (d === 'evict' ? evictData() : tradeCpiData())) as never);
+      });
+
+      it('is numbered in the tx-wide sequence (0,1,2), attributed to the entrant and the market, not the victim', async () => {
+        await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+        expect(rows.map((r) => r.leg_index)).toEqual([0, 1, 2]);
+        expect(rows[1]).toEqual(expect.objectContaining({ trader: TRADER, slab_address: SLAB, tx_signature: VALID_SIG }));
+        expect(rows.some((r) => r.trader === VICTIM)).toBe(false);
+      });
+
+      it('REPLAY: the same tx processed again inserts nothing new and publishes nothing (no double insert)', async () => {
+        await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        expect([...db].sort()).toEqual([`${VALID_SIG}|0|0`, `${VALID_SIG}|0|1`, `${VALID_SIG}|0|2`]);
+        vi.mocked(shared.eventBus.publish).mockClear();
+        const again = await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        expect(again).toBe(false);
+        expect(db.size).toBe(3);
+        expect(shared.eventBus.publish).not.toHaveBeenCalled();
+      });
+
+      it('NEGATIVE CONTROL: a 119 with only the victim account is not indexed and does not consume a leg number', async () => {
+        const bad = { ...evictIx(), accounts: [new PublicKey(VICTIM)] };
+        await (indexer as any).processTransaction({ meta: { err: null, logMessages: [] }, transaction: { message: { instructions: [bad, ix('l1')] } } }, VALID_SIG, SLAB, programIds);
+        expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).leg_index)).toEqual([0]);
+      });
+    });
   });
 });
