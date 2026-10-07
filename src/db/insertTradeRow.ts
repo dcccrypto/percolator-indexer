@@ -32,8 +32,11 @@ export interface IndexerTradeRow {
 /**
  * Insert one trade fill. Swallows 23505 (duplicate leg already indexed); throws on
  * any other error so callers with retry/catch semantics behave as before.
+ *
+ * Returns true when this call wrote the row, false when the leg already existed
+ * (23505), so callers can skip side effects (WS events) for duplicates.
  */
-export async function insertTradeRow(row: IndexerTradeRow): Promise<void> {
+export async function insertTradeRow(row: IndexerTradeRow): Promise<boolean> {
   const { error } = await getSupabase().from("trades").insert(toDbRow(row));
   if (error && error.code !== "23505") {
     logger.warn("insertTradeRow failed", {
@@ -44,6 +47,7 @@ export async function insertTradeRow(row: IndexerTradeRow): Promise<void> {
     });
     throw new Error(`insertTradeRow failed: ${error.message}`);
   }
+  return !error;
 }
 
 /** Map the indexer-side shape to the `trades` column set. */

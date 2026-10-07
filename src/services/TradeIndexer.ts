@@ -2,7 +2,7 @@ import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from 
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, getConnection, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { insertTradeRow } from "../db/insertTradeRow.js";
 import { parsePercolatorLiquidations, decodeV18SingleFill, decodeV18BatchLegs, computeFeeUsd } from "../parsers/percolatorTxParser.js";
 
@@ -346,10 +346,26 @@ export class TradeIndexerPolling {
     // per-fill cap as several single-leg TradeCpi instructions in ONE tx.
     let fillSeq = 0;
     let insertedAny = false;
-    // "Did another path already index this tx?" — asked once, before this pass
-    // writes anything. Asked after our own first insert it would always say yes
-    // and drop the remaining legs of a split order.
-    let alreadyIndexed: boolean | undefined;
+    // No transaction-level "already indexed?" gate: tradeExistsBySignature filters on
+    // (signature, network) only, so after ONE leg is written (by any path, or by an
+    // earlier pass that then threw on a later leg) it would hide every remaining leg
+    // for good — the cursor advances past the tx. Dedup is per leg instead, via the
+    // unique index (tx_signature, asset_index, leg_index): insertTradeRow swallows
+    // 23505 and reports whether the row was new. Same model as the webhook batch path.
+    //
+    // Fallback price (slab read) resolved lazily, ONCE per transaction, shared by
+    // every leg and instruction that lacks a wire exec_price. A tx that is already
+    // fully indexed therefore costs at most one slab read, not one per leg.
+    let fallbackPrice: number | null = null;
+    const resolveFallbackPrice = async (): Promise<number> => {
+      if (fallbackPrice === null) {
+        fallbackPrice = this.extractPriceFromLogs(tx);
+        if (fallbackPrice === 0) {
+          fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
+        }
+      }
+      return fallbackPrice;
+    };
 
     for (const ix of message.instructions) {
       // Skip parsed instructions (system, token, etc.)
@@ -398,32 +414,23 @@ export class TradeIndexerPolling {
         const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
         if (!base58PubkeyRegex.test(trader) || !base58SigRegex.test(signature)) return false;
 
-        // H2/H3: do NOT short-circuit the whole tx on tradeExistsBySignature — with
-        // the (tx_signature, asset_index, leg_index) key that would skip legs which
-        // failed on an earlier pass. Each leg is deduped per-leg by 23505 instead.
+        // H2/H3: each leg is deduped per-leg by 23505 (see above), never per tx.
 
         // #205: fall back to the slab read only when the leg itself doesn't carry
         // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
-        let fallbackPrice: number | null = null;
-        const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> => {
-          if (leg.execPriceE6 !== undefined) return Number(leg.execPriceE6) / 1_000_000;
-          if (fallbackPrice === null) {
-            fallbackPrice = this.extractPriceFromLogs(tx);
-            if (fallbackPrice === 0) {
-              fallbackPrice = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
-            }
-          }
-          return fallbackPrice;
-        };
+        const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> =>
+          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice();
 
         const i128Max = (1n << 127n) - 1n;
 
         for (const leg of legs) {
+          // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
+          const legIndex = fillSeq++;
           if (leg.sizeValue > i128Max) continue;
           const price = await resolvePrice(leg);
           const fee = computeFeeUsd(leg.sizeValue, price, leg.feeBps);
 
-          await insertTradeRow({
+          const inserted = await insertTradeRow({
             slab_address: slabAddress,
             trader,
             side: leg.side,
@@ -432,8 +439,9 @@ export class TradeIndexerPolling {
             fee,
             tx_signature: signature,
             asset_index: leg.assetIndex,
-            leg_index: fillSeq++,
+            leg_index: legIndex,
           });
+          if (!inserted) continue; // duplicate leg: already indexed, no event, no count
           eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: leg.sizeValue.toString() });
           insertedAny = true;
         }
@@ -452,12 +460,6 @@ export class TradeIndexerPolling {
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
 
-      // Check for duplicate
-      if (alreadyIndexed === undefined) {
-        alreadyIndexed = insertedAny ? false : await tradeExistsBySignature(signature);
-      }
-      if (alreadyIndexed) continue;
-
       // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
       // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the
       // requested cap), so it still falls back to the slab read.
@@ -465,10 +467,7 @@ export class TradeIndexerPolling {
       if (decoded.execPriceE6 !== undefined) {
         price = Number(decoded.execPriceE6) / 1_000_000;
       } else {
-        price = this.extractPriceFromLogs(tx);
-        if (price === 0) {
-          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress);
-        }
+        price = await resolveFallbackPrice();
       }
       const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
 
@@ -478,7 +477,7 @@ export class TradeIndexerPolling {
       
       if (!base58PubkeyRegex.test(trader)) {
         logger.warn("Invalid trader pubkey format", { trader: trader.slice(0, 12) });
-        return false;
+        continue; // this leg only — `return` would silently drop the legs after it
       }
       
       if (!base58SigRegex.test(signature)) {
@@ -490,10 +489,10 @@ export class TradeIndexerPolling {
       const i128Max = (1n << 127n) - 1n;
       if (sizeValue > i128Max) {
         logger.warn("Trade size out of i128 range", { sizeValue: sizeValue.toString().slice(0, 30) });
-        return false;
+        continue; // this leg only — `return` would silently drop the legs after it
       }
 
-      await insertTradeRow({
+      const inserted = await insertTradeRow({
         slab_address: slabAddress,
         trader,
         side,
@@ -504,6 +503,7 @@ export class TradeIndexerPolling {
         asset_index: decoded.assetIndex,
         leg_index: legIndex,
       });
+      if (!inserted) continue; // duplicate leg: already indexed, no event, no count
 
       eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
       insertedAny = true;

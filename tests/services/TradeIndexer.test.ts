@@ -5,6 +5,7 @@ import { PublicKey } from '@solana/web3.js';
 vi.hoisted(() => { process.env.INDEXER_BREAKER_ALERT_POLLS = '1'; }); // alert on the first held poll in tests
 const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
+const mockGetAccountInfo = vi.fn(async () => null);
 const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
   Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
 );
@@ -27,7 +28,8 @@ vi.mock('@percolatorct/sdk', () => ({
 
 // H2/H3: trades are now written via the indexer-local insertTradeRow helper
 // (src/db/insertTradeRow.ts), not shared's insertTrade. Mock it directly.
-vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn() }));
+// Resolves true = row written, false = duplicate leg (23505 swallowed).
+vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn(async () => true) }));
 
 vi.mock('@percolatorct/shared', () => ({
   config: {
@@ -43,7 +45,10 @@ vi.mock('@percolatorct/shared', () => ({
     getSignaturesForAddress: mockGetSignaturesForAddress,
     getParsedTransaction: mockGetParsedTransaction,
     getParsedTransactions: mockGetParsedTransactions,
+    getAccountInfo: mockGetAccountInfo,
   })),
+  // The poll path must NOT call this (a transaction-level gate drops legs 2..N of a split
+  // order); the split-order tests below back it with a fake DB and assert it is never asked.
   tradeExistsBySignature: vi.fn(async () => false),
   getMarkets: vi.fn(async () => []),
   eventBus: {
@@ -95,6 +100,7 @@ describe('TradeIndexerPolling', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(insertTradeRow).mockResolvedValue(true);
     indexer = new TradeIndexerPolling();
   });
 
@@ -139,11 +145,9 @@ describe('TradeIndexerPolling', () => {
   });
 
   describe('duplicate trade detection', () => {
-    it('should skip trades that already exist by signature', async () => {
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(true);
-
-      // The indexer checks tradeExistsBySignature internally
-      // We verify by checking insertTrade is NOT called when duplicate detected
+    it('should not publish or count trades whose leg already exists', async () => {
+      // Every leg already exists: insertTradeRow reports a swallowed 23505 (false).
+      vi.mocked(insertTradeRow).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       // Mock a transaction that would produce a trade
@@ -180,12 +184,13 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
       await new Promise(r => setTimeout(r, 6500));
 
-      // Should NOT insert because tradeExistsBySignature returns true
-      expect(insertTradeRow).not.toHaveBeenCalled();
+      // The row is offered to the per-leg dedup (unique index), found to be a
+      // duplicate, and produces no event.
+      expect(insertTradeRow).toHaveBeenCalledTimes(1);
+      expect(shared.eventBus.publish).not.toHaveBeenCalled();
     }, 10000);
 
     it('should insert trade when not duplicate', async () => {
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       mockGetSignaturesForAddress.mockResolvedValue([
@@ -230,7 +235,6 @@ describe('TradeIndexerPolling', () => {
     const SIGS = ['A', 'B', 'C', 'D', 'E', 'F'].map((c) => c.repeat(88));
     const V2 = Object.assign(new Error('failed to get transaction: Transaction version (2) is not supported by the requesting client'), { code: -32015 });
     const setup = (badSigs: string[]) => {
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
       mockGetSignaturesForAddress.mockResolvedValue(SIGS.map((signature) => ({ signature, err: null })));
       const ixData = new Uint8Array(77);
@@ -352,7 +356,6 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
 
     it('should skip instructions with data too short', async () => {
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       mockGetSignaturesForAddress.mockResolvedValue([
@@ -384,7 +387,6 @@ describe('TradeIndexerPolling', () => {
     it('v17: TradeCpiV2 (tag=35) NOT indexed — removed from decoder', async () => {
       // v17 BREAKING: TradeCpiV2 removed from the v17 wrapper decoder.
       // The old GH#1171 regression asserted tag=35 WAS indexed; in v17 it MUST NOT be.
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
@@ -418,7 +420,6 @@ describe('TradeIndexerPolling', () => {
       // H2/H3: a multi-leg batch must produce ONE insertTradeRow call PER LEG, each
       // with a distinct leg_index — this is the whole point of the H2/H3 fix (batch
       // legs previously collapsed under a tx_signature-only unique constraint).
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
       vi.mocked(shared.parseTradeSize).mockReturnValue({ sizeValue: 7_000_000n, side: 'long' as const });
 
@@ -468,7 +469,6 @@ describe('TradeIndexerPolling', () => {
     }, 10000);
 
     it('should skip non-trade instruction tags', async () => {
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       mockGetSignaturesForAddress.mockResolvedValue([
@@ -565,7 +565,6 @@ describe('TradeIndexerPolling', () => {
       // would grab the first in-range value (1_500_000) and call it price_e6,
       // writing $1.50 to the DB. The neutralized version MUST return 0 so the
       // caller falls through to readMarkPriceFromSlab.
-      vi.mocked(shared.tradeExistsBySignature).mockResolvedValue(false);
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
 
       mockGetSignaturesForAddress.mockResolvedValue([
@@ -639,10 +638,6 @@ describe('TradeIndexerPolling', () => {
     }
 
     async function pollOnce(instructions: unknown[]) {
-      // Like the real DB lookup: nothing indexed until this pass writes a row.
-      vi.mocked(shared.tradeExistsBySignature).mockImplementation(
-        async () => vi.mocked(insertTradeRow).mock.calls.length > 0,
-      );
       vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
       vi.mocked(shared.decodeBase58).mockImplementation(() => tradeCpiData());
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
@@ -670,9 +665,6 @@ describe('TradeIndexerPolling', () => {
           slab_address: SLAB, trader: TRADER, tx_signature: VALID_SIG, asset_index: 0,
         }));
       }
-      // The "already indexed by another path?" check runs once per tx, before this
-      // pass writes — not again after its own first insert.
-      expect(shared.tradeExistsBySignature).toHaveBeenCalledTimes(1);
     }, 10000);
 
     it('keeps the tx-wide leg number when an earlier fill in the tx is on another slab', async () => {
@@ -687,5 +679,97 @@ describe('TradeIndexerPolling', () => {
       expect(rows).toHaveLength(1);
       expect(rows[0]).toEqual(expect.objectContaining({ slab_address: SLAB, leg_index: 1 }));
     }, 10000);
+  });
+  describe('split order — per-leg dedup, no transaction-level gate', () => {
+    // A fake `trades` table keyed like the unique index (tx_signature, asset_index, leg_index).
+    // insertTradeRow resolves true for a new row and false for a duplicate (23505 swallowed);
+    // tradeExistsBySignature behaves like the real one (signature+network only), so a
+    // transaction-level gate in the poll path would be visibly wrong against it.
+    let db: Set<string>;
+    let failLeg: number | null;
+    const key = (r: any) => `${r.tx_signature}|${r.asset_index}|${r.leg_index}`;
+
+    function tradeCpiData(): Uint8Array {
+      const d = new Uint8Array(85);
+      d[0] = 11; // IX_TAG.TradeCpi (mocked)
+      d[51] = 0x40; d[52] = 0x42; d[53] = 0x0f;
+      return d;
+    }
+    const ix = (data: string) => ({
+      programId: new PublicKey(PROGRAM_ID),
+      accounts: [new PublicKey(TRADER), new PublicKey(SLAB)],
+      data,
+    });
+    const threeLegTx = () => ({
+      meta: { err: null, logMessages: [] },
+      transaction: { message: { instructions: [ix('l0'), ix('l1'), ix('l2')] } },
+    });
+
+    beforeEach(() => {
+      db = new Set();
+      failLeg = null;
+      mockGetAccountInfo.mockClear();
+      vi.mocked(shared.decodeBase58).mockImplementation(() => tradeCpiData());
+      vi.mocked(shared.tradeExistsBySignature).mockImplementation(
+        async (sig: string) => [...db].some((k) => k.startsWith(`${sig}|`)),
+      );
+      vi.mocked(insertTradeRow).mockImplementation(async (row: any) => {
+        if (failLeg !== null && row.leg_index === failLeg) throw new Error('insertTradeRow failed: boom');
+        const k = key(row);
+        if (db.has(k)) return false;
+        db.add(k);
+        return true;
+      });
+    });
+
+    afterEach(() => {
+      vi.mocked(shared.tradeExistsBySignature).mockImplementation(async () => false);
+      vi.mocked(insertTradeRow).mockResolvedValue(true);
+    });
+
+    it('partial failure: leg 0 written, leg 1 throws; the next pass writes legs 1 and 2 only, leg 0 is not duplicated', async () => {
+      const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
+      const process = (indexer as any).processTransaction.bind(indexer);
+
+      failLeg = 1;
+      await expect(process(threeLegTx(), VALID_SIG, SLAB, programIds)).rejects.toThrow('boom');
+      expect([...db]).toEqual([`${VALID_SIG}|0|0`]);
+      expect(shared.eventBus.publish).toHaveBeenCalledTimes(1); // leg 0 only
+
+      failLeg = null;
+      vi.mocked(insertTradeRow).mockClear();
+      vi.mocked(shared.eventBus.publish).mockClear();
+      const didIndex = await process(threeLegTx(), VALID_SIG, SLAB, programIds);
+
+      expect(didIndex).toBe(true);
+      expect([...db].sort()).toEqual([`${VALID_SIG}|0|0`, `${VALID_SIG}|0|1`, `${VALID_SIG}|0|2`]);
+      // leg 0 was offered again, found to exist, and produced NO second event
+      expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).leg_index)).toEqual([0, 1, 2]);
+      expect(shared.eventBus.publish).toHaveBeenCalledTimes(2); // legs 1 and 2, never leg 0 again
+      expect(shared.tradeExistsBySignature).not.toHaveBeenCalled();
+    });
+
+    it('backfill over a tx whose leg 0 already exists writes the missing legs 1..N', async () => {
+      db.add(`${VALID_SIG}|0|0`); // written earlier by the old poll path / webhook
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
+      mockGetParsedTransaction.mockResolvedValue(threeLegTx());
+
+      await (indexer as any).indexTradesForSlab(SLAB, 100);
+
+      expect([...db].sort()).toEqual([`${VALID_SIG}|0|0`, `${VALID_SIG}|0|1`, `${VALID_SIG}|0|2`]);
+      expect(shared.eventBus.publish).toHaveBeenCalledTimes(2); // only the 2 new legs
+      expect(shared.tradeExistsBySignature).not.toHaveBeenCalled();
+    });
+
+    it('an already fully indexed tx costs one slab read in total, not one per leg, and publishes nothing', async () => {
+      for (const l of [0, 1, 2]) db.add(`${VALID_SIG}|0|${l}`);
+      const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
+
+      const didIndex = await (indexer as any).processTransaction(threeLegTx(), VALID_SIG, SLAB, programIds);
+
+      expect(didIndex).toBe(false);
+      expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
+      expect(shared.eventBus.publish).not.toHaveBeenCalled();
+    });
   });
 });
