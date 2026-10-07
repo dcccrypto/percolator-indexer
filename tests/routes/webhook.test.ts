@@ -101,8 +101,13 @@ vi.mock('@percolatorct/shared', () => ({
   })),
 }));
 
+// #221: the fill-price reader. Default null = "not a readable v18 slot", which keeps
+// every existing test on its legacy mark path; the #221 test below sets a price.
+vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: vi.fn(() => null) }));
+
 import * as shared from '@percolatorct/shared';
 import { insertTradeRow } from '../../src/db/insertTradeRow.js';
+import { readAssetEffectivePriceE6 } from '../../src/parsers/markPrice.js';
 import { webhookRoutes, verifyWebhookSignature } from '../../src/routes/webhook.js';
 
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
@@ -242,6 +247,29 @@ describe('POST /webhook/trades — price extraction', () => {
     expect(insertTradeRow).toHaveBeenCalledWith(
       expect.objectContaining({ price: 42.5 }) // 42_500_000 / 1_000_000
     );
+  });
+
+  it('#221: prices the fill at its asset\'s booked effective_price, not the slab mark', async () => {
+    // The same slab bytes carry a legacy mark of $42.50; the booked price for asset 0
+    // is $13.614586. The fill must be stored at the booked price.
+    const slabData = new Uint8Array(1048);
+    new DataView(slabData.buffer).setBigUint64(1040, 42_500_000n, true);
+    vi.mocked(readAssetEffectivePriceE6).mockImplementation((_raw, assetIndex) =>
+      assetIndex === 0 ? 13_614_586 : null,
+    );
+
+    const tx = {
+      signature: SIG,
+      instructions: makeBaseInstructions(),
+      innerInstructions: [],
+      accountData: [{ account: SLAB, data: Buffer.from(slabData).toString('base64') }],
+      logs: [],
+    };
+    await app.fetch(makeRequest([tx]));
+
+    expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ price: 13.614586 }));
+    expect(vi.mocked(readAssetEffectivePriceE6).mock.calls.map((c) => c[1])).toEqual([0]);
+    vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => null);
   });
 
   it('extracts price from slab accountData with array [base64, "base64"] format', async () => {

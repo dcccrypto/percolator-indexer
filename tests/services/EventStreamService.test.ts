@@ -968,3 +968,81 @@ describe.skip("EventStreamService — Atlas jsonParsed accountKey shape", () => 
     vi.doUnmock("../../src/parsers/markPrice.js");
   });
 });
+
+describe("EventStreamService — #221 fill price per asset", () => {
+  it("prices each fill at its own asset's booked price, reading each asset once", async () => {
+    const SLAB = "SLAB221AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const PERC = "PERC221AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    // Booked effective_price per asset (raw e6): asset 0 = $100, asset 1 = $50.
+    const readMarkMock = vi.fn(async (_c: unknown, _s: string, assetIndex?: number) =>
+      assetIndex === 1 ? 50_000_000 : 100_000_000,
+    );
+    const fill = (assetIndex: number, sizeAbs: bigint) => ({
+      signature: "sig221",
+      trader: "trader221",
+      programId: PERC,
+      assetIndex,
+      sizeAbs,
+      side: "long" as const,
+      slabAddress: SLAB,
+      priceE6: undefined,
+    });
+    const parseFillsMock = vi.fn().mockReturnValue([fill(0, 1_000n), fill(1, 2_000n), fill(0, 3_000n)]);
+
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: vi.fn() };
+    });
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        return rows.map((r) => ({ tx_signature: r.tx_signature, asset_index: r.asset_index, leg_index: r.leg_index }));
+      }),
+    }));
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+
+    const { EventStreamService: Svc } = await import("../../src/services/EventStreamService.js");
+    const listeners: Array<(msg: any) => void> = [];
+    const svc = new Svc({
+      ws: { sub: () => {}, onNotification: (cb: any) => { listeners.push(cb); }, close: () => {}, isOpen: true } as any,
+      programId: PERC,
+      connection: { getAccountInfo: vi.fn() } as any,
+      autoIndex: true,
+      knownSlabs: [SLAB],
+    });
+    await svc.start();
+    listeners[0]({
+      jsonrpc: "2.0",
+      method: "transactionNotification",
+      params: {
+        result: {
+          transaction: { message: { instructions: [], accountKeys: [{ pubkey: { toBase58: () => SLAB } }] } },
+          meta: { err: null, logMessages: [] },
+          signature: "sig221",
+        },
+        subscription: 1,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // One slab read per ASSET (not per fill, and not one shared read for the whole slab),
+    // each told which asset it is pricing.
+    expect(readMarkMock).toHaveBeenCalledTimes(2);
+    expect(readMarkMock.mock.calls.map((c) => c[2]).sort()).toEqual([0, 1]);
+    expect(readMarkMock.mock.calls.every((c) => c[1] === SLAB)).toBe(true);
+
+    // Each fill carries its own asset's price ($ = e6 / 1e6).
+    const priceBySize = Object.fromEntries(insertTradeMock.mock.calls.map((c: any) => [c[0].size, c[0].price]));
+    expect(priceBySize).toEqual({ "1000": 100, "2000": 50, "3000": 100 });
+
+    vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
+    vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
+  });
+});
