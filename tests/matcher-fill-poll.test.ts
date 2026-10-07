@@ -5,9 +5,11 @@ import { PublicKey } from "@solana/web3.js";
 
 const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 const getAccountInfo = vi.fn();
+const getSignaturesForAddress = vi.fn();
+const getParsedTransactions = vi.fn();
 vi.mock("@percolatorct/shared", async (orig) => {
   const actual = await orig<typeof import("@percolatorct/shared")>();
-  return { ...actual, getConnection: vi.fn(() => ({ getAccountInfo })), withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()) };
+  return { ...actual, config: { ...actual.config, allProgramIds: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB"] }, getConnection: vi.fn(() => ({ getAccountInfo, getSignaturesForAddress, getParsedTransactions })), withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()) };
 });
 const recordSkipped = vi.fn(async () => undefined);
 vi.mock("../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: (...a: unknown[]) => recordSkipped(...(a as [])), assertSkippedSignatureSinkReady: vi.fn() }));
@@ -16,6 +18,7 @@ const storedLegs: { rows: any[] | null } = { rows: [] };
 vi.mock("../src/db/storedLegs.js", async (orig) => ({
   ...(await orig<typeof import("../src/db/storedLegs.js")>()),
   fetchStoredLegs: vi.fn(async () => storedLegs.rows),
+  fetchStoredLegsMany: vi.fn(async () => null),
 }));
 import { insertTradeRow } from "../src/db/insertTradeRow.js";
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
@@ -121,5 +124,77 @@ describe("poll path: TradeCpi rows", () => {
     expect(await idx.processTransaction(w, f.sig, market(f), new Set([PROGRAM]))).toBe(true);
     expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).size)).toEqual(["378397480755"]);
     expect(recordSkipped).not.toHaveBeenCalled();
+  });
+
+  // ---- F4: through the REAL polling loop (indexTradesForSlab), not processTransaction directly ----
+  describe("F4/F5: a transient context-read failure never loses the fill", () => {
+    const dup = (f: any) => {
+      // the same wrapper instruction twice (two same-side TradeCpi fills on one asset), with their inner groups
+      const w = asWeb3(f);
+      const ixs = w.transaction.message.instructions;
+      const idx = ixs.findIndex((i: any) => i.programId && i.programId.toBase58?.() === PROGRAM && i.data && i.data.length > 100);
+      const group = w.meta.innerInstructions.find((g: any) => g.index === idx);
+      ixs.push(ixs[idx]);
+      w.meta.innerInstructions.push({ index: ixs.length - 1, instructions: group.instructions });
+      return w;
+    };
+    const slabOf = (f: any) => market(f);
+    function wire(sigs: Array<{ f: any; w?: any }>) {
+      getSignaturesForAddress.mockResolvedValue([...sigs].reverse().map((x) => ({ signature: x.f.sig, err: null })));
+      getParsedTransactions.mockImplementation(async (list: string[]) => list.map((sig) => { const x = sigs.find((y) => y.f.sig === sig)!; return x.w ?? asWeb3(x.f); }));
+    }
+    const poll1 = async (idx: any, slab: string) => { await idx.indexTradesForSlab(slab); return idx.lastSignature.get(slab) as string | undefined; };
+    const sizes = () => vi.mocked(insertTradeRow).mock.calls.map((c) => `${(c[0] as any).leg_index}:${(c[0] as any).size}`);
+
+    it("poll 1: transport error -> no row, cursor NOT advanced; poll 2: the fallback row is written once and the cursor advances", async () => {
+      const f = fx("clipFull");
+      wire([{ f }]);
+      getAccountInfo.mockRejectedValue(new Error("429"));
+      const idx: any = new TradeIndexerPolling();
+      expect(await poll1(idx, slabOf(f))).toBeUndefined();
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(await poll1(idx, slabOf(f))).toBe(f.sig); // retry falls back (cannot hold again) and the cursor moves
+      expect(sizes()).toEqual(["0:189226154805"]);
+      await poll1(idx, slabOf(f));
+      expect(insertTradeRow).toHaveBeenCalledTimes(1); // written once
+    });
+
+    it("a held signature stops the window: a LATER signature is not processed (not even read) ahead of it, and nothing can hold the cursor twice", async () => {
+      const a = fx("clipFull");
+      const b = { ...a, sig: "5".repeat(88) }; // a second transaction on the same market, newer than a
+      const bw = asWeb3(b);
+      wire([{ f: a }, { f: b, w: bw }]); // oldest-first: a then b
+      getAccountInfo.mockRejectedValue(new Error("timeout"));
+      const idx: any = new TradeIndexerPolling();
+      expect(await poll1(idx, slabOf(a))).toBeUndefined();
+      expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(getAccountInfo).toHaveBeenCalledTimes(1); // b was never attempted ahead of the held a
+      getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") }); // RPC recovers
+      expect(await poll1(idx, slabOf(a))).toBe(b.sig); // a falls back (cannot hold twice), b follows, cursor advances to the newest
+      expect(sizes()).toEqual(["0:189226154805", "0:189226154805"]);
+    });
+
+    it("F5: two same-side fills, the first read errors: NONE of its later legs is written in that pass, and the retry writes both", async () => {
+      const f = fx("clipFull");
+      const w = dup(f);
+      wire([{ f, w }]);
+      getAccountInfo.mockRejectedValueOnce(new Error("timeout")).mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") });
+      const idx: any = new TradeIndexerPolling();
+      await idx.indexTradesForSlab(slabOf(f));
+      expect(insertTradeRow).not.toHaveBeenCalled(); // leg 1 was not written alone
+      await idx.indexTradesForSlab(slabOf(f));
+      expect(sizes().sort()).toEqual(["0:189226154805", "1:189226154805"]);
+    });
+
+    it("F5 mutation guard: leg 0 already stored, leg 1 genuinely new -> leg 1 is written (rank 2 > one stored row); `>= ordinal` must not become `>= 1`", async () => {
+      const f = fx("clipFull");
+      const w = dup(f);
+      const wireIx = f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
+      storedLegs.rows = [{ slab_address: slabOf(f), asset_index: 0, leg_index: 0, trader: wireIx.accounts[0], side: "short", size: "189226154805", is_liquidation: false }];
+      getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") });
+      const idx: any = new TradeIndexerPolling();
+      expect(await idx.processTransaction(w, f.sig, slabOf(f), new Set([PROGRAM]))).toBe(true);
+      expect(sizes()).toEqual(["1:189226154805"]);
+    });
   });
 });

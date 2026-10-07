@@ -19,6 +19,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
@@ -493,7 +494,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
   // before it. Stable, so transactions without a slot keep their delivery order.
   const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
-  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + CTX_DELIVERY_BUDGET_MS };
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + (Number(process.env.TRADECPI_DELIVERY_BUDGET_MS) || CTX_DELIVERY_BUDGET_MS) };
   const ordered = [...transactions].sort((x, y) => {
     const sx = slotOf(x), sy = slotOf(y);
     return sx === sy ? 0 : sx < sy ? -1 : 1;
@@ -519,7 +520,6 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         // Not an extraction bug: a transient RPC failure. Everything else in the delivery is still
         // written; this transaction is redelivered (its stored legs are skipped, then it falls back).
         ctxRetries++;
-        if (ctxReadAttempts.size > 2000) ctxReadAttempts.clear();
         ctxReadAttempts.set(err.signature, 1);
         delivery.incomplete = true;
         logger.warn("matcher context read failed; answering 500 so the delivery is retried", { signature: err.signature.slice(0, 16) });
@@ -614,7 +614,7 @@ interface DeliveryState {
 }
 
 /** signature -> 1: its matcher-context read already failed once and the delivery was answered 500. Bounded. */
-const ctxReadAttempts = new Map<string, number>();
+const ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
 
 /** The matcher-context read failed in transport; the delivery is answered 500 so Helius redelivers. */
 class MatcherContextRetry extends Error {
@@ -768,7 +768,7 @@ async function extractTradesFromEnhancedTx(
         trader,
         side: resolution.side,
         size: resolution.sizeValue.toString(),
-        price: await extractPrice(tx, slabAddress, reduce.assetIndex), // tag 44 has no matcher CPI: effective_price is its only exact source
+        price: await extractPriceWithinDeadline(tx, slabAddress, reduce.assetIndex, delivery.ctxDeadlineAt, signature), // tag 44 has no matcher CPI: effective_price is its only exact source
         fee: 0, // the engine charges no trading fee on tag 44
         tx_signature: signature,
         asset_index: reduce.assetIndex,
@@ -866,7 +866,7 @@ async function extractTradesFromEnhancedTx(
           continue;
         }
         const attempted = ctxReadAttempts.get(signature) ?? 0;
-        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError: attempted >= 1 ? "fallback" : "report" });
+        const r = await resolveCpiLeg({ evidence: cpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError: attempted >= 1 ? "fallback" : "report", signature });
         if (r.kind === "read-error") {
           // Transport failure: a size written now would be permanent (unique index). Fail this
           // transaction so the delivery answers 500 and Helius redelivers; the redelivery falls back.
@@ -892,7 +892,7 @@ async function extractTradesFromEnhancedTx(
         } else {
           let fallback = fallbackPriceByAsset.get(leg.assetIndex);
           if (fallback === undefined) {
-            fallback = await extractPrice(tx, slabAddress, leg.assetIndex);
+            fallback = await extractPriceWithinDeadline(tx, slabAddress, leg.assetIndex, delivery.ctxDeadlineAt, signature);
             fallbackPriceByAsset.set(leg.assetIndex, fallback);
           }
           price = fallback;
@@ -998,6 +998,29 @@ async function extractTradesFromEnhancedTx(
  * available source for TradeCpi/BatchTradeCpi fills, which don't carry a fill
  * price on the wire at all (see decodeV18SingleFill/decodeV18BatchLegs).
  */
+/**
+ * `extractPrice` under the delivery's deadline: its fresh-RPC strategy uses `withRetry` (several
+ * seconds), which must not push a webhook delivery past Helius's window. When the deadline passes
+ * before a price is found, the FIRST attempt fails the transaction (500, redelivered); the redelivery
+ * (attempt recorded) lets it run without the deadline, as before.
+ */
+async function extractPriceWithinDeadline(tx: ValidatedTransaction, slabAddress: string, assetIndex: number, deadlineAt: number | undefined, signature: string): Promise<number> {
+  if (deadlineAt === undefined || (ctxReadAttempts.get(signature) ?? 0) >= 1) return extractPrice(tx, slabAddress, assetIndex);
+  const fromAccount = extractPriceFromAccountData(tx, slabAddress, assetIndex);
+  if (fromAccount > 0) return fromAccount;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw new MatcherContextRetry(signature);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"deadline">((resolve) => { timer = setTimeout(() => resolve("deadline"), remaining); });
+  try {
+    const r = await Promise.race([extractPrice(tx, slabAddress, assetIndex), timeout]);
+    if (r === "deadline") throw new MatcherContextRetry(signature);
+    return r;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function extractPrice(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): Promise<number> {
   // #221: the asset's booked effective_price. Exact when it comes from the slab POST-STATE in this
   // payload (strategy 1); the fresh-RPC read (strategy 2) is the LATEST value, which drifts with

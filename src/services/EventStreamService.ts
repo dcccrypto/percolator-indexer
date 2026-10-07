@@ -153,7 +153,7 @@ export class EventStreamService {
         // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
         const r = await resolveCpiLeg({
           evidence: fill.cpi, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs,
-          legPos: fill.legPos ?? 0, readContext: readMatcherContext,
+          legPos: fill.legPos ?? 0, readContext: readMatcherContext, signature,
         });
         if (r.kind === "skip") {
           if (r.reason !== "zero-fill") {

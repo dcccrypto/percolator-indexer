@@ -79,6 +79,35 @@ describe("readAssetEffectivePriceE6 (#221)", () => {
   });
 });
 
+describe("layout pin (real account bytes)", () => {
+  const dv = new DataView(LIVE.buffer, LIVE.byteOffset, LIVE.byteLength);
+  const BASE = 592 + 758 + 1024; // asset 0's AssetStateV16Account
+  it("reads the field at +25, and NOT any off-by-n neighbour (real bytes: those are shifted, out-of-range or other fields)", () => {
+    const at = (rel: number) => dv.getBigUint64(BASE + rel, true);
+    expect(at(25)).toBe(BigInt(BOOKED_E6));
+    expect(readAssetEffectivePriceE6(LIVE, 0)).toBe(Number(at(25)));
+    for (const rel of [9, 24, 26, 41]) {
+      expect(at(rel)).not.toBe(BigInt(BOOKED_E6)); // an offset mutation to any of these returns another value or null
+    }
+    // NOTE: on every live devnet slab (47 markets x 14 slots) the adjacent u64s at +17, +25 and +33
+    // (raw oracle target, effective price, next field) are IDENTICAL, so no real account can tell
+    // those three offsets apart; the independent confirmation of +25 is the real-tx cross-check in
+    // tests/matcher-fill-xcheck.test.ts (the wrapper's own oracle_price_e6 == this field).
+  });
+  it("market_id sits at +0 and lifecycle at +16 of the same slot (the struct the +25 comes from)", () => {
+    expect(dv.getBigUint64(BASE, true)).toBe(1n);
+    expect(LIVE[BASE + 16]).toBeLessThan(8);
+  });
+  it("only the v18 layout version is read: version 17 or 19 in the header returns null even if the rest looks valid", () => {
+    for (const v of [17, 19]) {
+      const copy = LIVE.slice();
+      new DataView(copy.buffer).setUint16(8, v, true);
+      expect(readAssetEffectivePriceE6(copy, 0)).toBeNull();
+    }
+    expect(readAssetEffectivePriceE6(LIVE, 0)).toBe(BOOKED_E6);
+  });
+});
+
 describe("readMarkPriceE6 with an assetIndex (#221)", () => {
   const conn = { getAccountInfo: vi.fn(async () => ({ data: Buffer.from(LIVE) })) } as any;
   const SLAB = "Ar6khqrJVfPDx1KGmSP6Q4hxre6NNm66GpDJPHG1oF6N";

@@ -19,6 +19,7 @@ import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -82,7 +83,7 @@ export class TradeIndexerPolling {
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
-  private ctxReadAttempts = new Map<string, number>();
+  private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   private hasBackfilled = false;
   private backfillAttempts = 0;
 
@@ -268,6 +269,7 @@ export class TradeIndexerPolling {
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
+    windowLoop:
     for (let i = 0; i < validSigs.length; i += TX_BATCH_SIZE) {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
       // X-1: isolate an unreadable (e.g. v1-version) transaction instead of letting one poisoned signature
@@ -317,6 +319,16 @@ export class TradeIndexerPolling {
           if (didIndex) indexed++;
           pass.earlier.add(sig);
         } catch (err) {
+          if (err instanceof CtxReadRetry) {
+            // Transient matcher-context read failure: this signature must be retried, so the cursor
+            // must not pass it, and NOTHING after it may be processed ahead of it (oldest-first
+            // order: a tag 44 resolves against earlier fills). The next poll re-fetches the window,
+            // skips stored legs, and (attempt recorded) falls back to the request size, which
+            // cannot throw again, so the hold lasts at most one poll.
+            holdCursor = true;
+            logger.warn("matcher context read failed; holding the cursor, this signature is retried once on the next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8) });
+            break windowLoop;
+          }
           pass.incomplete = true;
           // Non-fatal: skip this tx, continue with others
           logger.warn("Failed to process transaction", {
@@ -594,7 +606,10 @@ export class TradeIndexerPolling {
           let legSize = leg.sizeValue;
           let price: number | undefined;
           if (batchCpi) {
-            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError });
+            // All-or-nothing per transaction: once one leg needs a retry, write none of its later
+            // legs in this pass (their stored-leg rank would make the retry drop the unwritten leg).
+            if (retryNeeded) continue;
+            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError, signature });
             if (r.kind === "read-error") { retryNeeded = true; continue; }
             if (r.kind === "skip") {
               if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
@@ -656,10 +671,11 @@ export class TradeIndexerPolling {
       if (decoded.execPriceE6 !== undefined) {
         price = Number(decoded.execPriceE6) / 1_000_000;
       } else if (tag === IX_TAG.TradeCpi) {
+        if (retryNeeded) continue; // all-or-nothing per transaction (see the batch branch)
         // #213/#221: executed size + booked price from the matcher call, never the request/mark.
         const r = await resolveCpiLeg({
           evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false),
-          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError,
+          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature,
         });
         if (r.kind === "read-error") { retryNeeded = true; continue; }
         if (r.kind === "skip") {
@@ -720,7 +736,6 @@ export class TradeIndexerPolling {
     if (retryNeeded) {
       // Transport failure reading the matcher context: do not write a size that can never be
       // corrected. Hold the cursor; the next pass re-reads (stored legs are skipped), then falls back.
-      if (this.ctxReadAttempts.size > 2000) this.ctxReadAttempts.clear();
       this.ctxReadAttempts.set(signature, 1);
       throw new CtxReadRetry(signature);
     }

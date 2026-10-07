@@ -135,7 +135,7 @@ export interface InnerIxLike {
 
 export type CpiEvidence =
   /** The source did not include inner instructions: nothing can be proven. */
-  | { kind: "unknown" }
+  | { kind: "unknown"; /** the instruction is a BatchTradeCpi (which always calls the matcher) */ batch?: boolean }
   /** Inner instructions are present and the wrapper never called the matcher: zero fill. */
   | { kind: "no-matcher-call" }
   | { kind: "call"; call: MatcherCall; matcherContext: string | undefined; batchReturns: MatcherReturn[] | null };
@@ -154,21 +154,22 @@ export function cpiEvidence(
   returnData: { programId: string; data: Uint8Array } | null | undefined,
   isBatch: boolean,
 ): CpiEvidence {
-  if (!inner) return { kind: "unknown" };
+  const unknown: CpiEvidence = isBatch ? { kind: "unknown", batch: true } : { kind: "unknown" };
+  if (!inner) return unknown;
   const matcherProgram = outerAccounts[CPI_MATCHER_PROGRAM_ACCOUNT_IDX];
-  if (!matcherProgram) return { kind: "unknown" };
+  if (!matcherProgram) return unknown;
   for (const ix of inner) {
     if (ix.programId !== matcherProgram) continue;
     const bytes = decodeBase58(ix.data);
     const call = bytes ? decodeMatcherCall(bytes) : null;
-    if (!call || call.batch !== isBatch) return { kind: "unknown" };
+    if (!call || call.batch !== isBatch) return unknown;
     let batchReturns: MatcherReturn[] | null = null;
     if (call.batch && returnData && returnData.programId === matcherProgram && returnData.data.length === call.legs.length * MATCHER_RETURN_BYTES) {
       batchReturns = call.legs.map((_, i) => decodeMatcherReturn(returnData.data.subarray(i * MATCHER_RETURN_BYTES, (i + 1) * MATCHER_RETURN_BYTES))!);
     }
     return { kind: "call", call, matcherContext: outerAccounts[CPI_MATCHER_CONTEXT_ACCOUNT_IDX], batchReturns };
   }
-  return isBatch ? { kind: "unknown" } : { kind: "no-matcher-call" };
+  return isBatch ? unknown : { kind: "no-matcher-call" };
 }
 
 /**
@@ -214,8 +215,10 @@ export interface TradecpiCounters {
   readError: number;
   /** undecodable evidence: written as the indexer did before this parser (wire size, legacy price) */
   legacy: number;
+  /** subset of `legacy`: a BatchTradeCpi of a recognised wrapper whose inner instructions lack the matcher call */
+  legacyBatch: number;
 }
-const zero = (): TradecpiCounters => ({ exact: 0, unverified: 0, zeroFill: 0, skipped: 0, readError: 0, legacy: 0 });
+const zero = (): TradecpiCounters => ({ exact: 0, unverified: 0, zeroFill: 0, skipped: 0, readError: 0, legacy: 0, legacyBatch: 0 });
 let counters = zero();
 let lastSummary = { at: Date.now(), total: 0 };
 const SUMMARY_EVERY_MS = 60_000;
@@ -235,9 +238,10 @@ export function resetTradecpiCounters(): void {
   lastSummary = { at: Date.now(), total: 0 };
 }
 /** Info-level summary every 60 s or 500 fills, whichever comes first. */
-function note(kind: keyof TradecpiCounters, alsoReadError = false): void {
+function note(kind: keyof TradecpiCounters, alsoReadError = false, alsoLegacyBatch = false): void {
   counters[kind]++;
   if (alsoReadError) counters.readError++;
+  if (alsoLegacyBatch) counters.legacyBatch++;
   const total = totalOf(counters);
   if (total - lastSummary.total >= SUMMARY_EVERY_FILLS || Date.now() - lastSummary.at >= SUMMARY_EVERY_MS) {
     summaryLogger().info("TradeCpi fill summary (process lifetime)", { ...counters, sinceLast: total - lastSummary.total });
@@ -294,6 +298,8 @@ export async function resolveCpiLeg(args: {
    * so the caller can retry once the read may succeed (the unique index makes a written size permanent).
    */
   onReadError?: "fallback" | "report";
+  /** for the warn log of a legacy batch */
+  signature?: string;
 }): Promise<CpiLegResolution> {
   const { evidence } = args;
   const policy = args.policy ?? unverifiedSizePolicy();
@@ -302,7 +308,10 @@ export async function resolveCpiLeg(args: {
     return { kind: "skip", reason: "zero-fill", detail: "the wrapper clipped the request to zero LP headroom and never called the matcher: no position change" };
   }
   if (evidence.kind === "unknown") {
-    note("legacy");
+    note("legacy", false, evidence.batch === true);
+    if (evidence.batch === true) {
+      summaryLogger().warn("BatchTradeCpi without a decodable matcher call: written as the legacy row (wire size, legacy price)", { signature: args.signature });
+    }
     return { kind: "legacy", detail: "no inner instructions in this source (or an undecodable / mismatched matcher call): booked price and executed size cannot be read" };
   }
   const { call } = evidence;

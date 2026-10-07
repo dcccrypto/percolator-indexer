@@ -88,6 +88,25 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     expect(getAccountInfo).toHaveBeenCalledTimes(1);
   });
 
+  it("the fallback price fetch (legacy leg) is under the per-delivery deadline: a hung RPC answers 500 on the first delivery, the redelivery runs through", async () => {
+    const f = classic("partial");
+    const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
+    for (const i of tx.instructions) delete i.innerInstructions; // unrecognised -> legacy -> extractPrice
+    const slab = JSON.parse(readFileSync(new URL("./fixtures/v18-market-link.json", import.meta.url), "utf8"));
+    getAccountInfo.mockImplementationOnce(() => new Promise(() => {})).mockResolvedValue({ data: Buffer.from(slab.dataBase64, "base64") });
+    process.env.TRADECPI_DELIVERY_BUDGET_MS = "150";
+    try {
+      const app = webhookRoutes();
+      const post = () => app.fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body: JSON.stringify([tx]) }));
+      const t0 = Date.now();
+      expect((await post()).status).toBe(500);
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[])).toEqual([]);
+      expect((await post()).status).toBe(200);
+      expect(vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[]).map((r) => r.size)).toEqual(["29041225"]);
+    } finally { delete process.env.TRADECPI_DELIVERY_BUDGET_MS; }
+  });
+
   it("strict mode: no row, signature recorded", async () => {
     const f = classic("issue213Partial");
     process.env.TRADECPI_UNVERIFIED_SIZE = "skip";

@@ -90,7 +90,7 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
     const tx = { ...part.tx, meta: { ...part.tx.meta, innerInstructions: undefined } };
     const [fl] = parsePercolatorFills(tx, part.sig, [PROGRAM]);
     await resolveCpiLeg({ evidence: fl.cpi!, assetIndex: 0, side: fl.side, wireSizeAbs: fl.sizeAbs, legPos: 0, readContext: async () => ({ kind: "ok", ret: null }) }); // legacy
-    expect(getTradecpiCounters()).toEqual({ exact: 1, unverified: 2, zeroFill: 1, skipped: 1, readError: 1, legacy: 1 });
+    expect(getTradecpiCounters()).toEqual({ exact: 1, unverified: 2, zeroFill: 1, skipped: 1, readError: 1, legacy: 1, legacyBatch: 0 });
     resetTradecpiCounters();
   });
 
@@ -101,7 +101,7 @@ describe("TradeCpi executed size and booked price (real devnet transactions)", (
     const read = async (): Promise<ContextRead> => ({ kind: "error", detail: "timeout after 2000 ms" });
     const base = { evidence: fill.cpi!, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs, legPos: 0, readContext: read, policy: "request" as const };
     expect(await resolveCpiLeg({ ...base, onReadError: "report" })).toMatchObject({ kind: "read-error" });
-    expect(getTradecpiCounters()).toEqual({ exact: 0, unverified: 0, zeroFill: 0, skipped: 0, readError: 0, legacy: 0 });
+    expect(getTradecpiCounters()).toEqual({ exact: 0, unverified: 0, zeroFill: 0, skipped: 0, readError: 0, legacy: 0, legacyBatch: 0 });
     expect(await resolveCpiLeg(base)).toMatchObject({ kind: "fill", exact: false, sizeValue: 29_041_225n });
     expect(getTradecpiCounters().readError).toBe(1);
     // "read fine, answer not ours" is never read-error, even in report mode
@@ -173,18 +173,28 @@ describe("F1: a batch always calls the matcher", () => {
   it("a BatchTradeCpi whose inner instructions lack the matcher call is NOT a zero fill: unknown -> legacy (nothing dropped)", async () => {
     const MATCHER = "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX";
     const accounts = ["a", "m", "p", "l", MATCHER, "ctx", "d"];
-    expect(cpiEvidence(accounts, [], null, true)).toEqual({ kind: "unknown" });
-    expect(cpiEvidence(accounts, [{ programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", data: "1" }], null, true)).toEqual({ kind: "unknown" });
+    expect(cpiEvidence(accounts, [], null, true)).toEqual({ kind: "unknown", batch: true });
+    expect(cpiEvidence(accounts, [{ programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", data: "1" }], null, true)).toEqual({ kind: "unknown", batch: true });
     // negative control: the same shape for a SINGLE TradeCpi is the proven zero fill
     expect(cpiEvidence(accounts, [], null, false)).toEqual({ kind: "no-matcher-call" });
     const r = await resolveCpiLeg({ evidence: cpiEvidence(accounts, [], null, true), assetIndex: 0, side: "long", wireSizeAbs: 5n, legPos: 0, readContext: async () => ({ kind: "ok", ret: null }) });
     expect(r).toMatchObject({ kind: "legacy" });
   });
+  it("a legacy batch is counted separately (legacyBatch, a subset of legacy) and a legacy single is not", async () => {
+    resetTradecpiCounters();
+    const accounts = ["a", "m", "p", "l", "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX", "ctx", "d"];
+    const args = { assetIndex: 0, side: "long" as const, wireSizeAbs: 5n, legPos: 0, readContext: async (): Promise<ContextRead> => ({ kind: "ok", ret: null }) };
+    await resolveCpiLeg({ ...args, evidence: cpiEvidence(accounts, [], null, true), signature: "SIG" });
+    expect(getTradecpiCounters()).toMatchObject({ legacy: 1, legacyBatch: 1 });
+    await resolveCpiLeg({ ...args, evidence: cpiEvidence(accounts, null, null, false) });
+    expect(getTradecpiCounters()).toMatchObject({ legacy: 2, legacyBatch: 1 });
+    resetTradecpiCounters();
+  });
   it("a single-call matcher instruction under a batch (or the reverse) is not trusted either", () => {
     const f = fx("full");
     const ix = f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
     const inner = f.tx.meta.innerInstructions[0].instructions.map((i: any) => ({ programId: i.programId, data: i.data }));
-    expect(cpiEvidence(ix.accounts, inner, null, true)).toEqual({ kind: "unknown" });
+    expect(cpiEvidence(ix.accounts, inner, null, true)).toEqual({ kind: "unknown", batch: true });
     expect(cpiEvidence(ix.accounts, inner, null, false).kind).toBe("call");
   });
 });

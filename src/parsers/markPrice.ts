@@ -23,6 +23,14 @@ const logger = createLogger("indexer:mark-price");
 export const ASSET_STATE_EFFECTIVE_PRICE_REL = 25;
 
 /**
+ * Account layout version this reader's offsets are valid for (u16 at byte 8 of the account header:
+ * "PERCV16\0" magic, then 18 for the v18 wrapper). The SDK calls this family "v17" but
+ * `V17_EXPECTED_VERSION` is 18; checked explicitly here so a different layout version can never be
+ * read at the v18 offset and return an in-range garbage price.
+ */
+export const V18_ACCOUNT_VERSION = 18;
+
+/**
  * #221: the price the engine books a fill at — `asset[assetIndex].effective_price`
  * (raw e6) — read from a v18 market account's bytes, or `null` when the account is
  * not a v18 market, the slot is out of range, or the value is zero/out of range.
@@ -41,6 +49,7 @@ export function readAssetEffectivePriceE6(data: Uint8Array, assetIndex: number):
   if (!Number.isInteger(assetIndex) || assetIndex < 0) return null;
   try {
     if (!isV17MarketAccount(data)) return null;
+    if (new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(8, true) !== V18_ACCOUNT_VERSION) return null;
   } catch {
     return null;
   }
