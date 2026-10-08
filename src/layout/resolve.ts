@@ -2,7 +2,7 @@
  * VERSION-keyed account geometry for the indexer.
  *
  * The wrapper's account layout changes with its VERSION (u16 at account offset 8): v2.1 is VERSION 18
- * (group header 758 B, slot 2,325 B, portfolio 9,563 B, leg 152 B) and v2.2 is VERSION 19 (806 / 2,629 /
+ * (group header 758 B, slot 2,325 B, portfolio 9,563 B, leg 152 B) and v2.2 is VERSION 19 (806 / 2,661 /
  * 10,603 / 217). Reading one with the other's offsets does not fail, it returns plausible garbage. So no
  * offset in the indexer is a literal any more: every market read goes through {@link readMarketGroupFields}
  * and every portfolio read through `layout/portfolio.ts`, both of which take their numbers from the SDK's

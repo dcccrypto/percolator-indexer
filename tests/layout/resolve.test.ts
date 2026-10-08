@@ -25,7 +25,7 @@ describe("readMarketGroupFields: VERSION-keyed", () => {
     const f = readMarketGroupFields(d, "t");
     expect(f.layout.version).toBe(19);
     expect(f.asset0ProfileOff).toBe(1398);
-    expect(f.geometry.slotOff(1)).toBe(1398 + 2629);
+    expect(f.geometry.slotOff(1)).toBe(1398 + 2661);
     expect(u128(d, 592 + 333)).toBe(777_000n); // the independent byte check
     expect([f.vault, f.insurance, f.cTot, f.materializedPortfolioCount]).toEqual([777_000n, 55n, 9n, 3n]);
   });

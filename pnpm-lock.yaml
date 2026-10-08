@@ -465,7 +465,7 @@ packages:
     resolution: {integrity: sha512-KzkdCd6Uxqnf6l3HOw1xfatAlUURA0g14cvBYFyJ5SaNOQbOUvBr9PKArcPcrNIeRsBdgcUzOGrhKveVpvOIGA==}
 
   '@percolatorct/sdk@file:vendor/percolatorct-sdk-9.0.0-candidate.tgz':
-    resolution: {integrity: sha512-6chX132uByUb4VU5uHQzQIhPruLJDc/W9wAHuIszys4K+/5FFK9MuMWvtwQ4QyoXq6a3hQk3jqIfvk/OedQo+g==, tarball: file:vendor/percolatorct-sdk-9.0.0-candidate.tgz}
+    resolution: {integrity: sha512-1+oqq99ZT6KOYRLr+2LgWXH6Zut7h0B2baxxxXUrRWC3cGvYumGqr/jUyhFysc/sRQ4SAye8N+gVJ6PPMGcQeQ==, tarball: file:vendor/percolatorct-sdk-9.0.0-candidate.tgz}
     version: 9.0.0-candidate
     engines: {node: '>=20.0.0'}
 

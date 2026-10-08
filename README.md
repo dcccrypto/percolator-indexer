@@ -29,7 +29,7 @@ pnpm test
 ## v2.2 support (wrapper VERSION 19)
 
 - Account geometry is **VERSION-keyed**, from the SDK layout tables (`src/layout/resolve.ts`, `src/layout/portfolio.ts`): v2.1
-  is VERSION 18 (header 758 B, slot 2,325 B, portfolio 9,563 B, leg 152 B), v2.2 variant B is VERSION 19 (806 / 2,629 /
+  is VERSION 18 (header 758 B, slot 2,325 B, portfolio 9,563 B, leg 152 B), v2.2 variant B is VERSION 19 (806 / 2,661 /
   10,603 / 217). No offset is a literal in the indexer. An unknown VERSION is a loud, per-market skip (error log, counter
   `indexer_unknown_layout_total`, Sentry once) and never stops the other markets.
 - New activity goes to the `v22_events` table (`supabase/migrations/20261007120000_v22_events.sql`, **applied by hand**, RLS on, no
