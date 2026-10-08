@@ -28,11 +28,41 @@ function isRateLimitError(err: unknown): boolean {
   return msg.includes("429") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("too many requests");
 }
 
+/**
+ * #223: cadence of the full multi-tier discovery pass (v17 scan + ~43 slab-size-tier scans +
+ * the legacy fallback scans, ~45 getProgramAccounts calls per program). Unchanged from the
+ * shared config's default; DISCOVERY_INTERVAL_MS still overrides it.
+ */
+export const DEFAULT_FULL_DISCOVERY_INTERVAL_MS = 300_000;
+
+/**
+ * #223: cadence of the light pass: ONE getProgramAccounts (v17 KIND_MARKET filter, header-only
+ * dataSlice) that registers a market created since the last pass. This is what bounds how long
+ * a new market stays unlisted. DISCOVERY_LIGHT_INTERVAL_MS overrides it; 0 disables the pass.
+ */
+export const DEFAULT_LIGHT_DISCOVERY_INTERVAL_MS = 60_000;
+
+type DiscoveredListener = (markets: DiscoveredMarket[]) => void | Promise<void>;
+
 export class MarketDiscovery {
   private markets = new Map<string, { market: DiscoveredMarket }>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private lightTimer: ReturnType<typeof setInterval> | null = null;
   private consecutiveFailures = 0;
   private _discovering = false;
+  private discoveredListeners: DiscoveredListener[] = [];
+
+  /**
+   * #223: run `fn` after a pass that found a market not previously known (so it can be
+   * registered right away instead of on the next stats sweep). Listener
+   * errors are logged and never affect discovery. Returns an unsubscribe function.
+   */
+  onDiscovered(fn: DiscoveredListener): () => void {
+    this.discoveredListeners.push(fn);
+    return () => {
+      this.discoveredListeners = this.discoveredListeners.filter((l) => l !== fn);
+    };
+  }
 
   async discover(): Promise<DiscoveredMarket[]> {
     if (this._discovering) {
@@ -40,10 +70,67 @@ export class MarketDiscovery {
       return [];
     }
     this._discovering = true;
+    let found: DiscoveredMarket[] = [];
+    const known = new Set(this.markets.keys());
     try {
-      return await this._doDiscover();
+      found = await this._doDiscover();
     } finally {
       this._discovering = false;
+    }
+    // #223: only a market that was not already known is news; an unchanged set must not
+    // trigger the registration pass (it reads the whole `markets` table).
+    const fresh = found.filter((m) => !known.has(m.slabAddress.toBase58()));
+    if (fresh.length > 0) this.notifyDiscovered(fresh);
+    return found;
+  }
+
+  /**
+   * #223: the light pass. One v17 KIND_MARKET-filtered scan per program with a header-only
+   * dataSlice (or one getMultipleAccounts under MARKETS_FILTER), instead of the ~45-call full
+   * pass. It only ever ADDS markets to the map: a failed, rate-limited or empty scan leaves the
+   * map untouched, and removal stays the full pass's job. Listeners fire only for addresses
+   * that were not already known. Skipped while a full pass is running. Returns the new markets.
+   */
+  async discoverLight(): Promise<DiscoveredMarket[]> {
+    if (this._discovering) return [];
+    this._discovering = true;
+    const fresh: DiscoveredMarket[] = [];
+    try {
+      const conn = getPrimaryConnection();
+      const filter = (process.env.MARKETS_FILTER ?? "").trim();
+      const addresses = filter ? filter.split(",").map((a) => a.trim()).filter(Boolean).map((a) => new PublicKey(a)) : undefined;
+      for (const id of config.allProgramIds) {
+        try {
+          const found = await discoverV17Markets(conn, new PublicKey(id), addresses, { light: true });
+          for (const m of found) {
+            const key = m.slabAddress.toBase58();
+            if (!this.markets.has(key) && !fresh.some((f) => f.slabAddress.toBase58() === key)) fresh.push(m);
+          }
+        } catch (e) {
+          logger.warn("Light discovery failed on program", { programId: id, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      if (fresh.length > 0) {
+        // Atomic swap on a copy: readers never see a partial map, and nothing is removed.
+        const next = new Map(this.markets);
+        for (const m of fresh) next.set(m.slabAddress.toBase58(), { market: m });
+        this.markets = next;
+      }
+    } finally {
+      this._discovering = false;
+    }
+    if (fresh.length > 0) {
+      logger.info("Light discovery found new markets", { count: fresh.length });
+      this.notifyDiscovered(fresh);
+    }
+    return fresh;
+  }
+
+  private notifyDiscovered(markets: DiscoveredMarket[]): void {
+    for (const fn of this.discoveredListeners) {
+      Promise.resolve()
+        .then(() => fn(markets))
+        .catch((err) => logger.warn("onDiscovered listener failed", { error: err instanceof Error ? err.message : String(err) }));
     }
   }
 
@@ -217,7 +304,7 @@ export class MarketDiscovery {
     return this.markets;
   }
   
-  async start(intervalMs = 300_000) {
+  async start(intervalMs = DEFAULT_FULL_DISCOVERY_INTERVAL_MS, lightIntervalMs = 0) {
     // Initial discovery with retry + backoff
     let initialSuccess = false;
     for (let attempt = 0; attempt <= INITIAL_RETRY_DELAYS.length; attempt++) {
@@ -252,12 +339,23 @@ export class MarketDiscovery {
       logger.error("Discovery failed", { error: err });
       captureException(err, { tags: { context: "market-discovery-periodic" } });
     }), intervalMs);
+
+    // #223: the fast path. Only worth running when it is meaningfully faster than the full pass.
+    if (lightIntervalMs > 0 && lightIntervalMs < intervalMs) {
+      this.lightTimer = setInterval(() => this.discoverLight().catch((err) => {
+        logger.warn("Light discovery failed", { error: err instanceof Error ? err.message : String(err) });
+      }), lightIntervalMs);
+    }
   }
   
   stop() {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.lightTimer) {
+      clearInterval(this.lightTimer);
+      this.lightTimer = null;
     }
   }
 }

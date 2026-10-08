@@ -377,6 +377,14 @@ function parseV17Account(
 }
 
 /**
+ * Bytes of a market account that registration reads: everything up to the end of the asset-0
+ * oracle profile (marketauth + config at the front, market-group header, oracle authority/price).
+ * parseV17Account touches nothing beyond this, so a dataSlice of this length yields a market
+ * identical to the one parsed from the whole (multi-KB to MB) slab.
+ */
+export const V17_REGISTRATION_SLICE_LEN = V17_MARKET_GROUP_OFF + 758 + V17_ASSET_ORACLE_PROFILE_LEN;
+
+/**
  * Discover v17 markets for a given program.
  *
  * When `knownAddresses` is provided, fetches those specific accounts via
@@ -388,12 +396,14 @@ function parseV17Account(
  * @param connection    Solana RPC connection
  * @param programId     Program that owns the market accounts
  * @param knownAddresses Optional specific addresses to fetch (MARKETS_FILTER path)
+ * @param opts.light     Sliced scan (header bytes only) for the fast discovery pass
  * @returns Parsed v17 DiscoveredMarket array
  */
 export async function discoverV17Markets(
   connection: Connection,
   programId: PublicKey,
   knownAddresses?: PublicKey[],
+  opts: { light?: boolean } = {},
 ): Promise<DiscoveredMarket[]> {
   const markets: DiscoveredMarket[] = [];
 
@@ -430,7 +440,9 @@ export async function discoverV17Markets(
     // otherwise be fetched and silently parsed as bogus market rows.
     // This mirrors the keeper's discoverV17Markets KIND_MARKET memcmp (crank.ts).
     // Reference: v16_program.rs:46 (KIND_MARKET=1), v16_program.rs:986 (check_header byte[10]).
+    // `light` (#223): fetch only the header bytes registration needs, not the whole slab.
     const results = await connection.getProgramAccounts(programId, {
+      ...(opts.light ? { dataSlice: { offset: 0, length: V17_REGISTRATION_SLICE_LEN } } : {}),
       filters: [
         {
           memcmp: {

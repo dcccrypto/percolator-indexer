@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert, createAtlasWs, type AtlasWs } from "@percolatorct/shared";
 import { MarketDiscovery } from "./services/MarketDiscovery.js";
+import { startDiscovery } from "./services/discoveryWiring.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
@@ -303,7 +304,9 @@ async function start() {
     });
   }
 
-  await discovery.start(config.discoveryIntervalMs);
+  // #223: register a just-discovered market immediately; full discovery every 5 min
+  // (DISCOVERY_INTERVAL_MS) plus a one-call light pass every minute (DISCOVERY_LIGHT_INTERVAL_MS).
+  await startDiscovery(discovery, statsCollector, process.env);
   statsCollector.start();
   const rpcPollingEnabled = process.env.INDEXER_RPC_POLLING_ENABLED !== "false";
   if (rpcPollingEnabled) {
