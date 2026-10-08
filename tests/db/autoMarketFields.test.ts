@@ -22,6 +22,7 @@ import {
   CREATOR_LOOKUP_MAX_PAGES,
   creatorFromCreationTx,
   findSlabCreator,
+  findSlabCreation,
   resolveAutoMarketFields,
   v17InitialMarginBps,
   V17_INITIAL_MARGIN_BPS_OFF,
@@ -162,6 +163,30 @@ describe("creatorFromCreationTx", () => {
 function sig(n: number, err: unknown = null): ConfirmedSignatureInfo {
   return { signature: `sig${n}`, slot: n, err: err as ConfirmedSignatureInfo["err"], memo: null, blockTime: null };
 }
+
+describe("findSlabCreation (#223)", () => {
+  it("returns the creation transaction's blockTime alongside the creator", async () => {
+    const tx = { ...creationTx(), blockTime: 1_700_000_123 };
+    const rpc: CreatorLookupRpc = {
+      getSignaturesForAddress: vi.fn(async () => [{ ...sig(1), blockTime: 1_700_000_100 }]),
+      getTransaction: vi.fn(async () => tx),
+    };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toEqual({ creator: CREATOR.toBase58(), blockTime: 1_700_000_123 });
+  });
+
+  it("falls back to the oldest signature's time, and is null when history is out of reach", async () => {
+    const rpc: CreatorLookupRpc = {
+      getSignaturesForAddress: vi.fn(async () => [{ ...sig(1), blockTime: 1_700_000_100 }]),
+      getTransaction: vi.fn(async () => null),
+    };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toEqual({ creator: null, blockTime: 1_700_000_100 });
+    const deep: CreatorLookupRpc = {
+      getSignaturesForAddress: vi.fn(async () => Array.from({ length: 1000 }, (_, i) => sig(i))),
+      getTransaction: vi.fn(async () => null),
+    };
+    await expect(findSlabCreation(deep, SLAB, WRAPPER)).resolves.toEqual({ creator: null, blockTime: null });
+  });
+});
 
 describe("findSlabCreator", () => {
   it("walks to the oldest page and returns the creator from the oldest successful tx", async () => {

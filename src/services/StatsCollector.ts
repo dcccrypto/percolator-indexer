@@ -231,7 +231,8 @@ function parseV17AccountStats(data: Uint8Array): {
 import { fetchDasTokenMetadata, placeholderIdentity } from "./tokenMetadata.js";
 import { insertMarketRow, updateAutoMarketMetadata } from "../db/insertMarketRow.js";
 import {
-  findSlabCreator,
+  findSlabCreation,
+  type SlabCreation,
   resolveAutoMarketFields,
   v17InitialMarginBps,
   type AutoRowMarketInput,
@@ -331,13 +332,16 @@ const SWEEP_BATCH_SIZE = 25;
 const SWEEP_BATCH_DELAY_MS = 250;
 
 /**
- * #223: how long a newly discovered market whose identity resolves ONLY to the placeholder is
- * held back from registration. Discovery runs every minute, so it can see a market mid-launch,
- * before the wizard has set its price pool; inserting then would write the placeholder name,
- * which syncMarkets never refreshes. Waiting lets the launch finish so the real name resolves.
- * After the grace the placeholder is written as before (admin-oracle markets never resolve).
+ * #223: how long after a slab's ON-CHAIN creation a market whose identity resolves only to the
+ * placeholder is held back from registration. Discovery can see a market mid-launch, before the
+ * wizard has set its price pool; inserting then would write the placeholder name. The window is
+ * measured from the creation transaction's blockTime, so an indexer restart cannot reset it and
+ * an old unregistered market is written on the first pass. refreshMarketMetadata heals auto
+ * rows later and the app's register path can set the name, so this only avoids the common
+ * transient placeholder. Short on purpose: it bounds the added listing delay for markets that
+ * never get a pool (admin-oracle markets).
  */
-export const PLACEHOLDER_REGISTRATION_GRACE_MS = 5 * 60_000;
+export const PLACEHOLDER_REGISTRATION_GRACE_MS = 90_000;
 
 export class StatsCollector {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -348,8 +352,11 @@ export class StatsCollector {
   private _syncingVolume = false;
   /** #223: one shared in-flight registration pass (the sweep and the discovery hook never overlap). */
   private syncInFlight: Promise<DbMarketRow[] | null> | null = null;
-  /** #223: when each still-unregistered slab was first seen missing (placeholder grace). */
-  private firstSeenMissingAt = new Map<string, number>();
+  /**
+   * #223: per-slab creation lookup (creator + on-chain creation time), so a market deferred by the
+   * placeholder grace does not repeat getSignaturesForAddress/getTransaction on every pass.
+   */
+  private creationCache = new Map<string, SlabCreation>();
   private _refreshingMetadata = false;
   /**
    * When the on-chain janitorial sweep last ran. 0 means "never", so the first
@@ -656,6 +663,13 @@ export class StatsCollector {
     await this.syncMarkets();
   }
 
+  /** #223: true while the slab is younger (on-chain) than the placeholder grace. Unknown time: never. */
+  private inPlaceholderGrace(creation: SlabCreation): boolean {
+    if (creation.blockTime == null) return false;
+    const ageMs = Date.now() - creation.blockTime * 1000;
+    return ageMs < PLACEHOLDER_REGISTRATION_GRACE_MS;
+  }
+
   private async doSyncMarkets(): Promise<DbMarketRow[] | null> {
     try {
       // Get on-chain markets from market provider
@@ -695,14 +709,9 @@ export class StatsCollector {
         logger.debug("Skipped blocked slabs during registration", { count: blockedSkipped });
       }
 
-      // #223: placeholder grace bookkeeping — forget slabs that now have a row (or left the
-      // on-chain set), and stamp the first time each still-missing slab was seen.
-      const nowMs = Date.now();
-      for (const slab of [...this.firstSeenMissingAt.keys()]) {
-        if (dbSlabAddresses.has(slab) || !onChainMarkets.has(slab)) this.firstSeenMissingAt.delete(slab);
-      }
-      for (const [slab] of missingMarkets) {
-        if (!this.firstSeenMissingAt.has(slab)) this.firstSeenMissingAt.set(slab, nowMs);
+      // #223: drop cached creation lookups for slabs that now have a row or left the on-chain set.
+      for (const slab of [...this.creationCache.keys()]) {
+        if (dbSlabAddresses.has(slab) || !onChainMarkets.has(slab)) this.creationCache.delete(slab);
       }
 
       if (missingMarkets.length === 0) return dbMarkets;
@@ -726,29 +735,43 @@ export class StatsCollector {
           // creation transaction and on-chain config (src/db/autoMarketFields.ts). The old
           // inline fallback `header.admin ?? (oracleAuthority || mint)` recorded the
           // COLLATERAL MINT as deployer for every v17/v18 market.
-          let creator: string | null = null;
-          try {
-            creator = await findSlabCreator(
-              {
-                getSignaturesForAddress: (address, options) =>
-                  connection.getSignaturesForAddress(address, options, "confirmed"),
-                getTransaction: (signature) =>
-                  connection.getTransaction(signature, { maxSupportedTransactionVersion: 1, commitment: "confirmed" }),
-              },
-              new PublicKey(slabAddress),
-              market.programId,
-            );
-          } catch (creatorErr) {
-            logger.debug("Creator lookup failed; falling back to on-chain config", {
-              slabAddress,
-              error: creatorErr instanceof Error ? creatorErr.message : creatorErr,
-            });
+          let creation: SlabCreation = this.creationCache.get(slabAddress) ?? { creator: null, blockTime: null };
+          if (!this.creationCache.has(slabAddress)) {
+            try {
+              creation = await findSlabCreation(
+                {
+                  getSignaturesForAddress: (address, options) =>
+                    connection.getSignaturesForAddress(address, options, "confirmed"),
+                  getTransaction: (signature) =>
+                    connection.getTransaction(signature, { maxSupportedTransactionVersion: 1, commitment: "confirmed" }),
+                },
+                new PublicKey(slabAddress),
+                market.programId,
+              );
+              this.creationCache.set(slabAddress, creation);
+            } catch (creatorErr) {
+              logger.debug("Creator lookup failed; falling back to on-chain config", {
+                slabAddress,
+                error: creatorErr instanceof Error ? creatorErr.message : creatorErr,
+              });
+            }
           }
+          const creator = creation.creator;
           const autoFields = resolveAutoMarketFields(market as AutoRowMarketInput, creator);
           if (!autoFields.deployer) {
             logger.warn("Skipping market registration: no creator, admin or marketauth on chain", { slabAddress });
             continue;
           }
+          // A hyperp market is identified by its base asset's price pool. With no pool recorded
+          // (cheap, in-memory check) the only identity available is the placeholder, so inside the
+          // grace window skip the remaining per-market RPCs (slab read, mint, DAS) entirely.
+          const isHyperpMarket = (market as any).configV17 != null
+            || (cfg?.indexFeedId?.equals(new PublicKey(new Uint8Array(32))) ?? false);
+          if (isHyperpMarket && cfg?.dexPool == null && this.inPlaceholderGrace(creation)) {
+            logger.info("Deferring market registration: market is new and has no price pool yet", { slabAddress });
+            continue;
+          }
+
           // v17/v18 discovery carries no `params`; read the engine's initial margin from the
           // slab itself, otherwise every v17 row got the max_leverage=10 fallback below.
           let v17ImBps: bigint | null = null;
@@ -843,9 +866,6 @@ export class StatsCollector {
           // for them and every such market claimed to be SOL — six unrelated devnet
           // markets all displayed as "SOL/USDC Perpetual". An unnamed market is
           // honest and is queryable for follow-up; a market mislabelled SOL is not.
-          const zeroKeyBytesHyperp = new Uint8Array(32);
-          const isHyperpMarket = (market as any).configV17 != null
-            || (cfg?.indexFeedId?.equals(new PublicKey(zeroKeyBytesHyperp)) ?? false);
           if (isHyperpMarket) {
             let baseSymbol: string | null = null;
             let baseName: string | null = null;
@@ -884,11 +904,9 @@ export class StatsCollector {
               symbol = baseSymbol;
               name = `${baseSymbol}/${collateralLabel} Perpetual`;
             } else {
-              // #223: a market seen mid-launch has no price pool yet, so only the placeholder
-              // is available — and this row is never refreshed. Hold it back for a grace
-              // window so the launch can finish and the real name resolve on a later pass.
-              const firstSeen = this.firstSeenMissingAt.get(slabAddress) ?? Date.now();
-              if (Date.now() - firstSeen < PLACEHOLDER_REGISTRATION_GRACE_MS) {
+              // A pool was recorded but did not resolve (pool not yet readable / DAS miss): same
+              // short, creation-time-based grace; the creation lookup is already cached.
+              if (this.inPlaceholderGrace(creation)) {
                 logger.info("Deferring market registration: identity not resolvable yet", { slabAddress });
                 continue;
               }
@@ -943,7 +961,7 @@ export class StatsCollector {
             logo_url: logoUrl,
           });
 
-          this.firstSeenMissingAt.delete(slabAddress);
+          this.creationCache.delete(slabAddress);
           logger.info("Market registered", { slabAddress, symbol, name, hasLogo: logoUrl != null });
         } catch (err) {
           logger.warn("Failed to register market", { slabAddress, error: err instanceof Error ? err.message : err });
