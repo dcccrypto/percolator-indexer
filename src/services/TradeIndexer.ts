@@ -3,6 +3,7 @@ import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { isBlockedSlab } from "../blocklist.js";
 import { insertTradeRow } from "../db/insertTradeRow.js";
 import {
   parsePercolatorLiquidations,
@@ -86,6 +87,9 @@ export class TradeIndexerPolling {
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   private hasBackfilled = false;
   private backfillAttempts = 0;
+  /** In-flight guards: a backfill / poll pass already running is joined or skipped, never doubled. */
+  private backfillInFlight: Promise<void> | null = null;
+  private pollInFlight = false;
 
   start(): void {
     if (this._running) return;
@@ -121,11 +125,33 @@ export class TradeIndexerPolling {
   /**
    * Backfill: fetch recent trades for all known markets on startup
    */
-  private async backfill(): Promise<void> {
-    if (this.hasBackfilled || !this._running) return;
+  private backfill(): Promise<void> {
+    if (this.hasBackfilled || !this._running) return Promise.resolve();
+    // Re-entrancy guard. A full backfill walks every market with a 1 s pause (about 20 minutes with
+    // ~200 markets) but pollAllMarkets re-triggers it every POLL_INTERVAL_MS while `hasBackfilled` is
+    // still false, which used to start a second, third and fourth full backfill on top of the first
+    // after every deploy (each is one getSignaturesForAddress per market plus up to
+    // BACKFILL_SIGNATURES getTransaction calls). Join the running one instead.
+    if (this.backfillInFlight) return this.backfillInFlight;
+    const run = this.runBackfill().finally(() => {
+      this.backfillInFlight = null;
+    });
+    this.backfillInFlight = run;
+    return run;
+  }
 
+  /**
+   * Markets worth polling as a webhook backstop: not blocklisted, not flagged indexer_excluded
+   * (permanently corrupt slabs the stats sweep already skips). Webhook delivery is unaffected.
+   */
+  private async pollTargets(): Promise<Awaited<ReturnType<typeof getMarkets>>> {
+    const markets = await getMarkets();
+    return markets.filter((m) => m.indexer_excluded !== true && !isBlockedSlab(m.slab_address));
+  }
+
+  private async runBackfill(): Promise<void> {
     try {
-      const markets = await getMarkets();
+      const markets = await this.pollTargets();
       if (markets.length === 0) {
         // #111: do NOT mark backfill complete with no markets yet — discovery may still be
         // running on cold start. Return WITHOUT the flag so pollAllMarkets re-triggers backfill
@@ -179,6 +205,17 @@ export class TradeIndexerPolling {
    */
   private async pollAllMarkets(): Promise<void> {
     if (!this._running) return;
+    // A pass still running (slow RPC, or waiting on the startup backfill) must not be stacked on.
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
+    try {
+      await this.pollAllMarketsOnce();
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
+  private async pollAllMarketsOnce(): Promise<void> {
 
     // #111: re-trigger the startup backfill if it hasn't completed (market discovery may not
     // have populated markets when it first ran). backfill()'s own guard makes this a no-op once done.
@@ -187,7 +224,7 @@ export class TradeIndexerPolling {
     }
 
     try {
-      const markets = await getMarkets();
+      const markets = await this.pollTargets();
       for (const market of markets) {
         if (!this._running) break;
         try {
