@@ -578,3 +578,119 @@ describe('MarketDiscovery.onDiscovered (#223)', () => {
     expect(fn).not.toHaveBeenCalled();
   });
 });
+
+describe('MarketDiscovery light pass and new-only notification (#223)', () => {
+  const mk = (addr: string) => ({
+    slabAddress: { toBase58: () => addr, equals: () => false },
+    programId: { toBase58: () => '11111111111111111111111111111111' },
+    config: {}, params: {}, header: {},
+  });
+  const A = mk('MarketAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+  const B = mk('MarketBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB');
+  // The full pass sleeps 2s between programs; drive it with fake timers.
+  const settle = () => vi.advanceTimersByTimeAsync(10_000);
+  const full = async (d: MarketDiscovery) => { const p = d.discover(); await settle(); return p; };
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    delete process.env.MARKETS_FILTER;
+    vi.mocked(v17disc.discoverV17Markets).mockReset();
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any);
+    vi.mocked(core.discoverMarkets).mockReset();
+  });
+
+  it('full pass notifies only for addresses not previously known', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([A] as any);
+    const d = new MarketDiscovery();
+    const fn = vi.fn();
+    d.onDiscovered(fn);
+    await full(d); await settle();
+    expect(fn).toHaveBeenCalledTimes(1);
+    await full(d); await settle(); // same set again
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.mocked(core.discoverMarkets).mockResolvedValue([A, B] as any);
+    await full(d); await settle();
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn.mock.calls[1][0].map((m: any) => m.slabAddress.toBase58())).toEqual([B.slabAddress.toBase58(), B.slabAddress.toBase58()]);
+  });
+
+  it('light pass makes one sliced v17 scan per program and never runs the multi-tier scan', async () => {
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([A] as any);
+    const d = new MarketDiscovery();
+    await d.discoverLight();
+    expect(core.discoverMarkets).not.toHaveBeenCalled();
+    const calls = vi.mocked(v17disc.discoverV17Markets).mock.calls;
+    expect(calls).toHaveLength(2); // the mocked config has two program ids
+    for (const c of calls) expect(c[3]).toEqual({ light: true });
+  });
+
+  it('light pass adds a new market, notifies once, and is silent for known addresses', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([A] as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    const fn = vi.fn();
+    d.onDiscovered(fn);
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([A, B] as any);
+    await d.discoverLight(); await settle();
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn.mock.calls[0][0]).toHaveLength(1);
+    expect([...d.getMarkets().keys()].sort()).toEqual([A.slabAddress.toBase58(), B.slabAddress.toBase58()].sort());
+    await d.discoverLight(); await settle();
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed, throwing or empty light pass never shrinks the map', async () => {
+    vi.mocked(core.discoverMarkets).mockResolvedValue([A, B] as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    const before = d.getMarkets();
+    expect(before.size).toBe(2);
+
+    vi.mocked(v17disc.discoverV17Markets).mockRejectedValue(new Error('429 rate limited'));
+    await expect(d.discoverLight()).resolves.toEqual([]);
+    expect(d.getMarkets().size).toBe(2);
+
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // swallowed RPC error returns []
+    await expect(d.discoverLight()).resolves.toEqual([]);
+    expect(d.getMarkets().size).toBe(2);
+
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([A] as any); // partial result
+    await d.discoverLight();
+    expect(d.getMarkets().size).toBe(2);
+  });
+
+  it('light pass is skipped while a full pass is in flight', async () => {
+    let release!: (v: any[]) => void;
+    const gate = new Promise<any[]>((r) => { release = r; });
+    vi.mocked(core.discoverMarkets).mockImplementation(() => gate);
+    const d = new MarketDiscovery();
+    const inFlight = d.discover();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(d.discoverLight()).resolves.toEqual([]);
+    expect(v17disc.discoverV17Markets).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), undefined, { light: true });
+    release([]); await settle(); await inFlight;
+  });
+
+  it('start() runs the light pass on its own, faster timer and stop() clears both', async () => {
+    {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([A] as any);
+      const d = new MarketDiscovery();
+      const started = d.start(300_000, 60_000);
+      await settle();
+      await started;
+      const fullCalls = vi.mocked(core.discoverMarkets).mock.calls.length;
+      vi.mocked(v17disc.discoverV17Markets).mockClear();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.every((c) => (c[3] as any)?.light === true)).toBe(true);
+      expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.length).toBeGreaterThan(0);
+      expect(vi.mocked(core.discoverMarkets).mock.calls.length).toBe(fullCalls); // no full pass yet
+      d.stop();
+      vi.mocked(v17disc.discoverV17Markets).mockClear();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(v17disc.discoverV17Markets).not.toHaveBeenCalled();
+    }
+  });
+});

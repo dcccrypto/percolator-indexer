@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { config, createLogger, initSentry, captureException, getSupabase, getConnection, sendCriticalAlert, sendInfoAlert, createAtlasWs, type AtlasWs } from "@percolatorct/shared";
-import { MarketDiscovery, DEFAULT_DISCOVERY_INTERVAL_MS } from "./services/MarketDiscovery.js";
+import { MarketDiscovery } from "./services/MarketDiscovery.js";
+import { startDiscovery } from "./services/discoveryWiring.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
@@ -303,13 +304,9 @@ async function start() {
     });
   }
 
-  // #223: register a just-discovered market immediately instead of on the next stats sweep,
-  // and refresh discovery every minute unless DISCOVERY_INTERVAL_MS overrides it (the shared
-  // config's own fallback is 300s, which kept new markets unlisted for up to ~6 minutes).
-  discovery.onDiscovered(() => statsCollector.registerNewMarkets());
-  await discovery.start(
-    process.env.DISCOVERY_INTERVAL_MS ? config.discoveryIntervalMs : DEFAULT_DISCOVERY_INTERVAL_MS,
-  );
+  // #223: register a just-discovered market immediately; full discovery every 5 min
+  // (DISCOVERY_INTERVAL_MS) plus a one-call light pass every minute (DISCOVERY_LIGHT_INTERVAL_MS).
+  await startDiscovery(discovery, statsCollector, process.env);
   statsCollector.start();
   const rpcPollingEnabled = process.env.INDEXER_RPC_POLLING_ENABLED !== "false";
   if (rpcPollingEnabled) {
