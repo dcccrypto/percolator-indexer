@@ -23,7 +23,9 @@ const TRADER = 'So11111111111111111111111111111111111111112';
 const SLAB = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, PermissionlessCrank: 5, BatchTradeNoCpi: 66, BatchTradeCpi: 67 },
   detectSlabLayout: vi.fn(() => ({ version: 1, engineOff: 640, engineMarkPriceOff: 400, engineBitmapOff: 656 })),
   isV17Account: vi.fn(() => false),

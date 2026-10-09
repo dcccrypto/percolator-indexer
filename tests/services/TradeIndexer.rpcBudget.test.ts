@@ -18,7 +18,9 @@ vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the TradeIndexer now reaches the v2.2 log-event decoder, which reads the real SDK tag tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
     TradeNoCpi: 10,

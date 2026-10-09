@@ -18,11 +18,9 @@ import {
   parseEngine,
   detectDexType,
   parseDexPool,
-  isV17Account,
   parseWrapperConfigV17,
   parseAssetOracleProfileV17,
   V17_HEADER_LEN,
-  V17_MARKET_GROUP_OFF,
   V17_ASSET_ORACLE_PROFILE_LEN,
   type EngineState,
   type MarketConfig,
@@ -30,21 +28,11 @@ import {
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 
-/**
- * v17 market group header layout (all offsets relative to V17_MARKET_GROUP_OFF=448).
- * VERIFIED via percolator-prog `cargo run --example dump_layout` (MarketGroupV16HeaderAccount):
- *   +0    market_group_id [u8;32]
- *   +32   config V16ConfigAccount        (249 bytes — INLINE, precedes vault)
- *   +281  asset_slot_capacity u32        (4 bytes)
- *   +285  vault u128
- *   +301  insurance u128
- *   +317  c_tot u128
- * (Earlier +32/48/64 was wrong — it read inside the 249-byte config block.)
+/*
+ * Market group geometry is NOT hard-coded here. vault / insurance / c_tot offsets, the group header length and the
+ * slot-0 start come from the SDK layout table of the account's wrapper VERSION (layout/resolve.ts):
+ * v2.1 (VERSION 18) header 758 B, v2.2 (VERSION 19) header 806 B (vault at +333, not +285).
  */
-const V17_MG_VAULT_OFF = 285;      // abs: V17_MARKET_GROUP_OFF + 285 = 733
-const V17_MG_INSURANCE_OFF = 301;  // abs: V17_MARKET_GROUP_OFF + 301 = 749
-const V17_MG_C_TOT_OFF = 317;      // abs: V17_MARKET_GROUP_OFF + 317 = 765
-const V17_MG_MIN_BYTES = 333;      // must cover the c_tot read at +317 (317 + 16)
 
 /**
  * M1: upper bound for a sane price in micro-USD (1e6). An unset/sentinel u64
@@ -64,21 +52,6 @@ export function sanePriceE6(priceE6: bigint): bigint {
 }
 
 /**
- * Market group header length between V17_MARKET_GROUP_OFF and the first
- * AssetOracleProfileV17. From the desync doc: asset-0 oracle profile at
- * abs offset 1206 = 448 + 758, so MARKET_GROUP_HDR_LEN = 758.
- */
-const V17_MARKET_GROUP_HDR_LEN = 758;
-const V17_ASSET0_PROFILE_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_HDR_LEN; // 1206
-
-function readU128LESB(data: Uint8Array, offset: number): bigint {
-  const dv = new DataView(data.buffer, data.byteOffset + offset, 16);
-  const lo = dv.getBigUint64(0, true);
-  const hi = dv.getBigUint64(8, true);
-  return lo | (hi << 64n);
-}
-
-/**
  * Parse a v17 account and return v12-compatible engine/config/params shapes.
  *
  * Desync fixes 2, 3, 4:
@@ -91,15 +64,18 @@ function parseV17AccountStats(data: Uint8Array): {
   marketConfig: MarketConfig;
   params: RiskParams;
 } {
+  // VERSION-keyed. An unknown VERSION throws UnknownLayoutError; every caller handles it per market.
+  const fields = readMarketGroupFields(data, "StatsCollector.parseV17AccountStats");
   const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
+  const asset0ProfileOff = fields.asset0ProfileOff;
 
   // Asset-0 oracle profile for oracleAuthority and authorityPriceE6
   const zeroKey = new PublicKey(new Uint8Array(32));
   let oracleAuthority = zeroKey;
   let authorityPriceE6 = 0n;
-  if (data.length >= V17_ASSET0_PROFILE_OFF + V17_ASSET_ORACLE_PROFILE_LEN) {
+  if (asset0ProfileOff !== null && data.length >= asset0ProfileOff + V17_ASSET_ORACLE_PROFILE_LEN) {
     try {
-      const op = parseAssetOracleProfileV17(data, V17_ASSET0_PROFILE_OFF);
+      const op = parseAssetOracleProfileV17(data, asset0ProfileOff);
       oracleAuthority = op.oracleAuthority;
       authorityPriceE6 = op.oracleTargetPriceE6;
     } catch {
@@ -152,12 +128,8 @@ function parseV17AccountStats(data: Uint8Array): {
     dexPool: null,
   };
 
-  // Read vault and insurance from v17 market group header (desync fix 4)
-  const mgOff = V17_MARKET_GROUP_OFF;
-  const hasGroupHeader = data.length >= mgOff + V17_MG_MIN_BYTES;
-  const vault = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_VAULT_OFF) : 0n;
-  const insurance = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_INSURANCE_OFF) : 0n;
-  const cTot = hasGroupHeader ? readU128LESB(data, mgOff + V17_MG_C_TOT_OFF) : 0n;
+  // Vault / insurance / c_tot from the VERSION-keyed group header (desync fix 4).
+  const { vault, insurance, cTot } = fields;
 
   const engine: EngineState = {
     vault,
@@ -237,6 +209,8 @@ import {
   v17InitialMarginBps,
   type AutoRowMarketInput,
 } from "../db/autoMarketFields.js";
+import { hasWrapperMagic, readMarketGroupFields, reportUnknownLayout } from "../layout/resolve.js";
+import { noteMarketLayout } from "../layout/marketVersions.js";
 import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
@@ -778,7 +752,7 @@ export class StatsCollector {
           if ((market as AutoRowMarketInput).configV17) {
             try {
               const info = await connection.getAccountInfo(new PublicKey(slabAddress));
-              v17ImBps = info ? v17InitialMarginBps(info.data) : null;
+              v17ImBps = info ? v17InitialMarginBps(info.data, slabAddress) : null;
             } catch (imErr) {
               logger.debug("Slab read for initial margin failed; using default leverage", {
                 slabAddress,
@@ -1040,13 +1014,14 @@ export class StatsCollector {
               const info = await getConnection().getAccountInfo(new PublicKey(m.slab_address));
               if (info?.data) {
                 const data = new Uint8Array(info.data);
-                const eng = isV17Account(data) ? parseV17AccountStats(data).engine : parseEngine(data);
+                const eng = hasWrapperMagic(data) ? parseV17AccountStats(data).engine : parseEngine(data);
                 vault = eng.vault;
                 numUsedAccounts = eng.numUsedAccounts;
               }
-            } catch {
+            } catch (err) {
               // Unreadable — leave it excluded and try again next cycle rather
-              // than un-hiding a market we cannot verify.
+              // than un-hiding a market we cannot verify. An unknown VERSION is loud (per market).
+              reportUnknownLayout(m.slab_address, err, "StatsCollector.reenable");
             }
             const isLive = vault > 1_000_000n || numUsedAccounts > 0;
 
@@ -1121,6 +1096,8 @@ export class StatsCollector {
               }
 
             const data = new Uint8Array(accountInfo.data);
+            // Remember this market's wrapper VERSION and asset generations (v2.2 log events are VERSION-gated; never throws).
+            noteMarketLayout(slabAddress, data);
 
             // Parse engine state — v17 dispatch (desync fixes 2, 3, 4).
             // marketConfig/params are intentionally NOT read here anymore: the only
@@ -1129,15 +1106,17 @@ export class StatsCollector {
             // only needs engine.vault / engine.numUsedAccounts.
             let engine: EngineState;
             try {
-              if (isV17Account(data)) {
-                // v17: use v17-correct parser (parseEngine throws "Unrecognized slab
+              if (hasWrapperMagic(data)) {
+                // v17+: use the VERSION-keyed parser (parseEngine throws "Unrecognized slab
                 // data length" for v17 account sizes — wrong magic + no registered tier)
                 engine = parseV17AccountStats(data).engine;
               } else {
                 engine = parseEngine(data);
               }
             } catch (parseErr) {
-              // Slab too small or invalid — skip
+              // Slab too small or invalid — skip THIS market only. An unknown wrapper VERSION is reported loudly
+              // (error log + counter + Sentry once) instead of silently dropped; it never throws out of the sweep.
+              reportUnknownLayout(slabAddress, parseErr, "StatsCollector.sweep");
               return;
             }
 

@@ -3,7 +3,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // We must mock BEFORE importing the module under test.
 const mockGetAccountInfo = vi.fn();
 
-vi.mock("@percolatorct/sdk", () => ({
+vi.mock("@percolatorct/sdk", async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // detectSlabLayout returns null for small/unknown sizes, a layout object otherwise.
   // We key off data.length in the mock to avoid needing real slab binaries.
   detectSlabLayout: vi.fn((len: number) => {

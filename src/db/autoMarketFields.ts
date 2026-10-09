@@ -1,7 +1,8 @@
 import { PublicKey } from "@solana/web3.js";
 import { isPoisonTxError, MAX_SKIPS_ABSOLUTE } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures, type SkippedSignature } from "./../lib/skippedSignatures.js";
-import { V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
+import { ACCOUNT_KIND, LAYOUT_V21, resolveLayout, type LayoutTable } from "@percolatorct/sdk";
+import { reportUnknownLayout } from "../layout/resolve.js";
 import type {
   ConfirmedSignatureInfo,
   SignaturesForAddressOptions,
@@ -25,18 +26,37 @@ import type {
  */
 
 /**
- * Absolute offset of the engine's `initial_margin_bps` (u64 LE) in a v17/v18 slab:
- * the V16ConfigAccount starts 32 bytes into the market-group region and the field
- * sits at +62. Same layout the app reads (percolator-launch lib/v17-engine-config.ts),
- * verified 2026-10-01 on 9EPm8nB8… (1819) and 8WC8vALs… (1000).
+ * Offset of the engine's `initial_margin_bps` (u64 LE) INSIDE the market-group region: the V16ConfigAccount
+ * starts at `group.config` (32) and the field sits at +62 of it (max_portfolio_assets u16, max_market_slots u32,
+ * min_nonzero_mm/im u128 x2, h_min/h_max u64 x2, maintenance_margin_bps u64, then initial_margin_bps). v2.2
+ * appends its band/rent words at the END of the config, so +62 holds in both layouts.
  */
-export const V17_INITIAL_MARGIN_BPS_OFF = V17_MARKET_GROUP_OFF + 32 + 62;
+const CONFIG_INITIAL_MARGIN_BPS_REL = 62;
 
-/** The engine's initial margin from raw v17/v18 slab bytes; NULL if too short or zero. */
-export function v17InitialMarginBps(data: Uint8Array): bigint | null {
-  if (data.length < V17_INITIAL_MARGIN_BPS_OFF + 8) return null;
+/** Absolute offset of `initial_margin_bps` for a layout (VERSION-keyed; never a literal). */
+export function initialMarginBpsOffset(layout: LayoutTable): number {
+  return layout.marketGroupOff + layout.group.config + CONFIG_INITIAL_MARGIN_BPS_REL;
+}
+
+/** The v2.1 (VERSION 18) value, 686. Kept for callers/tests that pin the deployed layout. */
+export const V17_INITIAL_MARGIN_BPS_OFF = initialMarginBpsOffset(LAYOUT_V21);
+
+/**
+ * The engine's initial margin from raw wrapper market bytes; NULL if too short, zero, or the account's VERSION is
+ * not known (reported loudly, never read with another layout's offset).
+ */
+export function v17InitialMarginBps(data: Uint8Array, account = "(market)"): bigint | null {
+  let layout: LayoutTable;
+  try {
+    layout = resolveLayout(data, { parser: "v17InitialMarginBps", kind: ACCOUNT_KIND.Market });
+  } catch (err) {
+    reportUnknownLayout(account, err, "v17InitialMarginBps");
+    return null;
+  }
+  const off = initialMarginBpsOffset(layout);
+  if (data.length < off + 8) return null;
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const v = dv.getBigUint64(V17_INITIAL_MARGIN_BPS_OFF, true);
+  const v = dv.getBigUint64(off, true);
   return v > 0n ? v : null;
 }
 

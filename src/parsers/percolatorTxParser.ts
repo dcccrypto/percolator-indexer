@@ -1,5 +1,6 @@
 import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
+import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
 import { cpiEvidence, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
 
@@ -396,8 +397,12 @@ export function parsePercolatorFills(
     const programId = pubkeyToBase58(ix.programId);
     if (!programId || !programIdSet.has(programId)) continue;
 
-    const data = decodeBase58(ix.data);
-    if (!data || data.length < 1) continue;
+    const rawData = decodeBase58(ix.data);
+    if (!rawData || rawData.length < 1) continue;
+
+    // v2.2 EvictAndTradeCpi (119) is a TradeCpi behind one prepended victim account: normalise it to the TradeCpi
+    // it wraps so its fill is indexed like any other. Every other tag passes through unchanged.
+    const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts ?? []);
 
     const tag = data[0];
     if (isRebalanceReduceTag(tag)) {
@@ -420,7 +425,7 @@ export function parsePercolatorFills(
     }
     if (!ALL_TRADE_TAGS.has(tag)) continue;
 
-    const trader = pubkeyToBase58(ix.accounts?.[0]);
+    const trader = pubkeyToBase58(ixAccounts[0]);
     if (!trader) continue;
 
     // #148: Derive slab per-instruction from the account list.
@@ -430,12 +435,12 @@ export function parsePercolatorFills(
     // correctly attribute each fill to its own slab, not the first known slab.
     const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
     const marketAccountIdx = isNoCpiTag ? 2 : 1;
-    const slabAddress = pubkeyToBase58(ix.accounts?.[marketAccountIdx]);
+    const slabAddress = pubkeyToBase58(ixAccounts[marketAccountIdx]);
 
     if (SINGLE_TRADE_TAGS.has(tag)) {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
-      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, false) : undefined;
+      const cpi = tag === IX_TAG.TradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, false, ixAccounts) : undefined;
 
       fills.push({
         signature,
@@ -450,7 +455,7 @@ export function parsePercolatorFills(
         ...(cpi ? { cpi, legPos: 0 } : {}),
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
-      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, true) : undefined;
+      const cpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, innerGroups, returnData, true, ixAccounts) : undefined;
       for (const leg of decodeV18BatchLegs(tag, data)) {
         fills.push({
           signature,
@@ -490,8 +495,10 @@ export function cpiEvidenceFromParsed(
   innerGroups: Array<{ index: number; instructions?: any[] }> | null | undefined,
   returnData: { programId: string; data: Uint8Array } | null,
   isBatch: boolean,
+  /** The instruction's account list as the TradeCpi layout sees it. Pass the unwrapped list for a v2.2 EvictAndTradeCpi (119), whose raw list has the victim portfolio prepended and would shift [4]/[5] by one. */
+  accountsOverride?: readonly unknown[],
 ): CpiEvidence {
-  const accounts = (ix.accounts ?? []).map((a) => pubkeyToBase58(a) ?? "");
+  const accounts = (accountsOverride ?? ix.accounts ?? []).map((a) => pubkeyToBase58(a) ?? "");
   let inner: InnerIxLike[] | null = null;
   if (Array.isArray(innerGroups)) {
     inner = [];
