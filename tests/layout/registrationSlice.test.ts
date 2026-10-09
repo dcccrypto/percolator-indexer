@@ -3,7 +3,7 @@ import { PublicKey } from "@solana/web3.js";
 import { LAYOUTS_BY_VERSION, V17_ASSET_ORACLE_PROFILE_LEN } from "@percolatorct/sdk";
 import { discoverV17Markets, V17_REGISTRATION_SLICE_LEN } from "../../src/v17/discovery.js";
 import { readMarketGroupFields, registrationSliceLenFor, resetUnknownLayoutState } from "../../src/layout/resolve.js";
-import { LAYOUT_V21, LAYOUT_V22, buildMarket, pk } from "../helpers/v22Fixtures.js";
+import { LAYOUT_V21, LAYOUT_V22, buildMarket, pk, stampHeader } from "../helpers/v22Fixtures.js";
 
 const PROGRAM = new PublicKey("11111111111111111111111111111111");
 
@@ -64,5 +64,41 @@ describe("light registration slice covers every layout VERSION", () => {
     const data = buildMarket(LAYOUT_V22, { slots: 1 }).subarray(0, V17_REGISTRATION_SLICE_LEN);
     expect(readMarketGroupFields(data, "t").asset0ProfileOff).toBe(1398);
     expect(readMarketGroupFields(data, "t").geometry.slotCount).toBe(0);
+  });
+});
+
+describe("the v2.2 market lengths (4,059 / 6,720 / 9,381 / 12,042 / 14,703 by capacity) and the other v2.2 account kinds", () => {
+  // literals from the RC's layout-v22.json (account_lengths.market_account_len_by_capacity)
+  const LENS = [4_059, 6_720, 9_381, 12_042, 14_703];
+
+  for (const [i, len] of LENS.entries()) {
+    it(`capacity ${i + 1} = ${len} B: built from the SDK table, discovered by the full AND the light pass with identical registration fields`, async () => {
+      const authority = pk();
+      const data = buildMarket(LAYOUT_V22, { slots: i + 1, vault: 1_234n, oracleAuthority: authority });
+      expect(data.length).toBe(len);
+      const m = { key: pk(), data };
+      const [full] = await discoverV17Markets(slicingConn([m]), PROGRAM);
+      const [light] = await discoverV17Markets(slicingConn([m]), PROGRAM, undefined, { light: true });
+      for (const d of [full, light]) {
+        expect(d.config.oracleAuthority.toBase58()).toBe(authority.toBase58());
+        expect(d.engine.vault).toBe(1_234n);
+      }
+      expect(readMarketGroupFields(data, "t").geometry.slotCount).toBe(i + 1);
+    });
+  }
+
+  it("the light slice (1,910 B) is shorter than the smallest v2.2 market (4,059 B) and than the smallest v2.1 slab, so it is always a strict prefix", () => {
+    expect(V17_REGISTRATION_SLICE_LEN).toBe(1_910);
+    expect(V17_REGISTRATION_SLICE_LEN).toBeLessThan(4_059);
+    expect(registrationSliceLenFor(LAYOUT_V21)).toBe(1_862);
+    expect(V17_REGISTRATION_SLICE_LEN).toBeLessThan(buildMarket(LAYOUT_V21, { slots: 1 }).length);
+  });
+
+  it("accounts of the other v2.2 kinds are not markets: the G9 allowlist (kind 15, 2,080 B), bond tranche, insurance units, a portfolio never register", async () => {
+    const kinds: Array<[string, number, number]> = [["g9 allowlist", 15, 2_080], ["bond tranche", 11, 16 + 128], ["bond position", 12, 16 + 96], ["insurance units", 13, 16 + 192], ["portfolio", 2, LAYOUT_V22.portfolio.accountLen]];
+    for (const [name, kind, len] of kinds) {
+      const a = { key: pk(), data: stampHeader(new Uint8Array(len), kind, 19) };
+      expect(await discoverV17Markets(slicingConn([a]), PROGRAM), name).toEqual([]);
+    }
   });
 });

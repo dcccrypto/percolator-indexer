@@ -49,11 +49,17 @@ export type V22EventKind =
   | "band_dust_swept"
   | "eviction";
 
-/** Every kind, in the order of the migration's CHECK constraint (a test pins the two together). */
+/** Kinds decoded from the wrapper's LOG events (parsers/v22FillEvents.ts), recorded by a second migration. */
+export type V22LogEventKind = "fill_event" | "reduce_event" | "move_event" | "events_unknown";
+
+/** Every instruction-event kind, in the order of the first migration's CHECK constraint (a test pins the two together). */
 export const V22_EVENT_KINDS: readonly V22EventKind[] = [
   "bond_deposit", "bond_withdraw_request", "bond_withdraw_execute", "rescue_deposit", "insurance_units_init",
   "backstop_propose", "backstop_draw", "backstop_restore", "holding_rent_settled", "band_dust_swept", "eviction",
 ];
+
+/** The log-event kinds the second migration adds, in its CHECK order (a test pins the two together). */
+export const V22_LOG_EVENT_KINDS: readonly V22LogEventKind[] = ["fill_event", "reduce_event", "move_event", "events_unknown"];
 
 export interface V22EventRow {
   signature: string;
@@ -61,7 +67,7 @@ export interface V22EventRow {
   ix_index: number;
   /** -1 for a top-level instruction, else the index inside its inner-instruction group. */
   inner_index: number;
-  kind: V22EventKind;
+  kind: V22EventKind | V22LogEventKind;
   slab_address: string | null;
   asset_index: number | null;
   /** The signer / beneficiary account the instruction names (depositor, holder, rescuer, cranker, caller, trader). */

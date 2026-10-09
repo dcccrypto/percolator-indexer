@@ -5,6 +5,7 @@ import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { decodeV22Events, rawInstructionsFromEnhancedTx } from "../parsers/v22Events.js";
 import { insertV22Events } from "../db/insertV22Events.js";
+import { recordV22LogEvents } from "../services/v22LogEvents.js";
 import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
@@ -572,6 +573,21 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
       }
     }
     if (v22Rows.length > 0) await insertV22Events(v22Rows);
+    // v2.2 wrapper LOG events: only when the delivery carries the logs (the enhanced payload normally does not; then nothing is
+    // attempted and nothing is claimed: the stream and poll paths read them from the transaction meta).
+    for (const tx of transactions) {
+      if (!tx.signature || !Array.isArray(tx.logMessages)) continue;
+      await recordV22LogEvents({
+        signature: tx.signature,
+        err: tx.transactionError ?? null,
+        logMessages: tx.logMessages,
+        wrapperInstructions: rawInstructionsFromEnhancedTx(tx, PROGRAM_IDS),
+        wrapperIds: PROGRAM_IDS,
+        slot: typeof (tx as { slot?: unknown }).slot === "number" ? (tx as { slot: number }).slot : null,
+        blockTimeSec: typeof (tx as { timestamp?: unknown }).timestamp === "number" ? (tx as { timestamp: number }).timestamp : null,
+        isKnownMarket: (slab) => !discovery || discovery.getMarkets().has(slab),
+      });
+    }
   } catch (err) {
     logger.warn("v22 event extraction failed (trades unaffected)", { error: err instanceof Error ? err.message : String(err) });
   }

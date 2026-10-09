@@ -8,6 +8,7 @@ import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/pe
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
 import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import { insertV22Events } from "../db/insertV22Events.js";
+import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -119,12 +120,24 @@ export class EventStreamService {
     // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
     // a failure here must never cost the tx's fills below.
     try {
-      const events = decodeV22Events(rawInstructionsFromParsedTx(tx, [this.deps.programId]), {
+      const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
+      const events = decodeV22Events(wrapperIxs, {
         signature,
         slot: typeof tx.slot === "number" ? tx.slot : null,
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
       }).filter((e) => !e.slab_address || (this.slabSet.has(e.slab_address) && !isBlockedSlab(e.slab_address)));
       if (events.length > 0) await insertV22Events(events);
+      // v2.2 wrapper LOG events (fills / reductions / moves), strict frame attribution; separate write, VERSION-keyed.
+      await recordV22LogEvents({
+        signature,
+        err: tx.meta?.err ?? null,
+        logMessages: tx.meta?.logMessages,
+        wrapperInstructions: wrapperIxs,
+        wrapperIds: new Set([this.deps.programId]),
+        slot: typeof tx.slot === "number" ? tx.slot : null,
+        blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
+        isKnownMarket: (slab) => this.slabSet.has(slab),
+      });
     } catch (err) {
       log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
     }

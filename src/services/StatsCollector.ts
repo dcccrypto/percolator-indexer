@@ -210,6 +210,7 @@ import {
   type AutoRowMarketInput,
 } from "../db/autoMarketFields.js";
 import { hasWrapperMagic, readMarketGroupFields, reportUnknownLayout } from "../layout/resolve.js";
+import { noteMarketLayout } from "../layout/marketVersions.js";
 import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
@@ -1095,6 +1096,8 @@ export class StatsCollector {
               }
 
             const data = new Uint8Array(accountInfo.data);
+            // Remember this market's wrapper VERSION and asset generations (v2.2 log events are VERSION-gated; never throws).
+            noteMarketLayout(slabAddress, data);
 
             // Parse engine state — v17 dispatch (desync fixes 2, 3, 4).
             // marketConfig/params are intentionally NOT read here anymore: the only

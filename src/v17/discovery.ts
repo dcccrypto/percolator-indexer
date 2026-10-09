@@ -32,6 +32,7 @@ import {
 } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
 import { encodeBase58 } from "../lib/base58.js";
+import { noteMarketLayout } from "../layout/marketVersions.js";
 import { isWrapperKind, readMarketGroupFields, registrationSliceLen, reportUnknownLayout, type MarketGroupFields } from "../layout/resolve.js";
 
 /**
@@ -305,6 +306,7 @@ function parseV17Account(
     // VERSION-keyed geometry (v2.1 = 18, v2.2 = 19). An unknown VERSION throws UnknownLayoutError here: loud,
     // and this ONE market is skipped; the caller's loop carries on with the others.
     const fields = readMarketGroupFields(data, "discoverV17Markets");
+    noteMarketLayout(pubkey.toBase58(), data);
     const header = makeV17SlabHeader(data, programId);
     const config = makeV17MarketConfig(data, fields);
     const engine = makeV17EngineStub(fields);

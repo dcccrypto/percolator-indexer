@@ -39,7 +39,7 @@ describe("insertV22Events", () => {
     expect(await insertV22Events([row(1)])).toBe(0);
     expect(await insertV22Events([row(2), row(3)])).toBe(0);
     expect(logError).toHaveBeenCalledTimes(1);
-    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 3 });
+    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 3, droppedKindConstraint: 0 });
   });
 
   it("PostgREST schema-cache miss is recognised as table-missing too", async () => {
@@ -48,8 +48,17 @@ describe("insertV22Events", () => {
     expect(getV22EventStats().droppedTableMissing).toBe(1);
   });
 
+  it("log-event migration NOT applied (kind CHECK violation 23514): dropped, ONE loud error per window naming the migration, counted separately", async () => {
+    state.result = async () => ({ error: { code: "23514", message: 'new row for relation "v22_events" violates check constraint "v22_events_kind_check"' } });
+    expect(await insertV22Events([{ ...row(1), kind: "fill_event" }])).toBe(0);
+    expect(await insertV22Events([{ ...row(2), kind: "move_event" }, { ...row(3), kind: "reduce_event" }])).toBe(0);
+    expect(logError).toHaveBeenCalledTimes(1);
+    expect(String(logError.mock.calls[0][0])).toMatch(/20261009120000_v22_log_events\.sql/);
+    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 0, droppedKindConstraint: 3 });
+  });
+
   it("any other DB error or a thrown exception is swallowed (an events problem must never fail a trade batch)", async () => {
-    state.result = async () => ({ error: { code: "23514", message: "check violation" } });
+    state.result = async () => ({ error: { code: "22003", message: "numeric field overflow" } });
     await expect(insertV22Events([row(1)])).resolves.toBe(0);
     state.result = async () => { throw new Error("network down"); };
     await expect(insertV22Events([row(1)])).resolves.toBe(0);

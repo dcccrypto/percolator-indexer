@@ -7,6 +7,8 @@ import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, c
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { insertTradeRow } from "../db/insertTradeRow.js";
+import { recordV22LogEvents } from "./v22LogEvents.js";
+import { rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import {
   parsePercolatorLiquidations,
   decodeV18SingleFill,
@@ -401,6 +403,23 @@ export class TradeIndexerPolling {
     pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set(), incomplete: false },
   ): Promise<boolean> {
     if (!tx.meta || tx.meta.err) return false;
+
+    // v2.2 wrapper LOG events of this slab (fills / reductions / moves; strict frame attribution; VERSION-keyed). Best effort and
+    // isolated: it never throws and never touches the trade path below.
+    try {
+      await recordV22LogEvents({
+        signature,
+        err: tx.meta.err,
+        logMessages: tx.meta.logMessages,
+        wrapperInstructions: rawInstructionsFromParsedTx(tx as Parameters<typeof rawInstructionsFromParsedTx>[0], Array.from(programIds)),
+        wrapperIds: programIds,
+        slot: tx.slot,
+        blockTimeSec: tx.blockTime ?? null,
+        isKnownMarket: (slab) => slab === slabAddress,
+      });
+    } catch (err) {
+      logger.warn("v22 log events skipped for a transaction (trades unaffected)", { signature: signature.slice(0, 12), err: String(err) });
+    }
 
     const message = tx.transaction.message;
 
