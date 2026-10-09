@@ -20,6 +20,8 @@ import {
   readWrapperHeader,
   resolveLayout,
   resolveMarketGeometry,
+  LAYOUTS_BY_VERSION,
+  V17_ASSET_ORACLE_PROFILE_LEN,
   V17_HEADER_LEN,
   type LayoutTable,
   type MarketGeometry,
@@ -75,8 +77,38 @@ export function readMarketGroupFields(data: Uint8Array, parser: string): MarketG
     insurance: u128(data, g + L.group.insurance),
     cTot: u128(data, g + L.group.cTot),
     materializedPortfolioCount: u128(data, g + L.group.materializedPortfolioCount),
-    asset0ProfileOff: geometry.slotCount >= 1 ? geometry.slotOff(0) : null,
+    asset0ProfileOff: asset0ProfileOffset(data, geometry),
   };
+}
+
+/**
+ * Where asset 0's oracle profile starts, or null when the buffer does not hold all of it. Deliberately NOT
+ * "slot 0 is whole": the light registration pass fetches a dataSlice that ends right after the asset-0 oracle
+ * profile (no whole slot), and registration still needs the oracle authority out of it. Counting whole slots
+ * returned null for every sliced market (oracle authority silently zero).
+ */
+function asset0ProfileOffset(data: Uint8Array, geometry: MarketGeometry): number | null {
+  const off = geometry.slotsBase + geometry.layout.wrapperSlot.oracleProfile;
+  return data.length >= off + V17_ASSET_ORACLE_PROFILE_LEN ? off : null;
+}
+
+/**
+ * Bytes of a market account that registration parses, for ONE layout: everything up to the end of the asset-0
+ * oracle profile (account header + wrapper config, market-group header, the profile). Derived from the table, no literal.
+ */
+export function registrationSliceLenFor(layout: LayoutTable): number {
+  return layout.marketGroupOff + layout.marketGroupLen + layout.wrapperSlot.oracleProfile + V17_ASSET_ORACLE_PROFILE_LEN;
+}
+
+/**
+ * The dataSlice length of the light discovery pass: the LARGEST registration prefix over every VERSION the SDK
+ * knows (v2.2's group header is 48 B longer than v2.1's, so a slice sized for v2.1 cuts the v2.2 profile off).
+ * A smaller slice for a smaller VERSION would still parse; a larger one is simply unused tail.
+ */
+export function registrationSliceLen(): number {
+  let max = 0;
+  for (const layout of LAYOUTS_BY_VERSION.values()) max = Math.max(max, registrationSliceLenFor(layout));
+  return max;
 }
 
 /**

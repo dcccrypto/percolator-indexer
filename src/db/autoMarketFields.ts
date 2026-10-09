@@ -197,6 +197,26 @@ export async function findSlabCreator(
   slab: PublicKey,
   programId: PublicKey,
 ): Promise<string | null> {
+  return (await findSlabCreation(rpc, slab, programId)).creator;
+}
+
+/** A slab's creator and the on-chain time (unix seconds) of its first successful transaction. */
+export interface SlabCreation {
+  creator: string | null;
+  /** blockTime of the creation transaction (else of the oldest successful signature); null when unknown. */
+  blockTime: number | null;
+}
+
+/**
+ * findSlabCreator plus the slab's creation time, from the same two RPC calls. The time is what
+ * lets the registration grace be measured from the chain rather than from an in-memory
+ * first-seen stamp that a restart would reset (#223).
+ */
+export async function findSlabCreation(
+  rpc: CreatorLookupRpc,
+  slab: PublicKey,
+  programId: PublicKey,
+): Promise<SlabCreation> {
   let before: string | undefined;
   let oldest: ConfirmedSignatureInfo[] = [];
   let exhausted = false;
@@ -213,12 +233,13 @@ export async function findSlabCreator(
       break;
     }
   }
-  if (!exhausted) return null;
+  if (!exhausted) return { creator: null, blockTime: null };
 
   const candidates = oldest
     .filter((s) => s.err === null)
     .slice(-CREATOR_LOOKUP_MAX_TX)
     .reverse(); // oldest first
+  const sigTime = candidates[0]?.blockTime ?? null;
   const skipped: SkippedSignature[] = [];
   for (const sig of candidates) {
     let tx;
@@ -235,7 +256,7 @@ export async function findSlabCreator(
     const creator = creatorFromCreationTx(tx, slab, programId);
     if (creator) {
       await recordSkippedSignatures(skipped);
-      return creator;
+      return { creator, blockTime: tx.blockTime ?? sigTime };
     }
   }
   // Successful-sibling rule: skipping is only acceptable if at least one candidate was read; all unreadable = broken reader.
@@ -243,5 +264,5 @@ export async function findSlabCreator(
     throw new Error(`creator lookup for ${slab.toBase58()}: mass skip refused (every candidate unreadable)`);
   }
   await recordSkippedSignatures(skipped);
-  return null;
+  return { creator: null, blockTime: sigTime };
 }
