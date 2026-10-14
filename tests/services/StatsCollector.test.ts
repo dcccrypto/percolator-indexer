@@ -32,6 +32,14 @@ vi.mock('@percolatorct/sdk', async (importOriginal) => ({
   parseDexPool: vi.fn(),
 }));
 
+// getMarkets moved to the narrow, paged src/db/marketRows.ts; route it to the shared stub above
+// so every case keeps driving the DB rows through `shared.getMarkets`.
+vi.mock('../../src/db/marketRows.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  const read = () => (shared as unknown as { getMarkets: () => Promise<unknown[]> }).getMarkets();
+  return { getMarketRows: vi.fn(read), getMarketRowsCached: vi.fn(read) };
+});
+
 vi.mock('@percolatorct/shared', () => ({
   createLogger: vi.fn(() => ({
     info: vi.fn(),

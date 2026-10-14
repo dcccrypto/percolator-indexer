@@ -45,6 +45,14 @@ vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn(async (
 // every existing test on its legacy mark path; the #221 tests below set a price.
 vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: vi.fn(() => null) }));
 
+// getMarkets moved to the narrow, paged src/db/marketRows.ts; route it to the shared stub above
+// so every case keeps driving the DB rows through `shared.getMarkets`.
+vi.mock('../../src/db/marketRows.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  const read = () => (shared as unknown as { getMarkets: () => Promise<unknown[]> }).getMarkets();
+  return { getMarketRows: vi.fn(read), getMarketRowsCached: vi.fn(read) };
+});
+
 vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD'],

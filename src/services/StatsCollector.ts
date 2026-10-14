@@ -215,7 +215,6 @@ import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
 import {
   getConnection,
-  getMarkets,
   getSupabase,
   getNetwork,
   withRetry,
@@ -223,6 +222,7 @@ import {
   captureException,
   addBreadcrumb,
 } from "@percolatorct/shared";
+import { getMarketRows, type MarketRowLite } from "../db/marketRows.js";
 
 /**
  * How often to sync volume/trade_count for ALL DB markets, including those not
@@ -234,8 +234,8 @@ import {
  * because it issues a single bulk trade fetch + N upserts (cheap), but still
  * infrequent enough to avoid hammering the DB under high trade volume.
  */
-/** A row of the `markets` table, as returned by the shared getMarkets() helper. */
-type DbMarketRow = Awaited<ReturnType<typeof getMarkets>>[number];
+/** The `markets` columns this collector reads back (slab_address, indexer_excluded, keeper_status). */
+type DbMarketRow = MarketRowLite;
 
 const VOLUME_SYNC_INTERVAL_MS = 10 * 60_000;
 
@@ -651,7 +651,7 @@ export class StatsCollector {
       if (onChainMarkets.size === 0) return null;
 
       // Get existing markets from DB
-      const dbMarkets = await getMarkets();
+      const dbMarkets = await getMarketRows();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
 
       // Feed the DB-driven half of the blocklist from the rows we just read
@@ -990,7 +990,7 @@ export class StatsCollector {
       // markets that recover after being abandoned.
       let excludedSlabs: Set<string> = new Set();
       try {
-        const dbMarkets = syncedDbMarkets ?? (await getMarkets());
+        const dbMarkets = syncedDbMarkets ?? (await getMarketRows());
         const excludedDbMarkets = dbMarkets.filter((m) => m.indexer_excluded === true);
 
         for (const m of excludedDbMarkets) {

@@ -3,7 +3,8 @@ import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
 import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
-import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { config, getConnection, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { getMarketRowsCached, type MarketRowLite } from "../db/marketRows.js";
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { insertTradeRow } from "../db/insertTradeRow.js";
@@ -148,8 +149,8 @@ export class TradeIndexerPolling {
    * Markets worth polling as a webhook backstop: not blocklisted, not flagged indexer_excluded
    * (permanently corrupt slabs the stats sweep already skips). Webhook delivery is unaffected.
    */
-  private async pollTargets(): Promise<Awaited<ReturnType<typeof getMarkets>>> {
-    const markets = await getMarkets();
+  private async pollTargets(): Promise<MarketRowLite[]> {
+    const markets = await getMarketRowsCached();
     return markets.filter((m) => m.indexer_excluded !== true && !isBlockedSlab(m.slab_address));
   }
 
