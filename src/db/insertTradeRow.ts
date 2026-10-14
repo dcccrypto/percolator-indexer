@@ -12,6 +12,11 @@ const logger = createLogger("indexer:trades");
  * key `(tx_signature, asset_index, leg_index)` via the partial unique index — a
  * duplicate leg raises 23505, which we swallow (idempotent re-index).
  */
+export type TradeSizeProvenance =
+  | "matcher_exact"
+  | "matcher_request_upper_bound"
+  | "legacy_unverified";
+
 export interface IndexerTradeRow {
   slab_address: string;
   trader: string;
@@ -27,6 +32,7 @@ export interface IndexerTradeRow {
   leg_index: number;
   /** True for forced closes captured from the crank (markers; see baseline note). */
   is_liquidation?: boolean;
+  size_provenance?: TradeSizeProvenance | null;
 }
 
 /**
@@ -91,6 +97,7 @@ function toDbRow(row: IndexerTradeRow) {
     asset_index: row.asset_index,
     leg_index: row.leg_index,
     is_liquidation: row.is_liquidation ?? false,
+    size_provenance: row.size_provenance ?? null,
     network: getNetwork(),
   };
 }

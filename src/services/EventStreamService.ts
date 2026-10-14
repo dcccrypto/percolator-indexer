@@ -1,7 +1,7 @@
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
-import { insertTradeRows, tradeKey, type IndexerTradeRow } from "../db/insertTradeRow.js";
+import { insertTradeRows, tradeKey, type IndexerTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
@@ -149,6 +149,7 @@ export class EventStreamService {
 
       let priceE6Value = fill.priceE6 ?? 0;
       let sizeAbs = fill.sizeAbs;
+      let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
       if (fill.cpi) {
         // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
         const r = await resolveCpiLeg({
@@ -162,6 +163,7 @@ export class EventStreamService {
           continue; // zero fill / strict skip: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           sizeAbs = r.sizeValue;
           priceE6Value = Number(r.priceE6);
           if (!r.exact) log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature });
@@ -202,6 +204,7 @@ export class EventStreamService {
         trader: fill.trader,
         side: fill.side,
         size: sizeAbs.toString(),
+        size_provenance: sizeProvenance,
         price,
         fee: 0,
         tx_signature: signature,

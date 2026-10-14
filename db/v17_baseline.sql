@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS trades (
   asset_index    SMALLINT    NOT NULL DEFAULT 0,      -- H2/H3
   leg_index      SMALLINT    NOT NULL DEFAULT 0,      -- H2/H3
   is_liquidation BOOLEAN     NOT NULL DEFAULT false,  -- forced close via crank (marker, no amounts)
+  size_provenance TEXT CHECK (
+    size_provenance IS NULL OR size_provenance IN (
+      'matcher_exact',
+      'matcher_request_upper_bound',
+      'legacy_unverified'
+    )
+  ),
   network        TEXT        NOT NULL DEFAULT 'devnet' CHECK (network IN ('devnet','mainnet')),
   created_at     TIMESTAMPTZ DEFAULT NOW()
 );

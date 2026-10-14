@@ -3,7 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
 import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
-import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
+import { insertTradeRows, tradeKey, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { parseLiquidation } from "../parsers/liquidations.js";
 import {
@@ -594,6 +594,7 @@ interface TradeData {
   asset_index: number;   // H2/H3
   leg_index: number;     // H2/H3 — reassigned tx-globally before return
   is_liquidation: boolean;
+  size_provenance?: TradeSizeProvenance | null;
   /** Holds a tx-wide leg number for a tag 44 that could not be written; dropped after renumbering. */
   placeholder?: boolean;
   /** This entry is a RebalanceReduce (tag 44), written or held; its leg number is not a TradeCpi fill's. */
@@ -848,6 +849,7 @@ async function extractTradesFromEnhancedTx(
 
       let price: number | undefined;
       let legSize = leg.sizeValue;
+      let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
       let cpiLeg = false;
       if (cpi) {
         cpiLeg = true;
@@ -882,6 +884,7 @@ async function extractTradesFromEnhancedTx(
         }
         if (r.kind === "fill") {
           legSize = r.sizeValue;
+          sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           price = Number(r.priceE6) / 1_000_000;
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic below, exactly as before this parser
@@ -905,6 +908,7 @@ async function extractTradesFromEnhancedTx(
         trader,
         side: leg.side,
         size: legSize.toString(),
+        size_provenance: sizeProvenance,
         price,
         fee,
         tx_signature: signature,
