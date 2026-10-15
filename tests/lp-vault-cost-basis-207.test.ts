@@ -378,6 +378,8 @@ class FakeChain implements LpVaultChain {
   claim: OnchainClaim = { heldShares: 0n, pendingShares: 0n, contextSlot: 0 };
   /** Signature to insert as newest AFTER the next getClaim — simulates a racing vault tx. */
   raceSig: SigInfo | null = null;
+  /** getTransaction call count (#231: proves what a pass did and did not re-read). */
+  reads = 0;
 
   add(tx: NormTx): void {
     this.txs.set(tx.signature, tx);
@@ -393,7 +395,7 @@ class FakeChain implements LpVaultChain {
     }
     return list.slice(0, o.limit);
   }
-  async getTransaction(sig: string): Promise<NormTx | null> { return this.txs.get(sig) ?? null; }
+  async getTransaction(sig: string): Promise<NormTx | null> { this.reads++; return this.txs.get(sig) ?? null; }
   async getClaim(): Promise<OnchainClaim> {
     if (this.raceSig) { this.sigs.unshift(this.raceSig); this.raceSig = null; }
     return this.claim;
@@ -440,9 +442,12 @@ describe("GH#207 indexer over real FXUC vault history", () => {
     const store = new MemoryLpVaultStore();
     const a = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
     await a.syncRegistry(FXUC);
-    // A restarted process has no cursor and re-reads all history.
+    // A restarted process resumes from the stored cursor (#231) and re-reads nothing; the fold
+    // is idempotent either way, which is what this test is really about.
     const b = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
+    chain.reads = 0;
     await b.syncRegistry(FXUC);
+    expect(chain.reads).toBe(0);
     const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
     expect(pos?.cost_basis_atoms).toBe("5000000000");
     expect(pos?.event_count).toBe(2);
@@ -623,3 +628,122 @@ describe("X-1 LP vault: unreadable transactions", () => {
   });
 });
 const fxucSigOf = (i: number): string => [SIG.createFxuc, SIG.depositFxuc, SIG.requestFxuc, SIG.crankFxuc][i]!;
+
+
+/**
+ * GH#231 — a vault's sync used to refuse, permanently, once it found >= 20_000 unread
+ * signatures: nothing ever read them, so the condition never cleared. Two things made that
+ * reachable — an in-memory cursor (every restart re-paged all of history) and the fact that
+ * `getSignaturesForAddress` indexes any transaction merely NAMING the registry, so anyone
+ * could push a vault over the cap for the price of the fees.
+ *
+ * The junk signatures here are the real shape of both: transactions that reference the
+ * registry and decode to no vault events at all.
+ */
+describe("GH#231 a long or spammed signature history drains instead of wedging the vault", () => {
+  const claimOfRecord = (): OnchainClaim => ({
+    heldShares: 4_999_999_000n - requestedShares(),
+    pendingShares: requestedShares(),
+    contextSlot: 505_500_000,
+  });
+
+  /** The real FXUC history, then `n` event-free transactions naming the registry on top of it. */
+  function spammed(n: number): FakeChain {
+    const c = fxucChain();
+    for (let i = 1; i <= n; i++) {
+      c.add({ signature: `junk${String(i).padStart(6, "0")}`, slot: 600_000_000 + i, blockTime: null, failed: false, instructions: [] });
+    }
+    return c;
+  }
+
+  it("drains 20_001 junk signatures over several passes and still reaches the exact basis", async () => {
+    const chain = spammed(20_001);
+    chain.claim = claimOfRecord();
+    const store = new MemoryLpVaultStore();
+    const ix = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
+
+    // Before the fix the FIRST call threw `> 20000 unread signatures` and so did every call
+    // after it, forever. Now it reports a backlog and works through it oldest-first.
+    let r = await ix.syncRegistry(FXUC);
+    expect(r.backlog).toBe(20_005);
+    expect(r.signatures).toBeLessThan(r.backlog);
+    // Oldest-first: the real history is at the old end, so the events land in the first pass.
+    expect(r.events).toBe(2);
+
+    let passes = 1;
+    while (r.backlog > r.signatures) {
+      r = await ix.syncRegistry(FXUC);
+      passes++;
+      expect(passes).toBeLessThan(50); // it must converge, not spin
+    }
+    expect(passes).toBeGreaterThan(1);
+    // The pass that exits the loop is the one that folded everything still outstanding.
+    expect(r.backlog).toBe(r.signatures);
+    expect((await ix.syncRegistry(FXUC)).backlog).toBe(0); // and then there is nothing left
+
+    // The control: not merely "it did not throw" but the same exact position the clean
+    // history produces. A fix that drained but folded a truncated history would fail here.
+    const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
+    expect(pos).toMatchObject({ cost_basis_atoms: "5000000000", lp_shares: "4999999000", realized_pnl_atoms: "0", event_count: 2 });
+
+    // And once caught up, the deferred reconcile runs and agrees with the chain.
+    const rec = await ix.reconcileOpenPositions(FXUC);
+    expect(rec).toEqual({ reconciled: 1, skipped: 0 });
+    const after = await store.loadPosition("devnet", FXUC.registry, LP_USER);
+    expect(after).toMatchObject({ basis_known: true, transfer_detected_slot: null, onchain_lp_shares: "4999999000" });
+  });
+
+  it("does not reconcile against a chain head it has not caught up to yet", async () => {
+    const chain = spammed(20_001);
+    chain.claim = claimOfRecord();
+    const store = new MemoryLpVaultStore();
+    const ix = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
+    const r = await ix.syncRegistry(FXUC);
+    // Mid-drain the on-chain shares include events this pass has not folded; comparing them
+    // would read as an LP transfer and wrongly clear basis_known.
+    expect(r.reconciled).toBe(0);
+    expect(r.reconcileSkipped).toBeGreaterThan(0);
+    const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
+    expect(pos?.transfer_detected_slot).toBeNull();
+  });
+
+  it("a restarted process resumes from the durable cursor instead of re-paging history", async () => {
+    const chain = fxucChain();
+    chain.claim = claimOfRecord();
+    const store = new MemoryLpVaultStore();
+    await new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] }).syncRegistry(FXUC);
+    expect(await store.loadCursor("devnet", FXUC.registry)).toBe(SIG.crankFxuc);
+
+    chain.reads = 0;
+    const restarted = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
+    const r = await restarted.syncRegistry(FXUC);
+    expect(r.backlog).toBe(0);
+    expect(chain.reads).toBe(0);
+  });
+
+  it("a store with no cursor table (load returns null) still works, it just re-pages", async () => {
+    const chain = fxucChain();
+    chain.claim = claimOfRecord();
+    const store = new MemoryLpVaultStore();
+    // What SupabaseLpVaultStore does when the hand-applied migration is absent.
+    store.loadCursor = async () => null;
+    store.saveCursor = async () => {};
+    await new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] }).syncRegistry(FXUC);
+    const restarted = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
+    chain.reads = 0;
+    const r = await restarted.syncRegistry(FXUC);
+    expect(chain.reads).toBeGreaterThan(0); // re-paged, as before #231
+    expect(r.backlog).toBe(4);
+    const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
+    expect(pos).toMatchObject({ cost_basis_atoms: "5000000000", event_count: 2 }); // and still idempotent
+  });
+
+  it("still refuses an implausible backlog, loudly, rather than enumerating forever", async () => {
+    const chain = spammed(2_000);
+    const ix = new LpVaultIndexer({
+      chain, store: new MemoryLpVaultStore(), network: "devnet", programIds: [WRAPPER],
+      maxBacklogSignatures: 1_000,
+    });
+    await expect(ix.syncRegistry(FXUC)).rejects.toThrow(/backlog exceeds 1000 signatures/);
+  });
+});

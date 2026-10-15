@@ -4,9 +4,12 @@
  * Two implementations behind one interface: Supabase (production) and in-memory
  * (tests, and the backfill script's default dry run, which must never write).
  */
+import { createLogger } from "@percolatorct/shared";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { LpVaultEvent, LpVaultEventKind } from "./decoder.js";
 import { basisKnown, foldPosition, type FoldEvent, type FoldedPosition } from "./position.js";
+
+const logger = createLogger("indexer:lp-vault-store");
 
 export interface PositionRow {
   network: string;
@@ -42,6 +45,21 @@ export interface LpVaultStore {
   writePosition(row: PositionRow): Promise<void>;
   /** Positions in a registry that may hold shares (indexed or on-chain). */
   listOpenPositions(network: string, registry: string): Promise<PositionRow[]>;
+  /**
+   * GH#231 — the newest signature already folded for a vault.
+   *
+   * Durable, so a restart does not re-page the vault's whole history: the fold itself is
+   * reproducible from `lp_vault_events`, so the cursor is the only thing a restart loses.
+   *
+   * It has to be the newest signature *processed*, not the newest one in `lp_vault_events`:
+   * a transaction that decodes to no vault events writes no row, so an events-derived
+   * watermark would never advance past unrelated traffic that merely names the registry.
+   *
+   * Best-effort on both sides: the migration is applied by hand (like `skipped_signatures`),
+   * so a missing table degrades to the in-memory cursor instead of failing the sync.
+   */
+  loadCursor(network: string, registry: string): Promise<string | null>;
+  saveCursor(network: string, registry: string, signature: string, slot: number): Promise<void>;
 }
 
 export interface Reconciliation {
@@ -118,6 +136,7 @@ export async function recomputePosition(
 export class MemoryLpVaultStore implements LpVaultStore {
   readonly events = new Map<string, { network: string; ev: LpVaultEvent }>();
   readonly positions = new Map<string, PositionRow>();
+  readonly syncCursors = new Map<string, { signature: string; slot: number }>();
 
   private static pk(network: string, registry: string, user: string): string {
     return `${network}|${registry}|${user}`;
@@ -153,6 +172,14 @@ export class MemoryLpVaultStore implements LpVaultStore {
       (p) => p.network === network && p.registry === registry &&
         (p.lp_shares !== "0" || (p.onchain_lp_shares !== null && p.onchain_lp_shares !== "0")),
     );
+  }
+
+  async loadCursor(network: string, registry: string): Promise<string | null> {
+    return this.syncCursors.get(`${network}|${registry}`)?.signature ?? null;
+  }
+
+  async saveCursor(network: string, registry: string, signature: string, slot: number): Promise<void> {
+    this.syncCursors.set(`${network}|${registry}`, { signature, slot });
   }
 }
 
@@ -262,4 +289,46 @@ export class SupabaseLpVaultStore implements LpVaultStore {
     if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
     return (data ?? []) as unknown as PositionRow[];
   }
+
+  // GH#231: best-effort on purpose. `lp_vault_sync_cursor` is applied by hand like
+  // `skipped_signatures`, and losing the cursor only costs a re-page of history that the
+  // chunked drain handles anyway -- it must never be the reason a vault stops syncing.
+  async loadCursor(network: string, registry: string): Promise<string | null> {
+    const { data, error } = await this.db
+      .from("lp_vault_sync_cursor")
+      .select("signature")
+      .eq("network", network)
+      .eq("registry", registry)
+      .maybeSingle();
+    if (error) {
+      cursorTableUnavailable("load", registry, error.message);
+      return null;
+    }
+    return (data as { signature: string } | null)?.signature ?? null;
+  }
+
+  async saveCursor(network: string, registry: string, signature: string, slot: number): Promise<void> {
+    const { error } = await this.db
+      .from("lp_vault_sync_cursor")
+      .upsert({ network, registry, signature, slot, updated_at: new Date().toISOString() }, { onConflict: "network,registry" });
+    if (error) cursorTableUnavailable("save", registry, error.message);
+  }
+}
+
+/**
+ * Log a cursor-table failure once per (op, registry) per process: without the table the
+ * indexer is back to an in-memory cursor, which is a degradation worth seeing in the logs
+ * but not worth repeating every 30 s.
+ */
+const cursorWarned = new Set<string>();
+function cursorTableUnavailable(op: "load" | "save", registry: string, message: string): void {
+  const key = `${op}:${registry}`;
+  if (cursorWarned.has(key)) return;
+  cursorWarned.add(key);
+  logger.error("lp_vault_sync_cursor unavailable: falling back to an in-memory cursor for this vault (apply supabase/migrations/20261015120000_lp_vault_sync_cursor.sql)", { op, registry, error: message });
+}
+
+/** Test hook. */
+export function resetCursorWarnings(): void {
+  cursorWarned.clear();
 }

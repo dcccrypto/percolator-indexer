@@ -54,9 +54,24 @@ async function main(): Promise<void> {
   const touched: PositionRow[] = [];
   for (const reg of registries) {
     try {
-      const r = await indexer.syncRegistry(reg);
-      console.log(`[lp-backfill] ${reg.registry} market=${reg.market} sigs=${r.signatures} events=${r.events} users=${r.users.length} reconciled=${r.reconciled} skipped=${r.reconcileSkipped}`);
-      for (const u of r.users) {
+      // #231: syncRegistry folds at most `maxSignaturesPerSync` transactions per call and
+      // commits its cursor, so a vault with a long history needs several passes. The indexer
+      // gets those from its poll loop; a one-shot script has to drain it here, or the tool
+      // would stop short of the history it exists to rebuild.
+      const users = new Set<string>();
+      let r = await indexer.syncRegistry(reg);
+      let passes = 1;
+      let events = r.events;
+      for (const u of r.users) users.add(u);
+      while (r.backlog > r.signatures) {
+        r = await indexer.syncRegistry(reg);
+        passes++;
+        events += r.events;
+        for (const u of r.users) users.add(u);
+        if (r.signatures === 0) break; // nothing folded: no progress is possible, stop rather than spin
+      }
+      console.log(`[lp-backfill] ${reg.registry} market=${reg.market} passes=${passes} events=${events} users=${users.size} reconciled=${r.reconciled} skipped=${r.reconcileSkipped}`);
+      for (const u of users) {
         const p = await store.loadPosition(CURRENT_NETWORK, reg.registry, u);
         if (p) touched.push(p);
       }
