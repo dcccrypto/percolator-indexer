@@ -18,7 +18,9 @@ vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the TradeIndexer now reaches the v2.2 log-event decoder, which reads the real SDK tag tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
     TradeNoCpi: 10,
@@ -42,6 +44,15 @@ vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn(async (
 // #221: the fill-price reader. Default null = "not a readable v18 slot", which keeps
 // every existing test on its legacy mark path; the #221 tests below set a price.
 vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: vi.fn(() => null) }));
+
+// getMarkets moved to the narrow, paged src/db/marketRows.ts (#230); route it to the shared stub
+// below so these cases keep driving the DB rows through `shared.getMarkets` (and bypass the 60 s
+// cache, which would otherwise carry rows from one case into the next).
+vi.mock('../../src/db/marketRows.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  const read = () => (shared as unknown as { getMarkets: () => Promise<unknown[]> }).getMarkets();
+  return { getMarketRows: vi.fn(read), getMarketRowsCached: vi.fn(read) };
+});
 
 vi.mock('@percolatorct/shared', () => ({
   config: {

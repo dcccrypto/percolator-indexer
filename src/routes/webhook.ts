@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
-import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
+import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
+import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
+import { decodeV22Events, rawInstructionsFromEnhancedTx } from "../parsers/v22Events.js";
+import { insertV22Events } from "../db/insertV22Events.js";
+import { recordV22LogEvents } from "../services/v22LogEvents.js";
+import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
@@ -550,6 +555,43 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
     logger.debug("Skipped fills on blocked slabs", { count: blockedFills });
   }
 
+  // v2.2 activity events. Best effort, isolated from the trade path: decode/insert problems are logged inside
+  // insertV22Events and never change this delivery's response (Helius would redeliver a 5xx, duplicating fill work).
+  try {
+    const v22Rows = [];
+    for (const tx of transactions) {
+      if (!tx.signature || tx.transactionError != null) continue;
+      const rows = decodeV22Events(rawInstructionsFromEnhancedTx(tx, PROGRAM_IDS), {
+        signature: tx.signature,
+        slot: typeof (tx as { slot?: unknown }).slot === "number" ? (tx as { slot: number }).slot : null,
+        blockTimeSec: typeof (tx as { timestamp?: unknown }).timestamp === "number" ? (tx as { timestamp: number }).timestamp : null,
+      });
+      for (const r of rows) {
+        if (r.slab_address && isBlockedSlab(r.slab_address)) continue;
+        if (r.slab_address && discovery && !discovery.getMarkets().has(r.slab_address)) continue;
+        v22Rows.push(r);
+      }
+    }
+    if (v22Rows.length > 0) await insertV22Events(v22Rows);
+    // v2.2 wrapper LOG events: only when the delivery carries the logs (the enhanced payload normally does not; then nothing is
+    // attempted and nothing is claimed: the stream and poll paths read them from the transaction meta).
+    for (const tx of transactions) {
+      if (!tx.signature || !Array.isArray(tx.logMessages)) continue;
+      await recordV22LogEvents({
+        signature: tx.signature,
+        err: tx.transactionError ?? null,
+        logMessages: tx.logMessages,
+        wrapperInstructions: rawInstructionsFromEnhancedTx(tx, PROGRAM_IDS),
+        wrapperIds: PROGRAM_IDS,
+        slot: typeof (tx as { slot?: unknown }).slot === "number" ? (tx as { slot: number }).slot : null,
+        blockTimeSec: typeof (tx as { timestamp?: unknown }).timestamp === "number" ? (tx as { timestamp: number }).timestamp : null,
+        isKnownMarket: (slab) => !discovery || discovery.getMarkets().has(slab),
+      });
+    }
+  } catch (err) {
+    logger.warn("v22 event extraction failed (trades unaffected)", { error: err instanceof Error ? err.message : String(err) });
+  }
+
   await flush();
 
   if (indexed > 0) {
@@ -668,8 +710,10 @@ async function extractTradesFromEnhancedTx(
     if (!PROGRAM_IDS.has(programId)) continue;
 
     // Decode instruction data (base58)
-    const data = ix.data ? decodeBase58(ix.data) : null;
-    if (!data || data.length < 2) continue;
+    const rawData = ix.data ? decodeBase58(ix.data) : null;
+    if (!rawData || rawData.length < 2) continue;
+    // v2.2 EvictAndTradeCpi (119) = TradeCpi behind one prepended victim account: normalise so its fill is indexed.
+    const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts ?? []);
 
     const tag = data[0];
     // Liquidation marker (crank tag 5, action 1) — not a TRADE_TAG, handle before the skip.
@@ -805,7 +849,7 @@ async function extractTradesFromEnhancedTx(
     //     [0]=signer_a, [1]=signer_b, [2]=market (writable), [3]=account_a, [4]=account_b
     //   TradeCpi (tag 10) / BatchTradeCpi (tag 67):
     //     [0]=signer_a, [1]=market (writable), [2]=account_a (taker portfolio), [3]=account_b (LP), ...
-    const accounts: string[] = ix.accounts ?? [];
+    const accounts: string[] = ixAccounts;
     const trader = accounts[0] ?? "";
     const isNoCpi = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
     const marketIdx = isNoCpi ? 2 : 1;
@@ -1043,23 +1087,23 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string, asset
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number): number {
-  // #221: on a v18 market the asset's effective_price is the price the engine books a fill at; the
-  // mark EWMA below is skewed by the trade itself and stays only for non-v18 layouts / unreadable slots.
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
+  // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
+  // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
   if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
 
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
-  if (isV17Account(raw)) {
+  if (hasWrapperMagic(raw)) {
     try {
-      const cfg = parseWrapperConfigV17(raw, V17_HEADER_LEN);
-      const markEwmaE6 = cfg.markEwmaE6;
+      const markEwmaE6 = readMarkEwmaE6(raw, "webhook.parseMarkPriceE6FromAccountBytes");
       if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
         return Number(markEwmaE6) / 1_000_000;
       }
-    } catch {
-      // parseWrapperConfigV17 failed — fall through (returns 0 below)
+    } catch (err) {
+      // Unknown VERSION is loud (per market); any other failure returns 0 below.
+      reportUnknownLayout(account, err, "webhook.parseMarkPriceE6FromAccountBytes");
     }
     return 0;
   }
@@ -1118,7 +1162,7 @@ function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: stri
     }
     if (!raw) continue;
 
-    const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex);
+    const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex, slabAddress);
     if (price > 0) return price;
   }
   return 0;
@@ -1138,7 +1182,7 @@ async function readFreshMarkPriceE6(slabAddress: string, assetIndex: number): Pr
       { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
     );
     if (!info?.data) return 0;
-    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), assetIndex);
+    return parseMarkPriceE6FromAccountBytes(new Uint8Array(info.data), assetIndex, slabAddress);
   } catch (err) {
     logger.warn("Failed to read fresh mark price from slab", {
       slabAddress: slabAddress.slice(0, 8),
