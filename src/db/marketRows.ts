@@ -24,7 +24,7 @@ let inFlight: Promise<MarketRowLite[]> | null = null;
 
 /**
  * Every `markets` row for this network, ALL statuses (registration must see closed
- * rows too, or it re-registers them), paged with `.range()` so the list is never
+ * rows too, or it re-registers them), keyset-paged on slab_address so the list is never
  * silently truncated at 1000 rows. Concurrent callers share one read.
  */
 export function getMarketRows(): Promise<MarketRowLite[]> {
@@ -54,17 +54,28 @@ export function resetMarketRowsCache(): void {
 }
 
 async function readAll(): Promise<MarketRowLite[]> {
+  // Keyset paging on `slab_address` (UNIQUE in `markets`), not offset paging: with .range(),
+  // a row inserted or deleted below the cursor between two page reads shifts every later row
+  // by one, so a market at the page boundary is read twice or skipped. A skipped row would be
+  // re-registered (harmless, 23505) but also missed by the retired blocklist and the poller
+  // for that cycle. `slab_address > last` is immune to writes elsewhere in the table.
   const out: MarketRowLite[] = [];
-  for (let from = 0; ; from += MARKET_ROWS_PAGE) {
-    const { data, error } = await getSupabase()
+  let after: string | null = null;
+  for (;;) {
+    let q = getSupabase()
       .from("markets")
       .select(COLUMNS)
-      .eq("network", getNetwork())
+      .eq("network", getNetwork());
+    if (after !== null) q = q.gt("slab_address", after);
+    const { data, error } = await q
       .order("slab_address", { ascending: true })
-      .range(from, from + MARKET_ROWS_PAGE - 1);
+      .limit(MARKET_ROWS_PAGE);
     if (error) throw error;
     const rows = (data ?? []) as MarketRowLite[];
     out.push(...rows);
+    // A short page is the last one. (Assumes the project's PostgREST max_rows >= MARKET_ROWS_PAGE;
+    // Supabase's default is 1000. A lower cap would end the read after its first page.)
     if (rows.length < MARKET_ROWS_PAGE) return out;
+    after = rows[rows.length - 1].slab_address;
   }
 }
