@@ -4,22 +4,39 @@ const logger = createLogger("indexer:webhook-manager");
 
 /**
  * Helius migrated from api.helius.dev to api-{network}.helius-rpc.com.
- * We build the URL dynamically based on the RPC URL (devnet vs mainnet).
  *
  * Note: Helius webhook management API requires the API key as a query
  * parameter (`?api-key=`). We cannot move it to an Authorization header.
  * To prevent the key from leaking into logs, Sentry breadcrumbs, or
  * error stack traces, use `redactedHeliusUrl()` for all logging.
  */
+/**
+ * Webhooks are an ACCOUNT-level Helius resource, not a per-network one: devnet vs
+ * mainnet delivery is chosen by the body's `webhookType` (`enhancedDevnet` / `enhanced`),
+ * not by the host. `api-devnet.helius-rpc.com/v0/webhooks` answers 404 for accounts
+ * created after the 2026-10-17 key rotation, while `api-mainnet.helius-rpc.com` serves
+ * the same account's devnet webhooks. Default to the mainnet host for both networks and
+ * allow an explicit override via HELIUS_WEBHOOK_API_BASE (e.g. https://api.helius.xyz).
+ */
+export const DEFAULT_HELIUS_WEBHOOK_API_BASE = "https://api-mainnet.helius-rpc.com";
+
+export function resolveWebhookApiBase(override: string | undefined = process.env.HELIUS_WEBHOOK_API_BASE): string {
+  const trimmed = (override ?? "").trim().replace(/\/+$/, "");
+  if (!trimmed) return DEFAULT_HELIUS_WEBHOOK_API_BASE;
+  if (!/^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(trimmed)) {
+    throw new Error("HELIUS_WEBHOOK_API_BASE must be an https origin without a path");
+  }
+  return trimmed;
+}
+
 function getHeliusWebhooksUrl(webhookId?: string): string {
-  const isDevnet = config.rpcUrl.includes("devnet");
-  const host = isDevnet ? "api-devnet.helius-rpc.com" : "api-mainnet.helius-rpc.com";
+  const base = resolveWebhookApiBase();
   // #177: the webhookId must go in the PATH, before the query string. The old
   // `${getHeliusWebhooksUrl()}/${webhookId}` produced `.../v0/webhooks?api-key=KEY/<id>`
   // (id after the query) so PUT/DELETE never hit the right resource and corrupted the
   // api-key — a prime suspect for webhook updates silently failing (→ trades not indexed).
   const path = webhookId ? `/v0/webhooks/${encodeURIComponent(webhookId)}` : "/v0/webhooks";
-  return `https://${host}${path}?api-key=${encodeURIComponent(config.heliusApiKey)}`;
+  return `${base}${path}?api-key=${encodeURIComponent(config.heliusApiKey)}`;
 }
 
 /** Return the Helius URL with the API key redacted for safe logging. */
