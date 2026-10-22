@@ -40,13 +40,26 @@ export interface LpVaultIndexerOptions {
   pollIntervalMs?: number;
   discoveryIntervalMs?: number;
   reconcileIntervalMs?: number;
-  /** Upper bound on history read for one vault in one sync (backfill safety valve). */
+  /**
+   * GH#231 — how many transactions are FOLDED in one sync. Enumerating signatures costs one
+   * RPC per 1000; it is the per-signature `getTransaction` that is expensive, so this is the
+   * bound that matters. A larger backlog drains over several polls rather than being refused.
+   */
   maxSignaturesPerSync?: number;
+  /**
+   * GH#231 — hard stop on *enumeration*, so a vault whose cursor is lost and whose history is
+   * enormous cannot page forever in one tick. Reaching it still throws, but with the durable
+   * cursor it is not reachable by ordinary traffic or by cheap spam.
+   */
+  maxBacklogSignatures?: number;
 }
 
 export interface SyncResult {
   registry: string;
+  /** Transactions folded in THIS sync (<= maxSignaturesPerSync). */
   signatures: number;
+  /** Transactions outstanding when this sync started; > `signatures` means it is still draining. */
+  backlog: number;
   events: number;
   users: string[];
   reconciled: number;
@@ -58,6 +71,8 @@ const PAGE = 1000;
 export class LpVaultIndexer {
   private readonly registries = new Map<string, RegistryInfo>();
   private readonly cursors = new Map<string, string>();
+  /** Registries whose durable cursor has already been looked up this process (#231). */
+  private readonly cursorLoaded = new Set<string>();
   private readonly wrapperIds: ReadonlySet<string>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -106,7 +121,14 @@ export class LpVaultIndexer {
       const fullReconcile = Date.now() - this.lastFullReconcile > (this.opts.reconcileIntervalMs ?? 600_000);
       for (const reg of this.registries.values()) {
         try {
-          await this.syncRegistry(reg);
+          const r = await this.syncRegistry(reg);
+          if (r.backlog > r.signatures) {
+            // #231: a backlog this pass could not finish. It drains over the next polls; log it
+            // so "this vault's Earn data is behind" is visible without reading the database.
+            logger.warn("LP-vault sync is draining a backlog", {
+              registry: reg.registry, folded: r.signatures, backlog: r.backlog,
+            });
+          }
           if (fullReconcile) await this.reconcileOpenPositions(reg);
         } catch (err) {
           logger.error("LP-vault sync failed", { registry: reg.registry, error: err instanceof Error ? err.message : String(err) });
@@ -133,32 +155,46 @@ export class LpVaultIndexer {
    */
   async syncRegistry(reg: RegistryInfo): Promise<SyncResult> {
     const { chain, store, network } = this.opts;
-    const cap = this.opts.maxSignaturesPerSync ?? 20_000;
-    const until = this.cursors.get(reg.registry);
+    const perSync = this.opts.maxSignaturesPerSync ?? 2_000;
+    const hardCap = this.opts.maxBacklogSignatures ?? 500_000;
+    const until = await this.cursorFor(reg.registry);
 
     const sigs: { signature: string; slot: number; failed: boolean }[] = [];
     let before: string | undefined;
     for (;;) {
       const page = await chain.getSignatures(reg.registry, { until, before, limit: PAGE });
       sigs.push(...page);
-      if (page.length < PAGE || sigs.length >= cap) break;
+      if (page.length < PAGE) break;
+      if (sigs.length >= hardCap) {
+        throw new Error(`LP-vault ${reg.registry}: backlog exceeds ${hardCap} signatures; raise maxBacklogSignatures`);
+      }
       before = page[page.length - 1]!.signature;
     }
-    if (sigs.length >= cap) {
-      // Folding a partial history would produce a wrong basis, and processing
-      // only the newest `cap` would never reach the rest. Fail loudly instead.
-      throw new Error(`LP-vault ${reg.registry}: > ${cap} unread signatures; raise maxSignaturesPerSync`);
-    }
 
-    const result: SyncResult = { registry: reg.registry, signatures: sigs.length, events: 0, users: [], reconciled: 0, reconcileSkipped: 0 };
+    const result: SyncResult = { registry: reg.registry, signatures: 0, backlog: sigs.length, events: 0, users: [], reconciled: 0, reconcileSkipped: 0 };
     if (sigs.length === 0) return result;
 
-    const newest = sigs[0]!.signature;
+    // #231: oldest first, and at most `perSync` of them, so a large backlog DRAINS over
+    // several polls instead of wedging the vault forever.
+    //
+    // A prefix of history folds to a correct basis -- just one that is temporarily behind --
+    // because `recomputePosition` always re-folds a user's whole stored history, and the
+    // cursor commits after each pass, so the next pass picks up exactly where this one
+    // stopped. Folding the NEWEST slice instead would produce a wrong basis AND never reach
+    // the rest, which is why this used to refuse outright rather than truncate.
+    const window = [...sigs].reverse().slice(0, perSync);
+    // While draining, the chain head is ahead of what has been folded, so on-chain shares
+    // include events this pass has not seen. Reconciling against them would read as a
+    // transfer and wrongly clear `basis_known`; defer it to the pass that catches up.
+    const draining = window.length < sigs.length;
+    const newest = window[window.length - 1]!.signature;
+    const newestSlot = window[window.length - 1]!.slot;
+    result.signatures = window.length;
     const touched = new Set<string>();
     const skippedTxs: SkippedSignature[] = [];
     let readOk = 0;
     // Oldest first, so a partially failed batch never leaves a gap behind the cursor.
-    for (const s of [...sigs].reverse()) {
+    for (const s of window) {
       if (s.failed) continue;
       let tx;
       try {
@@ -203,22 +239,49 @@ export class LpVaultIndexer {
         signatures: skippedTxs.map((t) => t.signature),
       });
       const open = await store.listOpenPositions(network, reg.registry);
-      const rec = await this.reconcileUsers(reg, open.map((p) => p.user_wallet), newest);
+      const rec = await this.reconcileUsers(reg, open.map((p) => p.user_wallet), newest, draining);
       result.reconciled += rec.reconciled;
       result.reconcileSkipped += rec.skipped;
     }
 
-    const rec = await this.reconcileUsers(reg, result.users, newest);
+    const rec = await this.reconcileUsers(reg, result.users, newest, draining);
     result.reconciled += rec.reconciled;
     result.reconcileSkipped += rec.skipped;
     // Only after the skipped signatures are recorded durably AND the reconcile ran does the cursor move past them.
-    this.cursors.set(reg.registry, newest);
+    await this.commitCursor(reg.registry, newest, newestSlot);
     return result;
+  }
+
+  /**
+   * #231: the in-memory cursor, seeded once per process from the durable one so a restart
+   * does not re-page the vault's whole history.
+   *
+   * If the stored signature is one the RPC no longer returns (pruned history), `until` is
+   * simply not found and the enumeration behaves as though it were absent -- the same
+   * position as before this change, and now drained in chunks rather than refused.
+   */
+  private async cursorFor(registry: string): Promise<string | undefined> {
+    const mem = this.cursors.get(registry);
+    if (mem) return mem;
+    // Ask the store once per registry per process: a vault with no stored cursor is the
+    // normal case for a new vault and must not cost a query every poll.
+    if (this.cursorLoaded.has(registry)) return undefined;
+    this.cursorLoaded.add(registry);
+    const stored = await this.opts.store.loadCursor(this.opts.network, registry);
+    if (stored) this.cursors.set(registry, stored);
+    return stored ?? undefined;
+  }
+
+  /** Advance both cursors. The durable write is best-effort (see LpVaultStore.saveCursor). */
+  private async commitCursor(registry: string, signature: string, slot: number): Promise<void> {
+    this.cursors.set(registry, signature);
+    this.cursorLoaded.add(registry);
+    await this.opts.store.saveCursor(this.opts.network, registry, signature, slot);
   }
 
   /** Reconcile every position in the vault that holds shares (indexed or on-chain). */
   async reconcileOpenPositions(reg: RegistryInfo): Promise<{ reconciled: number; skipped: number }> {
-    const expected = this.cursors.get(reg.registry);
+    const expected = await this.cursorFor(reg.registry);
     if (!expected) return { reconciled: 0, skipped: 0 };
     const open = await this.opts.store.listOpenPositions(this.opts.network, reg.registry);
     return this.reconcileUsers(reg, open.map((p) => p.user_wallet), expected);
@@ -228,9 +291,13 @@ export class LpVaultIndexer {
     reg: RegistryInfo,
     users: readonly string[],
     expectedNewest: string,
+    draining = false,
   ): Promise<{ reconciled: number; skipped: number }> {
     let reconciled = 0;
     let skipped = 0;
+    // #231: mid-drain the chain is knowingly ahead of the fold, so every user would be
+    // skipped by the check below anyway. Skip them without spending two RPCs each.
+    if (draining) return { reconciled: 0, skipped: users.length };
     for (const user of users) {
       const claim = await this.opts.chain.getClaim(user, reg.lpMint, reg.registry, reg.programId);
       const [latest] = await this.opts.chain.getSignatures(reg.registry, { limit: 1 });

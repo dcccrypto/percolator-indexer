@@ -54,7 +54,7 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     const f = classic("partial");
     getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(f.ctxReturnHex) });
     const rows = await deliver(enhanced[f.sig]);
-    expect(rows.filter((r) => !r.is_liquidation)).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short", tx_signature: f.sig, leg_index: 0 })]);
+    expect(rows.filter((r) => !r.is_liquidation)).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short", tx_signature: f.sig, leg_index: 0, size_provenance: "matcher_exact" })]);
     expect(getAccountInfo).toHaveBeenCalledTimes(1); // the matcher context, never the slab
     expect(getAccountInfo.mock.calls[0][0].toBase58()).toBe(f.ctx);
   });
@@ -71,7 +71,7 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     const f = classic("issue213Partial");
     getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(classic("full").ctxReturnHex) });
     const rows = await deliver(enhanced[f.sig]);
-    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, side: "long", leg_index: 0 })]);
+    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, side: "long", leg_index: 0, size_provenance: "matcher_request_upper_bound" })]);
     expect(recordSkipped).not.toHaveBeenCalled();
   });
 

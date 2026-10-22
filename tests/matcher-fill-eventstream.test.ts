@@ -32,7 +32,7 @@ describe("event stream: TradeCpi rows", () => {
     const f = fx("partial");
     const get = vi.fn(async () => ({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") }));
     const rows = await run(f, get);
-    expect(rows).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short" })]);
+    expect(rows).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short", size_provenance: "matcher_exact" })]);
     expect(get).toHaveBeenCalledTimes(1);
   });
 
@@ -46,7 +46,7 @@ describe("event stream: TradeCpi rows", () => {
     const f = fx("issue213Partial");
     const other = fx("full");
     const rows = await run(f, vi.fn(async () => ({ data: Buffer.from(other.ctxReturnHex.padEnd(640, "0"), "hex") })));
-    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511 })]);
+    expect(rows).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, size_provenance: "matcher_request_upper_bound" })]);
     expect(recordSkipped).not.toHaveBeenCalled();
   });
 

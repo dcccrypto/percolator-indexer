@@ -1,11 +1,14 @@
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
-import { insertTradeRows, tradeKey, type IndexerTradeRow } from "../db/insertTradeRow.js";
+import { insertTradeRows, tradeKey, type IndexerTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
+import { insertV22Events } from "../db/insertV22Events.js";
+import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -114,6 +117,31 @@ export class EventStreamService {
     // REDUCTION (2026-07-26): oracle_prices is no longer indexed — the frontend reads
     // price live from chain. UpdateHyperpMark txs no longer trigger a DB write here.
 
+    // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
+    // a failure here must never cost the tx's fills below.
+    try {
+      const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
+      const events = decodeV22Events(wrapperIxs, {
+        signature,
+        slot: typeof tx.slot === "number" ? tx.slot : null,
+        blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
+      }).filter((e) => !e.slab_address || (this.slabSet.has(e.slab_address) && !isBlockedSlab(e.slab_address)));
+      if (events.length > 0) await insertV22Events(events);
+      // v2.2 wrapper LOG events (fills / reductions / moves), strict frame attribution; separate write, VERSION-keyed.
+      await recordV22LogEvents({
+        signature,
+        err: tx.meta?.err ?? null,
+        logMessages: tx.meta?.logMessages,
+        wrapperInstructions: wrapperIxs,
+        wrapperIds: new Set([this.deps.programId]),
+        slot: typeof tx.slot === "number" ? tx.slot : null,
+        blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
+        isKnownMarket: (slab) => this.slabSet.has(slab),
+      });
+    } catch (err) {
+      log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
+    }
+
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
 
     // Collect this tx's rows and write them in one round-trip at the end, instead
@@ -149,6 +177,7 @@ export class EventStreamService {
 
       let priceE6Value = fill.priceE6 ?? 0;
       let sizeAbs = fill.sizeAbs;
+      let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
       if (fill.cpi) {
         // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
         const r = await resolveCpiLeg({
@@ -162,6 +191,7 @@ export class EventStreamService {
           continue; // zero fill / strict skip: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           sizeAbs = r.sizeValue;
           priceE6Value = Number(r.priceE6);
           if (!r.exact) log.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { sig: signature });
@@ -202,6 +232,7 @@ export class EventStreamService {
         trader: fill.trader,
         side: fill.side,
         size: sizeAbs.toString(),
+        size_provenance: sizeProvenance,
         price,
         fee: 0,
         tx_signature: signature,

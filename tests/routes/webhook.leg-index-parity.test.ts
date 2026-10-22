@@ -29,7 +29,9 @@ const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3
 
 // The mock DOES expose PermissionlessCrank so the crank instruction is recognised
 // as a crank (and correctly yields no row) rather than an unknown tag.
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   IX_TAG: {
     TradeNoCpi: 10,
     TradeCpi: 11,

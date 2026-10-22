@@ -1,39 +1,14 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import {
-  parseEngine,
-  detectSlabLayout,
-  isV17Account,
-  isV17MarketAccount,
-  parseWrapperConfigV17,
-  V17_HEADER_LEN,
-  V17_MARKET_GROUP_OFF,
-  V17_MARKET_GROUP_LEN,
-  V17_MARKET_ASSET_SLOT_LEN,
-  V17_ASSET_ORACLE_WRAPPER_LEN,
-} from "@percolatorct/sdk";
+import { parseEngine, detectSlabLayout, resolveMarketGeometry } from "@percolatorct/sdk";
+import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { createLogger, withRetry } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:mark-price");
 
 /**
- * Offset of `effective_price` inside the engine's `AssetStateV16Account`:
- * market_id[8] + retired_slot[8] + lifecycle[1] + raw_oracle_target_price[8] = 25.
- * Same value SDK >= 8 uses in `readAssetPricesP3` (`ASSET_STATE_EFFECTIVE_PRICE_OFF_P3`).
- */
-export const ASSET_STATE_EFFECTIVE_PRICE_REL = 25;
-
-/**
- * Account layout version this reader's offsets are valid for (u16 at byte 8 of the account header:
- * "PERCV16\0" magic, then 18 for the v18 wrapper). The SDK calls this family "v17" but
- * `V17_EXPECTED_VERSION` is 18; checked explicitly here so a different layout version can never be
- * read at the v18 offset and return an in-range garbage price.
- */
-export const V18_ACCOUNT_VERSION = 18;
-
-/**
  * #221: the price the engine books a fill at — `asset[assetIndex].effective_price`
- * (raw e6) — read from a v18 market account's bytes, or `null` when the account is
- * not a v18 market, the slot is out of range, or the value is zero/out of range.
+ * (raw e6) — read from a wrapper market account's bytes, or `null` when the account is
+ * not a market of a VERSION the SDK knows (v2.1 = 18, v2.2 = 19), the slot is out of range, or the value is zero/out of range.
  *
  * Every fill settles at this price ("the position enters/settles at the asset mark
  * (effective_price), NOT at the caller-supplied exec_price" — percolator-prog
@@ -41,24 +16,23 @@ export const V18_ACCOUNT_VERSION = 18;
  * profile's `mark_ewma_e6` toward the matcher's quote. So unlike the mark EWMA,
  * the post-trade value of this field IS the fill's price.
  *
- * Slot layout (SDK 6.0.0 constants, verified on a live v18 market): slots start at
- * V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN, each V17_MARKET_ASSET_SLOT_LEN long,
- * with the engine's AssetStateV16Account after the V17_ASSET_ORACLE_WRAPPER_LEN wrapper.
+ * Slot layout comes from the SDK's per-VERSION table (`resolveMarketGeometry`): the engine's
+ * AssetStateV16Account sits `wrapperSlotLen` into each slot and `effective_price` is `assetState.effectivePrice`
+ * (25) into it, for v2.1 (VERSION 18) and v2.2 (VERSION 19) alike.
  */
 export function readAssetEffectivePriceE6(data: Uint8Array, assetIndex: number): number | null {
   if (!Number.isInteger(assetIndex) || assetIndex < 0) return null;
+  // VERSION-keyed: the slot stride and the asset-state offset come from the SDK layout table for the account's
+  // VERSION (v2.1 = 18, v2.2 = 19), never from a literal. A VERSION the SDK does not know (or a non-wrapper
+  // account) yields null so the caller falls back to its other price source instead of reading garbage.
+  let off: number;
   try {
-    if (!isV17MarketAccount(data)) return null;
-    if (new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(8, true) !== V18_ACCOUNT_VERSION) return null;
+    const g = resolveMarketGeometry(data, { parser: "readAssetEffectivePriceE6", strictLength: false });
+    if (assetIndex >= g.slotCount) return null;
+    off = g.engineOff(assetIndex) + g.layout.assetState.effectivePrice;
   } catch {
     return null;
   }
-  const off =
-    V17_MARKET_GROUP_OFF +
-    V17_MARKET_GROUP_LEN +
-    assetIndex * V17_MARKET_ASSET_SLOT_LEN +
-    V17_ASSET_ORACLE_WRAPPER_LEN +
-    ASSET_STATE_EFFECTIVE_PRICE_REL;
   if (off + 8 > data.length) return null;
   const v = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(off, true);
   if (v <= 0n || v >= 1_000_000_000_000n) return null;
@@ -108,15 +82,15 @@ export async function readMarkPriceE6(
 
     // Desync fix 9: v17 account — detectSlabLayout returns null for v17 account sizes
     // (no v17 tier registered). Use parseWrapperConfigV17 to read mark_ewma_e6 directly.
-    if (isV17Account(data)) {
+    if (hasWrapperMagic(data)) {
       try {
-        const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
-        const markEwmaE6 = cfg.markEwmaE6;
+        const markEwmaE6 = readMarkEwmaE6(data, "readMarkPriceE6");
         if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
           return Number(markEwmaE6);
         }
-      } catch {
-        // parseWrapperConfigV17 failed — return null
+      } catch (err) {
+        // Unknown VERSION is loud (per market); any other parse failure — return null
+        reportUnknownLayout(slabAddress, err, "readMarkPriceE6");
       }
       return null;
     }

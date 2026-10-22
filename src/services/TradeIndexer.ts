@@ -1,10 +1,15 @@
 import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
-import { IX_TAG, detectSlabLayout, isV17Account, parseWrapperConfigV17, V17_HEADER_LEN } from "@percolatorct/sdk";
-import { config, getConnection, getMarkets, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
+import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
+import { config, getConnection, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
+import { getMarketRowsCached, type MarketRowLite } from "../db/marketRows.js";
+import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { isBlockedSlab } from "../blocklist.js";
-import { insertTradeRow } from "../db/insertTradeRow.js";
+import { insertTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
+import { recordV22LogEvents } from "./v22LogEvents.js";
+import { rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import {
   parsePercolatorLiquidations,
   decodeV18SingleFill,
@@ -144,8 +149,8 @@ export class TradeIndexerPolling {
    * Markets worth polling as a webhook backstop: not blocklisted, not flagged indexer_excluded
    * (permanently corrupt slabs the stats sweep already skips). Webhook delivery is unaffected.
    */
-  private async pollTargets(): Promise<Awaited<ReturnType<typeof getMarkets>>> {
-    const markets = await getMarkets();
+  private async pollTargets(): Promise<MarketRowLite[]> {
+    const markets = await getMarketRowsCached();
     return markets.filter((m) => m.indexer_excluded !== true && !isBlockedSlab(m.slab_address));
   }
 
@@ -400,6 +405,23 @@ export class TradeIndexerPolling {
   ): Promise<boolean> {
     if (!tx.meta || tx.meta.err) return false;
 
+    // v2.2 wrapper LOG events of this slab (fills / reductions / moves; strict frame attribution; VERSION-keyed). Best effort and
+    // isolated: it never throws and never touches the trade path below.
+    try {
+      await recordV22LogEvents({
+        signature,
+        err: tx.meta.err,
+        logMessages: tx.meta.logMessages,
+        wrapperInstructions: rawInstructionsFromParsedTx(tx as Parameters<typeof rawInstructionsFromParsedTx>[0], Array.from(programIds)),
+        wrapperIds: programIds,
+        slot: tx.slot,
+        blockTimeSec: tx.blockTime ?? null,
+        isKnownMarket: (slab) => slab === slabAddress,
+      });
+    } catch (err) {
+      logger.warn("v22 log events skipped for a transaction (trades unaffected)", { signature: signature.slice(0, 12), err: String(err) });
+    }
+
     const message = tx.transaction.message;
 
     // Liquidation markers (crank action=1) for the slab being polled. No size/price/side;
@@ -454,8 +476,9 @@ export class TradeIndexerPolling {
         const d = decodeBase58(ix.data);
         if (!d || d.length < 1) continue;
         if (isRebalanceReduceTag(d[0])) { if (decodeRebalanceReduce(d)) reduceLegs.add(seq++); continue; }
-        if (!TRADE_TAGS.has(d[0])) continue;
-        seq += (d[0] === IX_TAG.BatchTradeNoCpi || d[0] === IX_TAG.BatchTradeCpi) ? decodeV18BatchLegs(d[0], d).length : decodeV18SingleFill(d[0], d) ? 1 : 0;
+        const { data: dd } = unwrapEvictAndTradeIx(d, ix.accounts); // v2.2 tag 119 holds a TradeCpi's slot in the numbering
+        if (!TRADE_TAGS.has(dd[0])) continue;
+        seq += (dd[0] === IX_TAG.BatchTradeNoCpi || dd[0] === IX_TAG.BatchTradeCpi) ? decodeV18BatchLegs(dd[0], dd).length : decodeV18SingleFill(dd[0], dd) ? 1 : 0;
       }
     }
     // Occurrence rank of identical fills in this tx (a split order is identical legs).
@@ -524,8 +547,11 @@ export class TradeIndexerPolling {
       if (!programIds.has(programId)) continue;
 
       // Decode instruction tag from data
-      const data = decodeBase58(ix.data);
-      if (!data || data.length < 1) continue;
+      const rawData = decodeBase58(ix.data);
+      if (!rawData || rawData.length < 1) continue;
+      // v2.2 EvictAndTradeCpi (119) = TradeCpi behind one prepended victim account. Normalise it to the TradeCpi it
+      // wraps so it takes the SAME per-tx leg number (fillSeq) and per-leg dedup as every other fill, on every path.
+      const { data, accounts: ixAccounts } = unwrapEvictAndTradeIx(rawData, ix.accounts);
 
       const tag = data[0];
 
@@ -597,7 +623,7 @@ export class TradeIndexerPolling {
       // fills under the wrong slab.
       const isNoCpiTag = (tag === IX_TAG.TradeNoCpi || tag === IX_TAG.BatchTradeNoCpi);
       const marketAccountIdx = isNoCpiTag ? 2 : 1;
-      const ixMarket = ix.accounts[marketAccountIdx]?.toBase58();
+      const ixMarket = ixAccounts[marketAccountIdx]?.toBase58();
       if (ixMarket && ixMarket !== slabAddress) {
         // Not ours to write, but the other paths still number these fills.
         fillSeq += isBatch ? decodeV18BatchLegs(tag, data).length : decodeV18SingleFill(tag, data) ? 1 : 0;
@@ -608,7 +634,7 @@ export class TradeIndexerPolling {
         const legs = decodeV18BatchLegs(tag, data);
         if (legs.length === 0) continue;
 
-        const traderKey = ix.accounts[0];
+        const traderKey = ixAccounts[0];
         if (!traderKey) continue;
         const trader = traderKey.toBase58();
 
@@ -618,14 +644,15 @@ export class TradeIndexerPolling {
 
         // H2/H3: each leg is deduped per-leg by 23505 (see above), never per tx.
 
-        // #205: fall back to the slab read only when the leg itself doesn't carry
-        // a wire exec_price (BatchTradeCpi legs never do — see decodeV18BatchLegs).
-        const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> =>
-          leg.execPriceE6 !== undefined ? Number(leg.execPriceE6) / 1_000_000 : resolveFallbackPrice(leg.assetIndex);
+        // S3 audit 2026-10-17: a BatchTradeNoCpi leg's wire exec_price is caller-chosen and NOT the
+        // booked price (the wrapper books every fill at the asset's effective_price, F-TRADENOCPI-FEE;
+        // its own fill event marks exec_price `quoted_price_e6`, untrusted). Price every leg from the
+        // asset's effective_price instead, like the CPI and event-stream paths.
+        const resolvePrice = async (leg: (typeof legs)[number]): Promise<number> => resolveFallbackPrice(leg.assetIndex);
 
         const i128Max = (1n << 127n) - 1n;
 
-        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, true) : null;
+        const batchCpi = tag === IX_TAG.BatchTradeCpi ? cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, true, ixAccounts) : null;
 
         for (const leg of legs) {
           // Consume the leg number BEFORE any skip so later legs keep the tx-wide numbering.
@@ -641,6 +668,7 @@ export class TradeIndexerPolling {
             if (fillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, size: leg.sizeValue.toString(), ordinal }, reduceLegs)) continue;
           }
           let legSize = leg.sizeValue;
+          let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
           let price: number | undefined;
           if (batchCpi) {
             // All-or-nothing per transaction: once one leg needs a retry, write none of its later
@@ -654,6 +682,7 @@ export class TradeIndexerPolling {
             }
             if (r.kind === "fill") {
               legSize = r.sizeValue;
+              sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
               price = Number(r.priceE6) / 1_000_000;
               if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
             } // "legacy": wire size + the existing price logic, exactly as before this parser
@@ -666,6 +695,7 @@ export class TradeIndexerPolling {
             trader,
             side: leg.side,
             size: legSize.toString(),
+            size_provenance: sizeProvenance,
             price,
             fee,
             tx_signature: signature,
@@ -684,11 +714,12 @@ export class TradeIndexerPolling {
       const decoded = decodeV18SingleFill(tag, data);
       if (!decoded) continue;
       let { sizeValue } = decoded;
+      let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
       const { side } = decoded;
       const legIndex = fillSeq++;
 
       // Determine trader from account keys
-      const traderKey = ix.accounts[0];
+      const traderKey = ixAccounts[0];
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
       touched.add(`${trader}|${slabAddress}|${decoded.assetIndex}`);
@@ -701,17 +732,15 @@ export class TradeIndexerPolling {
         }
       }
 
-      // #205: TradeNoCpi carries the actual fill price on the wire (exec_price) —
-      // authoritative and RPC-free. TradeCpi doesn't (only limit_price, the
-      // requested cap), so it still falls back to the slab read.
+      // S3 audit 2026-10-17: TradeNoCpi's wire exec_price is chosen by the two signers and is NOT the
+      // booked price (the wrapper books at the asset's effective_price, F-TRADENOCPI-FEE). It is never
+      // used as the trade price: NoCpi falls through to the effective_price read below.
       let price: number | undefined;
-      if (decoded.execPriceE6 !== undefined) {
-        price = Number(decoded.execPriceE6) / 1_000_000;
-      } else if (tag === IX_TAG.TradeCpi) {
+      if (tag === IX_TAG.TradeCpi) {
         if (retryNeeded) continue; // all-or-nothing per transaction (see the batch branch)
         // #213/#221: executed size + booked price from the matcher call, never the request/mark.
         const r = await resolveCpiLeg({
-          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false),
+          evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false, ixAccounts),
           assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature,
         });
         if (r.kind === "read-error") { retryNeeded = true; continue; }
@@ -721,6 +750,7 @@ export class TradeIndexerPolling {
         }
         if (r.kind === "fill") {
           sizeValue = r.sizeValue;
+          sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           price = Number(r.priceE6) / 1_000_000;
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic, exactly as before this parser
@@ -754,6 +784,7 @@ export class TradeIndexerPolling {
         trader,
         side,
         size: sizeValue.toString(),
+        size_provenance: sizeProvenance,
         price,
         fee,
         tx_signature: signature,
@@ -824,15 +855,15 @@ export class TradeIndexerPolling {
       if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
-      if (isV17Account(rawData)) {
+      if (hasWrapperMagic(rawData)) {
         try {
-          const cfg = parseWrapperConfigV17(rawData, V17_HEADER_LEN);
-          const markEwmaE6 = cfg.markEwmaE6;
+          const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
             return Number(markEwmaE6) / 1_000_000;
           }
-        } catch {
-          // parseWrapperConfigV17 failed
+        } catch (err) {
+          // Unknown VERSION is loud (per market); the fill is skipped, never guessed.
+          reportUnknownLayout(slabAddress, err, "TradeIndexer.readMarkPriceFromSlab");
         }
         return 0;
       }

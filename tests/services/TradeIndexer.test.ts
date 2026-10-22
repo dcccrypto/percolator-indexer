@@ -18,7 +18,9 @@ vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
     TradeNoCpi: 10,
@@ -42,6 +44,14 @@ vi.mock('../../src/db/insertTradeRow.js', () => ({ insertTradeRow: vi.fn(async (
 // #221: the fill-price reader. Default null = "not a readable v18 slot", which keeps
 // every existing test on its legacy mark path; the #221 tests below set a price.
 vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: vi.fn(() => null) }));
+
+// getMarkets moved to the narrow, paged src/db/marketRows.ts; route it to the shared stub above
+// so every case keeps driving the DB rows through `shared.getMarkets`.
+vi.mock('../../src/db/marketRows.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  const read = () => (shared as unknown as { getMarkets: () => Promise<unknown[]> }).getMarkets();
+  return { getMarketRows: vi.fn(read), getMarketRowsCached: vi.fn(read) };
+});
 
 vi.mock('@percolatorct/shared', () => ({
   config: {
@@ -738,6 +748,32 @@ describe('TradeIndexerPolling', () => {
       expect(mockGetAccountInfo).toHaveBeenCalledTimes(1);
       expect(vi.mocked(readAssetEffectivePriceE6).mock.calls.map((c) => c[1])).toEqual([0]);
     }, 10000);
+
+    it('S3 audit: ignores a caller-chosen TradeNoCpi wire exec_price and stores the booked effective_price', async () => {
+      // The two signers of a TradeNoCpi pick exec_price freely; the wrapper books the fill at the
+      // asset's effective_price (F-TRADENOCPI-FEE). A self-trade declaring exec_price = 1 (1e-6 USD)
+      // must not write that price into trades (candles / leaderboard / trader volume).
+      vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: SLAB } as any]);
+      vi.mocked(shared.decodeBase58).mockImplementation(() => {
+        const d = tradeCpiData();
+        new DataView(d.buffer).setBigUint64(59, 1n, true); // attacker exec_price
+        return d;
+      });
+      mockGetSignaturesForAddress.mockResolvedValue([{ signature: VALID_SIG, err: null }]);
+      mockGetParsedTransaction.mockResolvedValue({
+        meta: { err: null, logMessages: [] },
+        transaction: { message: { instructions: [ix('l0')] } },
+      });
+      mockGetAccountInfo.mockImplementation(async () => ({ data: Buffer.alloc(64) }) as any);
+      vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => 13_614_586);
+
+      indexer.start();
+      await new Promise(r => setTimeout(r, 6500));
+
+      const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].price).toBe(13.614586);
+    }, 10000);
   });
 
   describe('split order — per-leg dedup, no transaction-level gate', () => {
@@ -830,6 +866,49 @@ describe('TradeIndexerPolling', () => {
       expect(didIndex).toBe(false);
       expect(mockGetAccountInfo).not.toHaveBeenCalled();
       expect(shared.eventBus.publish).not.toHaveBeenCalled();
+    });
+
+    describe('v2.2 EvictAndTradeCpi (119): same leg counter and per-leg dedup as every other fill', () => {
+      const VICTIM = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+      const evictData = (): Uint8Array => { const d = tradeCpiData(); d[0] = 119; return d; };
+      const evictIx = () => ({
+        programId: new PublicKey(PROGRAM_ID),
+        accounts: [new PublicKey(VICTIM), new PublicKey(TRADER), new PublicKey(SLAB)], // [victim] + TradeCpi accounts
+        data: 'evict',
+      });
+      const tx = () => ({
+        meta: { err: null, logMessages: [] },
+        transaction: { message: { instructions: [ix('l0'), evictIx(), ix('l2')] } },
+      });
+      const programIds = new Set(['FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD']);
+
+      beforeEach(() => {
+        vi.mocked(shared.decodeBase58).mockImplementation(((d: string) => (d === 'evict' ? evictData() : tradeCpiData())) as never);
+      });
+
+      it('is numbered in the tx-wide sequence (0,1,2), attributed to the entrant and the market, not the victim', async () => {
+        await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+        expect(rows.map((r) => r.leg_index)).toEqual([0, 1, 2]);
+        expect(rows[1]).toEqual(expect.objectContaining({ trader: TRADER, slab_address: SLAB, tx_signature: VALID_SIG }));
+        expect(rows.some((r) => r.trader === VICTIM)).toBe(false);
+      });
+
+      it('REPLAY: the same tx processed again inserts nothing new and publishes nothing (no double insert)', async () => {
+        await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        expect([...db].sort()).toEqual([`${VALID_SIG}|0|0`, `${VALID_SIG}|0|1`, `${VALID_SIG}|0|2`]);
+        vi.mocked(shared.eventBus.publish).mockClear();
+        const again = await (indexer as any).processTransaction(tx(), VALID_SIG, SLAB, programIds);
+        expect(again).toBe(false);
+        expect(db.size).toBe(3);
+        expect(shared.eventBus.publish).not.toHaveBeenCalled();
+      });
+
+      it('NEGATIVE CONTROL: a 119 with only the victim account is not indexed and does not consume a leg number', async () => {
+        const bad = { ...evictIx(), accounts: [new PublicKey(VICTIM)] };
+        await (indexer as any).processTransaction({ meta: { err: null, logMessages: [] }, transaction: { message: { instructions: [bad, ix('l1')] } } }, VALID_SIG, SLAB, programIds);
+        expect(vi.mocked(insertTradeRow).mock.calls.map((c) => (c[0] as any).leg_index)).toEqual([0]);
+      });
     });
   });
 });

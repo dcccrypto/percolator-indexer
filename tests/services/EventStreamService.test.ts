@@ -273,7 +273,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -373,7 +373,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -462,7 +462,7 @@ describe("EventStreamService — slab-price fallback (P0)", () => {
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -531,7 +531,7 @@ describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
       };
     });
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -603,7 +603,7 @@ describe("EventStreamService — UpdateHyperpMark oracle update (P2)", () => {
       };
     });
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -721,7 +721,7 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -834,7 +834,7 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService } = await import("../../src/services/EventStreamService.js");
 
@@ -1004,7 +1004,7 @@ describe("EventStreamService — #221 fill price per asset", () => {
       }),
     }));
     vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: readMarkMock }));
-    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
 
     const { EventStreamService: Svc } = await import("../../src/services/EventStreamService.js");
     const listeners: Array<(msg: any) => void> = [];

@@ -47,7 +47,7 @@ describe("poll path: TradeCpi rows", () => {
     const f = fx("partial");
     getAccountInfo.mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
     expect(await poll(f)).toBe(true);
-    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short", leg_index: 0 })]);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "483", price: 13.861751, side: "short", leg_index: 0, size_provenance: "matcher_exact" })]);
     expect(getAccountInfo).toHaveBeenCalledTimes(1);
   });
 
@@ -62,7 +62,7 @@ describe("poll path: TradeCpi rows", () => {
     const f = fx("issue213Partial");
     getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") });
     expect(await poll(f)).toBe(true);
-    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "822500", price: 121.580511 })]);
+    expect(vi.mocked(insertTradeRow).mock.calls.map((c) => c[0])).toEqual([expect.objectContaining({ size: "822500", price: 121.580511, size_provenance: "matcher_request_upper_bound" })]);
     expect(recordSkipped).not.toHaveBeenCalled();
   });
 

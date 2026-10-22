@@ -9,7 +9,9 @@ vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
 
-vi.mock('@percolatorct/sdk', () => ({
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
+  ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
   // v17 IX_TAG: TradeCpiV2 (35) REMOVED; BatchTradeNoCpi (66) and BatchTradeCpi (67) added.
   IX_TAG: {
     TradeNoCpi: 10,
@@ -636,28 +638,32 @@ describe('POST /webhook/trades — #205 wire price/fee + fresh-RPC price fallbac
     app = webhookRoutes(mockDiscovery);
   });
 
-  it('TradeNoCpi: prices and fees a fill straight off the wire — no accountData, no RPC needed', async () => {
+  it('S3 audit: TradeNoCpi is priced at the booked effective_price, never the caller-chosen wire exec_price', async () => {
     const { decodeBase58 } = await import('@percolatorct/shared') as any;
-    // TradeNoCpi mocked tag = 10 (see the IX_TAG mock above this file).
-    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(10, 84_500_000n, 25n));
+    // TradeNoCpi mocked tag = 10 (see the IX_TAG mock above this file). The two signers declare
+    // exec_price = 1 (1e-6 USD); the wrapper books at effective_price (F-TRADENOCPI-FEE) = 84.5.
+    vi.mocked(decodeBase58).mockReturnValueOnce(tradeIxBytes(10, 1n, 25n));
+    vi.mocked(readAssetEffectivePriceE6).mockReturnValue(84_500_000);
+    try {
+      const tx = {
+        signature: SIG,
+        instructions: makeBaseInstructions(),
+        innerInstructions: [],
+        accountData: [{ account: SLAB, data: Buffer.from(new Uint8Array(64)).toString('base64') }],
+        logs: [],
+      };
+      await app.fetch(makeRequest([tx]));
 
-    const tx = {
-      signature: SIG,
-      instructions: makeBaseInstructions(),
-      innerInstructions: [],
-      accountData: [], // deliberately empty — price must come from the wire, not account state
-      logs: [],
-    };
-    await app.fetch(makeRequest([tx]));
-
-    // notional = 1.0 (mocked parseTradeSize sizeValue) * 84.5 = $84.50
-    // fee = 84.50 * 25 / 10_000 = $0.21125
-    expect(insertTradeRow).toHaveBeenCalledWith(
-      expect.objectContaining({ price: 84.5, fee: expect.closeTo(0.21125, 10) }),
-    );
-    // getConnection must NOT have been reached — the wire price made it unnecessary.
-    const { getConnection } = await import('@percolatorct/shared') as any;
-    expect(vi.mocked(getConnection)).not.toHaveBeenCalled();
+      // notional = 1.0 (mocked parseTradeSize sizeValue) * 84.5 = $84.50
+      // fee = 84.50 * 25 / 10_000 = $0.21125
+      expect(insertTradeRow).toHaveBeenCalledWith(
+        expect.objectContaining({ price: 84.5, fee: expect.closeTo(0.21125, 10) }),
+      );
+      expect(insertTradeRow).not.toHaveBeenCalledWith(expect.objectContaining({ price: 0.000001 }));
+    } finally {
+      vi.mocked(readAssetEffectivePriceE6).mockReset();
+      vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => null);
+    }
   });
 
   it('TradeCpi: price is the booked price from the matcher call; the slab (mark EWMA) is never read (#221)', async () => {

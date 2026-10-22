@@ -12,6 +12,11 @@ const logger = createLogger("indexer:trades");
  * key `(tx_signature, asset_index, leg_index)` via the partial unique index — a
  * duplicate leg raises 23505, which we swallow (idempotent re-index).
  */
+export type TradeSizeProvenance =
+  | "matcher_exact"
+  | "matcher_request_upper_bound"
+  | "legacy_unverified";
+
 export interface IndexerTradeRow {
   slab_address: string;
   trader: string;
@@ -27,6 +32,7 @@ export interface IndexerTradeRow {
   leg_index: number;
   /** True for forced closes captured from the crank (markers; see baseline note). */
   is_liquidation?: boolean;
+  size_provenance?: TradeSizeProvenance | null;
 }
 
 /**
@@ -37,7 +43,10 @@ export interface IndexerTradeRow {
  * (23505), so callers can skip side effects (WS events) for duplicates.
  */
 export async function insertTradeRow(row: IndexerTradeRow): Promise<boolean> {
-  const { error } = await getSupabase().from("trades").insert(toDbRow(row));
+  let { error } = await getSupabase().from("trades").insert(toDbRow(row));
+  if (error && noteMissingProvenanceColumn(error)) {
+    ({ error } = await getSupabase().from("trades").insert(toDbRow(row)));
+  }
   if (error && error.code !== "23505") {
     logger.warn("insertTradeRow failed", {
       slab: row.slab_address.slice(0, 8),
@@ -78,8 +87,33 @@ function assertHasSignature(row: IndexerTradeRow): void {
   }
 }
 
+/**
+ * #228: `size_provenance` needs migration 20261012090000 (applied by hand). Until it is applied,
+ * PostgREST rejects every insert naming the column (PGRST204), which would stop ALL trade
+ * indexing. So the first such rejection switches this process to writing without the column
+ * (provenance is then simply unrecorded, i.e. NULL, as for historical rows) and logs once.
+ */
+let provenanceColumnMissing = false;
+
+function noteMissingProvenanceColumn(error: { code?: string; message?: string }): boolean {
+  if (provenanceColumnMissing) return false;
+  if (error.code !== "PGRST204" || !/size_provenance/.test(error.message ?? "")) return false;
+  provenanceColumnMissing = true;
+  logger.error(
+    "trades.size_provenance is missing (migration 20261012090000 not applied); writing trades without it",
+    { code: error.code, error: error.message },
+  );
+  return true;
+}
+
+/** Test hook: forget a previously detected missing column. */
+export function resetProvenanceColumnProbe(): void {
+  provenanceColumnMissing = false;
+}
+
 function toDbRow(row: IndexerTradeRow) {
   assertHasSignature(row);
+  const provenance = provenanceColumnMissing ? {} : { size_provenance: row.size_provenance ?? null };
   return {
     slab_address: row.slab_address,
     trader: row.trader,
@@ -91,6 +125,7 @@ function toDbRow(row: IndexerTradeRow) {
     asset_index: row.asset_index,
     leg_index: row.leg_index,
     is_liquidation: row.is_liquidation ?? false,
+    ...provenance,
     network: getNetwork(),
   };
 }
@@ -116,13 +151,16 @@ function toDbRow(row: IndexerTradeRow) {
 export async function insertTradeRows(rows: IndexerTradeRow[]): Promise<InsertedTradeKey[]> {
   if (rows.length === 0) return [];
 
-  const { data, error } = await getSupabase()
-    .from("trades")
-    .upsert(rows.map(toDbRow), {
-      onConflict: "tx_signature,asset_index,leg_index",
-      ignoreDuplicates: true,
-    })
-    .select("tx_signature, asset_index, leg_index");
+  const write = () =>
+    getSupabase()
+      .from("trades")
+      .upsert(rows.map(toDbRow), {
+        onConflict: "tx_signature,asset_index,leg_index",
+        ignoreDuplicates: true,
+      })
+      .select("tx_signature, asset_index, leg_index");
+  let { data, error } = await write();
+  if (error && noteMissingProvenanceColumn(error)) ({ data, error } = await write());
 
   if (error) {
     logger.warn("insertTradeRows failed", {
