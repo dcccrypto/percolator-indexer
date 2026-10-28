@@ -41,6 +41,9 @@ export const MOVE_LEN = 62;
 /** `NO_ASSET`: a MOVE that is not about one asset. */
 export const NO_ASSET = 0xffff;
 export const LOG_TRUNCATED = "Log truncated";
+/** The runtime prefix an emitted event line carries. Shared so the fast-path probe in
+ * `decodeV22LogEvents` and the attribution loop can never disagree about what a token looks like. */
+export const DATA_PREFIX = "Program data: ";
 /** Engine position units per whole unit (`POS_SCALE`). */
 export const POS_SCALE = 1_000_000n;
 
@@ -52,9 +55,16 @@ export const REDUCE_REASONS: Readonly<Record<number, { name: string; units: "bas
   3: { name: "liquidation", units: "adl_effective" },
   4: { name: "dust_sweep", units: "vault_lp_trade" },
   5: { name: "eviction", units: "vault_lp_trade" },
+  // prog#547 and the v2.2 lev build. `units` follows the program's own emit helper: tags 64 and 30
+  // report through `liquidation_event_view` (ADL-effective, like reason 3), and tag 124 through
+  // `band_forced_reduce_against_vault_lp` (a forced bilateral close at P_last against the vault LP,
+  // the same helper as reasons 4 and 5).
+  6: { name: "force_close_abandoned", units: "adl_effective" },
+  7: { name: "resolved_close", units: "adl_effective" },
+  8: { name: "lp_stop", units: "vault_lp_trade" },
 };
 
-export const MOVE_SUBS: Readonly<Record<number, string>> = { 1: "earn_exit", 2: "g9", 3: "rent_routed", 4: "g9_restore_pnl" };
+export const MOVE_SUBS: Readonly<Record<number, string>> = { 1: "earn_exit", 2: "g9", 3: "rent_routed", 4: "g9_restore_pnl", 5: "market_resolved" };
 
 /**
  * Log-event rows live in the same table as the instruction events and share its unique key
@@ -89,6 +99,14 @@ export const EVENT_EMITTING_TAGS: ReadonlySet<number> = new Set<number>(
     sdkTag(() => IX_TAG_V22.InsuranceBackstopDraw),
     sdkTag(() => IX_TAG_V22.SweepBandDustLeg),
     sdkTag(() => IX_TAG_V22.EvictAndTradeCpi),
+    // The market-lifecycle emitters (prog#547): REDUCE reason 6 on tag 64, reason 7 on tag 30, and
+    // MOVE sub 5 on tags 19 and 39. Tag 124 -- the leverage guard's LP stop, REDUCE reason 8 -- is
+    // absent from this SDK build and lands with the bump that ships the guard; until then the
+    // unlisted-tag check in decodeV22LogEvents is what keeps its events from vanishing silently.
+    sdkTag(() => IX_TAG.ResolveMarket),
+    sdkTag(() => IX_TAG.CloseResolved),
+    sdkTag(() => IX_TAG.ResolveStalePermissionless),
+    sdkTag(() => IX_TAG.ForceCloseAbandonedAsset),
   ].filter((t): t is number => typeof t === "number"),
 );
 /** The subset whose missing event is worth an `events_unknown` marker (a crank is far too frequent, and its event is best effort). */
@@ -96,7 +114,18 @@ const MARKER_TAGS: ReadonlySet<number> = new Set([...EVENT_EMITTING_TAGS].filter
 
 // ── Attribution ────────────────────────────────────────────────────────────────────────────────────────────────────
 
-export type UnknownReason = "no_logs" | "truncated" | "bad_invoke_depth" | "bad_return" | "data_outside_frame" | "unclosed_frame" | "logs_malformed";
+export type UnknownReason =
+  | "no_logs"
+  | "truncated"
+  | "bad_invoke_depth"
+  | "bad_return"
+  | "data_outside_frame"
+  | "unclosed_frame"
+  | "logs_malformed"
+  /** The logs carry wrapper event tokens but no instruction tag is in `EVENT_EMITTING_TAGS`. */
+  | "unlisted_tag"
+  /** A REDUCE reason or MOVE sub this build does not know, on a tag that IS listed. */
+  | "unknown_code";
 
 export interface AttributedToken {
   b64: string;
@@ -158,11 +187,11 @@ export function attributeWrapperTokens(logs: unknown, wrapperIds: ReadonlySet<st
       // any other runtime line about a program (`consumed N of M compute units`) is ignored
       continue;
     }
-    if (line.startsWith("Program data: ")) {
+    if (line.startsWith(DATA_PREFIX)) {
       const top = stack[stack.length - 1];
       if (top === undefined) return { ok: false, reason: "data_outside_frame" };
       if (wrapperIds.has(top)) {
-        for (const t of line.slice("Program data: ".length).split(" ")) if (t !== "") out.push({ b64: t, ixIndex: topLevel });
+        for (const t of line.slice(DATA_PREFIX.length).split(" ")) if (t !== "") out.push({ b64: t, ixIndex: topLevel });
       }
     }
   }
@@ -337,10 +366,13 @@ export type LogEventsResult =
  * Decode a transaction's wrapper log events into `v22_events` rows.
  *
  * `wrapperInstructions` are the transaction's instructions of the pinned wrapper program ids (top-level and inner, as
- * `rawInstructionsFromParsedTx` returns them); a transaction without an event-emitting tag among them is `not_applicable`
- * and its logs are not read. A failed transaction yields nothing. Unknown events (truncated / null logs, inconsistent
+ * `rawInstructionsFromParsedTx` returns them); a transaction without an event-emitting tag among them is `not_applicable`,
+ * and its logs are not read unless they carry an event token the tag set cannot account for (see "unlisted_tag" below).
+ * A failed transaction yields nothing. Unknown events (truncated / null logs, inconsistent
  * frames) yield one `events_unknown` marker per known v2.2 market the transaction's wrapper instructions name, so the
- * positions can be reconciled from account state; they never yield "no fill".
+ * positions can be reconciled from account state; they never yield "no fill". A coverage gap is reported the same way:
+ * an event-emitting tag missing from `EVENT_EMITTING_TAGS` ("unlisted_tag"), or a REDUCE reason / MOVE sub missing from
+ * the tables ("unknown_code"), yields markers rather than silence, so the tables lagging the program stays visible.
  *
  * Every row carries `source: "log"`. Pure apart from the module's counters.
  */
@@ -352,7 +384,26 @@ export function decodeV22LogEvents(
   ctx: LogEventContext,
 ): LogEventsResult {
   if (tx.err != null) return { status: "failed", rows: [] };
-  if (!wrapperInstructions.some((i) => i.data.length > 0 && EVENT_EMITTING_TAGS.has(i.data[0]))) return { status: "not_applicable", rows: [] };
+  // An emitter this tag set has not learned yet would otherwise vanish right here: the
+  // `not_applicable` return precedes `txsRead++`, so there would be no row, no marker and no
+  // counter -- indistinguishable from a transaction that emitted nothing, and `MARKER_TAGS` cannot
+  // cover the case either, being a subset of the same hand-maintained set. So before dismissing the
+  // transaction, look for wrapper event tokens in its logs: if they are there, the tag set is out
+  // of date, not the transaction.
+  //
+  // The gate keeps its fast path. A transaction carrying no event token at all -- the case the gate
+  // exists for -- is still dismissed without parsing anything; only one that does carry a
+  // `Program data:` line pays for full attribution, and only to decide whether those tokens are the
+  // wrapper's, i.e. whether this tag set is the thing that is wrong.
+  let unlistedTag = false;
+  if (!wrapperInstructions.some((i) => i.data.length > 0 && EVENT_EMITTING_TAGS.has(i.data[0]))) {
+    const maybeTokens =
+      Array.isArray(tx.logMessages) && (tx.logMessages as readonly unknown[]).some((l) => typeof l === "string" && l.startsWith(DATA_PREFIX));
+    if (!maybeTokens) return { status: "not_applicable", rows: [] };
+    const probe = attributeWrapperTokens(tx.logMessages, wrapperIds);
+    if (!probe.ok || probe.tokens.length === 0) return { status: "not_applicable", rows: [] };
+    unlistedTag = true;
+  }
   stats.txsRead++;
   const base = {
     signature: ctx.signature,
@@ -367,16 +418,17 @@ export function decodeV22LogEvents(
     ...r,
   });
 
-  const att = attributeWrapperTokens(tx.logMessages, wrapperIds);
-  if (!att.ok) {
-    bump(stats.unknownByReason, att.reason);
-    // One marker per known v2.2 market named by a wrapper instruction that should have emitted (VERSION-keyed: a market not known to be v2.2 gets none).
+  // One marker per known v2.2 market named by a wrapper instruction that should have emitted
+  // (VERSION-keyed: a market not known to be v2.2 gets none). `tagFilter` is how the attribution
+  // path keeps a crank's best-effort event from marking anything; a coverage gap gets no such
+  // exemption, because we cannot tell which instruction the unparsed event belonged to.
+  const markerRows = (reason: UnknownReason, tagFilter: ((tag: number) => boolean) | null): V22EventRow[] => {
     const markets = new Set<string>();
     for (const ix of wrapperInstructions) {
-      if (ix.data.length === 0 || !MARKER_TAGS.has(ix.data[0])) continue;
+      if (tagFilter !== null && (ix.data.length === 0 || !tagFilter(ix.data[0]))) continue;
       for (const a of ix.accounts) if (a && gate.isKnownMarket(a) && gate.versionOf(a) === LAYOUT_V22.version) markets.add(a);
     }
-    const rows = [...markets].sort().map((m) =>
+    return [...markets].sort().map((m) =>
       mk(-1, {
         kind: "events_unknown",
         slab_address: m,
@@ -384,14 +436,28 @@ export function decodeV22LogEvents(
         actor: null,
         subject: null,
         amount: null,
-        detail: { source: "log", reason: att.reason, wrapper_instructions: wrapperInstructions.length, reconcile: "from_account_state" },
+        detail: { source: "log", reason, wrapper_instructions: wrapperInstructions.length, reconcile: "from_account_state" },
       }),
     );
+  };
+
+  if (unlistedTag) {
+    bump(stats.unknownByReason, "unlisted_tag");
+    const rows = markerRows("unlisted_tag", null);
+    stats.rows += rows.length;
+    return { status: "unknown", reason: "unlisted_tag", rows };
+  }
+
+  const att = attributeWrapperTokens(tx.logMessages, wrapperIds);
+  if (!att.ok) {
+    bump(stats.unknownByReason, att.reason);
+    const rows = markerRows(att.reason, (t) => MARKER_TAGS.has(t));
     stats.rows += rows.length;
     return { status: "unknown", reason: att.reason, rows };
   }
 
   const rows: V22EventRow[] = [];
+  let unknownCode = false;
   const accept = (market: string): boolean => {
     if (!gate.isKnownMarket(market)) {
       stats.droppedUnknownMarket++;
@@ -416,6 +482,11 @@ export function decodeV22LogEvents(
     const d = decodeFillEventToken(t.b64);
     if (!d.ok) {
       bump(stats.skippedByReason, d.skip);
+      // A code this build does not know -- a new REDUCE reason or MOVE sub on an already-listed tag
+      // -- is a coverage gap, not a corrupt log. `skippedByReason` is read by no consumer (the one
+      // stats consumer publishes the sibling `unknownByReason`), so skipping silently would lose
+      // the event with no trace. Report it the way an attribution failure is reported.
+      if (d.skip === "unknown_reason" || d.skip === "unknown_sub") unknownCode = true;
       continue;
     }
     const e = d.event;
@@ -494,10 +565,16 @@ export function decodeV22LogEvents(
         // RENT_ROUTED: an internal re-labelling, no token moves
         Object.assign(detail, { routed_atoms: e.a.toString() });
         amount = e.a;
-      } else {
+      } else if (e.sub === 4) {
         // G9_RESTORE_PNL (mode 3): repaid from the vault LP's released profit first, capital for the remainder; a + b into insurance
         Object.assign(detail, { from_released_profit_atoms: e.a.toString(), from_capital_atoms: e.b.toString(), receivable_after_atoms: e.c.toString() });
         amount = e.a + e.b;
+      } else {
+        // MARKET_RESOLVED (sub 5, tags 19 and 39): a lifecycle marker, not a transfer. The program
+        // passes `(resolved_slot, 0, 0)` with NO_ASSET, so there is no amount to record. Keeping
+        // sub 4 explicit above is the point: this branch used to be sub 4 by elimination, and a
+        // newly added sub landing here would have been stored under G9's field names.
+        Object.assign(detail, { resolved_slot: e.a.toString() });
       }
       rows.push(
         mk(t.ixIndex, {
@@ -506,11 +583,19 @@ export function decodeV22LogEvents(
           asset_index: e.assetIndex,
           actor: null,
           subject: null,
-          amount: amount.toString(),
+          amount: amount === null ? null : amount.toString(),
           detail,
         }),
       );
     }
+  }
+  if (unknownCode) {
+    // Keep whatever did decode and mark the gap beside it, so the rows that were understood are not
+    // thrown away and the ones that were not can be reconciled from account state.
+    bump(stats.unknownByReason, "unknown_code");
+    rows.push(...markerRows("unknown_code", null));
+    stats.rows += rows.length;
+    return { status: "unknown", reason: "unknown_code", rows };
   }
   stats.rows += rows.length;
   return { status: "ok", rows };
