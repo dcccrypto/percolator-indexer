@@ -56,8 +56,15 @@ describe("recordV22LogEvents", () => {
 
   it("a failed transaction and a transaction with no event-emitting instruction are not read", async () => {
     expect((await recordV22LogEvents({ ...base, err: { InstructionError: [0, "x"] }, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).status).toBe("failed");
-    expect((await recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(108)] })).status).toBe("not_applicable");
+    expect((await recordV22LogEvents({ ...base, logMessages: [`Program ${W} invoke [1]`, `Program ${W} success`], wrapperInstructions: [ix(108)] })).status).toBe("not_applicable");
     expect(insertV22Events).not.toHaveBeenCalled();
+  });
+
+  it("#241: wrapper event tokens under a tag outside the set are reported unknown, not 'not applicable'", async () => {
+    noteMarketLayout(M, buildMarket(LAYOUT_V22, { slots: 1 }));
+    const r = await recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(108)] });
+    expect(r).toEqual({ status: "unknown", rows: 1, unknownReason: "unlisted_tag" });
+    expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ kind: "events_unknown", slab_address: M, detail: { reason: "unlisted_tag" } });
   });
 
   it("NEVER throws: an insert failure is swallowed", async () => {
