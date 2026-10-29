@@ -7,6 +7,8 @@
  * the 2026-10-01 relaunch wrapper (ETDLAdiA…); the earlier GnwdeQr… wrapper is
  * abandoned, so its vaults are not backfilled unless listed in ALL_PROGRAM_IDS.
  *
+ * It never uses the live service's durable sync cursor (ephemeralCursor): every run re-reads from the first signature.
+ *
  * DRY RUN BY DEFAULT: folds into memory and prints the positions. Pass --write
  * to upsert into Supabase (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY — the
  * indexer's own project). Idempotent: safe to re-run, and safe to run while the
