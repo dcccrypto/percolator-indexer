@@ -52,6 +52,13 @@ export interface LpVaultIndexerOptions {
    * cursor it is not reachable by ordinary traffic or by cheap spam.
    */
   maxBacklogSignatures?: number;
+  /**
+   * #231 follow-up: keep the cursor in memory only -- never seed it from the durable cursor and never write it. For the
+   * backfill tool, whose whole purpose is to re-read a vault's FULL history (a repair after lost event rows, a skipped
+   * signature or a corrected decoder). With a durable cursor it would otherwise resume from the live service's position and
+   * do nothing, and a full re-read must not move the live service's cursor either. The service leaves this unset.
+   */
+  ephemeralCursor?: boolean;
 }
 
 export interface SyncResult {
@@ -267,6 +274,7 @@ export class LpVaultIndexer {
     // normal case for a new vault and must not cost a query every poll.
     if (this.cursorLoaded.has(registry)) return undefined;
     this.cursorLoaded.add(registry);
+    if (this.opts.ephemeralCursor) return undefined;
     const stored = await this.opts.store.loadCursor(this.opts.network, registry);
     if (stored) this.cursors.set(registry, stored);
     return stored ?? undefined;
@@ -276,6 +284,7 @@ export class LpVaultIndexer {
   private async commitCursor(registry: string, signature: string, slot: number): Promise<void> {
     this.cursors.set(registry, signature);
     this.cursorLoaded.add(registry);
+    if (this.opts.ephemeralCursor) return;
     await this.opts.store.saveCursor(this.opts.network, registry, signature, slot);
   }
 
