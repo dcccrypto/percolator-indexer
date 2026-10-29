@@ -45,6 +45,8 @@ async function main(): Promise<void> {
     store,
     network: CURRENT_NETWORK,
     programIds: config.allProgramIds,
+    // Full history, every time: never resume from (or move) the live service's durable cursor.
+    ephemeralCursor: true,
   });
 
   const registries = (await indexer.refreshRegistries()).filter((r) => !only || r.registry === only);

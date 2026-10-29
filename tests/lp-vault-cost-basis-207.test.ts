@@ -738,6 +738,31 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
     expect(pos).toMatchObject({ cost_basis_atoms: "5000000000", event_count: 2 }); // and still idempotent
   });
 
+  it("the backfill tool (ephemeralCursor) re-reads FULL history even when a durable cursor exists, and leaves that cursor alone", async () => {
+    // backfill-lp-vault.ts exists to REBUILD a vault from its whole history ("there is no --since: a partial history would
+    // be silently wrong"). Once the live cursor is durable, an indexer that seeds `until` from it would make `--write` a
+    // no-op on exactly the vaults that need repairing (events rows lost, a skipped signature, a corrected decoder).
+    const chain = fxucChain();
+    chain.claim = claimOfRecord();
+    const store = new MemoryLpVaultStore();
+    await new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] }).syncRegistry(FXUC); // the live service
+    expect(await store.loadCursor("devnet", FXUC.registry)).toBe(SIG.crankFxuc);
+    store.events.clear(); // the repair scenario: the event rows are gone
+    store.positions.clear();
+
+    chain.reads = 0;
+    const tool = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER], ephemeralCursor: true });
+    const r = await tool.syncRegistry(FXUC);
+    expect(r.backlog).toBe(4);
+    expect(chain.reads).toBeGreaterThan(0);
+    const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
+    expect(pos).toMatchObject({ cost_basis_atoms: "5000000000", event_count: 2 });
+    // the live service's cursor is neither read nor moved by the tool
+    store.syncCursors.set(`devnet|${FXUC.registry}`, { signature: "LIVE_CURSOR", slot: 1 });
+    await tool.syncRegistry(FXUC);
+    expect(await store.loadCursor("devnet", FXUC.registry)).toBe("LIVE_CURSOR");
+  });
+
   it("still refuses an implausible backlog, loudly, rather than enumerating forever", async () => {
     const chain = spammed(2_000);
     const ix = new LpVaultIndexer({
