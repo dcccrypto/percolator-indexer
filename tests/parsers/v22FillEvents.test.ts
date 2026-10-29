@@ -367,6 +367,43 @@ describe("VOLUME is the executed size at the booked price, nothing else", () => 
   });
 });
 
+describe("rc23 tag 124: the leverage guard's W1 LP stop (REDUCE reason 8)", () => {
+  const OP_LP_STOP = 5;
+  const lev = (op: number, accounts: string[] = [M]): RawInstruction => ({ programId: W, accounts, data: new Uint8Array([124, op]), ixIndex: 0, innerIndex: -1 });
+  const stopEvent = (): string => {
+    const b = Buffer.from(Buffer.from(EX4_REDUCE, "base64"));
+    b[2] = 124; // ix_tag
+    b[109] = 8; // REASON_LP_STOP
+    return b64(new Uint8Array(b));
+  };
+  const v22 = gate({ version: { [M]: LAYOUT_V22.version } });
+
+  it("op 5 with an LP-stop REDUCE decodes into a reduce_event row, not an unlisted_tag marker", () => {
+    const r = run(okLogs(stopEvent()), [lev(OP_LP_STOP)], v22);
+    expect(r.status).toBe("ok");
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0]).toMatchObject({ kind: "reduce_event", slab_address: M, actor: T });
+    expect(r.rows[0].detail).toMatchObject({ ix_tag: 124, reason: 8, reason_name: "lp_stop", units: "vault_lp_trade" });
+    expect(getLogEventStats().unknownByReason).toEqual({});
+  });
+
+  it("op 5 whose logs are truncated is marked unknown (a cut that left no event is a gap, not 'no cut')", () => {
+    const r = run([`Program ${W} invoke [1]`, "Log truncated"], [lev(OP_LP_STOP)], v22);
+    expect(r.status).toBe("unknown");
+    expect(r.rows.map((x) => x.kind)).toEqual(["events_unknown"]);
+  });
+
+  it("op 5 that opens a round but cuts nothing emits no event and is not a gap", () => {
+    expect(run(okLogs(), [lev(OP_LP_STOP)], v22)).toEqual({ status: "ok", rows: [] });
+  });
+
+  it("the other ops (init / report / tighten / poke) never emit: no marker even with truncated logs", () => {
+    for (const op of [0, 1, 2, 3, 4, 6]) {
+      expect(run([`Program ${W} invoke [1]`, "Log truncated"], [lev(op)], v22)).toEqual({ status: "not_applicable", rows: [] });
+    }
+  });
+});
+
 describe("trust rules around the rows", () => {
   it("a failed transaction yields nothing, whatever its logs say", () => {
     expect(run(okLogs(EX1_CLIPPED), [ix(10)], gate(), { InstructionError: [1, { Custom: 1 }] })).toEqual({ status: "failed", rows: [] });
@@ -397,10 +434,9 @@ describe("trust rules around the rows", () => {
 
   it("the tag set matches the wrapper's event-emitting TAG_* constants", () => {
     // fill_events_v22.rs: 5 crank, 6, 10, 44, 66, 67, 77, 104, 106, 111, 118, 119, plus the
-    // market-lifecycle emitters 19 / 30 / 39 / 64 (prog#547). 124 -- the leverage guard's LP stop --
-    // is absent from this SDK build and lands with the bump that ships the guard; until then the
-    // unlisted-tag marker above is what keeps its events from vanishing.
-    expect([...EVENT_EMITTING_TAGS].sort((a, b) => a - b)).toEqual([5, 6, 10, 19, 30, 39, 44, 64, 66, 67, 77, 104, 106, 111, 118, 119]);
+    // market-lifecycle emitters 19 / 30 / 39 / 64 (prog#547), plus 124, the leverage guard (only its op 5, the LP stop,
+    // emits; the vendored SDK has no lev-guard module, so the tag is a pinned literal in the parser).
+    expect([...EVENT_EMITTING_TAGS].sort((a, b) => a - b)).toEqual([5, 6, 10, 19, 30, 39, 44, 64, 66, 67, 77, 104, 106, 111, 118, 119, 124]);
   });
 
   it("an event for a market outside the registry is dropped (counted); one for a market of another VERSION too", () => {

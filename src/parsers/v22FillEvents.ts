@@ -85,6 +85,15 @@ const sdkTag = (get: () => number | undefined): number | undefined => {
     return undefined;
   }
 };
+/**
+ * rc23 leverage guard (wrapper `TAG_LEV_GUARD` = `TAG_LEV_GUARD_LP_STOP` = 124, v16_program.rs / fill_events_v22.rs). The vendored SDK
+ * has no lev-guard module, so the tag is pinned here as a literal (a test pins the set). It is a MULTI-OP instruction: `data[1]` is the
+ * op, and only op 5 (`OP_LP_STOP`, lev_guard_v22.rs) emits events (REDUCE reason 8, one per cut account). Init / set-key / report /
+ * tighten / poke / set-t0 (ops 0-4, 6) never do, so `ixEmits` below looks at the op too, else every keeper heartbeat would be
+ * "missing an event" the moment truncated logs touched it.
+ */
+export const LEV_GUARD_TAG = 124;
+export const LEV_GUARD_OP_LP_STOP = 5;
 export const EVENT_EMITTING_TAGS: ReadonlySet<number> = new Set<number>(
   [
     sdkTag(() => IX_TAG.PermissionlessCrank), // liquidation REDUCE (best effort)
@@ -100,17 +109,23 @@ export const EVENT_EMITTING_TAGS: ReadonlySet<number> = new Set<number>(
     sdkTag(() => IX_TAG_V22.SweepBandDustLeg),
     sdkTag(() => IX_TAG_V22.EvictAndTradeCpi),
     // The market-lifecycle emitters (prog#547): REDUCE reason 6 on tag 64, reason 7 on tag 30, and
-    // MOVE sub 5 on tags 19 and 39. Tag 124 -- the leverage guard's LP stop, REDUCE reason 8 -- is
-    // absent from this SDK build and lands with the bump that ships the guard; until then the
-    // unlisted-tag check in decodeV22LogEvents is what keeps its events from vanishing silently.
+    // MOVE sub 5 on tags 19 and 39. Tag 124 (the leverage guard's LP stop, REDUCE reason 8) is
+    // appended below as a pinned literal: this SDK build has no lev-guard module. The unlisted-tag
+    // check in decodeV22LogEvents stays as the backstop for any emitter this list has not learned.
     sdkTag(() => IX_TAG.ResolveMarket),
     sdkTag(() => IX_TAG.CloseResolved),
     sdkTag(() => IX_TAG.ResolveStalePermissionless),
     sdkTag(() => IX_TAG.ForceCloseAbandonedAsset),
+    LEV_GUARD_TAG,
   ].filter((t): t is number => typeof t === "number"),
 );
 /** The subset whose missing event is worth an `events_unknown` marker (a crank is far too frequent, and its event is best effort). */
 const MARKER_TAGS: ReadonlySet<number> = new Set([...EVENT_EMITTING_TAGS].filter((t) => t !== sdkTag(() => IX_TAG.PermissionlessCrank)));
+/** True when this wrapper instruction is one that emits log events (tag listed and, for the multi-op lev guard, op 5). */
+const ixEmits = (i: { data: Uint8Array }): boolean =>
+  i.data.length > 0 && EVENT_EMITTING_TAGS.has(i.data[0]) && (i.data[0] !== LEV_GUARD_TAG || i.data[1] === LEV_GUARD_OP_LP_STOP);
+/** `ixEmits` and not the best-effort crank: the instructions whose missing event is worth an `events_unknown` marker. */
+const ixMarks = (i: { data: Uint8Array }): boolean => ixEmits(i) && MARKER_TAGS.has(i.data[0]);
 
 // ── Attribution ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -396,7 +411,7 @@ export function decodeV22LogEvents(
   // `Program data:` line pays for full attribution, and only to decide whether those tokens are the
   // wrapper's, i.e. whether this tag set is the thing that is wrong.
   let unlistedTag = false;
-  if (!wrapperInstructions.some((i) => i.data.length > 0 && EVENT_EMITTING_TAGS.has(i.data[0]))) {
+  if (!wrapperInstructions.some(ixEmits)) {
     const maybeTokens =
       Array.isArray(tx.logMessages) && (tx.logMessages as readonly unknown[]).some((l) => typeof l === "string" && l.startsWith(DATA_PREFIX));
     if (!maybeTokens) return { status: "not_applicable", rows: [] };
@@ -419,13 +434,13 @@ export function decodeV22LogEvents(
   });
 
   // One marker per known v2.2 market named by a wrapper instruction that should have emitted
-  // (VERSION-keyed: a market not known to be v2.2 gets none). `tagFilter` is how the attribution
+  // (VERSION-keyed: a market not known to be v2.2 gets none). `onlyMarking` is how the attribution
   // path keeps a crank's best-effort event from marking anything; a coverage gap gets no such
   // exemption, because we cannot tell which instruction the unparsed event belonged to.
-  const markerRows = (reason: UnknownReason, tagFilter: ((tag: number) => boolean) | null): V22EventRow[] => {
+  const markerRows = (reason: UnknownReason, onlyMarking: boolean): V22EventRow[] => {
     const markets = new Set<string>();
     for (const ix of wrapperInstructions) {
-      if (tagFilter !== null && (ix.data.length === 0 || !tagFilter(ix.data[0]))) continue;
+      if (onlyMarking && !ixMarks(ix)) continue;
       for (const a of ix.accounts) if (a && gate.isKnownMarket(a) && gate.versionOf(a) === LAYOUT_V22.version) markets.add(a);
     }
     return [...markets].sort().map((m) =>
@@ -443,7 +458,7 @@ export function decodeV22LogEvents(
 
   if (unlistedTag) {
     bump(stats.unknownByReason, "unlisted_tag");
-    const rows = markerRows("unlisted_tag", null);
+    const rows = markerRows("unlisted_tag", false);
     stats.rows += rows.length;
     return { status: "unknown", reason: "unlisted_tag", rows };
   }
@@ -451,7 +466,7 @@ export function decodeV22LogEvents(
   const att = attributeWrapperTokens(tx.logMessages, wrapperIds);
   if (!att.ok) {
     bump(stats.unknownByReason, att.reason);
-    const rows = markerRows(att.reason, (t) => MARKER_TAGS.has(t));
+    const rows = markerRows(att.reason, true);
     stats.rows += rows.length;
     return { status: "unknown", reason: att.reason, rows };
   }
@@ -593,7 +608,7 @@ export function decodeV22LogEvents(
     // Keep whatever did decode and mark the gap beside it, so the rows that were understood are not
     // thrown away and the ones that were not can be reconciled from account state.
     bump(stats.unknownByReason, "unknown_code");
-    rows.push(...markerRows("unknown_code", null));
+    rows.push(...markerRows("unknown_code", false));
     stats.rows += rows.length;
     return { status: "unknown", reason: "unknown_code", rows };
   }
