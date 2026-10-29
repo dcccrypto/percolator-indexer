@@ -52,7 +52,14 @@ export const REDUCE_REASONS: Readonly<Record<number, { name: string; units: "bas
   3: { name: "liquidation", units: "adl_effective" },
   4: { name: "dust_sweep", units: "vault_lp_trade" },
   5: { name: "eviction", units: "vault_lp_trade" },
+  // rc23 (wrapper fill_events_v22.rs, prog#547 + the v2.2 lev build): closes the owner did not sign for.
+  6: { name: "force_close_abandoned", units: "adl_effective" },
+  7: { name: "resolved_close", units: "adl_effective" },
+  8: { name: "lp_stop", units: "vault_lp_trade" },
 };
+
+/** rc23 emitters with no SDK tag constant here: tag 30 CloseResolved, tag 64 ForceCloseAbandonedAsset, tag 124 LevGuard (op 5 LP stop). */
+const RC23_REDUCE_TAGS: readonly number[] = [30, 64, 124];
 
 export const MOVE_SUBS: Readonly<Record<number, string>> = { 1: "earn_exit", 2: "g9", 3: "rent_routed", 4: "g9_restore_pnl" };
 
@@ -89,6 +96,7 @@ export const EVENT_EMITTING_TAGS: ReadonlySet<number> = new Set<number>(
     sdkTag(() => IX_TAG_V22.InsuranceBackstopDraw),
     sdkTag(() => IX_TAG_V22.SweepBandDustLeg),
     sdkTag(() => IX_TAG_V22.EvictAndTradeCpi),
+    ...RC23_REDUCE_TAGS,
   ].filter((t): t is number => typeof t === "number"),
 );
 /** The subset whose missing event is worth an `events_unknown` marker (a crank is far too frequent, and its event is best effort). */

@@ -338,8 +338,8 @@ describe("trust rules around the rows", () => {
   it("a transaction without an event-emitting wrapper instruction is not read at all", () => {
     expect(run(okLogs(EX1_CLIPPED), [ix(108)])).toEqual({ status: "not_applicable", rows: [] });
     expect(run(null, [])).toEqual({ status: "not_applicable", rows: [] });
-    // the wrapper's fill_events_v22.rs TAG_* constants (5 crank, 6, 10, 44, 66, 67, 77, 104, 106, 111, 118, 119), as literals
-    expect([...EVENT_EMITTING_TAGS].sort((a, b) => a - b)).toEqual([5, 6, 10, 44, 66, 67, 77, 104, 106, 111, 118, 119]);
+    // the wrapper's fill_events_v22.rs TAG_* REDUCE/FILL emitters, as literals (rc23 adds 30, 64, 124; MOVE-only 19 / 39 not yet)
+    expect([...EVENT_EMITTING_TAGS].sort((a, b) => a - b)).toEqual([5, 6, 10, 30, 44, 64, 66, 67, 77, 104, 106, 111, 118, 119, 124]);
   });
 
   it("an event for a market outside the registry is dropped (counted); one for a market of another VERSION too", () => {
@@ -389,5 +389,31 @@ describe("unknown events: a marker, never 'no fill'; VERSION-keyed", () => {
     const r = run(null, [ix(67, [M, M2]), ix(10, [M2])], gate({ known: [M, M2], version: { [M]: 19, [M2]: 19 } }));
     expect(r.rows.map((x) => x.slab_address)).toEqual([M, M2].sort());
     expect(new Set(r.rows.map((x) => x.inner_index)).size).toBe(2);
+  });
+});
+
+// ── navcheck 2026-10-29: rc23 REDUCE reasons 6-8 (wrapper fill_events_v22.rs) ───────────────────────────────────────
+describe("rc23 REDUCE reasons: 6 force-close-abandoned (tag 64), 7 resolved close (tag 30), 8 LP stop (tag 124 op 5)", () => {
+  const reduceAs = (tag: number, reason: number): string => {
+    const b = Buffer.from(Buffer.from(EX4_REDUCE, "base64"));
+    b[2] = tag;
+    b[109] = reason;
+    return b.toString("base64");
+  };
+  it("each decodes (never skipped as unknown_reason)", () => {
+    for (const [tag, reason] of [[64, 6], [30, 7], [124, 8]] as const) {
+      const d = decodeFillEventToken(reduceAs(tag, reason));
+      expect(d.ok, `reason ${reason}`).toBe(true);
+    }
+  });
+  it("an LP-stop transaction (tag 124 only) is read and yields one reduce_event row", () => {
+    const r = run(okLogs(reduceAs(124, 8)), [ix(124)]);
+    expect(r.status).toBe("ok");
+    expect(r.rows.map((x) => x.kind)).toEqual(["reduce_event"]);
+    expect(r.rows[0].detail).toMatchObject({ reason: 8, reason_name: "lp_stop", ix_tag: 124 });
+  });
+  it("resolved-close (tag 30) and force-close (tag 64) transactions are read too", () => {
+    expect(run(okLogs(reduceAs(30, 7)), [ix(30)]).rows.map((x) => x.kind)).toEqual(["reduce_event"]);
+    expect(run(okLogs(reduceAs(64, 6)), [ix(64)]).rows.map((x) => x.kind)).toEqual(["reduce_event"]);
   });
 });
