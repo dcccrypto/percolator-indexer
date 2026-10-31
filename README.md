@@ -50,8 +50,8 @@ pnpm test
 - Discovery and the light pass: the light registration slice is derived from the SDK table as the largest registration prefix over every VERSION
   (v2.1 1,862 B, v2.2 1,910 B = 592 + 806 + 512), so a v2.2 market of any capacity (4,059 / 6,720 / 9,381 / 12,042 / 14,703 B) registers
   with the same fields from the slice as from the whole account.
-- `@percolatorct/sdk` is currently the vendored `vendor/percolatorct-sdk-9.0.0-candidate.tgz` (built from
-  `dcccrypto/percolator-sdk#406`). Replace it with the published 9.x when it exists.
+- `@percolatorct/sdk` is currently the vendored `vendor/percolatorct-sdk-9.0.0-candidate.tgz` (`pnpm pack` of
+  `dcccrypto/percolator-sdk` feat/v22-sdk-growth d13e1a48, the merge of #437). Replace it with the published 9.x when it exists.
 
 ## Deployment
 
