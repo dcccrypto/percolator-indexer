@@ -287,7 +287,7 @@ function makeV17RiskParamsStub(): RiskParams {
  *
  * The program discriminates account kinds at byte[10] (check_header @v16_program.rs:986):
  *   KIND_MARKET=1, KIND_PORTFOLIO=2, KIND_BACKING_DOMAIN_LEDGER=3, KIND_INSURANCE_LEDGER=4.
- * Without this guard, PORTFOLIO accounts (9347 bytes pre-v18; 9563 bytes v2.1; 10,603 bytes v2.2) and other non-market v17 accounts (any
+ * Without this guard, PORTFOLIO accounts (9347 bytes pre-v18; 9563 bytes v2.1; 10,607 bytes v2.2 rc23, 10,603 before engine #299) and other non-market v17 accounts (any
  * >=448-byte account with the v17 magic) would pass isV17Account and be parsed
  * as markets, producing bogus rows via StatsCollector.insertMarket. The guard
  * is size-independent (kind byte only), so it is unaffected by that growth.

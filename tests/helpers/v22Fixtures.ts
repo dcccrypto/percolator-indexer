@@ -66,7 +66,8 @@ export interface LegSpec { index: number; assetIndex: number; marketId: bigint; 
 
 /** A portfolio of `layout` with the given active legs, stamped from the SDK table (exact PORTFOLIO_ACCOUNT_LEN). */
 export function buildPortfolio(layout: LayoutTable = LAYOUT_V22, legs: LegSpec[] = [], owner: PublicKey = pk()): Uint8Array {
-  const d = stampHeader(new Uint8Array(layout.portfolio.accountLen), 2, layout.version);
+  // the engine discriminator comes from the row (VERSION 19 -> 20 since engine #299), not from the VERSION
+  const d = stampHeader(new Uint8Array(layout.portfolio.accountLen), 2, layout.version, layout.engineDiscriminator);
   d.set(owner.toBytes(), 116);
   const g = layout.portfolio;
   const dv = new DataView(d.buffer);

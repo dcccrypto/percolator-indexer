@@ -30,7 +30,7 @@ pnpm test
 
 - Account geometry is **VERSION-keyed**, from the SDK layout tables (`src/layout/resolve.ts`, `src/layout/portfolio.ts`): v2.1
   is VERSION 18 (header 758 B, slot 2,325 B, portfolio 9,563 B, leg 152 B), v2.2 variant B is VERSION 19 (806 / 2,661 /
-  10,603 / 217). No offset is a literal in the indexer. An unknown VERSION is a loud, per-market skip (error log, counter
+  10,607 / 217; engine discriminator 20 since engine #299). No offset is a literal in the indexer. An unknown VERSION is a loud, per-market skip (error log, counter
   `indexer_unknown_layout_total`, Sentry once) and never stops the other markets.
 - New activity goes to the `v22_events` table (`supabase/migrations/20261007120000_v22_events.sql`, **applied by hand**, RLS on, no
   anon grants). Until it is applied the writer logs one error per 10 minutes and drops the events; nothing else is affected.
@@ -50,8 +50,8 @@ pnpm test
 - Discovery and the light pass: the light registration slice is derived from the SDK table as the largest registration prefix over every VERSION
   (v2.1 1,862 B, v2.2 1,910 B = 592 + 806 + 512), so a v2.2 market of any capacity (4,059 / 6,720 / 9,381 / 12,042 / 14,703 B) registers
   with the same fields from the slice as from the whole account.
-- `@percolatorct/sdk` is currently the vendored `vendor/percolatorct-sdk-9.0.0-candidate.tgz` (built from
-  `dcccrypto/percolator-sdk#406`). Replace it with the published 9.x when it exists.
+- `@percolatorct/sdk` is currently the vendored `vendor/percolatorct-sdk-9.0.0-candidate.tgz` (`pnpm pack` of
+  `dcccrypto/percolator-sdk` feat/v22-sdk-growth d13e1a48, the merge of #437). Replace it with the published 9.x when it exists.
 
 ## Deployment
 
