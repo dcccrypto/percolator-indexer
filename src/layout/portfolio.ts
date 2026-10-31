@@ -2,7 +2,7 @@
  * Portfolio and position decoding, selected by wrapper VERSION.
  *
  * - VERSION 18 (v2.1): 9,563 B account, 152 B legs.
- * - VERSION 19 (v2.2 variant B): 10,603 B account, 217 B legs (K/F remainders mid-leg, band/rent tail).
+ * - VERSION 19 (v2.2 variant B): 10,607 B account (engine discriminator 20 since engine #299: +4 B loss_provenance), 217 B legs (K/F remainders mid-leg, band/rent tail).
  * - Legacy (v1, `PERCOLAT` magic) accounts are not wrapper-v17 accounts at all: {@link decodePortfolio}
  *   returns `null` for them and the pre-existing v1 path is untouched.
  *
