@@ -322,7 +322,7 @@ export class TradeIndexerPolling {
     let holdCursor = false;
     const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
-    await this.prefetchMisses(connection, validSigs);
+    const prefetchClean = await this.prefetchMisses(connection, validSigs);
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -331,7 +331,7 @@ export class TradeIndexerPolling {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
       // X-1: isolate an unreadable (e.g. v1-version) transaction instead of letting one poisoned signature
       // hold this slab's cursor forever. Transient RPC failures still hold the cursor (#147).
-      const fetched = await this.fetchBatchCached(connection, batch);
+      const fetched = await this.fetchBatchCached(connection, batch, prefetchClean);
       if (fetched.skipped.length > 0) {
         pass.incomplete = true; // an unreadable earlier tx may have changed a position unseen
         // Durable + loud: FULL signature and slab, counter, DB table (or JSONL fallback). Re-index from there.
@@ -404,34 +404,39 @@ export class TradeIndexerPolling {
   }
 
   /**
+   * Warm the cache with this window's uncached signatures, packed into full TX_BATCH_SIZE batches. Once
+   * other slabs have filled the cache, the few misses are spread thinly across the window, and without
+   * this each window batch would cost its own round trip for one or two signatures. Best effort only: it
+   * writes nothing except the cache, makes ONE attempt per call (no withRetry backoff), and stops at the
+   * first batch that does not come back clean. Returns false in that case, and the window loop then
+   * fetches every batch that still has a miss in full, exactly as without the cache (no misses-only step),
+   * so an RPC brown-out or a poison pill costs at most one extra call, never a second retry cycle.
+   */
+  private async prefetchMisses(connection: Connection, sigs: string[]): Promise<boolean> {
+    if (!TX_CACHE_ENABLED) return true;
+    const misses = sigs.filter((s) => this.txCache.get(s) === undefined);
+    // Nothing to pack: everything is cached, or the whole window is new and the loop's batches are already full.
+    if (misses.length === 0 || misses.length === sigs.length) return true;
+    for (let i = 0; i < misses.length; i += TX_BATCH_SIZE) {
+      const chunk = misses.slice(i, i + TX_BATCH_SIZE);
+      const r = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, chunk, (fn) => fn());
+      if (r.failed || r.skipped.length > 0) return false;
+      r.txs.forEach((tx, j) => { if (tx) this.txCache.set(chunk[j], tx); });
+    }
+    return true;
+  }
+
+  /**
    * fetchParsedTxsTolerant for one batch, fetching only the signatures not already in the shared cache.
    * The result is the same as an uncached call: same order, same skip / failure / breaker outcome.
    * - All cached: no RPC call.
-   * - Misses only: one tolerant fetch of the misses. Its transient failure holds the cursor as before.
+   * - Misses only (`partial`, i.e. the window's prefetch was clean): one tolerant fetch of the misses. Its
+   *   transient failure holds the cursor as before.
    * - The mass-skip breaker judges a batch by its successfully fetched siblings, and cached siblings
    *   were not fetched in this call. So if the misses-only fetch trips the breaker, the whole batch is
    *   fetched again exactly as without the cache, and that result is returned.
    */
-  /**
-   * Warm the cache with this window's uncached signatures, packed into full TX_BATCH_SIZE batches. Once
-   * other slabs have filled the cache, the few misses are spread thinly across the window, and without
-   * this each window batch would cost its own round trip for one or two signatures. Best effort only: it
-   * writes nothing except the cache. It stops at the first batch that does not come back clean, and the
-   * window loop then fetches whatever is still missing with the full per-batch rules.
-   */
-  private async prefetchMisses(connection: Connection, sigs: string[]): Promise<void> {
-    if (!TX_CACHE_ENABLED) return;
-    const misses = sigs.filter((s) => this.txCache.get(s) === undefined);
-    // Nothing to pack: everything is cached, or the whole window is new and the loop's batches are already full.
-    if (misses.length === 0 || misses.length === sigs.length) return;
-    for (let i = 0; i < misses.length; i += TX_BATCH_SIZE) {
-      const r = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, misses.slice(i, i + TX_BATCH_SIZE), (fn, label) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label }));
-      if (r.failed || r.skipped.length > 0) return;
-      r.txs.forEach((tx, j) => { if (tx) this.txCache.set(misses[i + j], tx); });
-    }
-  }
-
-  private async fetchBatchCached(connection: Connection, batch: string[]): Promise<TolerantFetchResult<ParsedTransactionWithMeta>> {
+  private async fetchBatchCached(connection: Connection, batch: string[], partial: boolean): Promise<TolerantFetchResult<ParsedTransactionWithMeta>> {
     const retry = <R>(fn: () => Promise<R>, label: string) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label });
     const fetchAndStore = async (sigs: string[]) => {
       const r = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, sigs, retry);
@@ -442,7 +447,7 @@ export class TradeIndexerPolling {
     const cached = batch.map((s) => this.txCache.get(s) ?? null);
     const misses = batch.filter((_, i) => cached[i] === null);
     if (misses.length === 0) return { txs: cached, skipped: [], failed: false };
-    if (misses.length === batch.length) return fetchAndStore(batch);
+    if (!partial || misses.length === batch.length) return fetchAndStore(batch);
     const part = await fetchAndStore(misses);
     if (part.massSkip) return fetchAndStore(batch);
     if (part.failed) return { ...part, txs: batch.map(() => null) };

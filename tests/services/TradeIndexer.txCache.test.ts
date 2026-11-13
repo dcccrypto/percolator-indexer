@@ -10,6 +10,7 @@ const fetchedSingles: string[] = [];
 const sigLists = new Map<string, { signature: string; err: null }[]>();
 const poison = new Set<string>();
 const transient = new Set<string>();
+const withRetrySpy = vi.fn(async (fn: () => Promise<unknown>) => fn());
 
 const minimalTx = (sig: string) => ({ slot: 1, blockTime: 1, meta: { err: null, logMessages: [], innerInstructions: [] }, transaction: { signatures: [sig], message: { accountKeys: [], instructions: [] } } });
 const versionErr = () => Object.assign(new Error("Transaction version (2) is not supported by the requesting client"), { code: -32015 });
@@ -37,7 +38,7 @@ vi.mock("@percolatorct/shared", async (orig) => {
     ...actual,
     config: { ...actual.config, allProgramIds: ["5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe"] },
     getConnection: () => connection,
-    withRetry: async (fn: () => Promise<unknown>) => fn(),
+    withRetry: (fn: () => Promise<unknown>) => withRetrySpy(fn),
     createLogger: () => ({ info: noop, warn: noop, error: noop, debug: noop }),
     captureException: noop,
   };
@@ -51,12 +52,17 @@ vi.mock("../../src/db/storedLegs.js", async (orig) => ({
   fetchStoredLegsMany: vi.fn(async () => null),
 }));
 
+import { TradeIndexerPolling } from "../../src/services/TradeIndexer.js";
+
+/** The cache flag is read at module load: the enabled case uses the static import, the disabled control re-imports. */
 async function freshIndexer(disabled = false): Promise<any> {
-  vi.resetModules();
-  if (disabled) process.env.INDEXER_TX_CACHE_DISABLED = "true";
-  else delete process.env.INDEXER_TX_CACHE_DISABLED;
-  const { TradeIndexerPolling } = await import("../../src/services/TradeIndexer.js");
-  const idx: any = new TradeIndexerPolling();
+  let Ctor: typeof TradeIndexerPolling = TradeIndexerPolling;
+  if (disabled) {
+    vi.resetModules();
+    process.env.INDEXER_TX_CACHE_DISABLED = "true";
+    try { Ctor = (await import("../../src/services/TradeIndexer.js")).TradeIndexerPolling; } finally { delete process.env.INDEXER_TX_CACHE_DISABLED; }
+  }
+  const idx: any = new Ctor();
   idx._running = true;
   return idx;
 }
@@ -69,7 +75,7 @@ const allFetched = () => [...fetchedBatches.flat(), ...fetchedSingles];
 describe("TradeIndexer shared tx cache", () => {
   beforeEach(() => {
     fetchedBatches.length = 0; fetchedSingles.length = 0; sigLists.clear(); poison.clear(); transient.clear();
-    recordSkipped.mockClear(); connection.getParsedTransactions.mockClear(); connection.getParsedTransaction.mockClear();
+    recordSkipped.mockClear(); withRetrySpy.mockClear(); connection.getParsedTransactions.mockClear(); connection.getParsedTransaction.mockClear();
   });
 
   it("a signature shared by two slabs is fetched once; both cursors commit", async () => {
@@ -95,7 +101,7 @@ describe("TradeIndexer shared tx cache", () => {
     await idx.indexTradesForSlab(A, 100);
     await idx.indexTradesForSlab(B, 100);
     expect(allFetched()).toHaveLength(7);
-  });
+  }, 60_000); // cold re-import of the module graph
 
   it("all cached: no RPC transaction fetch at all", async () => {
     const idx = await freshIndexer();
@@ -153,5 +159,37 @@ describe("TradeIndexer shared tx cache", () => {
     await idx.indexTradesForSlab(B, 100);
     expect(fetchedBatches.flat()).toEqual([q]); // q re-fetched (never cached), a still cached
     expect(idx.lastSignature.get(B)).toBe(q);
+  });
+
+  it("prefetch packs a window's scattered misses into one call instead of one per window batch", async () => {
+    const idx = await freshIndexer();
+    const [A, B] = [slab(), slab()];
+    const shared = Array.from({ length: 20 }, (_, i) => sig("S" + String(i).padStart(2, "0")));
+    const [m1, m2] = [sig("M1"), sig("M2")];
+    sigLists.set(A, list(...shared));
+    const bList = [...shared];
+    bList[3] = m1; bList[15] = m2; // one miss in each of B's two window batches of 10
+    sigLists.set(B, list(...bList));
+    await idx.indexTradesForSlab(A, 100);
+    fetchedBatches.length = 0;
+    await idx.indexTradesForSlab(B, 100);
+    expect(fetchedBatches).toEqual([[m2, m1]]); // oldest-first window order, one round trip
+    expect(idx.lastSignature.get(B)).toBe(bList[0]);
+  });
+
+  it("a transient failure during prefetch: one attempt, no retry cycle, then the plain full-batch fetch", async () => {
+    const idx = await freshIndexer();
+    const [A, B] = [slab(), slab()];
+    const [a, q] = ["A", "Q"].map(sig);
+    sigLists.set(A, list(a));
+    sigLists.set(B, list(q, a));
+    await idx.indexTradesForSlab(A, 100);
+    transient.add(q);
+    fetchedBatches.length = 0; withRetrySpy.mockClear();
+    await idx.indexTradesForSlab(B, 100);
+    // prefetch [q] once (outside withRetry), then the window batch in full as without the cache (no misses-only step)
+    expect(fetchedBatches).toEqual([[q], [a, q]]);
+    expect(withRetrySpy).toHaveBeenCalledTimes(2); // getSignaturesForAddress + the full-batch fetch; none from prefetch
+    expect(idx.lastSignature.has(B)).toBe(false);
   });
 });
