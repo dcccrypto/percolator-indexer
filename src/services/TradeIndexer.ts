@@ -465,6 +465,8 @@ export class TradeIndexerPolling {
     const touched = new Set<string>();
     // Rows already stored for this tx, read once and only if a fill needs it (F2 + old-numbering check).
     let stored: StoredLeg[] | null | undefined;
+    // Batched rows are prefetched only for txs where mayReadStoredLegs() is true; a getStored() call added outside the
+    // top-level trade / tag 44 path must widen that predicate too (otherwise it silently falls back to one query per tx).
     const getStored = async (): Promise<StoredLeg[] | null> => {
       if (stored === undefined) stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
       return stored;

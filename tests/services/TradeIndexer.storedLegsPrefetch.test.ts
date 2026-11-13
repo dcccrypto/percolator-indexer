@@ -112,4 +112,15 @@ describe("stored-legs prefetch only for transactions that can use it", () => {
     expect(mayReadStoredLegs(wrapperTx(IX_TAG.TradeCpi), new Set([Keypair.generate().publicKey.toBase58()]))).toBe(false);
     expect(mayReadStoredLegs(wrapperTx(IX_TAG.TradeCpi, { InstructionError: [0, "Custom"] }), ids)).toBe(false);
   });
+
+  it("predicate over several instructions: a trade after a crank or a parsed ix qualifies; a trade only in inner instructions does not", () => {
+    const ids = new Set([PROGRAM]);
+    const ixOf = (tag: number) => wrapperTx(tag).transaction.message.instructions[0];
+    const parsed = { programId: pk("11111111111111111111111111111111"), parsed: { type: "transfer" }, program: "system" };
+    const multi = (...ixs: unknown[]) => ({ ...wrapperTx(IX_TAG.KeeperCrank), transaction: { message: { instructions: ixs } } });
+    expect(mayReadStoredLegs(multi(ixOf(IX_TAG.KeeperCrank), ixOf(IX_TAG.TradeCpi)) as never, ids)).toBe(true);
+    expect(mayReadStoredLegs(multi(parsed, ixOf(IX_TAG.RebalanceReduce)) as never, ids)).toBe(true);
+    const innerOnly = { ...wrapperTx(IX_TAG.KeeperCrank), meta: { err: null, logMessages: [], innerInstructions: [{ index: 0, instructions: [ixOf(IX_TAG.TradeCpi)] }] } };
+    expect(mayReadStoredLegs(innerOnly as never, ids)).toBe(false);
+  });
 });
