@@ -2,6 +2,7 @@
  * Shared parsed-transaction cache on the poll path: a signature in several slabs' windows is fetched once, and the
  * skip / failure / cursor outcome of every batch is the same as without the cache.
  */
+import { RpcLimiter } from "../../src/lib/rpcLimiter.js";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Keypair } from "@solana/web3.js";
 
@@ -63,6 +64,7 @@ async function freshIndexer(disabled = false): Promise<any> {
     try { Ctor = (await import("../../src/services/TradeIndexer.js")).TradeIndexerPolling; } finally { delete process.env.INDEXER_TX_CACHE_DISABLED; }
   }
   const idx: any = new Ctor();
+  idx.rpcLimiter = new RpcLimiter({ minIntervalMs: 0, baseBackoffMs: 1, maxBackoffMs: 1, maxRateLimitRetries: 1 });
   idx._running = true;
   return idx;
 }
@@ -187,8 +189,9 @@ describe("TradeIndexer shared tx cache", () => {
     transient.add(q);
     fetchedBatches.length = 0; withRetrySpy.mockClear();
     await idx.indexTradesForSlab(B, 100);
-    // prefetch [q] once (outside withRetry), then the window batch in full as without the cache (no misses-only step)
-    expect(fetchedBatches).toEqual([[q], [a, q]]);
+    // prefetch [q] once (no 429 retry), then the window batch in full as without the cache (no misses-only step);
+    // that one is retried once by the limiter (maxRateLimitRetries 1 above) before the failure holds the cursor
+    expect(fetchedBatches).toEqual([[q], [a, q], [a, q]]);
     expect(withRetrySpy).toHaveBeenCalledTimes(2); // getSignaturesForAddress + the full-batch fetch; none from prefetch
     expect(idx.lastSignature.has(B)).toBe(false);
   });
