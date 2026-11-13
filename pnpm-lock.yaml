@@ -12,6 +12,7 @@ overrides:
   brace-expansion: '>=5.0.11'
   nanoid: '>=3.3.17 <4'
   source-map-js: '>=1.2.2'
+  zod: 4.6.7
 
 importers:
 
@@ -1377,8 +1378,8 @@ packages:
     resolution: {integrity: sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==}
     engines: {node: '>=0.4'}
 
-  zod@4.3.6:
-    resolution: {integrity: sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==}
+  zod@4.6.7:
+    resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
 
 snapshots:
 
@@ -1798,7 +1799,7 @@ snapshots:
       dotenv: 16.6.1
       tweetnacl: 1.0.3
       ws: 8.21.1(bufferutil@4.1.0)(utf-8-validate@6.0.6)
-      zod: 4.3.6
+      zod: 4.6.7
     transitivePeerDependencies:
       - bufferutil
       - encoding
@@ -2689,4 +2690,4 @@ snapshots:
 
   xtend@4.0.2: {}
 
-  zod@4.3.6: {}
+  zod@4.6.7: {}
