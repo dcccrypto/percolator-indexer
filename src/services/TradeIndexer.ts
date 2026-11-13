@@ -58,7 +58,8 @@ const TRADE_TAGS = new Set<number>([
  * pass is a bounded look-back, not a window). With `until`, a full page means older signatures may remain, so
  * it pages on with `before` = the page's oldest signature until a short page (the cursor was reached) or
  * MAX_SIGNATURE_PAGES. Each page has its own retries; a page that still fails throws, and the caller then returns
- * with the cursor untouched, so the next poll re-reads the same window. Only the page bound below truncates.
+ * with the cursor untouched, so the next poll re-reads the same window. Only the page bound (and a full page of
+ * repeats from a misbehaving RPC) cut the window short; both are logged.
  */
 async function fetchSignatureWindow(
   connection: Connection,
