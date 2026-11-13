@@ -53,6 +53,45 @@ const TRADE_TAGS = new Set<number>([
   IX_TAG.BatchTradeCpi,   // 67
 ]);
 
+/**
+ * getSignaturesForAddress for (until, newest], newest-first. Without `until` it is one call of `limit` (the first
+ * pass is a bounded look-back, not a window). With `until`, a full page means older signatures may remain, so
+ * it pages on with `before` = the page's oldest signature until a short page (the cursor was reached) or
+ * MAX_SIGNATURE_PAGES. Each page has its own retries; a page that still fails throws, and the caller then returns
+ * with the cursor untouched, so the next poll re-reads the same window. Nothing is processed from a partial window.
+ */
+async function fetchSignatureWindow(
+  connection: Connection,
+  slabPk: PublicKey,
+  limit: number,
+  until: string | undefined,
+  slabAddress: string,
+): Promise<Awaited<ReturnType<Connection["getSignaturesForAddress"]>>> {
+  const page = (before?: string) => withRetry(
+    () => connection.getSignaturesForAddress(slabPk, { limit, ...(before ? { before } : {}), ...(until ? { until } : {}) }),
+    { maxRetries: 3, baseDelayMs: 1000, label: `getSignaturesForAddress(${slabAddress.slice(0, 8)})` },
+  );
+  const out = await page();
+  if (!until) return out;
+  const seen = new Set(out.map((s) => s.signature));
+  let raw = out; // last page as returned (a full one means there may be more); `fresh` drops any repeat
+  let fresh = out;
+  for (let pages = 1; raw.length >= limit && fresh.length > 0; pages++) {
+    if (pages >= MAX_SIGNATURE_PAGES) {
+      // Past the bound the window is processed as far as it was read and the cursor still moves to the newest,
+      // which skips the older remainder (the pre-pagination behaviour, at MAX_SIGNATURE_PAGES times the volume).
+      logger.error("signature window exceeds TRADE_MAX_SIGNATURE_PAGES; older signatures in it are not polled", { slab: slabAddress, pages, signatures: out.length });
+      captureException(new Error(`trade poll window truncated at ${out.length} signatures (slab ${slabAddress})`), { tags: { context: "trade-indexer-window-truncated" }, extra: { slab: slabAddress, pages } });
+      break;
+    }
+    raw = await page(raw[raw.length - 1].signature);
+    fresh = raw.filter((s) => !seen.has(s.signature));
+    for (const s of fresh) seen.add(s.signature);
+    out.push(...fresh);
+  }
+  return out;
+}
+
 function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -61,8 +100,16 @@ function readPositiveIntEnv(name: string, fallback: number, max?: number): numbe
   return max ? Math.min(parsed, max) : parsed;
 }
 
-/** How many recent signatures to fetch per slab per cycle */
+/** Page size of each getSignaturesForAddress call (and the whole window when the slab has no cursor yet) */
 const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
+
+/**
+ * With a cursor, the window (cursor, newest] is paged until it is exhausted, so a window longer than one page is
+ * not cut down to its newest MAX_SIGNATURES (the cursor then moves past the rest and they are never polled).
+ * This only bounds a runaway walk, e.g. after a long outage: 200 pages of 50 is 10,000 signatures, about 6 hours
+ * at the ~25/min of the v2.2 markets.
+ */
+const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 200, 10_000);
 
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
 const POLL_INTERVAL_MS = readPositiveIntEnv("TRADE_POLL_INTERVAL_MS", 5 * 60_000);
@@ -273,21 +320,13 @@ export class TradeIndexerPolling {
     const slabPk = new PublicKey(slabAddress);
     const programIds = new Set(config.allProgramIds);
 
-    // Fetch recent signatures for this slab account
-    const opts: { limit: number; until?: string } = { limit: maxSigs };
+    // Fetch the signatures newer than this slab's cursor (newest-first). Without a cursor (first pass) this
+    // is the newest maxSigs; with one, the window is paged until the cursor is reached.
     const lastSig = this.lastSignature.get(slabAddress);
-    if (lastSig) opts.until = lastSig;
 
-    let signatures;
+    let signatures: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>;
     try {
-      signatures = await withRetry(
-        () => connection.getSignaturesForAddress(slabPk, opts),
-        { 
-          maxRetries: 3, 
-          baseDelayMs: 1000, 
-          label: `getSignaturesForAddress(${slabAddress.slice(0, 8)})` 
-        }
-      );
+      signatures = await fetchSignatureWindow(connection, slabPk, maxSigs, lastSig, slabAddress);
     } catch (err) {
       logger.warn("Failed to get signatures after retries", {
         slabAddress: slabAddress.slice(0, 8),

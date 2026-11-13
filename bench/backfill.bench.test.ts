@@ -52,19 +52,27 @@ function rehydrate(tx: any) {
 const counts: Record<string, number> = {};
 let txFetched = 0;
 let dbCalls = 0;
-const writes: string[] = []; // every DB write payload, in order (compared as a hash between runs)
+const writes: string[] = [];
+const seen = new Set<string>(); // "slab signature" pairs returned by getSignaturesForAddress // every DB write payload, in order (compared as a hash between runs)
 const jsonSafe = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 const bump = (k: string, n = 1) => { counts[k] = (counts[k] ?? 0) + n; };
 const rpcSleep = () => new Promise((r) => setTimeout(r, RPC_MS));
 const dbSleep = async () => { dbCalls++; await new Promise((r) => setTimeout(r, DB_MS)); };
 
 const fakeConnection = {
-  async getSignaturesForAddress(addr: PublicKey, opts: { limit?: number; until?: string } = {}) {
+  // Same contract as the RPC: newest-first, `before` and `until` exclusive, at most `limit` (default 1000).
+  async getSignaturesForAddress(addr: PublicKey, opts: { limit?: number; before?: string; until?: string } = {}) {
     bump("getSignaturesForAddress");
     await rpcSleep();
-    const all = fx.sigs[addr.toBase58()] ?? [];
+    let all = fx.sigs[addr.toBase58()] ?? [];
+    if (opts.before) {
+      const b = all.findIndex((s) => s.signature === opts.before);
+      all = b >= 0 ? all.slice(b + 1) : [];
+    }
     const cut = opts.until ? all.findIndex((s) => s.signature === opts.until) : -1;
-    return (cut >= 0 ? all.slice(0, cut) : all).slice(0, opts.limit ?? 1000);
+    const page = (cut >= 0 ? all.slice(0, cut) : all).slice(0, opts.limit ?? 1000);
+    for (const s of page) seen.add(addr.toBase58() + " " + s.signature);
+    return page;
   },
   // web3.js sends a JSON-RPC batch: one HTTP round trip, but one getTransaction per signature (what RPC providers bill).
   async getParsedTransactions(sigs: string[]) {
@@ -134,5 +142,50 @@ describe("bench: cold trade backfill, 6 live v2.2 markets (recorded)", () => {
     console.log("BENCH " + JSON.stringify(out));
     expect(idx.hasBackfilled).toBe(true);
     for (const s of fx.slabs) expect(idx.lastSignature.get(s)).toBe(fx.sigs[s][0].signature); // every cursor committed
+  }, 600_000);
+});
+
+/**
+ * Steady-state poll whose window is longer than one getSignaturesForAddress page. Each slab's cursor sits on its
+ * OLDEST recorded signature, so the window is the 99 newer ones (about 4 minutes at ~25 signatures/min, less than
+ * one 5-minute poll interval). A signature the poll never sees is a missed trade: the cursor moves to the newest one
+ * at the end of the pass and the skipped ones are never polled again.
+ * Reference (full, untruncated window): TRADE_MAX_SIGNATURES=100 fetches all 99 in one call.
+ */
+describe("bench: steady-state poll, cursor 99 signatures back, 6 live v2.2 markets (recorded)", () => {
+  it("replays", async () => {
+    for (const k of Object.keys(counts)) delete counts[k];
+    txFetched = 0;
+    dbCalls = 0;
+    writes.length = 0;
+    seen.clear();
+    const idx: any = new TradeIndexerPolling();
+    idx._running = true;
+    idx.hasBackfilled = true;
+    for (const s of fx.slabs) idx.lastSignature.set(s, fx.sigs[s].at(-1)!.signature);
+    const window = fx.slabs.flatMap((s) => fx.sigs[s].slice(0, -1).map((x) => s + " " + x.signature));
+    const t0 = performance.now();
+    await idx.pollAllMarketsOnce();
+    const wallMs = Math.round(performance.now() - t0);
+    idx._running = false;
+    const missed = window.filter((k) => !seen.has(k)).length;
+    const windowSec = Math.max(...fx.slabs.map((s) => (fx.sigs[s][0] as any).blockTime - (fx.sigs[s].at(-1) as any).blockTime));
+    const out = {
+      markets: fx.slabs.length,
+      maxSignatures: Number(process.env.TRADE_MAX_SIGNATURES ?? 50),
+      windowSec,
+      windowSigs: window.length,
+      windowUnique: new Set(window.map((k) => k.split(" ")[1])).size,
+      seenSigs: seen.size,
+      missed,
+      txFetched,
+      rpc: counts,
+      dbCalls,
+      writes: writes.length,
+      writesSha256: createHash("sha256").update(writes.join("\n")).digest("hex").slice(0, 16),
+      wallMs,
+    };
+    console.log("BENCH-POLL " + JSON.stringify(out));
+    for (const s of fx.slabs) expect(idx.lastSignature.get(s)).toBe(fx.sigs[s][0].signature);
   }, 600_000);
 });
