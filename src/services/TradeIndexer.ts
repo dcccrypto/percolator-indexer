@@ -58,7 +58,7 @@ const TRADE_TAGS = new Set<number>([
  * pass is a bounded look-back, not a window). With `until`, a full page means older signatures may remain, so
  * it pages on with `before` = the page's oldest signature until a short page (the cursor was reached) or
  * MAX_SIGNATURE_PAGES. Each page has its own retries; a page that still fails throws, and the caller then returns
- * with the cursor untouched, so the next poll re-reads the same window. Nothing is processed from a partial window.
+ * with the cursor untouched, so the next poll re-reads the same window. Only the page bound below truncates.
  */
 async function fetchSignatureWindow(
   connection: Connection,
@@ -88,6 +88,9 @@ async function fetchSignatureWindow(
     fresh = raw.filter((s) => !seen.has(s.signature));
     for (const s of fresh) seen.add(s.signature);
     out.push(...fresh);
+    if (fresh.length === 0 && raw.length >= limit) {
+      logger.error("getSignaturesForAddress returned a full page of signatures already seen; window walk stopped", { slab: slabAddress, signatures: out.length });
+    }
   }
   return out;
 }
@@ -106,10 +109,10 @@ const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
 /**
  * With a cursor, the window (cursor, newest] is paged until it is exhausted, so a window longer than one page is
  * not cut down to its newest MAX_SIGNATURES (the cursor then moves past the rest and they are never polled).
- * This only bounds a runaway walk, e.g. after a long outage: 200 pages of 50 is 10,000 signatures, about 6 hours
- * at the ~25/min of the v2.2 markets.
+ * This only bounds a runaway walk, e.g. after a long outage: 20 pages of 50 is 1,000 signatures (the tx cache size),
+ * about 40 minutes at the ~25/min of the v2.2 markets, against ~125 in a normal 5-minute poll.
  */
-const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 200, 10_000);
+const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 20, 1_000);
 
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
 const POLL_INTERVAL_MS = readPositiveIntEnv("TRADE_POLL_INTERVAL_MS", 5 * 60_000);

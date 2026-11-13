@@ -52,8 +52,8 @@ function rehydrate(tx: any) {
 const counts: Record<string, number> = {};
 let txFetched = 0;
 let dbCalls = 0;
-const writes: string[] = [];
-const seen = new Set<string>(); // "slab signature" pairs returned by getSignaturesForAddress // every DB write payload, in order (compared as a hash between runs)
+const writes: string[] = []; // every DB write payload, in order (compared as a hash between runs)
+const seen = new Set<string>(); // "slab signature" pairs returned by getSignaturesForAddress
 const jsonSafe = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 const bump = (k: string, n = 1) => { counts[k] = (counts[k] ?? 0) + n; };
 const rpcSleep = () => new Promise((r) => setTimeout(r, RPC_MS));
