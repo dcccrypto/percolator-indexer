@@ -1,4 +1,4 @@
-import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant } from "../lib/tolerantTxFetch.js";
+import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, type TolerantFetchResult } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
@@ -76,6 +76,17 @@ const TX_FETCH_RETRIES = readPositiveIntEnv("INDEXER_TX_FETCH_RETRIES", 2, 5);
 const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !== "false";
 
 /**
+ * Parsed transactions shared across slabs. One keeper crank transaction touches several markets, so the
+ * same signature shows up in several slabs' getSignaturesForAddress windows of one pass (recorded on the
+ * 6 v2.2 markets: 600 signatures, 167 unique). A signature's transaction never changes, so each one is
+ * fetched once and reused for the other slabs. Only successfully fetched, non-null transactions are kept;
+ * bounded by entries (INDEXER_TX_CACHE_MAX) and age. INDEXER_TX_CACHE_DISABLED=true turns it off.
+ */
+const TX_CACHE_MAX = readPositiveIntEnv("INDEXER_TX_CACHE_MAX", 1_000, 10_000);
+const TX_CACHE_TTL_MS = 10 * 60_000;
+const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
+
+/**
  * TradeIndexerPolling — backup/backfill trade indexer using on-chain polling.
  *
  * Primary indexing is now webhook-driven (see HeliusWebhookManager + webhook routes).
@@ -90,6 +101,8 @@ export class TradeIndexerPolling {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+  /** signature -> parsed transaction, shared by every slab whose window contains it (see TX_CACHE_MAX). */
+  private txCache = new BoundedTtlMap<string, ParsedTransactionWithMeta>(TX_CACHE_MAX, TX_CACHE_TTL_MS);
   private hasBackfilled = false;
   private backfillAttempts = 0;
   /** In-flight guards: a backfill / poll pass already running is joined or skipped, never doubled. */
@@ -309,6 +322,8 @@ export class TradeIndexerPolling {
     let holdCursor = false;
     const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
+    const prefetchClean = await this.prefetchMisses(connection, validSigs);
+
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
     windowLoop:
@@ -316,11 +331,7 @@ export class TradeIndexerPolling {
       const batch = validSigs.slice(i, i + TX_BATCH_SIZE);
       // X-1: isolate an unreadable (e.g. v1-version) transaction instead of letting one poisoned signature
       // hold this slab's cursor forever. Transient RPC failures still hold the cursor (#147).
-      const fetched = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(
-        connection,
-        batch,
-        (fn, label) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label }),
-      );
+      const fetched = await this.fetchBatchCached(connection, batch, prefetchClean);
       if (fetched.skipped.length > 0) {
         pass.incomplete = true; // an unreadable earlier tx may have changed a position unseen
         // Durable + loud: FULL signature and slab, counter, DB table (or JSONL fallback). Re-index from there.
@@ -390,6 +401,58 @@ export class TradeIndexerPolling {
     if (indexed > 0) {
       logger.info("Trades indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
     }
+  }
+
+  /**
+   * Warm the cache with this window's uncached signatures, packed into full TX_BATCH_SIZE batches. Once
+   * other slabs have filled the cache, the few misses are spread thinly across the window, and without
+   * this each window batch would cost its own round trip for one or two signatures. Best effort only: it
+   * writes nothing except the cache, makes ONE attempt per call (no withRetry backoff), and stops at the
+   * first batch that does not come back clean. Returns false in that case, and the window loop then
+   * fetches every batch that still has a miss in full, exactly as without the cache (no misses-only step),
+   * so an RPC brown-out or a poison pill costs at most one extra call, never a second retry cycle.
+   */
+  private async prefetchMisses(connection: Connection, sigs: string[]): Promise<boolean> {
+    if (!TX_CACHE_ENABLED) return true;
+    const misses = sigs.filter((s) => this.txCache.get(s) === undefined);
+    // Nothing to pack: everything is cached, or the whole window is new and the loop's batches are already full.
+    if (misses.length === 0 || misses.length === sigs.length) return true;
+    for (let i = 0; i < misses.length; i += TX_BATCH_SIZE) {
+      const chunk = misses.slice(i, i + TX_BATCH_SIZE);
+      const r = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, chunk, (fn) => fn());
+      if (r.failed || r.skipped.length > 0) return false;
+      r.txs.forEach((tx, j) => { if (tx) this.txCache.set(chunk[j], tx); });
+    }
+    return true;
+  }
+
+  /**
+   * fetchParsedTxsTolerant for one batch, fetching only the signatures not already in the shared cache.
+   * The result is the same as an uncached call: same order, same skip / failure / breaker outcome.
+   * - All cached: no RPC call.
+   * - Misses only (`partial`, i.e. the window's prefetch was clean): one tolerant fetch of the misses. Its
+   *   transient failure holds the cursor as before.
+   * - The mass-skip breaker judges a batch by its successfully fetched siblings, and cached siblings
+   *   were not fetched in this call. So if the misses-only fetch trips the breaker, the whole batch is
+   *   fetched again exactly as without the cache, and that result is returned.
+   */
+  private async fetchBatchCached(connection: Connection, batch: string[], partial: boolean): Promise<TolerantFetchResult<ParsedTransactionWithMeta>> {
+    const retry = <R>(fn: () => Promise<R>, label: string) => withRetry(fn, { maxRetries: TX_FETCH_RETRIES, baseDelayMs: 1000, label });
+    const fetchAndStore = async (sigs: string[]) => {
+      const r = await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, sigs, retry);
+      if (TX_CACHE_ENABLED && !r.failed) r.txs.forEach((tx, i) => { if (tx) this.txCache.set(sigs[i], tx); });
+      return r;
+    };
+    if (!TX_CACHE_ENABLED) return fetchAndStore(batch);
+    const cached = batch.map((s) => this.txCache.get(s) ?? null);
+    const misses = batch.filter((_, i) => cached[i] === null);
+    if (misses.length === 0) return { txs: cached, skipped: [], failed: false };
+    if (!partial || misses.length === batch.length) return fetchAndStore(batch);
+    const part = await fetchAndStore(misses);
+    if (part.massSkip) return fetchAndStore(batch);
+    if (part.failed) return { ...part, txs: batch.map(() => null) };
+    let k = 0;
+    return { txs: cached.map((tx) => tx ?? part.txs[k++] ?? null), skipped: part.skipped, failed: false };
   }
 
   private async processTransaction(
