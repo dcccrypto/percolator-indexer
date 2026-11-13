@@ -359,8 +359,11 @@ export class TradeIndexerPolling {
         break;
       }
       const txs = fetched.txs;
-      // One stored-legs query for the whole fetched batch (not one per transaction).
-      pass.stored = await fetchStoredLegsMany(batch);
+      // One stored-legs query for the batch's transactions that can read stored legs (a fill or a tag 44 of
+      // ours), not one per transaction. A batch of keeper cranks has none and costs no query; a transaction
+      // missing from the map still falls back to its own lookup in processTransaction.
+      const needStored = batch.filter((_, j) => txs[j] != null && mayReadStoredLegs(txs[j]!, programIds));
+      pass.stored = needStored.length > 0 ? await fetchStoredLegsMany(needStored) : null;
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
@@ -525,6 +528,8 @@ export class TradeIndexerPolling {
     const touched = new Set<string>();
     // Rows already stored for this tx, read once and only if a fill needs it (F2 + old-numbering check).
     let stored: StoredLeg[] | null | undefined;
+    // Batched rows are prefetched only for txs where mayReadStoredLegs() is true; a getStored() call added outside the
+    // top-level trade / tag 44 path must widen that predicate too (otherwise it silently falls back to one query per tx).
     const getStored = async (): Promise<StoredLeg[] | null> => {
       if (stored === undefined) stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
       return stored;
@@ -981,4 +986,20 @@ export class TradeIndexerPolling {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * True when processTransaction may read this transaction's stored legs: some top-level instruction of
+ * ours is a trade tag (after unwrapping tag 119) or a tag 44. A superset of where getStored() is called.
+ */
+export function mayReadStoredLegs(tx: ParsedTransactionWithMeta, programIds: Set<string>): boolean {
+  if (!tx.meta || tx.meta.err) return false;
+  for (const ix of tx.transaction.message.instructions) {
+    if ("parsed" in ix || !programIds.has(ix.programId.toBase58())) continue;
+    const raw = decodeBase58(ix.data);
+    if (!raw || raw.length < 1) continue;
+    const tag = unwrapEvictAndTradeIx(raw, ix.accounts).data[0];
+    if (TRADE_TAGS.has(tag) || isRebalanceReduceTag(tag)) return true;
+  }
+  return false;
 }
