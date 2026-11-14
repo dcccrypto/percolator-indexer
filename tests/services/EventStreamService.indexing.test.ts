@@ -317,12 +317,12 @@ describe("handle: batch write and fan-out", () => {
   });
 
   it("emits only legs that were actually written (re-delivered legs are skipped)", async () => {
-    m.fills.mockReturnValue([fill(), fill({ assetIndex: 1 })]);
+    m.fills.mockReturnValue([fill(), fill({ assetIndex: 1, trader: "TRADER2" })]);
     m.insertRows.mockImplementation(async (rows: any[]) => [rows[1]]);
     const { handle } = setup();
     await handle(note(tx()));
     expect(emitSpy).toHaveBeenCalledTimes(1);
-    expect(emitSpy.mock.calls[0][1]).toEqual(expect.objectContaining({ slabAddress: SLAB }));
+    expect((emitSpy.mock.calls[0][1] as any).data.trader).toBe("TRADER2");
   });
 
   it("keeps emitting later legs if the event bus throws on one", async () => {
@@ -389,12 +389,13 @@ describe("start() notification wiring", () => {
     deliver(note(tx()));
     await vi.waitFor(() => expect(m.insertRows).toHaveBeenCalledTimes(1));
 
-    m.fills.mockImplementation(() => { throw new Error("parser exploded"); });
+    m.fills.mockImplementationOnce(() => { throw new Error("parser exploded"); });
     deliver(note(tx({ signature: "SIG3" })));
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(m.fills).toHaveBeenCalledTimes(2));
     m.fills.mockReturnValue([fill()]);
     deliver(note(tx({ signature: "SIG4" })));
     await vi.waitFor(() => expect(m.insertRows).toHaveBeenCalledTimes(2));
+    expect(m.insertRows.mock.calls.map((c: any) => c[0][0].tx_signature)).toEqual(["SIG1", "SIG4"]);
   });
 });
 
