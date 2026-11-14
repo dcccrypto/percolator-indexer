@@ -26,6 +26,7 @@ import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
+import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -133,6 +134,15 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
  * fetched once and reused for the other slabs. Only successfully fetched, non-null transactions are kept;
  * bounded by entries (INDEXER_TX_CACHE_MAX) and age. INDEXER_TX_CACHE_DISABLED=true turns it off.
  */
+/**
+ * Minimum gap between two history RPC calls (getSignaturesForAddress / getParsedTransactions), shared by backfill and
+ * poll. Replaces the fixed 1 s / 0.5 s sleep per market. 125 ms = 8 calls/s, under the 10 req/s of a free Helius plan.
+ * 0 disables pacing.
+ */
+const RPC_MIN_INTERVAL_MS = (() => {
+  const n = Number(process.env.TRADE_RPC_MIN_INTERVAL_MS);
+  return !!process.env.TRADE_RPC_MIN_INTERVAL_MS && Number.isFinite(n) && n >= 0 ? n : 125;
+})();
 const TX_CACHE_MAX = readPositiveIntEnv("INDEXER_TX_CACHE_MAX", 1_000, 10_000);
 const TX_CACHE_TTL_MS = 10 * 60_000;
 const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
@@ -154,6 +164,10 @@ export class TradeIndexerPolling {
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   /** signature -> parsed transaction, shared by every slab whose window contains it (see TX_CACHE_MAX). */
   private txCache = new BoundedTtlMap<string, ParsedTransactionWithMeta>(TX_CACHE_MAX, TX_CACHE_TTL_MS);
+  private rpcLimiter = new RpcLimiter({
+    minIntervalMs: RPC_MIN_INTERVAL_MS,
+    onRateLimited: (i) => logger.warn("RPC 429 on trade history read, backing off", i),
+  });
   private hasBackfilled = false;
   private backfillAttempts = 0;
   /** In-flight guards: a backfill / poll pass already running is joined or skipped, never doubled. */
@@ -196,8 +210,8 @@ export class TradeIndexerPolling {
    */
   private backfill(): Promise<void> {
     if (this.hasBackfilled || !this._running) return Promise.resolve();
-    // Re-entrancy guard. A full backfill walks every market with a 1 s pause (about 20 minutes with
-    // ~200 markets) but pollAllMarkets re-triggers it every POLL_INTERVAL_MS while `hasBackfilled` is
+    // Re-entrancy guard. A full backfill walks every market (about 20 minutes with
+    // ~200 markets at the old 1 s pause) but pollAllMarkets re-triggers it every POLL_INTERVAL_MS while `hasBackfilled` is
     // still false, which used to start a second, third and fourth full backfill on top of the first
     // after every deploy (each is one getSignaturesForAddress per market plus up to
     // BACKFILL_SIGNATURES getTransaction calls). Join the running one instead.
@@ -246,8 +260,6 @@ export class TradeIndexerPolling {
             },
           });
         }
-        // Small delay between markets to avoid rate limits
-        await sleep(1_000);
       }
       this.hasBackfilled = true;
       logger.info("Trade backfill complete");
@@ -304,8 +316,6 @@ export class TradeIndexerPolling {
             error: err instanceof Error ? err.message : err
           });
         }
-        // Small delay between markets
-        await sleep(500);
       }
     } catch (err) {
       logger.error("Poll failed", { error: err instanceof Error ? err.message : err });
@@ -320,7 +330,10 @@ export class TradeIndexerPolling {
    * to collect all slabs before processing
    */
   private async indexTradesForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
-    const connection = getConnection();
+    const rawConnection = getConnection();
+    const connection = paceConnection(rawConnection, this.rpcLimiter);
+    // The cache prefetch is best effort and makes ONE attempt (see prefetchMisses): paced, but no 429 retry.
+    const prefetchConnection = paceConnection(rawConnection, this.rpcLimiter, 0);
     const slabPk = new PublicKey(slabAddress);
     const programIds = new Set(config.allProgramIds);
 
@@ -365,7 +378,7 @@ export class TradeIndexerPolling {
     let holdCursor = false;
     const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
 
-    const prefetchClean = await this.prefetchMisses(connection, validSigs);
+    const prefetchClean = await this.prefetchMisses(prefetchConnection, validSigs);
 
     // Fetch transactions in Helius-supported historical batches instead of
     // parallel single-tx calls. This reduces request bursts and avoids 429 loops.
@@ -1025,10 +1038,6 @@ export class TradeIndexerPolling {
   private extractFeeFromBalances(_tx: ParsedTransactionWithMeta, _trader: string): number {
     return 0;
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**

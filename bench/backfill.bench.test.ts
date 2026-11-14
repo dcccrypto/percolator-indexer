@@ -56,6 +56,17 @@ const writes: string[] = []; // every DB write payload, in order (compared as a 
 const seen = new Set<string>(); // "slab signature" pairs returned by getSignaturesForAddress
 const jsonSafe = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 const bump = (k: string, n = 1) => { counts[k] = (counts[k] ?? 0) + n; };
+// Provider budget: more than BENCH_RPS_LIMIT history calls inside any sliding 1 s window counts one "429" (counted only,
+// the call still succeeds, so the replay and its write hash stay comparable between runs).
+const RPS_LIMIT = Number(process.env.BENCH_RPS_LIMIT ?? 10);
+const callTimes: number[] = [];
+let would429 = 0;
+const meter = () => {
+  const t = performance.now();
+  while (callTimes.length && t - callTimes[0] >= 1000) callTimes.shift();
+  callTimes.push(t);
+  if (callTimes.length > RPS_LIMIT) would429++;
+};
 const rpcSleep = () => new Promise((r) => setTimeout(r, RPC_MS));
 const dbSleep = async () => { dbCalls++; await new Promise((r) => setTimeout(r, DB_MS)); };
 
@@ -63,6 +74,7 @@ const fakeConnection = {
   // Same contract as the RPC: newest-first, `before` and `until` exclusive, at most `limit` (default 1000).
   async getSignaturesForAddress(addr: PublicKey, opts: { limit?: number; before?: string; until?: string } = {}) {
     bump("getSignaturesForAddress");
+    meter();
     await rpcSleep();
     let all = fx.sigs[addr.toBase58()] ?? [];
     if (opts.before) {
@@ -77,12 +89,14 @@ const fakeConnection = {
   // web3.js sends a JSON-RPC batch: one HTTP round trip, but one getTransaction per signature (what RPC providers bill).
   async getParsedTransactions(sigs: string[]) {
     bump("getParsedTransactions");
+    meter();
     txFetched += sigs.length;
     await rpcSleep();
     return sigs.map((s) => rehydrate(fx.txs[s] ?? null));
   },
   async getParsedTransaction(sig: string) {
     bump("getParsedTransaction");
+    meter();
     txFetched += 1;
     await rpcSleep();
     return rehydrate(fx.txs[sig] ?? null);
@@ -138,7 +152,7 @@ describe("bench: cold trade backfill, 6 live v2.2 markets (recorded)", () => {
     idx._running = false;
     const signatures = Object.values(fx.sigs).reduce((n, l) => n + l.length, 0);
     const unique = new Set(Object.values(fx.sigs).flat().map((s) => s.signature)).size;
-    const out = { markets: fx.slabs.length, signatures, uniqueTxs: unique, rpcMs: RPC_MS, dbMs: DB_MS, txFetched, rpc: counts, dbCalls, writes: writes.length, writesSha256: createHash("sha256").update(writes.join("\n")).digest("hex").slice(0, 16), wallMs };
+    const out = { markets: fx.slabs.length, signatures, uniqueTxs: unique, rpcMs: RPC_MS, dbMs: DB_MS, txFetched, rpc: counts, rpsLimit: RPS_LIMIT, would429, dbCalls, writes: writes.length, writesSha256: createHash("sha256").update(writes.join("\n")).digest("hex").slice(0, 16), wallMs };
     console.log("BENCH " + JSON.stringify(out));
     expect(idx.hasBackfilled).toBe(true);
     for (const s of fx.slabs) expect(idx.lastSignature.get(s)).toBe(fx.sigs[s][0].signature); // every cursor committed
@@ -157,6 +171,8 @@ describe("bench: steady-state poll, cursor 99 signatures back, 6 live v2.2 marke
     for (const k of Object.keys(counts)) delete counts[k];
     txFetched = 0;
     dbCalls = 0;
+    would429 = 0;
+    callTimes.length = 0;
     writes.length = 0;
     seen.clear();
     const idx: any = new TradeIndexerPolling();
@@ -180,6 +196,8 @@ describe("bench: steady-state poll, cursor 99 signatures back, 6 live v2.2 marke
       missed,
       txFetched,
       rpc: counts,
+      rpsLimit: RPS_LIMIT,
+      would429,
       dbCalls,
       writes: writes.length,
       writesSha256: createHash("sha256").update(writes.join("\n")).digest("hex").slice(0, 16),
