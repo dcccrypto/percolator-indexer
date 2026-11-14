@@ -140,6 +140,13 @@ vi.mock("../src/db/storedLegs.js", async (orig) => ({
   fetchStoredLegsMany: async () => { await dbSleep(); return new Map(); },
 }));
 
+// The durable cursor table, faked in memory so it survives a "restart" (a new TradeIndexerPolling) inside one test run.
+const cursorTable = new Map<string, string>();
+vi.mock("../src/db/tradeCursor.js", () => ({
+  loadTradeCursors: async () => { await dbSleep(); return new Map(cursorTable); },
+  saveTradeCursor: async (slab: string, sig: string) => { cursorTable.set(slab, sig); await dbSleep(); },
+}));
+
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
 
 describe("bench: cold trade backfill, 6 live v2.2 markets (recorded)", () => {
@@ -205,5 +212,27 @@ describe("bench: steady-state poll, cursor 99 signatures back, 6 live v2.2 marke
     };
     console.log("BENCH-POLL " + JSON.stringify(out));
     for (const s of fx.slabs) expect(idx.lastSignature.get(s)).toBe(fx.sigs[s][0].signature);
+  }, 600_000);
+});
+
+/**
+ * Restart: backfill, "restart" (a new TradeIndexerPolling, in-memory cursors gone, the DB kept), backfill again.
+ * Second run = work re-done after a restart. Trade writes (everything but cursor writes) hash the same as run 1.
+ * (Signatures that arrive between the runs are covered by tests/services/TradeIndexer.durableCursor.test.ts.)
+ */
+describe("bench: restart after backfill, 6 live v2.2 markets (recorded)", () => {
+  it("replays", async () => {
+    const reset = () => { for (const k of Object.keys(counts)) delete counts[k]; txFetched = 0; dbCalls = 0; would429 = 0; callTimes.length = 0; writes.length = 0; };
+    const snap = () => ({ txFetched, rpc: { ...counts }, rpcTotal: Object.values(counts).reduce((a, b) => a + b, 0), dbCalls, writes: writes.length, writesSha256: createHash("sha256").update(writes.join("\n")).digest("hex").slice(0, 16) });
+    reset(); seen.clear(); cursorTable.clear();
+    const a: any = new TradeIndexerPolling(); a._running = true;
+    await a.backfill(); a._running = false;
+    const first = snap();
+    reset();
+    const b: any = new TradeIndexerPolling(); b._running = true; // restart
+    await b.backfill(); b._running = false;
+    const second = snap();
+    console.log("BENCH-RESTART " + JSON.stringify({ first, second, cursorsStored: cursorTable.size }));
+    for (const s of fx.slabs) expect(b.lastSignature.get(s)).toBe(fx.sigs[s][0].signature);
   }, 600_000);
 });

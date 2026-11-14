@@ -27,6 +27,7 @@ import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
+import { loadTradeCursors, saveTradeCursor } from "../db/tradeCursor.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -158,6 +159,20 @@ const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
 export class TradeIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
   private lastSignature = new Map<string, string>();
+  /** The durable cursors are read once per process, before the first window of the first slab. */
+  private cursorsLoaded: Promise<void> | null = null;
+  private loadDurableCursors(): Promise<void> {
+    this.cursorsLoaded ??= loadTradeCursors().then((m) => {
+      // Never overwrite a cursor this process already moved.
+      for (const [slab, sig] of m) if (!this.lastSignature.has(slab)) this.lastSignature.set(slab, sig);
+    });
+    return this.cursorsLoaded;
+  }
+  /** Move the cursor past a window that is fully committed: memory first, then the durable row (best effort). */
+  private async commitCursor(slabAddress: string, signature: string): Promise<void> {
+    this.lastSignature.set(slabAddress, signature);
+    await saveTradeCursor(slabAddress, signature);
+  }
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
@@ -339,6 +354,7 @@ export class TradeIndexerPolling {
 
     // Fetch the signatures newer than this slab's cursor (newest-first). Without a cursor (first pass) this
     // is the newest maxSigs; with one, the window is paged until the cursor is reached.
+    await this.loadDurableCursors();
     const lastSig = this.lastSignature.get(slabAddress);
 
     let signatures: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>;
@@ -369,7 +385,7 @@ export class TradeIndexerPolling {
     const validSigs = signatures.filter(s => !s.err).map(s => s.signature).reverse();
     if (validSigs.length === 0) {
       // No valid txs in this window but signatures were fetched — safe to advance.
-      this.lastSignature.set(slabAddress, signatures[0].signature);
+      await this.commitCursor(slabAddress, signatures[0].signature);
       return;
     }
 
@@ -454,7 +470,7 @@ export class TradeIndexerPolling {
     // #147: Only commit the cursor after the full batch is fetched and processed.
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
     if (!batchFailed && !holdCursor) {
-      this.lastSignature.set(slabAddress, signatures[0].signature);
+      await this.commitCursor(slabAddress, signatures[0].signature);
     }
 
     if (indexed > 0) {
