@@ -7,7 +7,7 @@ import { config, getConnection, eventBus, decodeBase58, withRetry, createLogger,
 import { getMarketRowsCached, type MarketRowLite } from "../db/marketRows.js";
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { isBlockedSlab } from "../blocklist.js";
-import { insertTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
+import { insertTradeRow, insertTradeRows, tradeKey, type IndexerTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
 import { rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import {
@@ -31,7 +31,24 @@ import { loadTradeCursors, saveTradeCursor } from "../db/tradeCursor.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
+/**
+ * Oldest-first state of one slab window. `pending` (poll path only) holds the fill rows of the transactions
+ * processed so far that are not written yet: they go out in one upsert per FLUSH_AT rows, and always before a
+ * tag 44 is resolved (it reads the indexed fills) and before the cursor moves. Without `pending` every fill is
+ * written at once (one insert each), as before.
+ */
+interface PassState {
+  earlier: Set<string>;
+  incomplete: boolean;
+  stored?: Map<string, StoredLeg[]> | null;
+  pending?: Array<{ row: IndexerTradeRow; onNew: () => void }>;
+  /** Rows a flush actually wrote (duplicates excluded). */
+  newCount?: number;
+}
+const FLUSH_AT = 200;
+
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
+
 class CtxReadRetry extends Error {
   constructor(readonly signature: string) { super("matcher context read failed; signature will be retried"); }
 }
@@ -392,7 +409,7 @@ export class TradeIndexerPolling {
     let indexed = 0;
     let batchFailed = false;
     let holdCursor = false;
-    const pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set<string>(), incomplete: false }; // oldest-first: everything in `earlier` precedes the current tx
+    const pass: PassState = { earlier: new Set<string>(), incomplete: false, pending: [], newCount: 0 }; // oldest-first: everything in `earlier` precedes the current tx
 
     const prefetchClean = await this.prefetchMisses(prefetchConnection, validSigs);
 
@@ -443,8 +460,7 @@ export class TradeIndexerPolling {
         const sig = batch[j];
 
         try {
-          const didIndex = await this.processTransaction(tx, sig, slabAddress, programIds, pass);
-          if (didIndex) indexed++;
+          await this.processTransaction(tx, sig, slabAddress, programIds, pass); // rows written are counted in pass.newCount
           pass.earlier.add(sig);
         } catch (err) {
           if (err instanceof CtxReadRetry) {
@@ -466,6 +482,10 @@ export class TradeIndexerPolling {
         }
       }
     }
+
+    // Queued fills are written before the cursor can move (and on every early exit, as each was before).
+    await this.flushPending(pass);
+    indexed += pass.newCount ?? 0;
 
     // #147: Only commit the cursor after the full batch is fetched and processed.
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
@@ -530,6 +550,39 @@ export class TradeIndexerPolling {
     return { txs: cached.map((tx) => tx ?? part.txs[k++] ?? null), skipped: part.skipped, failed: false };
   }
 
+  /**
+   * Write the queued fills in one upsert (known legs are skipped, as insertTradeRow's 23505 did), then run each new
+   * row's side effects. If the batch call fails, fall back to one insert per row so a failure is logged and
+   * marks the pass incomplete exactly like a failed single insert did.
+   */
+  private async flushPending(pass: PassState): Promise<void> {
+    const queued = pass.pending;
+    if (!queued || queued.length === 0) return;
+    pass.pending = [];
+    let written: Set<string> | null = null;
+    try {
+      written = new Set((await insertTradeRows(queued.map((q) => q.row))).map(tradeKey));
+    } catch (err) {
+      logger.warn("batched trade insert failed; writing the rows one by one", { count: queued.length, err: String(err) });
+    }
+    for (const q of queued) {
+      let isNew: boolean;
+      if (written) isNew = written.has(tradeKey(q.row));
+      else {
+        try {
+          isNew = await insertTradeRow(q.row);
+        } catch (err) {
+          pass.incomplete = true;
+          logger.warn("Failed to process transaction", { signature: q.row.tx_signature?.slice(0, 12), error: err instanceof Error ? err.message : err });
+          continue;
+        }
+      }
+      if (!isNew) continue;
+      pass.newCount = (pass.newCount ?? 0) + 1;
+      q.onNew();
+    }
+  }
+
   private async processTransaction(
     tx: ParsedTransactionWithMeta,
     signature: string,
@@ -539,7 +592,7 @@ export class TradeIndexerPolling {
      * Oldest-first pass state: signatures of this slab's window already indexed before this one, and
      * whether any earlier one could not be (failed / unreadable / skipped), which makes a tag 44 unresolvable.
      */
-    pass: { earlier: Set<string>; incomplete: boolean; stored?: Map<string, StoredLeg[]> | null } = { earlier: new Set(), incomplete: false },
+    pass: PassState = { earlier: new Set(), incomplete: false },
   ): Promise<boolean> {
     if (!tx.meta || tx.meta.err) return false;
 
@@ -605,6 +658,16 @@ export class TradeIndexerPolling {
     const getStored = async (): Promise<StoredLeg[] | null> => {
       if (stored === undefined) stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
       return stored;
+    };
+    // Write a fill now (no pass queue) or queue it for the window's batched upsert; `onNew` runs only for a row
+    // that was really written (not a duplicate leg).
+    const writeFill = async (row: IndexerTradeRow, onNew: () => void): Promise<void> => {
+      if (!pass.pending) {
+        if (await insertTradeRow(row)) onNew();
+        return;
+      }
+      pass.pending.push({ row, onNew });
+      if (pass.pending.length >= FLUSH_AT) await this.flushPending(pass);
     };
     // Leg numbers of this tx's tag 44s (their own inferred rows are not TradeCpi fills), by a dry walk
     // of the same numbering the loop below uses.
@@ -712,6 +775,7 @@ export class TradeIndexerPolling {
         // later rows would make it look "not provably earlier" and it would be reported as missing.
         if (reduceAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: reduce.assetIndex, legIndex, trader, reduceQ: reduce.reduceQ })) continue;
         const reduceKey = `${trader}|${slabAddress}|${reduce.assetIndex}`;
+        await this.flushPending(pass); // the resolution reads the fills of the earlier transactions of this window
         const resolution = await resolveRebalanceReduce({
           trader,
           slabAddress,
@@ -731,7 +795,7 @@ export class TradeIndexerPolling {
         }
         const price = await resolveFallbackPrice(reduce.assetIndex); // tag 44: no matcher CPI, effective_price is its only exact source
         // The engine charges no trading fee on tag 44.
-        const inserted = await insertTradeRow({
+        await writeFill({
           slab_address: slabAddress,
           trader,
           side: resolution.side,
@@ -741,10 +805,10 @@ export class TradeIndexerPolling {
           tx_signature: signature,
           asset_index: reduce.assetIndex,
           leg_index: legIndex,
+        }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
+          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: resolution.side, size: resolution.sizeValue.toString() });
+          insertedAny = true;
         });
-        if (!inserted) continue; // duplicate leg: already indexed, no event, no count
-        eventBus.publish("trade.executed", slabAddress, { signature, trader, side: resolution.side, size: resolution.sizeValue.toString() });
-        insertedAny = true;
         continue;
       }
 
@@ -830,21 +894,22 @@ export class TradeIndexerPolling {
           if (price === undefined) price = await resolvePrice(leg);
           const fee = computeFeeUsd(legSize, price, leg.feeBps);
 
-          const inserted = await insertTradeRow({
+          const legSizeStr = legSize.toString();
+          await writeFill({
             slab_address: slabAddress,
             trader,
             side: leg.side,
-            size: legSize.toString(),
+            size: legSizeStr,
             size_provenance: sizeProvenance,
             price,
             fee,
             tx_signature: signature,
             asset_index: leg.assetIndex,
             leg_index: legIndex,
+          }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
+            eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: legSizeStr });
+            insertedAny = true;
           });
-          if (!inserted) continue; // duplicate leg: already indexed, no event, no count
-          eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: legSize.toString() });
-          insertedAny = true;
         }
         continue;
       }
@@ -919,22 +984,22 @@ export class TradeIndexerPolling {
         continue; // this leg only — `return` would silently drop the legs after it
       }
 
-      const inserted = await insertTradeRow({
+      const sizeStr = sizeValue.toString();
+      await writeFill({
         slab_address: slabAddress,
         trader,
         side,
-        size: sizeValue.toString(),
+        size: sizeStr,
         size_provenance: sizeProvenance,
         price,
         fee,
         tx_signature: signature,
         asset_index: decoded.assetIndex,
         leg_index: legIndex,
+      }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
+        eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeStr });
+        insertedAny = true;
       });
-      if (!inserted) continue; // duplicate leg: already indexed, no event, no count
-
-      eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeValue.toString() });
-      insertedAny = true;
     }
 
     if (unverified.length > 0) {
