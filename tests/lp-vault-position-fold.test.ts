@@ -38,6 +38,7 @@ describe("compareEvents tie-breaks", () => {
       ev({ kind: "execute_redeem", ixIndex: 2, collateralAtoms: 90n, lpAmount: 100n }),
       ev({ kind: "deposit", ixIndex: 1, collateralAtoms: 100n, lpAmount: 100n }),
     ]);
+    expect(f.eventsConsistent).toBe(true);
     expect(f.realizedPnlAtoms).toBe(-10n);
     expect(f.costBasisAtoms).toBe(0n);
   });
