@@ -640,6 +640,10 @@ const fxucSigOf = (i: number): string => [SIG.createFxuc, SIG.depositFxuc, SIG.r
  * The junk signatures here are the real shape of both: transactions that reference the
  * registry and decode to no vault events at all.
  */
+// 20_001 signatures are really read through the indexer: ~2 s alone, but it is CPU work, so it stretched past
+// the 10 s default when other suites compete for the cores (12.7 s seen in a full run). It is slow work, not a sleep.
+const SLOW_MS = 60_000;
+
 describe("GH#231 a long or spammed signature history drains instead of wedging the vault", () => {
   const claimOfRecord = (): OnchainClaim => ({
     heldShares: 4_999_999_000n - requestedShares(),
@@ -650,9 +654,14 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
   /** The real FXUC history, then `n` event-free transactions naming the registry on top of it. */
   function spammed(n: number): FakeChain {
     const c = fxucChain();
+    // Built in one go: calling add() n times does n `unshift`s onto a growing array (O(n^2): ~4 s for 20_001).
+    const junk: SigInfo[] = [];
     for (let i = 1; i <= n; i++) {
-      c.add({ signature: `junk${String(i).padStart(6, "0")}`, slot: 600_000_000 + i, blockTime: null, failed: false, instructions: [] });
+      const tx: NormTx = { signature: `junk${String(i).padStart(6, "0")}`, slot: 600_000_000 + i, blockTime: null, failed: false, instructions: [] };
+      c.txs.set(tx.signature, tx);
+      junk.push({ signature: tx.signature, slot: tx.slot, failed: tx.failed });
     }
+    c.sigs = junk.reverse().concat(c.sigs); // newest first
     return c;
   }
 
@@ -691,7 +700,7 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
     expect(rec).toEqual({ reconciled: 1, skipped: 0 });
     const after = await store.loadPosition("devnet", FXUC.registry, LP_USER);
     expect(after).toMatchObject({ basis_known: true, transfer_detected_slot: null, onchain_lp_shares: "4999999000" });
-  });
+  }, SLOW_MS);
 
   it("does not reconcile against a chain head it has not caught up to yet", async () => {
     const chain = spammed(20_001);
@@ -705,7 +714,7 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
     expect(r.reconcileSkipped).toBeGreaterThan(0);
     const pos = await store.loadPosition("devnet", FXUC.registry, LP_USER);
     expect(pos?.transfer_detected_slot).toBeNull();
-  });
+  }, SLOW_MS);
 
   it("a restarted process resumes from the durable cursor instead of re-paging history", async () => {
     const chain = fxucChain();
