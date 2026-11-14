@@ -74,7 +74,7 @@ vi.mock("@percolatorct/sdk", () => ({
   detectSlabLayout: (len: number) => {
     if (len === 2048) return { engineOff: 640, engineMarkPriceOff: 400, configMarkEwmaOff: null };
     if (len === 1024) return { engineOff: 0, engineMarkPriceOff: -1, configMarkEwmaOff: 100 };
-    if (len === 512) return { engineOff: 0, engineMarkPriceOff: 8, configMarkEwmaOff: null };
+    if (len === 512) return { engineOff: 0, engineMarkPriceOff: 508, configMarkEwmaOff: null };
     return null;
   },
 }));
@@ -183,7 +183,8 @@ describe("backfill main()", () => {
     expect(body.transactions).toEqual(["sigA", "sigB"]);
     expect(fetchMock.mock.calls[0][0]).toContain("api-devnet.helius-rpc.com");
 
-    expect(updateCalls.map((c) => c.patch.price).sort()).toEqual([2.5, 2.5, 3]);
+    const byId = updateCalls.map((c) => [c.filters.find(([k]) => k === "id")![1], c.patch.price]);
+    expect(byId.sort()).toEqual([["t1", 2.5], ["t2", 2.5], ["t3", 3]]);
     for (const c of updateCalls) {
       expect(c.filters).toContainEqual(["network", "devnet"]);
       expect(c.filters).toContainEqual(["price", 0]);
@@ -226,7 +227,7 @@ describe("backfill main()", () => {
         { signature: "sigNoData", accountData: [{ account: SLAB }] },
         { signature: "sigGarbage", accountData: [{ account: SLAB, data: 42 }] },
         enhanced("sigOther", blob(2048, 1040, 2_000_000n)),
-        // layout with markPrice offset past the buffer end
+        // layout whose mark-price offset runs past the buffer end
         enhanced("sigTiny", blob(512, 0, 1n)),
         enhanced("sigZero", blob(2048, 1040, 0n)),
         enhanced("sigHuge", blob(2048, 1040, 1_000_000_000_000n)),
@@ -273,7 +274,9 @@ describe("backfill main()", () => {
       });
       const { main } = await loadMain();
       const p = main();
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(3); // 4th chunk waits for the 200 ms pause
+      await vi.advanceTimersByTimeAsync(200);
       await p;
       expect(fetchMock).toHaveBeenCalledTimes(4);
       expect(updateCalls).toHaveLength(301);
@@ -299,6 +302,7 @@ describe("backfill main()", () => {
     mod = await loadMain();
     await mod.main();
     expect(logs.join("\n")).not.toContain("SECRET456");
+    expect(logs.join("\n")).toContain("Helius batch fetch failed");
 
     logs.length = 0;
     fetchMock.mockResolvedValueOnce({
@@ -338,7 +342,7 @@ describe("backfill main()", () => {
     expect(out).toContain("manual recovery");
   });
 
-  it("reports when the verification count fails or comes back zero", async () => {
+  it("reports when the verification count fails ", async () => {
     trades = [trade("t1", "sigA")];
     fetchMock.mockResolvedValue(jsonResponse([enhanced("sigA", blob(2048, 1040, 1_000_000n))]));
     countError = { message: "count failed" };
