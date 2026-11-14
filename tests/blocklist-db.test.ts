@@ -7,8 +7,16 @@
  * rather than replacing it, and that an empty/failed refresh cannot silently
  * un-block the permanently-retired markets.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { isBlockedSlab, setDbRetiredSlabs, blockedSlabCount } from "../src/blocklist.js";
+
+// blocklist.ts only needs a logger from @percolatorct/shared. Loading the whole
+// package (Sentry, Supabase, ...) and printing through vitest's console relay
+// is what made the first test here blow the 10 s limit on a loaded machine
+// (the logic itself is a Set lookup). Stub the logger; nothing here asserts on logs.
+vi.mock("@percolatorct/shared", () => ({
+  createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }),
+}));
 
 /** A slab that is in the hardcoded BLOCKED list (CATE, retired 2026-07-31). */
 const HARDCODED = "6CFMN29zPgsczCQUjeZZiWxVPDUKN52RJqBLvRsTTERn";
