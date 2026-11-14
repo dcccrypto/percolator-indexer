@@ -14,6 +14,8 @@ interface UpdateCall {
 let trades: any[] = [];
 let selectError: any = null;
 let updateCalls: UpdateCall[] = [];
+let selectRanges: [number, number][] = [];
+const SERVER_MAX_ROWS = 1000;
 let updateOutcome: (call: UpdateCall) => Promise<any> | any = () => ({ error: null });
 let remaining: number | null = 0;
 let countError: any = null;
@@ -31,10 +33,20 @@ function makeSupabase() {
           };
           return q;
         }
+        // Like PostgREST, an un-ranged select returns at most 1000 rows.
+        const page = (from: number, to: number) => {
+          selectRanges.push([from, to]);
+          return Promise.resolve({
+            data: trades === null ? null : trades.slice(from, to + 1),
+            error: selectError,
+          });
+        };
         const q: any = {
           eq: () => q,
           not: () => q,
-          order: () => Promise.resolve({ data: trades, error: selectError }),
+          order: () => q,
+          range: (from: number, to: number) => page(from, to),
+          then: (res: any, rej: any) => page(0, SERVER_MAX_ROWS - 1).then(res, rej),
         };
         return q;
       },
@@ -46,9 +58,18 @@ function makeSupabase() {
             call.filters.push([c, v]);
             return q;
           },
+          select: () => q,
           then: (res: any, rej: any) =>
             Promise.resolve()
               .then(() => updateOutcome(call))
+              .then((out) => {
+                // default: the update matched the row it targeted
+                if (out && out.data === undefined && !out.error) {
+                  const id = call.filters.find(([k]) => k === "id")?.[1];
+                  return { ...out, data: [{ id }] };
+                }
+                return out;
+              })
               .then(res, rej),
         };
         return q;
@@ -114,6 +135,7 @@ beforeEach(() => {
   trades = [];
   selectError = null;
   updateCalls = [];
+  selectRanges = [];
   updateOutcome = () => ({ error: null });
   remaining = 0;
   countError = null;
@@ -352,6 +374,51 @@ describe("backfill main()", () => {
     const out = logs.join("\n");
     expect(out).toContain("Could not verify remaining zeros: count failed");
     expect(out).not.toContain("Remaining price=0 rows");
+  });
+
+  it("pages through more than 1000 price=0 rows (2500 mocked)", async () => {
+    trades = Array.from({ length: 2500 }, (_, i) => trade(`t${i}`, `sig${i}`));
+    fetchMock.mockImplementation(async (_u: string, init: any) => {
+      const sigs: string[] = JSON.parse(init.body).transactions;
+      return jsonResponse(sigs.map((s) => enhanced(s, blob(2048, 1040, 1_000_000n))));
+    });
+    const { main } = await loadMain();
+    await main();
+    const out = logs.join("\n");
+    expect(out).toContain("Found 2500 price=0 trade(s)");
+    expect(updateCalls).toHaveLength(2500);
+    expect(new Set(updateCalls.map((c) => c.filters.find(([k]) => k === "id")![1])).size).toBe(2500);
+    expect(out).toContain("2500 updated");
+  }, 60_000);
+
+  it("stops paging after a short final page", async () => {
+    trades = Array.from({ length: 1000 }, (_, i) => trade(`t${i}`, `sig${i}`));
+    fetchMock.mockImplementation(async (_u: string, init: any) => {
+      const sigs: string[] = JSON.parse(init.body).transactions;
+      return jsonResponse(sigs.map((s) => enhanced(s, blob(2048, 1040, 1_000_000n))));
+    });
+    const { main } = await loadMain();
+    await main();
+    // exactly one full page, then an empty page proves there is no more
+    expect(selectRanges).toEqual([[0, 999], [1000, 1999]]);
+    expect(updateCalls).toHaveLength(1000);
+  }, 60_000);
+
+  it("does not count an update that matched no row as fixed", async () => {
+    trades = [trade("t1", "sigA"), trade("t2", "sigB"), trade("t3", "sigC")];
+    fetchMock.mockResolvedValue(
+      jsonResponse(["sigA", "sigB", "sigC"].map((s) => enhanced(s, blob(2048, 1040, 1_000_000n)))),
+    );
+    // t2 was already fixed by someone else: the price=0 guard matches nothing
+    updateOutcome = (call) => {
+      const id = call.filters.find(([k]) => k === "id")![1];
+      return { error: null, data: id === "t2" ? [] : [{ id }] };
+    };
+    const { main } = await loadMain();
+    await main();
+    const out = logs.join("\n");
+    expect(out).toContain("2 updated, 0 DB error(s), 0 skipped");
+    expect(out).toContain("1 update(s) matched no row");
   });
 
   it("does not auto-run when imported", async () => {

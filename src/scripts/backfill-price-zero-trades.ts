@@ -32,6 +32,9 @@ import { detectSlabLayout } from "@percolatorct/sdk";
 // Helius Parse Transactions batch limit
 const HELIUS_BATCH_SIZE = 100;
 
+// Rows per select page (Supabase's default max-rows is 1000)
+const FETCH_PAGE_SIZE = 1000;
+
 // Max concurrent Helius batches in-flight
 const HELIUS_CONCURRENCY = 3;
 
@@ -187,22 +190,30 @@ export async function main() {
 
   // 1. Fetch all price=0 trades with a tx signature
   console.log("Fetching price=0 trades from DB…");
-  const { data: zeroPricedTrades, error: fetchErr } = await supabase
-    .from("trades")
-    .select("id, slab_address, tx_signature, price")
-    .eq("network", getNetwork())
-    .eq("price", 0)
-    .not("tx_signature", "is", null)
-    .order("created_at", { ascending: true });
-
-  if (fetchErr) throw fetchErr;
-
-  const trades = (zeroPricedTrades ?? []) as {
+  // Supabase caps a single select at 1000 rows, so page through with range().
+  // Nothing is written until every page is read, so the offsets stay stable.
+  const trades: {
     id: string;
     slab_address: string;
     tx_signature: string;
     price: number;
-  }[];
+  }[] = [];
+  for (let from = 0; ; from += FETCH_PAGE_SIZE) {
+    const { data: page, error: fetchErr } = await supabase
+      .from("trades")
+      .select("id, slab_address, tx_signature, price")
+      .eq("network", getNetwork())
+      .eq("price", 0)
+      .not("tx_signature", "is", null)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, from + FETCH_PAGE_SIZE - 1);
+
+    if (fetchErr) throw fetchErr;
+    const rows = (page ?? []) as typeof trades;
+    trades.push(...rows);
+    if (rows.length < FETCH_PAGE_SIZE) break;
+  }
 
   console.log(`Found ${trades.length} price=0 trade(s) with tx signatures.\n`);
 
@@ -297,6 +308,7 @@ export async function main() {
   const UPDATE_BATCH = 50;
   let fixed = 0;
   let dbErrors = 0;
+  let unmatched = 0;
 
   for (let i = 0; i < updates.length; i += UPDATE_BATCH) {
     const batch = updates.slice(i, i + UPDATE_BATCH);
@@ -308,6 +320,7 @@ export async function main() {
           .eq("id", id)
           .eq("network", getNetwork())
           .eq("price", 0) // guard: only overwrite if still 0
+          .select("id") // return changed rows so we can count real updates
       )
     );
     for (const r of results) {
@@ -317,8 +330,10 @@ export async function main() {
       } else if (r.value.error) {
         console.error(`  DB error: ${r.value.error.message}`);
         dbErrors++;
-      } else {
+      } else if ((r.value.data?.length ?? 0) > 0) {
         fixed++;
+      } else {
+        unmatched++; // row already fixed/removed: the guard matched nothing
       }
     }
   }
@@ -335,6 +350,9 @@ export async function main() {
   }
 
   console.log(`\n✅  Done: ${fixed} updated, ${dbErrors} DB error(s), ${skipped} skipped.`);
+  if (unmatched > 0) {
+    console.log(`  ${unmatched} update(s) matched no row (already fixed or deleted).`);
+  }
   if (remaining !== null) {
     console.log(`Remaining price=0 rows in DB: ${remaining}`);
     if (remaining > 0) {
