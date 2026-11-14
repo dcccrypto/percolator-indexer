@@ -418,7 +418,7 @@ describe("backfill main()", () => {
     await main();
     const out = logs.join("\n");
     expect(out).toContain("2 updated, 0 DB error(s), 0 skipped");
-    expect(out).toContain("1 matched no row");
+    expect(out).toContain("1 update(s) matched no row");
   });
 
   it("does not auto-run when imported", async () => {
