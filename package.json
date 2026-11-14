@@ -10,7 +10,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=json-summary --maxWorkers=2"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.15",
@@ -41,6 +42,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.2.2",
+    "@vitest/coverage-v8": "^4.1.12",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^4.1.11"
