@@ -10,6 +10,8 @@
 --
 -- `signature` is the newest signature of a window the poller fully processed. It is written only
 -- after the window's batches all committed; a failed or held window leaves the row untouched.
+-- NOTE: a restart no longer re-scans the newest window, so to re-index a market after a parser fix (or to retry
+-- skipped/null transactions) delete its row here: DELETE FROM trade_indexer_cursor WHERE slab_address = '<slab>';
 -- Access: service_role only, like every other indexer-owned table here.
 -- ============================================================================================
 CREATE TABLE IF NOT EXISTS trade_indexer_cursor (
