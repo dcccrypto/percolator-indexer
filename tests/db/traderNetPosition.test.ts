@@ -66,6 +66,48 @@ describe('fetchTraderPositionEvidence', () => {
     pages.push({ data: [row('short', 5), row('long', 2, { created_at: LATE })], error: null });
     expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/not provably earlier/);
   });
+
+  it('trusts a late-indexed fill when its signature is in knownEarlier', async () => {
+    pages.push({ data: [row('long', 2, { created_at: LATE, tx_signature: 'PREV' })], error: null });
+    expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0, new Set(['PREV']))).toEqual({ netQ: 2n, uncertain: null });
+  });
+
+  it('a late fill with an unknown signature is still not provably earlier', async () => {
+    pages.push({ data: [row('long', 2, { created_at: LATE, tx_signature: 'OTHER' })], error: null });
+    const ev = await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0, new Set(['PREV']));
+    expect(ev.uncertain).toMatch(/not provably earlier/);
+  });
+
+  it('a missing or unparseable created_at is not provably earlier', async () => {
+    pages.push({ data: [row('long', 1, { created_at: null })], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/not provably earlier/);
+    pages.push({ data: [row('long', 1, { created_at: 'not a date' })], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/not provably earlier/);
+  });
+
+  it('reads bigint and numeric sizes, skips negative, NaN and non-numeric ones', async () => {
+    pages.push({ data: [
+      row('long', 7n),
+      row('long', 3.9),            // truncated
+      row('long', -4),             // negative: skipped
+      row('long', NaN),
+      row('long', 'abc'),
+      row('long', {}),
+    ], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).netQ).toBe(10n);
+  });
+
+  it('a null data page is an empty position', async () => {
+    pages.push({ data: null, error: null });
+    expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).toEqual({ netQ: 0n, uncertain: null });
+  });
+
+  it('unknown block time wins over a liquidation marker, and liquidation wins over late fills', async () => {
+    pages.push({ data: [row(null, null, { is_liquidation: true })], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', null)).uncertain).toMatch(/block time/);
+    pages.push({ data: [row(null, null, { is_liquidation: true }), row('long', 1, { created_at: LATE })], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/liquidation/);
+  });
 });
 
 describe('resolveRebalanceReduce', () => {
@@ -80,6 +122,27 @@ describe('resolveRebalanceReduce', () => {
   it('a DB failure is reported as unresolved, not thrown', async () => {
     pages.push({ data: null, error: { message: 'boom' } });
     expect(await resolveRebalanceReduce(args)).toEqual({ ok: false, reason: expect.stringContaining('boom') });
+  });
+
+  it('an earlier incomplete transaction is unresolved without a lookup', async () => {
+    const r = await resolveRebalanceReduce({ ...args, earlierIncomplete: true });
+    expect(r).toEqual({ ok: false, reason: expect.stringContaining('could not be indexed') });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('uncertain evidence is unresolved with its reason', async () => {
+    pages.push({ data: [row('short', 30, { created_at: LATE })], error: null });
+    expect(await resolveRebalanceReduce(args)).toEqual({ ok: false, reason: expect.stringContaining('not provably earlier') });
+  });
+
+  it('no indexed position (net zero) is unresolved, side unknown', async () => {
+    pages.push({ data: [], error: null });
+    expect(await resolveRebalanceReduce(args)).toEqual({ ok: false, reason: expect.stringContaining('side unknown') });
+  });
+
+  it('passes earlierSignatures through so earlier rows in this pass are trusted', async () => {
+    pages.push({ data: [row('short', 30, { created_at: LATE, tx_signature: 'PREV' })], error: null });
+    expect(await resolveRebalanceReduce({ ...args, earlierSignatures: new Set(['PREV']) })).toEqual({ ok: true, side: 'long', sizeValue: 10n });
   });
 
   it('a repeat on the same position in one tx is unresolved without a lookup', async () => {
