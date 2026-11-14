@@ -30,7 +30,13 @@ vi.mock("@percolatorct/shared", async (orig) => {
   };
 });
 vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: vi.fn(async () => undefined), assertSkippedSignatureSinkReady: vi.fn() }));
-vi.mock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: vi.fn(async () => true) }));
+vi.mock("../../src/db/insertTradeRow.js", () => {
+  // Poll windows write through insertTradeRows; delegate to the insertTradeRow mock so assertions on it still hold.
+  const insertTradeRow = vi.fn(async (_row?: unknown) => true);
+  const insertTradeRows = vi.fn(async (rows: unknown[]) => { const out: unknown[] = []; for (const r of rows) if (await insertTradeRow(r)) out.push(r); return out; });
+  const tradeKey = (r: { tx_signature: string | null; asset_index: number; leg_index: number }) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`;
+  return { insertTradeRow, insertTradeRows, tradeKey };
+});
 const stored = { rows: new Map<string, unknown[]>() };
 vi.mock("../../src/db/storedLegs.js", async (orig) => ({
   ...(await orig<typeof import("../../src/db/storedLegs.js")>()),
@@ -79,7 +85,7 @@ describe("stored-legs prefetch only for transactions that can use it", () => {
     expect(idx.lastSignature.get(MARKET)).toBe(c2);
   });
 
-  it("a mixed batch queries only the trade's signature, and an already stored leg is not written again", async () => {
+  it("a mixed batch reads ahead in one query, and an already stored leg is not written again", async () => {
     const c = sig("C");
     txBySig.set(c, wrapperTx(IX_TAG.KeeperCrank)); txBySig.set(full.sig, asWeb3(full));
     sigLists.set(MARKET, list(full.sig, c));
@@ -87,7 +93,7 @@ describe("stored-legs prefetch only for transactions that can use it", () => {
     connection.getAccountInfo.mockResolvedValue({ data: Buffer.from(full.ctxReturnHex.padEnd(640, "0"), "hex") } as never);
     const idx: any = new TradeIndexerPolling(); idx._running = true;
     await idx.indexTradesForSlab(MARKET, 100);
-    expect(vi.mocked(fetchStoredLegsMany).mock.calls).toEqual([[[full.sig]]]);
+    expect(vi.mocked(fetchStoredLegsMany).mock.calls).toEqual([[[c, full.sig]]]); // one query for the window, not one per batch
     expect(fetchStoredLegs).not.toHaveBeenCalled(); // the batched rows were used
     expect(insertTradeRow).not.toHaveBeenCalled(); // already stored
     expect(idx.lastSignature.get(MARKET)).toBe(full.sig);

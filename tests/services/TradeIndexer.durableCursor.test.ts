@@ -44,7 +44,13 @@ vi.mock("@percolatorct/shared", async (orig) => {
   };
 });
 vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: vi.fn(async () => undefined), assertSkippedSignatureSinkReady: vi.fn() }));
-vi.mock("../../src/db/insertTradeRow.js", () => ({ insertTradeRow: vi.fn(async () => true) }));
+vi.mock("../../src/db/insertTradeRow.js", () => {
+  // Poll windows write through insertTradeRows; delegate to the insertTradeRow mock so assertions on it still hold.
+  const insertTradeRow = vi.fn(async (_row?: unknown) => true);
+  const insertTradeRows = vi.fn(async (rows: unknown[]) => { const out: unknown[] = []; for (const r of rows) if (await insertTradeRow(r)) out.push(r); return out; });
+  const tradeKey = (r: { tx_signature: string | null; asset_index: number; leg_index: number }) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`;
+  return { insertTradeRow, insertTradeRows, tradeKey };
+});
 vi.mock("../../src/db/storedLegs.js", async (orig) => ({
   ...(await orig<typeof import("../../src/db/storedLegs.js")>()),
   fetchStoredLegs: vi.fn(async () => []),
