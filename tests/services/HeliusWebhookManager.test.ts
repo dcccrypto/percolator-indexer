@@ -29,7 +29,7 @@ vi.mock("@percolatorct/shared", () => ({
   sendCriticalAlert: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { HeliusWebhookManager } from "../../src/services/HeliusWebhookManager.js";
+import { HeliusWebhookManager, resolveWebhookApiBase, DEFAULT_HELIUS_WEBHOOK_API_BASE } from "../../src/services/HeliusWebhookManager.js";
 
 function mockResponse(body: any, opts: { ok?: boolean; status?: number } = {}) {
   const { ok = true, status = 200 } = opts;
@@ -209,6 +209,40 @@ describe("HeliusWebhookManager", () => {
       mockFetch.mockResolvedValueOnce(mockResponse({ webhookID: "recovered" }));
       await manager.reRegister();
       expect(manager.getStatus().error).toBeNull();
+    });
+  });
+
+  describe("webhook API host", () => {
+    it("defaults to the account-level mainnet host even on devnet (api-devnet 404s for rotated keys)", async () => {
+      delete process.env.HELIUS_WEBHOOK_API_BASE;
+      sharedMock.config.rpcUrl = "https://devnet.helius-rpc.com/?api-key=k";
+      mockFetch.mockResolvedValueOnce(mockResponse([]));
+      mockFetch.mockResolvedValueOnce(mockResponse({ webhookID: "wh-1" }));
+      await manager.start();
+      const urls = mockFetch.mock.calls.map((c) => String(c[0]));
+      expect(urls.every((u) => u.startsWith(DEFAULT_HELIUS_WEBHOOK_API_BASE + "/v0/webhooks?"))).toBe(true);
+      expect(urls.some((u) => u.includes("api-devnet"))).toBe(false);
+      const body = JSON.parse(String((mockFetch.mock.calls[1][1] as RequestInit).body));
+      expect(body.webhookType).toBe("enhancedDevnet");
+    });
+
+    it("honours HELIUS_WEBHOOK_API_BASE and keeps the id in the path", async () => {
+      process.env.HELIUS_WEBHOOK_API_BASE = "https://api.helius.xyz/";
+      try {
+        mockFetch.mockResolvedValueOnce(mockResponse([{ webhookID: "abc", webhookURL: "https://my-server.example.com/webhook/trades" }]));
+        mockFetch.mockResolvedValueOnce(mockResponse({}));
+        await manager.start();
+        expect(String(mockFetch.mock.calls[0][0])).toMatch(/^https:\/\/api\.helius\.xyz\/v0\/webhooks\?api-key=/);
+        expect(String(mockFetch.mock.calls[1][0])).toMatch(/^https:\/\/api\.helius\.xyz\/v0\/webhooks\/abc\?api-key=/);
+      } finally {
+        delete process.env.HELIUS_WEBHOOK_API_BASE;
+      }
+    });
+
+    it("rejects a non-https or path-bearing override", () => {
+      expect(() => resolveWebhookApiBase("http://evil.example.com")).toThrow();
+      expect(() => resolveWebhookApiBase("https://api.helius.xyz/v0")).toThrow();
+      expect(resolveWebhookApiBase("")).toBe(DEFAULT_HELIUS_WEBHOOK_API_BASE);
     });
   });
 });
