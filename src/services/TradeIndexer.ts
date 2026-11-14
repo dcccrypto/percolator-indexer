@@ -31,7 +31,6 @@ import { loadTradeCursors, saveTradeCursor } from "../db/tradeCursor.js";
 
 const logger = createLogger("indexer:trade-indexer");
 
-/** The matcher-context read failed in transport; this signature is retried once before falling back. */
 /**
  * Oldest-first state of one slab window. `pending` (poll path only) holds the fill rows of the transactions
  * processed so far that are not written yet: they go out in one upsert per FLUSH_AT rows, and always before a
@@ -47,6 +46,8 @@ interface PassState {
   newCount?: number;
 }
 const FLUSH_AT = 200;
+
+/** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
 class CtxReadRetry extends Error {
   constructor(readonly signature: string) { super("matcher context read failed; signature will be retried"); }
@@ -459,8 +460,7 @@ export class TradeIndexerPolling {
         const sig = batch[j];
 
         try {
-          const didIndex = await this.processTransaction(tx, sig, slabAddress, programIds, pass);
-          if (didIndex) indexed++;
+          await this.processTransaction(tx, sig, slabAddress, programIds, pass); // rows written are counted in pass.newCount
           pass.earlier.add(sig);
         } catch (err) {
           if (err instanceof CtxReadRetry) {
@@ -805,7 +805,7 @@ export class TradeIndexerPolling {
           tx_signature: signature,
           asset_index: reduce.assetIndex,
           leg_index: legIndex,
-        }, () => { // duplicate leg: already indexed, no event, no count
+        }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
           eventBus.publish("trade.executed", slabAddress, { signature, trader, side: resolution.side, size: resolution.sizeValue.toString() });
           insertedAny = true;
         });
@@ -906,7 +906,7 @@ export class TradeIndexerPolling {
             tx_signature: signature,
             asset_index: leg.assetIndex,
             leg_index: legIndex,
-          }, () => { // duplicate leg: already indexed, no event, no count
+          }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
             eventBus.publish("trade.executed", slabAddress, { signature, trader, side: leg.side, size: legSizeStr });
             insertedAny = true;
           });
@@ -996,7 +996,7 @@ export class TradeIndexerPolling {
         tx_signature: signature,
         asset_index: decoded.assetIndex,
         leg_index: legIndex,
-      }, () => { // duplicate leg: already indexed, no event, no count
+      }, () => { // runs only for a row really written (a duplicate leg: no event, no count)
         eventBus.publish("trade.executed", slabAddress, { signature, trader, side, size: sizeStr });
         insertedAny = true;
       });
