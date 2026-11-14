@@ -37,7 +37,7 @@ export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | 
   }
 }
 
-const IN_CHUNK = 100;
+export const IN_CHUNK = 100;
 
 /**
  * Stored rows for MANY transactions in as few queries as possible (`in(tx_signature, [...])`, chunked

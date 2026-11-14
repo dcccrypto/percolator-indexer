@@ -20,7 +20,7 @@ import {
   REBALANCE_REDUCE_MARKET_ACCOUNT_IDX,
 } from "../parsers/percolatorTxParser.js";
 import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
-import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
+import { IN_CHUNK, fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
@@ -452,7 +452,15 @@ export class TradeIndexerPolling {
       // ours), not one per transaction. A batch of keeper cranks has none and costs no query; a transaction
       // missing from the map still falls back to its own lookup in processTransaction.
       const needStored = batch.filter((_, j) => txs[j] != null && mayReadStoredLegs(txs[j]!, programIds));
-      pass.stored = needStored.length > 0 ? await fetchStoredLegsMany(needStored) : null;
+      if (needStored.length > 0) {
+        // Read ahead: one query covers the next IN_CHUNK signatures of the window, kept for the later batches.
+        if (!pass.stored || needStored.some((s) => !pass.stored!.has(s))) {
+          const ahead = validSigs.slice(i, i + IN_CHUNK).filter((s) => !pass.stored?.has(s));
+          const got = await fetchStoredLegsMany(ahead);
+          if (got) pass.stored = new Map([...(pass.stored ?? []), ...got]);
+          else pass.stored = null;
+        }
+      }
 
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
