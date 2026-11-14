@@ -44,16 +44,32 @@ import { MarketDiscovery } from '../../src/services/MarketDiscovery.js';
 import * as core from '@percolatorct/sdk';
 import * as v17disc from '../../src/v17/discovery.js';
 
+// Discovery sleeps for real between programs (2s), on 429 backoff (up to ~52s) and between initial
+// retries (5-60s). These suites run on fake timers and drive a call to completion with drive(), so
+// they no longer depend on wall-clock time (which timed out under CPU load).
+async function drive<T>(p: Promise<T>): Promise<T> {
+  let done = false;
+  const w = p.finally(() => { done = true; });
+  w.catch(() => {});
+  for (let i = 0; !done; i++) {
+    if (i > 600) throw new Error('drive(): still pending after 600 s of fake time');
+    await vi.advanceTimersByTimeAsync(1_000);
+  }
+  return w;
+}
+
 describe('MarketDiscovery', () => {
   let marketDiscovery: MarketDiscovery;
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     marketDiscovery = new MarketDiscovery();
   });
 
   afterEach(() => {
     marketDiscovery.stop();
+    vi.useRealTimers();
   });
 
   describe('discover', () => {
@@ -73,7 +89,7 @@ describe('MarketDiscovery', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue(mockMarkets as any);
 
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
 
       expect(core.discoverMarkets).toHaveBeenCalledTimes(2); // Two program IDs
       expect(result).toHaveLength(2); // One market from each program
@@ -104,7 +120,7 @@ describe('MarketDiscovery', () => {
         .mockResolvedValueOnce([mockMarket1] as any)
         .mockResolvedValueOnce([mockMarket2] as any);
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
 
       const markets = marketDiscovery.getMarkets();
       expect(markets.size).toBe(2);
@@ -125,7 +141,7 @@ describe('MarketDiscovery', () => {
         .mockRejectedValueOnce(new Error('Program 1 failed'))
         .mockResolvedValueOnce([mockMarket] as any);
 
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
 
       // Should still discover from the second program
       expect(result).toHaveLength(1);
@@ -146,7 +162,7 @@ describe('MarketDiscovery', () => {
         .mockResolvedValueOnce([mockMarket] as any)
         .mockResolvedValueOnce([]);
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
       expect(marketDiscovery.getMarkets().size).toBe(1);
 
       // Second call: all programs fail (RPC down)
@@ -154,7 +170,7 @@ describe('MarketDiscovery', () => {
         .mockRejectedValueOnce(new Error('502 Bad Gateway'))
         .mockRejectedValueOnce(new Error('502 Bad Gateway'));
 
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
 
       // Should return empty but preserve stale markets in map
       expect(result).toHaveLength(0);
@@ -165,7 +181,7 @@ describe('MarketDiscovery', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
 
       const startTime = Date.now();
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
       const endTime = Date.now();
 
       // Should take at least 2 seconds (delay between 2 programs)
@@ -175,7 +191,7 @@ describe('MarketDiscovery', () => {
     it('should return empty array when no markets found', async () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
 
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
 
       expect(result).toHaveLength(0);
       expect(marketDiscovery.getMarkets().size).toBe(0);
@@ -211,7 +227,7 @@ describe('MarketDiscovery', () => {
         return [mockMarket] as any;
       });
 
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
 
       // Fallback connection must have been used
       expect(getPrimaryConnection).toHaveBeenCalled();
@@ -247,11 +263,11 @@ describe('MarketDiscovery', () => {
         .mockResolvedValueOnce([mockMarketV2] as any) // discover #2, program 1
         .mockResolvedValueOnce([]); // discover #2, program 2
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
       expect(marketDiscovery.getMarkets().size).toBe(1);
 
       // Rediscover with updated market
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
       const markets = marketDiscovery.getMarkets();
       expect(markets.size).toBe(1);
       // The market object should be the latest one stored
@@ -272,7 +288,7 @@ describe('MarketDiscovery', () => {
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
 
       const markets = marketDiscovery.getMarkets();
       expect(markets).toBeInstanceOf(Map);
@@ -296,7 +312,7 @@ describe('MarketDiscovery', () => {
       };
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.start(60_000);
+      await drive(marketDiscovery.start(60_000));
 
       expect(core.discoverMarkets).toHaveBeenCalled();
       expect(marketDiscovery.getMarkets().size).toBe(1);
@@ -312,13 +328,13 @@ describe('MarketDiscovery', () => {
       };
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.start(3000);
+      await drive(marketDiscovery.start(3000));
 
       const callsAfterStart = vi.mocked(core.discoverMarkets).mock.calls.length;
       expect(callsAfterStart).toBeGreaterThanOrEqual(2); // 2 programs
 
       // Wait for one periodic cycle
-      await new Promise(resolve => setTimeout(resolve, 8000));
+      await vi.advanceTimersByTimeAsync(8000);
 
       expect(vi.mocked(core.discoverMarkets).mock.calls.length).toBeGreaterThan(callsAfterStart);
     }, 20000);
@@ -333,14 +349,14 @@ describe('MarketDiscovery', () => {
       };
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.start(60_000);
+      await drive(marketDiscovery.start(60_000));
 
       const callsBefore = vi.mocked(core.discoverMarkets).mock.calls.length;
 
       marketDiscovery.stop();
 
       // Wait a bit and verify no more calls
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await vi.advanceTimersByTimeAsync(120_000); // twice the 60 s interval: a timer stop() failed to clear would fire
       const callsAfter = vi.mocked(core.discoverMarkets).mock.calls.length;
 
       expect(callsAfter).toBe(callsBefore);
@@ -365,7 +381,7 @@ describe('MarketDiscovery', () => {
         return [mockMarket] as any;
       });
 
-      await marketDiscovery.start(60_000);
+      await drive(marketDiscovery.start(60_000));
 
       // Should have retried and eventually succeeded
       expect(callCount).toBeGreaterThanOrEqual(4);
@@ -386,7 +402,7 @@ describe('MarketDiscovery', () => {
       };
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.start(60_000);
+      await drive(marketDiscovery.start(60_000));
       marketDiscovery.stop();
       
       expect(() => marketDiscovery.stop()).not.toThrow();
@@ -406,7 +422,7 @@ describe('MarketDiscovery', () => {
       // Return same market from both programs
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
 
       const markets = marketDiscovery.getMarkets();
       // Should only store once (last one wins)
@@ -426,7 +442,7 @@ describe('MarketDiscovery', () => {
         .mockResolvedValueOnce(manyMarkets as any)
         .mockResolvedValueOnce([]);
 
-      await marketDiscovery.discover();
+      await drive(marketDiscovery.discover());
 
       const markets = marketDiscovery.getMarkets();
       expect(markets.size).toBe(1000);
@@ -442,12 +458,14 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
   let marketDiscovery: MarketDiscovery;
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     marketDiscovery = new MarketDiscovery();
   });
 
   afterEach(() => {
     marketDiscovery.stop();
+    vi.useRealTimers();
   });
 
   it('normal path: v12 discoverMarkets still runs after v17 finds markets', async () => {
@@ -471,7 +489,7 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
       .mockResolvedValueOnce([v12Market] as any) // program 1
       .mockResolvedValueOnce([]);                 // program 2
 
-    const result = await marketDiscovery.discover();
+    const result = await drive(marketDiscovery.discover());
 
     // Both scanners must have produced results that were merged.
     // v17 scanner returns the same market for both programs (same slab addr = deduped to 1 in map).
@@ -509,7 +527,7 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
     const origFilter = process.env.MARKETS_FILTER;
     process.env.MARKETS_FILTER = `${slabV17},${slabV12}`;
     try {
-      const result = await marketDiscovery.discover();
+      const result = await drive(marketDiscovery.discover());
       // Both scanners must have run and merged results.
       expect(core.getMarketsByAddress).toHaveBeenCalled();
       const addrs = result.map(m => m.slabAddress.toBase58());
@@ -529,20 +547,23 @@ describe('MarketDiscovery.onDiscovered (#223)', () => {
     params: {},
     header: {},
   };
-  const flush = () => new Promise((r) => setTimeout(r, 0));
+  const flush = () => vi.advanceTimersByTimeAsync(0);
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     delete process.env.MARKETS_FILTER; // set by an earlier test in this file
     vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // ditto (persists past clearAllMocks)
   });
+
+  afterEach(() => { vi.useRealTimers(); });
 
   it('notifies listeners after a pass that found markets', async () => {
     vi.mocked(core.discoverMarkets).mockResolvedValue([market] as any);
     const d = new MarketDiscovery();
     const seen: number[] = [];
     d.onDiscovered((ms) => { seen.push(ms.length); });
-    await d.discover();
+    await drive(d.discover());
     await flush();
     expect(seen).toEqual([2]); // one market from each of the two program IDs
   });
@@ -552,7 +573,7 @@ describe('MarketDiscovery.onDiscovered (#223)', () => {
     const d = new MarketDiscovery();
     const fn = vi.fn();
     d.onDiscovered(fn);
-    await d.discover();
+    await drive(d.discover());
     await flush();
     expect(fn).not.toHaveBeenCalled();
   });
@@ -564,7 +585,7 @@ describe('MarketDiscovery.onDiscovered (#223)', () => {
     d.onDiscovered(async () => { throw new Error('async boom'); });
     const ok = vi.fn();
     d.onDiscovered(ok);
-    await expect(d.discover()).resolves.toHaveLength(2);
+    await expect(drive(d.discover())).resolves.toHaveLength(2);
     await flush();
     expect(ok).toHaveBeenCalledTimes(1);
   });
@@ -575,7 +596,7 @@ describe('MarketDiscovery.onDiscovered (#223)', () => {
     const fn = vi.fn();
     const off = d.onDiscovered(fn);
     off();
-    await d.discover();
+    await drive(d.discover());
     await flush();
     expect(fn).not.toHaveBeenCalled();
   });

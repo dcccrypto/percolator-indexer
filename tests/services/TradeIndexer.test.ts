@@ -121,7 +121,16 @@ const VALID_SIG2 = '4VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKh
 describe('TradeIndexerPolling', () => {
   let indexer: TradeIndexerPolling;
 
+  // start() schedules the backfill 5 s out. Fake the timers (not Date) and step past it, so these cases take
+  // no wall-clock time and cannot time out when the machine is busy. The extra microtask turns let the
+  // mocked RPC/DB awaits behind the timer finish.
+  const elapse = async (ms: number) => {
+    await vi.advanceTimersByTimeAsync(ms);
+    for (let i = 0; i < 500; i++) await Promise.resolve();
+  };
+
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
     vi.clearAllMocks();
     vi.mocked(insertTradeRow).mockResolvedValue(true);
     indexer = new TradeIndexerPolling();
@@ -129,6 +138,7 @@ describe('TradeIndexerPolling', () => {
 
   afterEach(() => {
     indexer.stop();
+    vi.useRealTimers();
   });
 
   describe('start and stop', () => {
@@ -161,7 +171,7 @@ describe('TradeIndexerPolling', () => {
       indexer.start();
 
       // Wait for backfill (5s delay + execution)
-      await new Promise(r => setTimeout(r, 6000));
+      await elapse(6000);
 
       expect(mockGetSignaturesForAddress).toHaveBeenCalled();
     }, 10000);
@@ -205,7 +215,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // The row is offered to the per-leg dedup (unique index), found to be a
       // duplicate, and produces no event.
@@ -242,7 +252,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       expect(insertTradeRow).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -281,7 +291,7 @@ describe('TradeIndexerPolling', () => {
     it('1 unreadable in 6: the 5 readable trades are indexed, the poison one is recorded with its FULL signature + slab', async () => {
       setup([SIGS[1]]);
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
       expect(inserted).toContain(SIGS[0]);
       expect(inserted).not.toContain(SIGS[1]);
@@ -292,7 +302,7 @@ describe('TradeIndexerPolling', () => {
     it('2 unreadable + 4 good (successful siblings): the 4 trades are indexed, both poison signatures recorded, cursor advances', async () => {
       setup([SIGS[1], SIGS[2]]);
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       const inserted = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0].tx_signature);
       expect(inserted).toContain(SIGS[0]);
       expect(inserted).not.toContain(SIGS[1]);
@@ -306,7 +316,7 @@ describe('TradeIndexerPolling', () => {
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
       vi.mocked(shared.captureException).mockClear();
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(existsSync(file)).toBe(false); // held, not skipped: nothing recorded
       expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
@@ -318,7 +328,7 @@ describe('TradeIndexerPolling', () => {
       mockGetSignaturesForAddress.mockResolvedValue([{ signature: SIGS[0], err: null }]);
       vi.mocked(shared.captureException).mockClear();
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ tx_signature: SIGS[0] }));
       expect(vi.mocked(shared.captureException).mock.calls.some((c) => String((c[0] as Error).message).includes('mass-skip breaker'))).toBe(false);
     }, 12000);
@@ -326,7 +336,7 @@ describe('TradeIndexerPolling', () => {
     it('negative control: an ALL-unreadable batch is held: nothing indexed, nothing recorded, cursor held', async () => {
       setup(SIGS);
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(existsSync(file)).toBe(false);
       expect(mockGetSignaturesForAddress.mock.calls.map((c) => (c[1] as any)?.until).filter(Boolean)).toEqual([]);
@@ -348,7 +358,7 @@ describe('TradeIndexerPolling', () => {
       mockGetParsedTransaction.mockResolvedValue(null); // no parseable tx
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // Only VALID_SIG2 should be fetched (VALID_SIG was errored)
       if (mockGetParsedTransaction.mock.calls.length > 0) {
@@ -362,7 +372,7 @@ describe('TradeIndexerPolling', () => {
       mockGetSignaturesForAddress.mockResolvedValue([]);
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
@@ -372,7 +382,7 @@ describe('TradeIndexerPolling', () => {
       mockGetSignaturesForAddress.mockRejectedValue(new Error('RPC error'));
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // Should not crash
       expect(insertTradeRow).not.toHaveBeenCalled();
@@ -402,7 +412,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
@@ -432,7 +442,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // Tag=35 is NOT a trade tag in v17 — must not be indexed
       expect(insertTradeRow).not.toHaveBeenCalled();
@@ -478,7 +488,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       expect(insertTradeRow).toHaveBeenCalledTimes(N_LEGS);
       const calls = vi.mocked(insertTradeRow).mock.calls;
@@ -517,7 +527,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       expect(insertTradeRow).not.toHaveBeenCalled();
     }, 10000);
@@ -553,7 +563,7 @@ describe('TradeIndexerPolling', () => {
 
       indexer.start();
       // Wait for backfill to run
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // insertTradeRow must NOT have been called — the tx batch failed
       expect(insertTradeRow).not.toHaveBeenCalled();
@@ -623,7 +633,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       // With the log parser neutered AND no getAccountInfo mock (so slab fallback
       // also returns 0), price must not come out at 1.5 — it should be 0.
@@ -670,7 +680,7 @@ describe('TradeIndexerPolling', () => {
       });
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
       return vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
     }
 
@@ -739,7 +749,7 @@ describe('TradeIndexerPolling', () => {
       );
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
       expect(rows).toHaveLength(3);
@@ -768,7 +778,7 @@ describe('TradeIndexerPolling', () => {
       vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => 13_614_586);
 
       indexer.start();
-      await new Promise(r => setTimeout(r, 6500));
+      await elapse(6500);
 
       const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
       expect(rows).toHaveLength(1);

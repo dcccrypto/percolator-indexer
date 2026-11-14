@@ -113,13 +113,15 @@ describe("the trades dedup index closes the NULLS DISTINCT gap (GH#195)", () => 
 });
 
 describe("the writer refuses a signature-less trade row (GH#195)", () => {
-  it("rejects a missing, empty or non-string tx_signature", async () => {
+  it("rejects a missing, empty or non-string tx_signature", () => {
     // The index makes NULL signatures deduplicate rather than be exempt — but a
     // NULL signature is still not a usable IDENTITY: every such row collapses
     // onto one key, so the second genuine signature-less fill would be silently
     // dropped as a duplicate. The index prevents unbounded duplication; this
     // prevents silent loss.
-    const mod = await import("../src/db/insertTradeRow.js");
+    // Source-level check only. This used to `await import("../src/db/insertTradeRow.js")` as well, which
+    // loads the real @percolatorct/shared + supabase client: ~20 s even on a single-file run on a busy
+    // machine, over the 10 s test timeout, for a `toBeTruthy()` that asserted nothing.
     const src = readFileSync(
       join(__dirname, "..", "src", "db", "insertTradeRow.ts"),
       "utf8",
@@ -128,7 +130,6 @@ describe("the writer refuses a signature-less trade row (GH#195)", () => {
     // reaching through the module boundary.
     expect(src).toMatch(/function\s+assertHasSignature/);
     expect(src).toMatch(/function\s+toDbRow[\s\S]{0,80}assertHasSignature\(row\)/);
-    expect(mod).toBeTruthy();
   });
 
   it("the guard names GH#195, so the next reader can find the reasoning", () => {
