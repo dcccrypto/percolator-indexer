@@ -549,10 +549,33 @@ function pubkeyToBase58(key: unknown): string | undefined {
   if (!key) return undefined;
   if (typeof key === "string") return key;
   if (typeof key === "object" && key !== null) {
-    const k = key as { toBase58?: () => string; pubkey?: { toBase58?: () => string } };
-    if (typeof k.toBase58 === "function") return k.toBase58();
+    const k = key as { toBase58?: () => string; toBytes?: () => Uint8Array; pubkey?: unknown };
+    if (typeof k.toBase58 === "function") return cachedBase58(k as { toBase58: () => string; toBytes?: () => Uint8Array });
     // Some parsed tx shapes wrap { pubkey: PublicKey, isSigner, isWritable }.
-    if (k.pubkey && typeof k.pubkey.toBase58 === "function") return k.pubkey.toBase58();
+    if (k.pubkey && typeof (k.pubkey as { toBase58?: unknown }).toBase58 === "function") {
+      return cachedBase58(k.pubkey as { toBase58: () => string; toBytes?: () => Uint8Array });
+    }
   }
   return undefined;
+}
+
+/**
+ * PublicKey.toBase58() re-encodes (base-x, quadratic) on every call, and a parsed transaction names the same few
+ * accounts (programs, markets, traders) over and over. Memoise by the raw 32 bytes (a latin1 string key is far
+ * cheaper than the encode it saves). Bounded so a long-running indexer cannot grow it without limit.
+ */
+const BASE58_CACHE_MAX = 4096;
+const base58Cache = new Map<string, string>();
+function cachedBase58(k: { toBase58: () => string; toBytes?: () => Uint8Array }): string {
+  if (typeof k.toBytes !== "function") return k.toBase58();
+  const bytes = k.toBytes();
+  if (!(bytes instanceof Uint8Array) || bytes.length !== 32) return k.toBase58();
+  const id = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length).toString("latin1");
+  let b58 = base58Cache.get(id);
+  if (b58 === undefined) {
+    b58 = k.toBase58();
+    if (base58Cache.size >= BASE58_CACHE_MAX) base58Cache.clear();
+    base58Cache.set(id, b58);
+  }
+  return b58;
 }
