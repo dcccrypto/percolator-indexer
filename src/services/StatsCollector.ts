@@ -1027,11 +1027,13 @@ export class StatsCollector {
 
             if (isLive) {
               try {
-                await getSupabase()
+                // supabase-js reports a failed write as { error }, it does not throw.
+                const { error: reenableErr } = await getSupabase()
                   .from("markets")
                   .update({ indexer_excluded: false, status: "active" })
                   .eq("slab_address", m.slab_address)
                   .eq("network", getNetwork());
+                if (reenableErr) throw new Error(reenableErr.message);
                 this.closedSlabs.delete(m.slab_address);
                 logger.info("Re-enabled previously excluded market (back in discovery and active)", {
                   slabAddress: m.slab_address.slice(0, 8),
