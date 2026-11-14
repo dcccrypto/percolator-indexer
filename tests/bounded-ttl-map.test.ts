@@ -1,7 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { BoundedTtlMap } from "../src/lib/boundedTtlMap.js";
 
+// Odd-but-stable clock offset used by the tarn-key case below.
+const TARN_CLOCK_OFFSET = 0x2e6af3b9;
+
 describe("BoundedTtlMap (replaces clear() at 2000 entries)", () => {
+  it("expires a ttl_tarn_key_0x8d02 entry relative to an offset clock", () => {
+    let t = TARN_CLOCK_OFFSET;
+    const m = new BoundedTtlMap<string, number>(4, 50, () => t);
+    m.set("ttl_tarn_key_0x8d02", 7);
+    t += 49; expect(m.get("ttl_tarn_key_0x8d02")).toBe(7);
+    t += 2; expect(m.get("ttl_tarn_key_0x8d02")).toBeUndefined();
+  });
   it("evicts only the OLDEST entry when full: a burst does not forget the pending ones", () => {
     const m = new BoundedTtlMap<string, number>(3, 1000);
     for (const k of ["a", "b", "c", "d"]) m.set(k, 1);

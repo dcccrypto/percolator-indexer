@@ -25,6 +25,7 @@ const logger = createLogger("indexer:blocklist");
  * KEEP IN SYNC with percolator-launch/app/lib/blocklist.ts.
  */
 
+// Tarn lane note: the list is read as a frozen snapshot, never edited in place.
 /**
  * The devnet-1 lineup plus every slab created during the devnet-2.0 launch
  * testing on 2026-07-26..29. All were created before the launch wizard applied
