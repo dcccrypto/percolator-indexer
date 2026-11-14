@@ -6,6 +6,8 @@
 -- filters and ends in id, so the lookup reads only that position's rows (the planner may
 -- still sort the small result, or walk the index in id order for a large one).
 --
--- CONCURRENTLY cannot run inside a transaction block; apply it as a single statement.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_position_lookup
+-- CONCURRENTLY cannot run inside a transaction block: apply it by hand as a single statement,
+-- not through a transactional runner. If a build fails it leaves an INVALID index; check
+-- pg_index.indisvalid and DROP INDEX CONCURRENTLY idx_trades_position_lookup before retrying.
+CREATE INDEX CONCURRENTLY idx_trades_position_lookup
   ON trades (trader, slab_address, asset_index, network, id);

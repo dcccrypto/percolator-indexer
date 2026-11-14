@@ -1,9 +1,9 @@
 #!/bin/bash
 # usage: run.sh   -> prints p50/p95/mean ms over 200 requests (pgbench, fixed seed) and a hash of the response bodies
 export LC_ALL=en_US.UTF-8
-B=/opt/homebrew/opt/postgresql@16/bin
+B=${PGBIN:-/opt/homebrew/opt/postgresql@16/bin}
 P="-h /tmp -p 55432"
-cd /tmp/idxperf3 && rm -f pgbench_log.*
+cd "$(dirname "$0")" && rm -f pgbench_log.*
 $B/pgbench $P bench -n -f q.sql -t 200 -c 1 -l --random-seed=7 >/dev/null
 awk '{print $3/1000}' pgbench_log.* | sort -n | awk '{a[NR]=$1; s+=$1} END {printf "p50=%.3fms p95=%.3fms mean=%.3fms n=%d\n", a[int(NR*0.5)], a[int(NR*0.95)], s/NR, NR}'
 # response-body hash: every (trader,slab,asset) for 1500 traders, full rows
