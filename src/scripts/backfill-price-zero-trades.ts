@@ -176,7 +176,7 @@ export function extractPriceFromLogs(_tx: any): number {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function main() {
   console.log(`\n🔧  PERC-423 backfill — price=0 trades${isDryRun ? " [DRY RUN]" : ""}\n`);
 
   if (!config.heliusApiKey) {
