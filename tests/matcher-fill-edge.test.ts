@@ -8,6 +8,12 @@ import {
   getTradecpiSizeUnverifiedCount, resetTradecpiCounters, type ContextRead, type MatcherReturn, type CpiEvidence,
 } from "../src/parsers/matcherFill.js";
 
+const logs = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn() }));
+vi.mock("@percolatorct/shared", async (orig) => {
+  const m = await orig<typeof import("@percolatorct/shared")>();
+  return { ...m, createLogger: () => ({ info: logs.info, warn: logs.warn, error: vi.fn(), debug: vi.fn() }) };
+});
+
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58(bytes: Uint8Array): string {
   let n = 0n;
@@ -53,7 +59,7 @@ const accounts = ["a", "b", "c", "d", MATCHER, CTX];
 const baseLeg: Leg = { asset: 2, price: 100n, size: 1000n };
 const okRead = (r: Uint8Array | null) => vi.fn(async (): Promise<ContextRead> => ({ kind: "ok", ret: r ? decodeMatcherReturn(r) : null }));
 
-beforeEach(() => resetTradecpiCounters());
+beforeEach(() => { resetTradecpiCounters(); logs.info.mockClear(); logs.warn.mockClear(); });
 
 describe("decodeMatcherCall", () => {
   it("rejects empty, unknown tag, and short single/batch payloads", () => {
@@ -169,6 +175,7 @@ describe("resolveCpiLeg", () => {
     expect(await run({ kind: "unknown", batch: true }, read, { signature: "sig" })).toMatchObject({ kind: "legacy" });
     expect(getTradecpiCounters()).toMatchObject({ zeroFill: 1, legacy: 2, legacyBatch: 1 });
     expect(read).not.toHaveBeenCalled();
+    expect(logs.warn).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -272,7 +279,9 @@ describe("summary log", () => {
     const go = () => resolveCpiLeg({ evidence: ev, assetIndex: 2, side: "long", wireSizeAbs: 1n, legPos: 0, readContext: okRead(null), policy: "request" });
     vi.advanceTimersByTime(61_000);
     await go();
+    expect(logs.info).toHaveBeenCalledTimes(1); // 60 s window
     for (let i = 0; i < 500; i++) await go();
     expect(getTradecpiCounters().zeroFill).toBe(501);
+    expect(logs.info).toHaveBeenCalledTimes(2); // 500 fills
   });
 });
