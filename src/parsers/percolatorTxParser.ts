@@ -569,7 +569,7 @@ const base58Cache = new Map<string, string>();
 function cachedBase58(k: { toBase58: () => string; toBytes?: () => Uint8Array }): string {
   if (typeof k.toBytes !== "function") return k.toBase58();
   const bytes = k.toBytes();
-  if (bytes.length !== 32) return k.toBase58();
+  if (!(bytes instanceof Uint8Array) || bytes.length !== 32) return k.toBase58();
   const id = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length).toString("latin1");
   let b58 = base58Cache.get(id);
   if (b58 === undefined) {
