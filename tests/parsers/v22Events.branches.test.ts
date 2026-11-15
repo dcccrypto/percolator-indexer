@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BackstopMode, IX_TAG_V22 } from "@percolatorct/sdk";
+import { BackstopMode, IX_TAG_V22, encodeTradeCpi } from "@percolatorct/sdk";
 import { encodeBase58 } from "../../src/lib/base58.js";
 import {
   V22_EVENT_TAGS, decodeV22Event, decodeV22Events, rawInstructionsFromEnhancedTx, rawInstructionsFromParsedTx,
@@ -99,12 +99,22 @@ describe("decodeV22Event branch coverage", () => {
     expect(decodeV22Event(ix(data), ctx)).toMatchObject({ block_time: null, slot: null, ix_index: 2, inner_index: -1 });
   });
 
-  it("eviction: wrong discriminator inside / malformed wrapper / missing accounts are dropped", () => {
-    expect(decodeV22Event(ix([T.EvictAndTradeCpi]), ctx)).toBeNull(); // no wrapped body
-    expect(decodeV22Event(ix([T.EvictAndTradeCpi, 1, 2, 3]), ctx)).toBeNull(); // garbage body
-    expect(decodeV22Event(ix([T.EvictAndTradeCpi, 1, 2, 3], []), ctx)).toBeNull(); // no accounts
-    expect(decodeV22Event(ix([T.EvictAndTradeCpi, 1, 2, 3], ["only-victim"]), ctx)).toBeNull(); // fewer than 2 accounts
-    expect(decodeV22Event(ix([T.EvictAndTradeCpi, 1, 2, 3], ["", "x", "y"]), ctx)).toBeNull(); // blank victim
+  it("eviction: each guard (valid wrapped TradeCpi body) drops the row on its own", () => {
+    const body = encodeTradeCpi({
+      accountAPortfolioId: 1n, accountAPositionEpoch: 2n, accountBPortfolioId: 3n, accountBPositionEpoch: 4n, accountBMatcherSequence: 5n,
+      assetIndex: 4, marketId: 9n, sizeQ: 1_000_000n, feeBps: 5n, limitPrice: 100_000_000n, backingFeeCapBps: 0,
+    });
+    const data = [T.EvictAndTradeCpi, ...body.slice(1)]; // the wrapper replaces the inner tag byte
+    const good = ["victim", "trader", "market"];
+    const e = decodeV22Event(ix(data, good), ctx)!;
+    expect([e.kind, e.subject, e.actor, e.slab_address, e.asset_index, e.detail.entrant_side]).toEqual(["eviction", "victim", "trader", "market", 4, "long"]);
+    expect(decodeV22Event(ix(data, []), ctx)).toBeNull(); // no accounts
+    expect(decodeV22Event(ix(data, ["victim"]), ctx)).toBeNull(); // fewer than 2 accounts
+    expect(decodeV22Event(ix(data, ["", "trader", "market"]), ctx)).toBeNull(); // blank victim
+    expect(decodeV22Event(ix(data, ["victim", "trader"]), ctx)).toBeNull(); // no market account
+    expect(decodeV22Event(ix(data, ["victim", "trader", ""]), ctx)).toBeNull(); // blank market
+    expect(decodeV22Event(ix([T.EvictAndTradeCpi], good), ctx)).toBeNull(); // no wrapped body
+    expect(decodeV22Event(ix([T.EvictAndTradeCpi, 1, 2, 3], good), ctx)).toBeNull(); // truncated body
   });
 
   it("the switch default is unreachable for known tags, but a tag added to the set without a case is dropped", () => {
