@@ -6,7 +6,7 @@
  * and nothing is claimed).
  *
  * BEST EFFORT and ISOLATED: never throws (a failed DB write is reported as status "write_failed"), and the rows go through their own `insertV22Events` call, so a problem here can
- * never cost an instruction event, a trade row or a webhook delivery. VERSION-keyed: only markets known to be wrapper
+ * never cost an instruction event or a trade row (a failed DB write does make the webhook answer 5xx, deliberately). VERSION-keyed: only markets known to be wrapper
  * VERSION 19 (or not yet read) get events, and only a market known to be VERSION 19 gets an unknown marker.
  */
 import { createLogger } from "@percolatorct/shared";

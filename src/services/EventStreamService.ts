@@ -152,7 +152,7 @@ export class EventStreamService {
     }
 
     // The fills are indexed first and unconditionally; a v22 write that failed after its retries is surfaced AFTER them
-    // (the handler logs it as "handler failed"; the 5-minute poll path re-reads the tx).
+    // (the handler logs it as "handler failed"; the failure is counted and alerted in insertV22Events). Only the instruction events are retried here; the log events go through recordV22LogEvents, which reports "write_failed" once.
     await this.indexFills(tx, signature);
     if (v22WriteFailed) throw new Error(`v22_events write failed after retries for ${signature.slice(0, 16)}`);
   }
