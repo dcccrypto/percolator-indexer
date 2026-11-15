@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
+const captureSpy = vi.hoisted(() => vi.fn());
 const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 const txBySig = new Map<string, unknown>();
 const sigLists = new Map<string, { signature: string; err: null }[]>();
@@ -23,7 +24,7 @@ vi.mock("@percolatorct/shared", async (orig) => {
   const noop = () => undefined;
   return { ...actual, config: { ...actual.config, allProgramIds: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB"] }, getConnection: () => connection,
     withRetry: async (fn: () => Promise<unknown>) => fn(), createLogger: () => ({ info: noop, warn: noop, error: noop, debug: noop }),
-    captureException: noop, eventBus: { on: noop, off: noop, publish: noop } };
+    captureException: captureSpy, eventBus: { on: noop, off: noop, publish: noop } };
 });
 vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: vi.fn(async () => undefined), assertSkippedSignatureSinkReady: vi.fn() }));
 vi.mock("../../src/db/tradeCursor.js", () => ({ loadTradeCursors: vi.fn(async () => new Map()), saveTradeCursor: vi.fn(async () => undefined) }));
@@ -55,7 +56,7 @@ const setup = () => {
 };
 
 describe("poll path: a failed fill write must not lose the fill", () => {
-  beforeEach(() => { store.clear(); vi.clearAllMocks(); });
+  beforeEach(() => { store.clear(); vi.clearAllMocks(); captureSpy.mockClear(); });
 
   it("fill 2 fails once: cursor is held, next poll stores it", async () => {
     const { sigs, idx } = setup();
@@ -81,7 +82,24 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     }
     await idx.indexTradesForSlab(MARKET, 100);
     expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
+    expect(captureSpy).toHaveBeenCalledTimes(1);
     expect(store.has(sigs[1])).toBe(false);
     expect(store.has(sigs[0]) && store.has(sigs[2])).toBe(true);
+  });
+
+  it("a clean poll resets the hold count (no alert after fail, succeed, fail)", async () => {
+    const { sigs, idx } = setup();
+    let bad = true;
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === sigs[1] && bad) throw new Error("db");
+      store.add(key(r)); return true; }) as never);
+    for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
+    bad = false;
+    await idx.indexTradesForSlab(MARKET, 100);
+    bad = true; store.clear();
+    idx.lastSignature.delete(MARKET);
+    for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
+    expect(captureSpy).not.toHaveBeenCalled();
+    expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
   });
 });

@@ -46,6 +46,8 @@ interface PassState {
   newCount?: number;
   /** A fill / liquidation row could not be written (insert threw): the cursor must not pass this window. */
   writeFailed?: boolean;
+  /** Signatures (12-char prefix) whose write failed, for the cap alert. */
+  failedSigs?: string[];
 }
 const FLUSH_AT = 200;
 
@@ -514,10 +516,10 @@ export class TradeIndexerPolling {
         logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slabAddress.slice(0, 8), hold: holds, max: MAX_WRITE_HOLDS });
       } else {
         writeHolds.delete(slabAddress);
-        logger.error("ALERT: fill write kept failing; hold cap reached, advancing the cursor and SKIPPING the unwritten rows (needs manual backfill)", { slabAddress: slabAddress.slice(0, 8), holds: MAX_WRITE_HOLDS });
-        captureException(new Error(`indexer fill write failed ${MAX_WRITE_HOLDS} consecutive polls; cursor advanced past unwritten rows (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-hold-cap" }, extra: { slabAddress, holds: MAX_WRITE_HOLDS } });
+        logger.error("ALERT: fill write kept failing; hold cap reached, advancing the cursor and SKIPPING the unwritten rows (needs manual backfill); every row of the window may be missing", { slabAddress: slabAddress.slice(0, 8), holds: MAX_WRITE_HOLDS, failedSigs: pass.failedSigs?.slice(0, 20) });
+        captureException(new Error(`indexer fill write failed ${MAX_WRITE_HOLDS} consecutive polls; cursor advanced past unwritten rows (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-hold-cap" }, extra: { slabAddress, holds: MAX_WRITE_HOLDS, failedSigs: pass.failedSigs?.slice(0, 20) } });
       }
-    } else if (!pass.writeFailed && !batchFailed && !holdCursor) {
+    } else if (!pass.writeFailed) {
       writeHolds.delete(slabAddress);
     }
     if (!batchFailed && !holdCursor) {
@@ -605,6 +607,7 @@ export class TradeIndexerPolling {
         } catch (err) {
           pass.incomplete = true;
           pass.writeFailed = true;
+          (pass.failedSigs ??= []).push(q.row.tx_signature?.slice(0, 12) ?? "?");
           logger.warn("Failed to process transaction", { signature: q.row.tx_signature?.slice(0, 12), error: err instanceof Error ? err.message : err });
           continue;
         }
@@ -667,6 +670,7 @@ export class TradeIndexerPolling {
         });
       } catch (err) {
         pass.writeFailed = true;
+        (pass.failedSigs ??= []).push(signature.slice(0, 12));
         logger.warn("liquidation insert failed", { signature: signature.slice(0, 12), err: String(err) });
       }
     }
