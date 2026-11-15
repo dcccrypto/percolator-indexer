@@ -5,7 +5,7 @@
  * `logMessages` only when the delivery carries them (the enhanced payload normally does not, and then nothing is attempted
  * and nothing is claimed).
  *
- * BEST EFFORT and ISOLATED: never throws, and the rows go through their own `insertV22Events` call, so a problem here can
+ * BEST EFFORT and ISOLATED: never throws (a failed DB write is reported as status "write_failed"), and the rows go through their own `insertV22Events` call, so a problem here can
  * never cost an instruction event, a trade row or a webhook delivery. VERSION-keyed: only markets known to be wrapper
  * VERSION 19 (or not yet read) get events, and only a market known to be VERSION 19 gets an unknown marker.
  */
@@ -14,7 +14,7 @@ import { isBlockedSlab } from "../blocklist.js";
 import { assetGenerationOf, marketVersionOf } from "../layout/marketVersions.js";
 import { decodeV22LogEvents, getLogEventStats, type EventGate, type UnknownReason } from "../parsers/v22FillEvents.js";
 import type { RawInstruction } from "../parsers/v22Events.js";
-import { insertV22Events } from "../db/insertV22Events.js";
+import { insertV22Events, V22EventWriteError } from "../db/insertV22Events.js";
 
 const logger = createLogger("indexer:v22-log-events");
 
@@ -38,7 +38,7 @@ export interface RecordLogEventsInput {
 }
 
 export interface RecordLogEventsResult {
-  status: "not_applicable" | "failed" | "ok" | "unknown";
+  status: "not_applicable" | "failed" | "ok" | "unknown" | "write_failed";
   rows: number;
   unknownReason?: UnknownReason;
 }
@@ -70,7 +70,16 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
         });
       }
     }
-    if (res.rows.length > 0) await insertV22Events(res.rows);
+    if (res.rows.length > 0) {
+      try {
+        await insertV22Events(res.rows);
+      } catch (err) {
+        if (!(err instanceof V22EventWriteError)) throw err;
+        // The DB write failed (already counted + alerted in insertV22Events). Report it instead of pretending it was recorded,
+        // so a caller that can be redelivered (the webhook) answers 5xx.
+        return { status: "write_failed", rows: res.rows.length };
+      }
+    }
     return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : {}) };
   } catch (err) {
     logger.warn("v22 log-event recording failed (trades unaffected)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });

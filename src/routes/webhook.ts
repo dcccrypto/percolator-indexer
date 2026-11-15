@@ -4,7 +4,7 @@ import { PublicKey } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { decodeV22Events, rawInstructionsFromEnhancedTx } from "../parsers/v22Events.js";
-import { insertV22Events } from "../db/insertV22Events.js";
+import { insertV22Events, V22EventWriteError } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "../services/v22LogEvents.js";
 import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
@@ -555,8 +555,10 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
     logger.debug("Skipped fills on blocked slabs", { count: blockedFills });
   }
 
-  // v2.2 activity events. Best effort, isolated from the trade path: decode/insert problems are logged inside
-  // insertV22Events and never change this delivery's response (Helius would redeliver a 5xx, duplicating fill work).
+  // v2.2 activity events. Isolated from the trade path: DECODE problems never change this delivery's response. A failed DB
+  // WRITE does (below, after the trades are flushed): swallowing it lost the events for good, since a 200 means no redelivery.
+  // The redelivery is cheap: trade inserts are idempotent and the v22_events upsert ignores duplicates.
+  let v22WriteFailures = 0;
   try {
     const v22Rows = [];
     for (const tx of transactions) {
@@ -572,12 +574,19 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         v22Rows.push(r);
       }
     }
-    if (v22Rows.length > 0) await insertV22Events(v22Rows);
+    if (v22Rows.length > 0) {
+      try {
+        await insertV22Events(v22Rows);
+      } catch (err) {
+        if (!(err instanceof V22EventWriteError)) throw err;
+        v22WriteFailures++; // counted + alerted in insertV22Events; answered 5xx below so the provider redelivers
+      }
+    }
     // v2.2 wrapper LOG events: only when the delivery carries the logs (the enhanced payload normally does not; then nothing is
     // attempted and nothing is claimed: the stream and poll paths read them from the transaction meta).
     for (const tx of transactions) {
       if (!tx.signature || !Array.isArray(tx.logMessages)) continue;
-      await recordV22LogEvents({
+      const logRes = await recordV22LogEvents({
         signature: tx.signature,
         err: tx.transactionError ?? null,
         logMessages: tx.logMessages,
@@ -587,6 +596,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         blockTimeSec: typeof (tx as { timestamp?: unknown }).timestamp === "number" ? (tx as { timestamp: number }).timestamp : null,
         isKnownMarket: (slab) => !discovery || discovery.getMarkets().has(slab),
       });
+      if (logRes.status === "write_failed") v22WriteFailures++;
     }
   } catch (err) {
     logger.warn("v22 event extraction failed (trades unaffected)", { error: err instanceof Error ? err.message : String(err) });
@@ -596,6 +606,10 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
 
   if (indexed > 0) {
     logger.info("Trades indexed", { count: indexed });
+  }
+
+  if (v22WriteFailures > 0) {
+    throw new Error(`${v22WriteFailures} v2.2 event write(s) failed (DB); 5xx so the provider redelivers`);
   }
 
   // Surface persistent DB failures to the caller so Helius can retry
