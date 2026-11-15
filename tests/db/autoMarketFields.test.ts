@@ -283,3 +283,100 @@ describe("v17InitialMarginBps (max_leverage source), VERSION-keyed", () => {
     expect(v17InitialMarginBps(raw)).toBeNull();
   });
 });
+
+describe("resolveAutoMarketFields fallbacks", () => {
+  const key = () => Keypair.generate().publicKey;
+
+  it("a null/absent header, config, params and configV17 yields all-null fields and the default fee", () => {
+    for (const m of [{}, { header: null, config: null, params: null, configV17: null }]) {
+      expect(resolveAutoMarketFields(m, null)).toEqual({ deployer: null, oracle_authority: null, initial_price_e6: null, trading_fee_bps: 10 });
+    }
+  });
+
+  it("an all-zero (default) header.admin or oracleAuthority counts as unset; creator wins over everything", () => {
+    const real = key();
+    expect(resolveAutoMarketFields({ header: { admin: PublicKey.default }, config: { oracleAuthority: PublicKey.default } }, null))
+      .toMatchObject({ deployer: null, oracle_authority: null });
+    expect(resolveAutoMarketFields({ header: { admin: real }, configV17: { marketauth: MARKETAUTH } }, null).deployer).toBe(real.toBase58());
+    expect(resolveAutoMarketFields({ header: { admin: real } }, CREATOR.toBase58()).deployer).toBe(CREATOR.toBase58());
+  });
+
+  it("v12 price falls back authorityPriceE6 -> markEwmaE6 -> null (zero, negative, absent all unset)", () => {
+    expect(resolveAutoMarketFields({ config: { authorityPriceE6: 0n, markEwmaE6: 42n } }, null).initial_price_e6).toBe(42);
+    expect(resolveAutoMarketFields({ config: { authorityPriceE6: -1n, markEwmaE6: 0n } }, null).initial_price_e6).toBeNull();
+    expect(resolveAutoMarketFields({ config: {} }, null).initial_price_e6).toBeNull();
+  });
+
+  it("v17 price falls back oracleTargetPriceE6 -> markEwmaE6; a value beyond double range is unset", () => {
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: 0n, markEwmaE6: 99n } }, null).initial_price_e6).toBe(99);
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: 10n ** 400n } }, null).initial_price_e6).toBeNull();
+  });
+
+  it("fee bounds: 0 and 10000 are kept; 10001 and negative fall back to 10; null falls back; v12 reads params", () => {
+    const f = (tradeFeeBps: bigint | null | undefined) => resolveAutoMarketFields({ configV17: { tradeFeeBps: tradeFeeBps as bigint } }, null).trading_fee_bps;
+    expect([f(0n), f(10_000n), f(10_001n), f(-1n), f(null), f(undefined)]).toEqual([0, 10_000, 10, 10, 10, 10]);
+    expect(resolveAutoMarketFields({ params: { tradingFeeBps: 10_001n } }, null).trading_fee_bps).toBe(10);
+    expect(resolveAutoMarketFields({ params: {} }, null).trading_fee_bps).toBe(10);
+  });
+});
+
+describe("findSlabCreation history-walk and tx edge cases", () => {
+  it("an account with no signatures at all: exhausted, nothing found", async () => {
+    const rpc: CreatorLookupRpc = { getSignaturesForAddress: vi.fn(async () => []), getTransaction: vi.fn() };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toEqual({ creator: null, blockTime: null });
+    expect(rpc.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it("a full 1000-signature page followed by an empty page ends the walk on the earlier page", async () => {
+    const full = Array.from({ length: 1000 }, (_, i) => sig(2000 - i));
+    const getSignaturesForAddress = vi.fn()
+      .mockResolvedValueOnce(full)
+      .mockResolvedValueOnce([]);
+    const rpc: CreatorLookupRpc = { getSignaturesForAddress, getTransaction: vi.fn(async (s: string) => (s === "sig1001" ? creationTx() : null)) };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toMatchObject({ creator: CREATOR.toBase58() });
+    expect(getSignaturesForAddress).toHaveBeenCalledTimes(2);
+    expect(getSignaturesForAddress.mock.calls[1][1]).toMatchObject({ before: "sig1001" });
+  });
+
+  it("failed (err) signatures are never fetched; with only failed ones the result is null/null", async () => {
+    const rpc: CreatorLookupRpc = { getSignaturesForAddress: vi.fn(async () => [sig(1, { InstructionError: [0, "x"] })]), getTransaction: vi.fn() };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toEqual({ creator: null, blockTime: null });
+    expect(rpc.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it("a null getTransaction result is skipped; no creation found returns the oldest signature's time", async () => {
+    const s = { ...sig(5), blockTime: 1_700_000_000 };
+    const rpc: CreatorLookupRpc = { getSignaturesForAddress: vi.fn(async () => [s]), getTransaction: vi.fn(async () => null) };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).resolves.toEqual({ creator: null, blockTime: 1_700_000_000 });
+  });
+
+  it("blockTime comes from the creation tx when it has one, else from the oldest signature", async () => {
+    const withTime = { ...creationTx(), blockTime: 123 } as VersionedTransactionResponse;
+    const mk = (tx: VersionedTransactionResponse): CreatorLookupRpc => ({
+      getSignaturesForAddress: vi.fn(async () => [{ ...sig(1), blockTime: 77 }]),
+      getTransaction: vi.fn(async () => tx),
+    });
+    await expect(findSlabCreation(mk(withTime), SLAB, WRAPPER)).resolves.toEqual({ creator: CREATOR.toBase58(), blockTime: 123 });
+    await expect(findSlabCreation(mk(creationTx()), SLAB, WRAPPER)).resolves.toEqual({ creator: CREATOR.toBase58(), blockTime: 77 });
+  });
+
+  it("only the 5 OLDEST successful signatures are tried", async () => {
+    const page = Array.from({ length: 8 }, (_, i) => sig(100 - i)); // newest first
+    const getTransaction = vi.fn(async () => null);
+    await findSlabCreation({ getSignaturesForAddress: vi.fn(async () => page), getTransaction }, SLAB, WRAPPER);
+    expect(getTransaction.mock.calls.map((c) => c[0])).toEqual(["sig93", "sig94", "sig95", "sig96", "sig97"]);
+  });
+
+  it("a non-poison fetch error (e.g. network) propagates instead of being skipped", async () => {
+    const rpc: CreatorLookupRpc = { getSignaturesForAddress: vi.fn(async () => [sig(1)]), getTransaction: vi.fn(async () => { throw new Error("socket hang up"); }) };
+    await expect(findSlabCreation(rpc, SLAB, WRAPPER)).rejects.toThrow("socket hang up");
+  });
+
+  it("a creation tx whose wrapper ix has no creator-bearing account keeps scanning; v0 lookup addresses are accepted", async () => {
+    const tx = creationTx();
+    (tx as unknown as { meta: unknown }).meta = { loadedAddresses: { writable: [], readonly: [] } };
+    expect(creatorFromCreationTx(tx, SLAB, WRAPPER)).toBe(CREATOR.toBase58());
+    // wrapper program present but a different program id asked for -> no creation
+    expect(creatorFromCreationTx(tx, SLAB, SYSTEM)).toBeNull();
+  });
+});

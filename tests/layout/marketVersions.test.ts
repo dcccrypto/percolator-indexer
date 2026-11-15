@@ -48,3 +48,50 @@ describe("noteMarketLayout / marketVersionOf / assetGenerationOf", () => {
     for (const s of ["A", "B", "C", "D"]) expect(marketVersionOf(s)).toBeNull();
   });
 });
+
+describe("noteMarketLayout edge branches", () => {
+  const slotOff = (i: number) => LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + i * LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlotLen + ASSET_STATE_MARKET_ID_OFF;
+
+  it("a buffer cut inside a later slot's market_id records only the slots that fit", () => {
+    const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 2 }), LAYOUT_V22, 0, 3n);
+    withGeneration(d, LAYOUT_V22, 1, 4n);
+    noteMarketLayout("T", d.subarray(0, slotOff(1) + 4)); // 4 of slot 1's 8 bytes
+    expect(marketVersionOf("T")).toBe(19);
+    expect(assetGenerationOf("T", 0)).toBe(3n);
+    expect(assetGenerationOf("T", 1)).toBeNull();
+  });
+
+  it("a light read of a slab never read before records the VERSION with no generations", () => {
+    const d = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("L", d.subarray(0, registrationSliceLen()));
+    expect(marketVersionOf("L")).toBe(19);
+    expect(assetGenerationOf("L", 0)).toBeNull();
+  });
+
+  it("unknown slab and unknown asset index read as null", () => {
+    expect(marketVersionOf("never")).toBeNull();
+    expect(assetGenerationOf("never", 0)).toBeNull();
+    expect(assetGenerationOf("never", -1)).toBeNull();
+  });
+
+  it("each mapped VERSION (18 -> v2.1, 19 -> v2.2) is recorded; 0, 17 and 20 (out of range) are not", () => {
+    noteMarketLayout("v18", REAL_MARKET_V21);
+    noteMarketLayout("v19", buildMarket(LAYOUT_V22, { slots: 1 }));
+    expect([marketVersionOf("v18"), marketVersionOf("v19")]).toEqual([18, 19]);
+    for (const v of [0, 1, 17, 20, 255]) {
+      noteMarketLayout(`bad${v}`, buildMarket(LAYOUT_V22, {}, v));
+      expect(marketVersionOf(`bad${v}`)).toBeNull();
+    }
+  });
+
+  it("at the 20,000-note cap a NEW slab is dropped but an already-noted slab is still refreshed", () => {
+    const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 1n);
+    for (let i = 0; i < 20_000; i++) noteMarketLayout(`cap${i}`, d);
+    noteMarketLayout("overflow", d);
+    expect(marketVersionOf("overflow")).toBeNull();
+    expect(marketVersionOf("cap19999")).toBe(19);
+    noteMarketLayout("cap0", withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 2n));
+    expect(assetGenerationOf("cap0", 0)).toBe(2n);
+  });
+});
+
