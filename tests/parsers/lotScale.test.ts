@@ -3,8 +3,8 @@
  * 10^lot_exp base units, so the per-token price is price_e6 / 1e6 / 10^lot_exp. A default (lot_exp = 0) market
  * must come out exactly as before (price_e6 / 1e6).
  */
-import { describe, it, expect, beforeEach } from "vitest";
-import { cachedLotExp, lotExpOfSlabData, noteLotExps, perLotPrice, perTokenPrice, resetLotExpCache } from "../../src/parsers/lotScale.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { knownLotExp, resolveLotExp, cachedLotExp, lotExpOfSlabData, noteLotExps, perLotPrice, perTokenPrice, resetLotExpCache } from "../../src/parsers/lotScale.js";
 import { readAssetEffectivePriceE6 } from "../../src/parsers/markPrice.js";
 import { buildMarket, LAYOUT_V21, LAYOUT_V22 } from "../helpers/v22Fixtures.js";
 
@@ -107,5 +107,51 @@ describe("fees stay in per-lot units", () => {
     expect(cachedLotExp("S", 0)).toBe(3);
     expect(cachedLotExp("S", 1)).toBe(0);
     expect(cachedLotExp("S", 2)).toBe(7);
+  });
+});
+
+describe("resolveLotExp (never a guessed lot 0)", () => {
+  const SLAB = "SlabAddr1111111111111111111111111111111111";
+  it("a cache hit makes no read", async () => {
+    noteLotExps(SLAB, market(LAYOUT_V22, [1n], [4]));
+    const read = vi.fn();
+    expect(await resolveLotExp(SLAB, 0, read)).toBe(4);
+    expect(read).not.toHaveBeenCalled();
+  });
+  it("a miss reads the market once, fills the cache for every slot, then serves from cache", async () => {
+    const d = market(LAYOUT_V22, [1n, 1n], [3, 5]);
+    const read = vi.fn(async () => d);
+    expect(await resolveLotExp(SLAB, 1, read)).toBe(5);
+    expect(await resolveLotExp(SLAB, 0, read)).toBe(3);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+  it("null when the market cannot be read (throw, null, undefined), and nothing is cached", async () => {
+    expect(await resolveLotExp(SLAB, 0, async () => { throw new Error("x"); })).toBeNull();
+    expect(await resolveLotExp(SLAB, 0, async () => null)).toBeNull();
+    expect(await resolveLotExp(SLAB, 0, async () => undefined)).toBeNull();
+    expect(knownLotExp(SLAB, 0)).toBeUndefined();
+  });
+  it("a market that was read but has no v2.2 slot is lot 0 (as before) and is not cached", async () => {
+    expect(await resolveLotExp(SLAB, 0, async () => new Uint8Array(64))).toBe(0);
+    expect(knownLotExp(SLAB, 0)).toBeUndefined();
+  });
+  it("lot_exp is immutable: the cache entry does not expire (no 24 h TTL)", async () => {
+    vi.useFakeTimers();
+    try {
+      noteLotExps(SLAB, market(LAYOUT_V22, [1n], [7]));
+      vi.setSystemTime(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      expect(knownLotExp(SLAB, 0)).toBe(7);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe("readMarkPriceE6 mark-EWMA fallback records lot_exp (consumers divide the per-lot EWMA the same way as effective_price)", () => {
+  it("effective_price 0, lot 6: returns the per-lot EWMA and the cache knows lot 6", async () => {
+    const { readMarkPriceE6 } = await import("../../src/parsers/markPrice.js");
+    const d = buildMarket(LAYOUT_V22, { slots: 1, markEwmaE6: 300_000n });
+    d[LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + LAYOUT_V22.wrapperSlot.profileLotExp] = 6;
+    const e6 = await readMarkPriceE6({ getAccountInfo: async () => ({ data: Buffer.from(d) }) } as any, "EwmaSlab1111111111111111111111111111111111", 0);
+    expect(e6).toBe(300_000);
+    expect(perTokenPrice(e6!, cachedLotExp("EwmaSlab1111111111111111111111111111111111", 0))).toBeCloseTo(3e-7, 20);
   });
 });
