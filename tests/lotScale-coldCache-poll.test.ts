@@ -82,14 +82,24 @@ describe("poll path: TradeCpi on a cold lot_exp cache", () => {
     expect(written()[0].fee).toBeCloseTo(lot0.fee, 12);
   });
 
-  it("market unreadable: no row, signature recorded for re-index; a later pass writes the right row", async () => {
+  it("M1: market unreadable: nothing written and the cursor is HELD (CtxReadRetry), not skipped; a later pass writes the right row", async () => {
     rpc("throw");
-    await process1();
+    const indexer: any = new TradeIndexerPolling();
+    await expect(indexer.processTransaction(asWeb3(f), f.sig, SLAB, new Set([PROGRAM]))).rejects.toThrow(/will be retried/);
+    expect(written()).toEqual([]);
+    expect(recordSkipped).not.toHaveBeenCalled();
+    rpc(slabBytes(6));
+    await indexer.processTransaction(asWeb3(f), f.sig, SLAB, new Set([PROGRAM]));
+    expect(written()[0].price).toBeCloseTo(13.861751e-6, 18);
+  });
+
+  it("M1: the hold is bounded: after 5 held polls the signature is recorded for re-index and the cursor may move on", async () => {
+    rpc("throw");
+    const indexer: any = new TradeIndexerPolling();
+    for (let i = 0; i < 5; i++) await expect(indexer.processTransaction(asWeb3(f), f.sig, SLAB, new Set([PROGRAM]))).rejects.toThrow(/will be retried/);
+    await indexer.processTransaction(asWeb3(f), f.sig, SLAB, new Set([PROGRAM]));
     expect(written()).toEqual([]);
     expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("lot_exp") })]);
-    rpc(slabBytes(6));
-    await process1();
-    expect(written()[0].price).toBeCloseTo(13.861751e-6, 18);
   });
 
   it("H2: the startup backfill runs with a cold cache (before the first sweep) and still writes per-token prices", async () => {
