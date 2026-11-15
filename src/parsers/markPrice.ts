@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { parseEngine, detectSlabLayout, resolveMarketGeometry } from "@percolatorct/sdk";
+import { noteLotExps } from "./lotScale.js";
 import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { createLogger, withRetry } from "@percolatorct/shared";
 
@@ -42,7 +43,7 @@ export function readAssetEffectivePriceE6(data: Uint8Array, assetIndex: number):
 /**
  * Read the slab's on-chain `mark_price_e6` for a Percolator market.
  *
- * Returns the raw e6 integer (e.g. 85_187_279 for $85.187279). Returns `null` on any
+ * Returns the raw e6 integer PER LOT (e.g. 85_187_279 for $85.187279 on a default lot_exp=0 market; divide by 10^lot_exp more for a per-token price, see lotScale.ts). Returns `null` on any
  * failure — account missing, layout undetectable, V0 slab (no mark_price field),
  * RPC error, or zero/out-of-range value.
  *
@@ -77,7 +78,11 @@ export async function readMarkPriceE6(
 
     if (assetIndex !== undefined) {
       const effective = readAssetEffectivePriceE6(data, assetIndex);
-      if (effective !== null) return effective;
+      if (effective !== null) {
+        // Remember lot_exp so the caller can show a per-token price without another read.
+        noteLotExps(slabAddress, data);
+        return effective;
+      }
     }
 
     // Desync fix 9: v17 account — detectSlabLayout returns null for v17 account sizes

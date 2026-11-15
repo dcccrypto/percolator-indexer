@@ -23,6 +23,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
 import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -929,7 +930,7 @@ async function extractTradesFromEnhancedTx(
         if (r.kind === "fill") {
           legSize = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = Number(r.priceE6) / 1_000_000;
+          price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, leg.assetIndex));
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic below, exactly as before this parser
       }
@@ -945,7 +946,7 @@ async function extractTradesFromEnhancedTx(
         }
         price = fallback;
       }
-      const fee = computeFeeUsd(legSize, price, leg.feeBps);
+      const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
       trades.push({
         slab_address: slabAddress,
@@ -1095,7 +1096,10 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
   // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
-  if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+  if (effectiveE6 !== null) {
+    noteLotExps(account, raw);
+    return perTokenPrice(effectiveE6, lotExpOfSlabData(raw, assetIndex)); // per-token (lot_exp scale)
+  }
 
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).

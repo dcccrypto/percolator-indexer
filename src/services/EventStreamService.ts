@@ -6,6 +6,7 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perTokenPrice } from "../parsers/lotScale.js";
 import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import { insertV22Events } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
@@ -225,7 +226,8 @@ export class EventStreamService {
       // `priceE6` field name on the fill — returns the raw e6 integer, so it must
       // be divided here too. Previously this raw e6 value was stored directly
       // into `trades.price`, inflating every Atlas-indexed fill 1,000,000x.
-      const price = priceE6Value / 1_000_000;
+      // per-token: the engine/matcher price is per 10^lot_exp units (lot 0 == / 1_000_000, unchanged).
+      const price = perTokenPrice(priceE6Value, cachedLotExp(slab, fill.assetIndex));
 
       rows.push({
         slab_address: slab,

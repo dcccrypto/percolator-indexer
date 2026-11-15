@@ -24,6 +24,7 @@ import { IN_CHUNK, fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiF
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
@@ -895,12 +896,12 @@ export class TradeIndexerPolling {
             if (r.kind === "fill") {
               legSize = r.sizeValue;
               sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-              price = Number(r.priceE6) / 1_000_000;
+              price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, leg.assetIndex));
               if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
             } // "legacy": wire size + the existing price logic, exactly as before this parser
           }
           if (price === undefined) price = await resolvePrice(leg);
-          const fee = computeFeeUsd(legSize, price, leg.feeBps);
+          const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
           const legSizeStr = legSize.toString();
           await writeFill({
@@ -964,12 +965,12 @@ export class TradeIndexerPolling {
         if (r.kind === "fill") {
           sizeValue = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = Number(r.priceE6) / 1_000_000;
+          price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, decoded.assetIndex));
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
       if (price === undefined) price = await resolveFallbackPrice(decoded.assetIndex);
-      const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
+      const fee = computeFeeUsd(sizeValue, perLotPrice(price, cachedLotExp(slabAddress, decoded.assetIndex)), decoded.feeBps);
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1065,7 +1066,10 @@ export class TradeIndexerPolling {
 
       // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
       const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
-      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+      if (effectiveE6 !== null) {
+        noteLotExps(slabAddress, rawData);
+        return perTokenPrice(effectiveE6, lotExpOfSlabData(rawData, assetIndex)); // per-token: the engine price is per 10^lot_exp units
+      }
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (hasWrapperMagic(rawData)) {
