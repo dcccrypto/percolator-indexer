@@ -12,7 +12,7 @@ for _ in range(runs):
     q = None
     for line in out.splitlines():
         if re.fullmatch(r"Q\d", line.strip()):
-            q = line.strip(); first = True
+            q = line.strip()
         m = re.search(r"Execution Time: ([\d.]+) ms", line)
         if m and q: times.setdefault(q, []).append(float(m.group(1)))
         m = re.match(r"\s*Buffers: shared (.*)", line)

@@ -12,8 +12,8 @@
 --    sync with 20260726180000_volume_rollup_fn.sql.
 -- 2. fetchTraderPositionEvidence (src/db/traderNetPosition.ts, one paged read per close). Same key as
 --    idx_trades_position_lookup plus the five columns the read returns, so it never touches the heap.
---    It supersedes idx_trades_position_lookup (same leading columns), which is dropped at the end so the
---    table does not carry both.
+--    It supersedes idx_trades_position_lookup (same leading columns), which can be dropped afterwards (manual step at the
+--    end) so the table does not carry both.
 --
 -- Write cost: every trades insert now maintains these two indexes instead of idx_trades_position_lookup
 -- alone (the volume index is partial and skips liquidation markers). Index-only scans need an up-to-date
@@ -32,5 +32,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_position_lookup_cover
   ON trades (trader, slab_address, asset_index, network, id)
   INCLUDE (side, size, is_liquidation, created_at, tx_signature);
 
--- Only after the line above has finished and pg_index.indisvalid is true for it:
-DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;
+-- SEPARATE, MANUAL STEP (deliberately commented out: `IF NOT EXISTS` above does NOT detect an INVALID leftover,
+-- and a script run without ON_ERROR_STOP would carry on to the DROP). Only after this returns `t`:
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_trades_position_lookup_cover'::regclass;
+-- run, as its own statement:
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;

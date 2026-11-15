@@ -8,7 +8,7 @@ const live = read("../../supabase/migrations/20261115120000_trades_covering_read
 describe("covering read indexes migration", () => {
   it("is concurrent", () => {
     expect(live.match(/CREATE INDEX CONCURRENTLY/g)).toHaveLength(2);
-    expect(live).toMatch(/DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;/);
+    expect(live).not.toMatch(/DROP INDEX/); // the old-index drop is a manual, commented step
   });
 
   it("volume index carries the rollup function's own filter and columns", () => {

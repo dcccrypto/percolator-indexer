@@ -6,7 +6,7 @@ EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON) SELECT * FROM volume_24h_by_s
 \echo Q2 stored legs IN(100)
 EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON)
 SELECT tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation
-FROM trades WHERE tx_signature IN (SELECT 'sig'||(1000+g*3000) FROM generate_series(1,100) g) AND network='devnet';
+FROM trades WHERE tx_signature IN (SELECT 'sig'||(1000+g*997+7) FROM generate_series(1,100) g) AND network='devnet';
 -- Q3 fetchTraderPositionEvidence (per close): heavy trader, one position
 \echo Q3 position evidence
 EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON)
