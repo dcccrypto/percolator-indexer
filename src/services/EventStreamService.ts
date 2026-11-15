@@ -1,3 +1,4 @@
+import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
@@ -6,7 +7,7 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
-import { cachedLotExp, perTokenPrice } from "../parsers/lotScale.js";
+import { resolveLotExp, perTokenPrice } from "../parsers/lotScale.js";
 import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import { insertV22Events } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
@@ -227,7 +228,17 @@ export class EventStreamService {
       // be divided here too. Previously this raw e6 value was stored directly
       // into `trades.price`, inflating every Atlas-indexed fill 1,000,000x.
       // per-token: the engine/matcher price is per 10^lot_exp units (lot 0 == / 1_000_000, unchanged).
-      const price = perTokenPrice(priceE6Value, cachedLotExp(slab, fill.assetIndex));
+      // Never guessed: cache (filled by the slab reads above), else one read of the market account. Unreadable: skip
+      // the fill and keep the signature for re-index, since a lot-0 price would be stored permanently.
+      const lot = await resolveLotExp(slab, fill.assetIndex, async () => {
+        const info = await this.deps.connection.getAccountInfo(new PublicKey(slab));
+        return info?.data ? new Uint8Array(info.data) : null;
+      });
+      if (lot === null) {
+        await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: "TradeCpi lot_exp unreadable: market account not read" }]);
+        continue;
+      }
+      const price = perTokenPrice(priceE6Value, lot);
 
       rows.push({
         slab_address: slab,

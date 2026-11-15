@@ -91,6 +91,8 @@ export async function readMarkPriceE6(
       try {
         const markEwmaE6 = readMarkEwmaE6(data, "readMarkPriceE6");
         if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
+          // Per lot, like effective_price: record lot_exp so callers divide it out the same way.
+          if (assetIndex !== undefined) noteLotExps(slabAddress, data);
           return Number(markEwmaE6);
         }
       } catch (err) {

@@ -39,8 +39,9 @@ export function perLotPrice(perToken: number, lotExp: number): number {
   return lot === 0 ? perToken : perToken * 10 ** lot;
 }
 
-// lot_exp is immutable per (market, asset), so a value read once is good for the life of the process.
-const newCache = () => new BoundedTtlMap<string, number>(200_000, 24 * 60 * 60 * 1000);
+// lot_exp is immutable per (market, asset), so a value read once is good for the life of the process (no TTL;
+// the size cap evicts the oldest entries, which are simply re-read on demand by resolveLotExp).
+const newCache = () => new BoundedTtlMap<string, number>(200_000, Number.POSITIVE_INFINITY);
 let lotExpCache = newCache();
 
 /** Test hook: forget every cached lot_exp. */
@@ -74,4 +75,34 @@ export function noteLotExps(slabAddress: string, data: Uint8Array): void {
  */
 export function cachedLotExp(slabAddress: string, assetIndex: number): number {
   return lotExpCache.get(`${slabAddress}:${assetIndex}`) ?? 0;
+}
+
+/** Cached `lot_exp`, or `undefined` when this (market, asset) has never been read (unlike cachedLotExp, which says 0). */
+export function knownLotExp(slabAddress: string, assetIndex: number): number | undefined {
+  return lotExpCache.get(`${slabAddress}:${assetIndex}`);
+}
+
+/**
+ * `lot_exp` to price a TradeCpi fill with, NEVER guessed: the cache, else one read of the market account
+ * (`readSlab`, which also fills the cache for every asset slot). Returns `null` when the market could not be read
+ * at all (RPC failure / account missing) so the caller defers or skips the row and retries later instead of writing
+ * an unscaled price that the insert's ignoreDuplicates would keep forever. A market that was read but has no
+ * readable v2.2 slot (legacy layout) is lot 0, which is what it always was.
+ */
+export async function resolveLotExp(
+  slabAddress: string,
+  assetIndex: number,
+  readSlab: () => Promise<Uint8Array | null | undefined>,
+): Promise<number | null> {
+  const known = knownLotExp(slabAddress, assetIndex);
+  if (known !== undefined) return known;
+  let data: Uint8Array | null | undefined;
+  try {
+    data = await readSlab();
+  } catch {
+    return null;
+  }
+  if (!data) return null;
+  noteLotExps(slabAddress, data);
+  return knownLotExp(slabAddress, assetIndex) ?? 0;
 }

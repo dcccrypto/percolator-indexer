@@ -24,7 +24,7 @@ import { IN_CHUNK, fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiF
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
-import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice } from "../parsers/lotScale.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
@@ -894,9 +894,11 @@ export class TradeIndexerPolling {
               continue;
             }
             if (r.kind === "fill") {
+              const lot = await this.lotExpForCpi(slabAddress, leg.assetIndex);
+              if (lot === null) { unverified.push("lot_exp unreadable: market account not read"); continue; }
               legSize = r.sizeValue;
               sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-              price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, leg.assetIndex));
+              price = perTokenPrice(r.priceE6, lot);
               if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
             } // "legacy": wire size + the existing price logic, exactly as before this parser
           }
@@ -963,9 +965,11 @@ export class TradeIndexerPolling {
           continue; // zero fill: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          const lot = await this.lotExpForCpi(slabAddress, decoded.assetIndex);
+          if (lot === null) { unverified.push("lot_exp unreadable: market account not read"); continue; }
           sizeValue = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, decoded.assetIndex));
+          price = perTokenPrice(r.priceE6, lot);
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
@@ -1050,6 +1054,17 @@ export class TradeIndexerPolling {
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
+  /** lot_exp for pricing a CPI fill: cache, else one slab read (primes the cache); null = unreadable, skip + retry. */
+  private lotExpForCpi(slabAddress: string, assetIndex: number): Promise<number | null> {
+    return resolveLotExp(slabAddress, assetIndex, async () => {
+      const info = await withRetry(
+        () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+        { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+      );
+      return info?.data ? new Uint8Array(info.data) : null;
+    });
+  }
+
   private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
@@ -1076,7 +1091,9 @@ export class TradeIndexerPolling {
         try {
           const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-            return Number(markEwmaE6) / 1_000_000;
+            // The EWMA is per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
+            noteLotExps(slabAddress, rawData);
+            return perTokenPrice(markEwmaE6, lotExpOfSlabData(rawData, assetIndex));
           }
         } catch (err) {
           // Unknown VERSION is loud (per market); the fill is skipped, never guessed.

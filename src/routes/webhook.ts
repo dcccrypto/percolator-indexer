@@ -23,7 +23,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
 import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
-import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice } from "../parsers/lotScale.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -928,9 +928,18 @@ async function extractTradesFromEnhancedTx(
           continue;
         }
         if (r.kind === "fill") {
+          // Never price a lot market at lot 0: slab post-state in this payload, else the cache, else one read.
+          noteLotExpsFromAccountData(tx, slabAddress);
+          const lot = await resolveLotExp(slabAddress, leg.assetIndex, () => readSlabBytes(slabAddress));
+          if (lot === null) {
+            // Written now it would be permanent (ignoreDuplicates): skip, keep the signature for re-index.
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: "TradeCpi lot_exp unreadable: market account not read" }]);
+            trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+            continue;
+          }
           legSize = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = perTokenPrice(r.priceE6, cachedLotExp(slabAddress, leg.assetIndex));
+          price = perTokenPrice(r.priceE6, lot);
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic below, exactly as before this parser
       }
@@ -1107,7 +1116,9 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
     try {
       const markEwmaE6 = readMarkEwmaE6(raw, "webhook.parseMarkPriceE6FromAccountBytes");
       if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-        return Number(markEwmaE6) / 1_000_000;
+        // Per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
+        noteLotExps(account, raw);
+        return perTokenPrice(markEwmaE6, lotExpOfSlabData(raw, assetIndex));
       }
     } catch (err) {
       // Unknown VERSION is loud (per market); any other failure returns 0 below.
@@ -1157,6 +1168,31 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
+function slabBytesFromAccountData(tx: ValidatedTransaction, slabAddress: string): Uint8Array | null {
+  for (const acc of (tx.accountData ?? []) as any[]) {
+    if (acc.account !== slabAddress) continue;
+    const b64 = typeof acc.data === "string" ? acc.data : Array.isArray(acc.data) && typeof acc.data[0] === "string" ? acc.data[0] : null;
+    if (!b64) continue;
+    try { return Uint8Array.from(Buffer.from(b64, "base64")); } catch { /* skip */ }
+  }
+  return null;
+}
+
+/** Record lot_exp from the slab post-state already in the payload (no RPC). */
+function noteLotExpsFromAccountData(tx: ValidatedTransaction, slabAddress: string): void {
+  const raw = slabBytesFromAccountData(tx, slabAddress);
+  if (raw) noteLotExps(slabAddress, raw);
+}
+
+/** One live read of the market account (retrying); null when unavailable. */
+async function readSlabBytes(slabAddress: string): Promise<Uint8Array | null> {
+  const info = await withRetry(
+    () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+    { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+  );
+  return info?.data ? new Uint8Array(info.data) : null;
+}
+
 function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {
