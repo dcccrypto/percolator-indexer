@@ -6,7 +6,7 @@ const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 const rowsOut: any[] = [];
 const recordSkipped = vi.fn(async () => undefined);
 // These tests are about sizes/prices/dedup, not lot scale: a cold lot_exp cache reads as lot 0 here (the pre-fix
-// behaviour) instead of triggering a slab read. The cold-cache behaviour is covered in tests/lotScale-coldCache.test.ts.
+// behaviour) instead of triggering a slab read. The cold-cache behaviour is covered in tests/lotScale-coldCache-*.test.ts.
 vi.mock("../src/parsers/lotScale.js", async (orig) => {
   const actual = await orig<typeof import("../src/parsers/lotScale.js")>();
   return { ...actual, resolveLotExp: async (s: string, a: number) => actual.knownLotExp(s, a) ?? 0 };
