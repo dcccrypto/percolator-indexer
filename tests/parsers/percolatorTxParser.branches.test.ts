@@ -16,6 +16,7 @@ const PERC = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
 const OTHER = "11111111111111111111111111111111";
 const TRADER = PublicKey.unique().toBase58();
 const SLAB = PublicKey.unique().toBase58();
+const MATCHER_PK = PublicKey.unique().toBase58();
 
 function b58(bytes: Uint8Array): string {
   const A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -105,11 +106,13 @@ describe("decoders — edge branches", () => {
     expect(legs[0].legIndex).toBe(1);
   });
 
-  it("decodeV18BatchLegs: trailer past end gives undefined fee/exec price", () => {
-    const full = batchNo([1_000_000n]);
-    const cut = full.slice(0, 2 + 42); // leg complete, nothing after
-    const [leg] = decodeV18BatchLegs(IX_TAG.BatchTradeNoCpi, cut);
-    expect(leg).toBeDefined();
+  it("decodeV18BatchLegs: NoCpi reads exec_price+fee, Cpi reads fee only (trailer slot swap)", () => {
+    const [n] = decodeV18BatchLegs(IX_TAG.BatchTradeNoCpi, batchNo([1_000_000n]));
+    expect(n.feeBps).toBe(30);
+    expect(n.execPriceE6).toBe(50_000_000_000n);
+    const [c] = decodeV18BatchLegs(IX_TAG.BatchTradeCpi, batchCpi([1_000_000n]));
+    expect(c.feeBps).toBe(30);
+    expect(c.execPriceE6).toBeUndefined();
   });
 
   it("decodeRebalanceReduce: wrong tag, short, zero, 128-bit value", () => {
@@ -147,8 +150,7 @@ describe("parsePercolatorFills — branch coverage", () => {
         { programId: undefined, accounts: [TRADER, SLAB, SLAB], data: b58(noCpi(1_000_000n)) },
         ix("0OIl", [TRADER]), // invalid base58 chars
         ix(new Uint8Array(0), [TRADER]),
-        null,
-      ].filter((x) => x !== null)),
+      ]),
       "s",
       [PERC],
     );
@@ -239,15 +241,15 @@ describe("parsePercolatorFills — branch coverage", () => {
 
   it("inner instructions are matched only to their own outer index", () => {
     const out = parsePercolatorFills(
-      txOf([ix(cpi(1_000_000n), [TRADER, SLAB])], {
+      txOf([ix(cpi(1_000_000n), [TRADER, SLAB, "a", "b", MATCHER_PK, "ctx"])], {
         err: null,
-        innerInstructions: [{ index: 5, instructions: [{ programId: OTHER, data: "abc" }] }],
+        innerInstructions: [{ index: 5, instructions: [{ programId: MATCHER_PK, data: "abc" }] }],
       }),
       "s",
       [PERC],
     );
-    // matcher program account [4] absent -> unknown
-    expect(out[0].cpi).toEqual({ kind: "unknown" });
+    // matcher IS at accounts[4], but its inner call sits under another outer index -> none seen
+    expect(out[0].cpi).toEqual({ kind: "no-matcher-call" });
   });
 });
 
@@ -277,6 +279,8 @@ describe("cpiEvidenceFromParsed", () => {
   it("matcher inner ix that does not decode -> unknown; uses accountsOverride and missing accounts", () => {
     const groups = [{ index: 0, instructions: [{ programId: MATCHER, data: "1" }] }];
     expect(cpiEvidenceFromParsed({ accounts: [] }, 0, groups, null, false, accts)).toEqual({ kind: "unknown" });
+    // override supplies the matcher account: with no inner calls that is "no-matcher-call", not "unknown"
+    expect(cpiEvidenceFromParsed({ accounts: [] }, 0, [], null, false, accts)).toEqual({ kind: "no-matcher-call" });
     expect(cpiEvidenceFromParsed({}, 0, groups, null, false)).toEqual({ kind: "unknown" });
   });
 });
