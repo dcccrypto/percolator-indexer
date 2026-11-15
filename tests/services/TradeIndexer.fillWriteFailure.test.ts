@@ -2,7 +2,7 @@
  * Data-loss regression (IDX-FILLLOSS): a failed fallback fill insert was log-only and the cursor still
  * committed, so the fill was never stored. The cursor is now held (capped) so the signatures are retried.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 const captureSpy = vi.hoisted(() => vi.fn());
