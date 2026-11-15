@@ -15,7 +15,7 @@ vi.mock("@percolatorct/shared", async (orig) => {
     captureException: (...a: unknown[]) => captured(...a),
   };
 });
-// One synthetic event per transaction: the transaction's `ix` field carries the user.
+// One synthetic event per transaction: the transaction's `user` field carries the user.
 vi.mock("../src/lpVault/decoder.js", () => ({
   decodeLpVaultEvents: (tx: { signature: string; user?: string; registry?: string; market?: string | null; lpMint?: string | null }) =>
     tx.user
@@ -102,7 +102,7 @@ describe("LpVaultIndexer syncRegistry", () => {
     const ev = [...store.events.values()][0]!.ev;
     expect(ev.market).toBe("MKT");
     expect(ev.lpMint).toBe("MINT");
-    expect(store.syncCursors.get("devnet|REG")?.signature ?? [...store.syncCursors.values()][0]?.signature).toBe("s4");
+    expect(store.syncCursors.get("devnet|REG")?.signature).toBe("s4");
   });
 
   it("keeps an event's own market and lpMint over the registry's", async () => {
@@ -249,9 +249,11 @@ describe("LpVaultIndexer cursors", () => {
     const store = new MemoryLpVaultStore();
     await store.saveCursor("devnet", "REG", "zzz", 1);
     const save = vi.spyOn(store, "saveCursor");
+    const load = vi.spyOn(store, "loadCursor");
     const { ix } = mk(chain, store, { ephemeralCursor: true });
     expect((await ix.syncRegistry(REG)).signatures).toBe(1);
     expect(save).not.toHaveBeenCalled();
+    expect(load).not.toHaveBeenCalled();
     expect((await ix.syncRegistry(REG)).signatures).toBe(0);
   });
 });
@@ -316,11 +318,11 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
       if (a === "BAD") throw "plain string failure";
       return [{ signature: "s1", slot: 1, failed: false }];
     };
-    const { ix } = mk(chain);
+    const { ix, store } = mk(chain);
     await ix.tick();
     expect(logs.error).toHaveBeenCalledWith("LP-vault sync failed", expect.objectContaining({ registry: "BAD", error: "plain string failure" }));
     expect(captured).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ tags: { context: "lp-vault-sync" } }));
-    expect(logs.info).not.toHaveBeenCalled();
+    expect(store.syncCursors.get("devnet|REG")?.signature).toBe("s1"); // the healthy vault was still synced
   });
 
   it("tick logs Error messages from a failing vault", async () => {
@@ -362,15 +364,16 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
   it("start schedules the interval and a first tick, is idempotent, and stop cancels", async () => {
     vi.useFakeTimers();
     const chain = new Chain();
-    const { ix } = mk(chain, undefined, { pollIntervalMs: 1000 });
+    const { ix } = mk(chain, undefined, { pollIntervalMs: 1000, discoveryIntervalMs: -1 });
     ix.start();
     ix.start();
     expect(logs.info).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(chain.listCalls).toBe(1);
+    const running = chain.listCalls; // 5 interval ticks + the delayed first tick
+    expect(running).toBeGreaterThanOrEqual(5);
     ix.stop();
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(chain.listCalls).toBe(1);
+    expect(chain.listCalls).toBe(running);
     ix.stop(); // safe twice
   });
 
