@@ -214,12 +214,19 @@ export class TradeIndexerPolling {
   /** Move the cursor past a window that is fully committed: memory first, then the durable row (best effort). */
   private async commitCursor(slabAddress: string, signature: string): Promise<void> {
     this.lastSignature.set(slabAddress, signature);
+    this.holdAnchor.delete(slabAddress);
     await saveTradeCursor(slabAddress, signature);
   }
   /** Per-slab hold state of a failed write (see MAX_WRITE_HOLDS). Per instance. */
   private writeHolds = new Map<string, WriteHold>();
   /** Per-slab full signatures whose write failed and are still held; re-added to the next window if it no longer reaches them. */
   private heldSigs = new Map<string, Set<string>>();
+  /**
+   * Per-slab `until` boundary for a slab with no cursor yet whose window was held: the oldest signature of the first
+   * held window. Later retries page (anchor, newest], so signatures that arrive during a hold are not cut off by the
+   * newest-limit first-poll window. Cleared when the cursor commits.
+   */
+  private holdAnchor = new Map<string, string>();
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
@@ -402,7 +409,7 @@ export class TradeIndexerPolling {
     // Fetch the signatures newer than this slab's cursor (newest-first). Without a cursor (first pass) this
     // is the newest maxSigs; with one, the window is paged until the cursor is reached.
     await this.loadDurableCursors();
-    const lastSig = this.lastSignature.get(slabAddress);
+    const lastSig = this.lastSignature.get(slabAddress) ?? this.holdAnchor.get(slabAddress);
 
     let signatures: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>;
     try {
@@ -435,7 +442,7 @@ export class TradeIndexerPolling {
     const held = this.heldSigs.get(slabAddress);
     if (held) {
       const have = new Set(validSigs);
-      validSigs.unshift(...[...held].filter((s) => !have.has(s)));
+      validSigs.unshift(...[...held].filter((s) => s !== "?" && !have.has(s)));
     }
     if (validSigs.length === 0) {
       // No valid txs in this window but signatures were fetched — safe to advance.
@@ -535,13 +542,20 @@ export class TradeIndexerPolling {
     // #147: Only commit the cursor after the full batch is fetched and processed.
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
     if (pass.writeFailed && !batchFailed && !holdCursor) {
-      holdCursor = this.holdAfterWriteFailure(slabAddress, pass);
+      holdCursor = await this.holdAfterWriteFailure(slabAddress, pass);
     } else if (!pass.writeFailed && !batchFailed) {
       this.writeHolds.delete(slabAddress);
       this.heldSigs.delete(slabAddress);
     }
     if (!batchFailed && !holdCursor) {
       await this.commitCursor(slabAddress, signatures[0].signature);
+    } else {
+      // Held without a saved cursor: pin the window's oldest signature so the retry pages from it (not just the newest page).
+      if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) this.holdAnchor.set(slabAddress, signatures[signatures.length - 1].signature);
+      // A pass that failed writes AND ended on a read hold: keep those signatures for the retry too.
+      if (pass.writeFailed && (batchFailed || holdCursor) && pass.failedSigs) {
+        this.heldSigs.set(slabAddress, new Set([...(this.heldSigs.get(slabAddress) ?? []), ...pass.failedSigs]));
+      }
     }
 
     if (indexed > 0) {
@@ -554,7 +568,7 @@ export class TradeIndexerPolling {
    * Database down (no write or read of the pass completed): hold, never skip, alert after a while. Database up: count each
    * failing signature, and skip only those that failed more than MAX_WRITE_HOLDS polls, with an alert naming them.
    */
-  private holdAfterWriteFailure(slabAddress: string, pass: PassState): boolean {
+  private async holdAfterWriteFailure(slabAddress: string, pass: PassState): Promise<boolean> {
     const now = Date.now();
     const failed = [...(pass.failedSigs ?? [])];
     const hold = this.writeHolds.get(slabAddress) ?? { since: now, lastAlertAt: 0, sigFails: new Map<string, number>() };
@@ -576,6 +590,7 @@ export class TradeIndexerPolling {
       this.heldSigs.delete(slabAddress);
       const names = poison.slice(0, 20);
       logger.error("ALERT: signature kept failing to write while other writes succeed (poison row); SKIPPING it, needs manual backfill", { slabAddress: slab, failedSigs: names });
+      await recordSkippedSignatures(poison.map((sig) => ({ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `fill write failed ${MAX_WRITE_HOLDS}+ polls (poison row)` })));
       captureException(new Error(`indexer write failed ${MAX_WRITE_HOLDS}+ polls for signature(s) ${names.join(",")}; skipped (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-poison" }, extra: { slabAddress, failedSigs: names } });
       return false;
     }

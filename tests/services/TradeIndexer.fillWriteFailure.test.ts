@@ -37,6 +37,7 @@ function storedOf(sig: string) { const r = rows.get(sig); return r ? [{ slab_add
 const put = (r: any) => { store.add(r.tx_signature); rows.set(r.tx_signature, r); return true; };
 vi.mock("../../src/db/insertTradeRow.js", async (orig) => ({ ...(await orig<any>()), insertTradeRow: vi.fn(), insertTradeRows: vi.fn() }));
 import { insertTradeRow, insertTradeRows } from "../../src/db/insertTradeRow.js";
+import { recordSkippedSignatures } from "../../src/lib/skippedSignatures.js";
 import { TradeIndexerPolling, MAX_WRITE_HOLDS } from "../../src/services/TradeIndexer.js";
 import { encodeBase58 } from "../../src/lib/base58.js";
 const pk = (s: string) => new PublicKey(s);
@@ -95,6 +96,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(captureSpy.mock.calls[0][1].extra.failedSigs).toEqual([sigs[1]]);
     expect(store.has(sigs[1])).toBe(false);
     expect(store.has(sigs[0]) && store.has(sigs[2])).toBe(true);
+    expect(vi.mocked(recordSkippedSignatures).mock.calls.some(([r]) => r.some((x: any) => x.signature === sigs[1]))).toBe(true);
   });
 
   it("quiet slab: a lone failing row with no other write in a pass is held, never skipped (no data loss)", async () => {
@@ -121,6 +123,23 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
     expect(captureSpy).not.toHaveBeenCalled();
     expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
+  });
+
+  it("no saved cursor: signatures arriving during a hold, beyond the newest-limit window, are still fetched and written", async () => {
+    const { sigs, idx } = setup();
+    let bad = true;
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === sigs[1] && bad) throw new Error("db");
+      return put(r); }) as never);
+    await idx.indexTradesForSlab(MARKET, 3); // held: no cursor
+    expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    const all = [...sigs];
+    for (let n = 0; n < 6; n++) { const x = sigOf(40 + n); txBySig.set(x, mkTx(40 + n)); all.push(x); }
+    sigLists.set(MARKET, [...all].reverse().map((signature) => ({ signature, err: null })));
+    bad = false;
+    await idx.indexTradesForSlab(MARKET, 3); // limit 3 < 6 new signatures
+    expect(all.map((x) => store.has(x))).toEqual(all.map(() => true));
+    expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
   });
 
   it("a DB outage far longer than MAX_WRITE_HOLDS polls drops nothing: every fill is written after recovery", async () => {
