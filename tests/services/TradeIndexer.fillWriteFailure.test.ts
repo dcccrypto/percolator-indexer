@@ -155,11 +155,11 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(idx.lastSignature.get(MARKET)).toBe(more[2]);
   });
 
-  it("a failed direct write (no pending queue, e.g. a tag 44 row) marks the pass failed instead of throwing past the cursor", async () => {
+  it("a failed direct write (no pending queue, e.g. a tag 44 row) marks the pass failed (the cursor will hold)", async () => {
     const { sigs, idx } = setup();
     vi.mocked(insertTradeRow).mockRejectedValue(new Error("db down") as never);
     const pass: any = { earlier: new Set(), incomplete: false };
-    await idx.processTransaction(txBySig.get(sigs[0]), sigs[0], MARKET, new Set([PROGRAM]), pass);
+    await expect(idx.processTransaction(txBySig.get(sigs[0]), sigs[0], MARKET, new Set([PROGRAM]), pass)).rejects.toThrow("db down");
     expect(pass.writeFailed).toBe(true);
     expect(pass.incomplete).toBe(true);
     expect([...pass.failedSigs]).toEqual([sigs[0]]);

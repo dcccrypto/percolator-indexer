@@ -756,9 +756,8 @@ export class TradeIndexerPolling {
           isNew = await insertTradeRow(row);
           pass.writesOk = (pass.writesOk ?? 0) + 1;
         } catch (err) {
-          markFailed(pass, signature); // hold the cursor; the rest of this tx is still tried (rows are deduped on retry)
-          logger.warn("fill insert failed", { signature: signature.slice(0, 12), err: String(err) });
-          return;
+          markFailed(pass, signature); // hold the cursor; the throw still aborts this tx (the caller logs it and holds too)
+          throw err;
         }
         if (isNew) onNew();
         return;
