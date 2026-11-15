@@ -543,7 +543,7 @@ export class TradeIndexerPolling {
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
     if (pass.writeFailed && !batchFailed && !holdCursor) {
       holdCursor = await this.holdAfterWriteFailure(slabAddress, pass);
-    } else if (!pass.writeFailed && !batchFailed) {
+    } else if (!pass.writeFailed && !batchFailed && !holdCursor) {
       this.writeHolds.delete(slabAddress);
       this.heldSigs.delete(slabAddress);
     }
@@ -551,7 +551,12 @@ export class TradeIndexerPolling {
       await this.commitCursor(slabAddress, signatures[0].signature);
     } else {
       // Held without a saved cursor: pin the window's oldest signature so the retry pages from it (not just the newest page).
-      if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) this.holdAnchor.set(slabAddress, signatures[signatures.length - 1].signature);
+      if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) {
+        // `until` is exclusive: the anchor itself would drop out of later windows, so it is held (re-added) explicitly.
+        const oldest = signatures[signatures.length - 1];
+        this.holdAnchor.set(slabAddress, oldest.signature);
+        if (!oldest.err) this.heldSigs.set(slabAddress, new Set([...(this.heldSigs.get(slabAddress) ?? []), oldest.signature]));
+      }
       // A pass that failed writes AND ended on a read hold: keep those signatures for the retry too.
       if (pass.writeFailed && (batchFailed || holdCursor) && pass.failedSigs) {
         this.heldSigs.set(slabAddress, new Set([...(this.heldSigs.get(slabAddress) ?? []), ...pass.failedSigs]));

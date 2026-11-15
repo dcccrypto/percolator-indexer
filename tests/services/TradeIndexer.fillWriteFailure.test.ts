@@ -142,6 +142,21 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
   });
 
+  it("no saved cursor, tx fetch fails on the first poll: the oldest signature is still processed after recovery (anchor is exclusive)", async () => {
+    const { sigs, idx } = setup();
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => put(r)) as never);
+    vi.mocked(insertTradeRows).mockImplementation((async (rs: any[]) => { rs.forEach(put); return rs.length; }) as never);
+    connection.getParsedTransactions.mockRejectedValueOnce(new Error("rpc down"));
+    await idx.indexTradesForSlab(MARKET, 3);
+    expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    const all = [...sigs];
+    for (let n = 0; n < 4; n++) { const x = sigOf(60 + n); txBySig.set(x, mkTx(60 + n)); all.push(x); }
+    sigLists.set(MARKET, [...all].reverse().map((signature) => ({ signature, err: null })));
+    await idx.indexTradesForSlab(MARKET, 3);
+    expect(all.map((x) => store.has(x))).toEqual(all.map(() => true));
+    expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
+  });
+
   it("a DB outage far longer than MAX_WRITE_HOLDS polls drops nothing: every fill is written after recovery", async () => {
     const { sigs, idx } = setup();
     let down = true;
