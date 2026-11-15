@@ -12,17 +12,23 @@
 --    sync with 20260726180000_volume_rollup_fn.sql.
 -- 2. fetchTraderPositionEvidence (src/db/traderNetPosition.ts, one paged read per close). Same key as
 --    idx_trades_position_lookup plus the five columns the read returns, so it never touches the heap.
---    It supersedes idx_trades_position_lookup (same leading columns), which can be dropped afterwards (manual step at the
---    end) so the table does not carry both.
+--    It supersedes idx_trades_position_lookup (identical key columns in the same order; no SQL, function or
+--    route names the old index), which this file drops at the end so the table does not carry both.
 --
--- Write cost: every trades insert now maintains these two indexes instead of idx_trades_position_lookup
--- alone (the volume index is partial and skips liquidation markers). Index-only scans need an up-to-date
--- visibility map: autovacuum handles it on the busy table; Heap Fetches in EXPLAIN shows if it lags.
+-- Write cost: the cover index REPLACES idx_trades_position_lookup (dropped below), so every trades insert
+-- maintains idx_trades_position_lookup_cover plus the partial volume index (which skips liquidation markers).
+-- Keeping the old index too measured +69% (+77 MB) on the bench; with the drop it is ~+26% (+35 MB): see
+-- bench/slow-queries/README.md. Index-only scans need an up-to-date visibility map: autovacuum handles it on
+-- the busy table; Heap Fetches in EXPLAIN shows if it lags.
 --
--- CONCURRENTLY cannot run inside a transaction block: apply each statement by hand on its own, not
--- through a transactional runner. A failed build leaves an INVALID index: check pg_index.indisvalid and
--- DROP INDEX CONCURRENTLY <name> before retrying. Roll back with DROP INDEX CONCURRENTLY of the two new
--- names (and re-create idx_trades_position_lookup from 20261114130000 if it was dropped).
+-- RUN WITH ON_ERROR_STOP, one statement at a time or as a script:
+--   psql -v ON_ERROR_STOP=1 -f 20261115120000_trades_covering_read_indexes.sql
+-- so a failed or INVALID cover build stops the script BEFORE the DROP (`IF NOT EXISTS` does not detect an
+-- INVALID leftover). If the cover build fails: check pg_index.indisvalid, DROP INDEX CONCURRENTLY the invalid
+-- one and retry; the old index is still in place until the DROP runs.
+-- CONCURRENTLY cannot run inside a transaction block: do not use a transactional runner.
+--
+-- Rollback: DROP INDEX CONCURRENTLY IF EXISTS the two new names, and re-create idx_trades_position_lookup from 20261114130000.
 -- ============================================================================================
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_volume_24h
   ON trades (network, created_at) INCLUDE (slab_address, size)
@@ -32,8 +38,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_position_lookup_cover
   ON trades (trader, slab_address, asset_index, network, id)
   INCLUDE (side, size, is_liquidation, created_at, tx_signature);
 
--- SEPARATE, MANUAL STEP (deliberately commented out: `IF NOT EXISTS` above does NOT detect an INVALID leftover,
--- and a script run without ON_ERROR_STOP would carry on to the DROP). Only after this returns `t`:
---   SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_trades_position_lookup_cover'::regclass;
--- run, as its own statement:
---   DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;
+-- Only reached if both builds above succeeded (ON_ERROR_STOP). Optional sanity check before this runs:
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_trades_position_lookup_cover'::regclass;  -- t
+DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;

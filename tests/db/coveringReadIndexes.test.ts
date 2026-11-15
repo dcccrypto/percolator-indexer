@@ -8,7 +8,23 @@ const live = read("../../supabase/migrations/20261115120000_trades_covering_read
 describe("covering read indexes migration", () => {
   it("is concurrent", () => {
     expect(live.match(/CREATE INDEX CONCURRENTLY/g)).toHaveLength(2);
-    expect(live).not.toMatch(/DROP INDEX/); // the old-index drop is a manual, commented step
+  });
+
+  it("drops the superseded idx_trades_position_lookup as an active statement after the cover CREATE", () => {
+    const drop = /DROP INDEX CONCURRENTLY IF EXISTS idx_trades_position_lookup;/;
+    expect(live).toMatch(drop);
+    expect(live.match(/DROP INDEX/g)).toHaveLength(1);
+    expect(live.search(drop)).toBeGreaterThan(live.indexOf("idx_trades_position_lookup_cover"));
+    expect(live.search(drop)).toBeGreaterThan(live.indexOf("idx_trades_volume_24h"));
+    // the cover index must not be the one dropped (name is a prefix of the cover's)
+    expect(live).not.toMatch(/DROP INDEX[^;]*idx_trades_position_lookup_cover/);
+  });
+
+  it("documents ON_ERROR_STOP and the rollback in the header", () => {
+    const raw = read("../../supabase/migrations/20261115120000_trades_covering_read_indexes.sql");
+    expect(raw).toMatch(/psql -v ON_ERROR_STOP=1/);
+    expect(raw).toMatch(/NOT APPLIED/);
+    expect(raw).toMatch(/re-create idx_trades_position_lookup from 20261114130000/);
   });
 
   it("volume index carries the rollup function's own filter and columns", () => {
