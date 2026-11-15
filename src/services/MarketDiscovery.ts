@@ -164,11 +164,13 @@ export class MarketDiscovery {
           // A program may host a mix of v17 and v12 markets — skipping the v12
           // scan whenever v17 finds anything silently drops all v12 markets under
           // that program from the live map.
-          const v17Found = await discoverV17Markets(primaryConn, new PublicKey(id), slabAddresses);
-          if (v17Found.length > 0) {
+          // A v17 failure must not hide the program's v12 markets: run v12 regardless, keep what it
+          // found, then report the failure so the program's known markets are carried over.
+          let v17Err: unknown;
+          try {
+            const v17Found = await discoverV17Markets(primaryConn, new PublicKey(id), slabAddresses);
             all.push(...v17Found);
-          }
-          // Always also run v12 SDK path for legacy markets, regardless of v17 results.
+          } catch (e) { v17Err = e; }
           const found = await getMarketsByAddress(
             primaryConn,
             new PublicKey(id),
@@ -176,6 +178,7 @@ export class MarketDiscovery {
             { batchSize: 25, interBatchDelayMs: 250 },
           );
           all.push(...found);
+          if (v17Err !== undefined) throw v17Err;
         } catch (e) {
           failedPrograms++;
           failedProgramIds.add(id);
@@ -211,6 +214,7 @@ export class MarketDiscovery {
     
     for (const id of programIds) {
       let discovered = false;
+      let partial: DiscoveredMarket[] = [];
       for (let attempt = 0; attempt <= HELIUS_429_BACKOFF_MS.length; attempt++) {
         // After exhausting all retries on primary, try public fallback once before giving up
         const conn = attempt === HELIUS_429_BACKOFF_MS.length ? fallbackConn : primaryConn;
@@ -220,13 +224,16 @@ export class MarketDiscovery {
           // A program may host a mix of v17 and v12 markets — breaking out of the
           // retry loop on the first v17 hit silently drops all v12 markets under
           // that program from the live map.
-          const v17Found = await discoverV17Markets(conn, new PublicKey(id));
-          if (v17Found.length > 0) {
-            all.push(...v17Found);
-          }
-          // Always also run v12 discovery for legacy markets, regardless of v17 results.
+          // v17 failure must not skip v12; run both, keep v12's results, then rethrow v17's error.
+          let v17Err: unknown;
+          let v17Found: DiscoveredMarket[] = [];
+          try { v17Found = await discoverV17Markets(conn, new PublicKey(id)); } catch (e) { v17Err = e; }
           const found = await discoverMarkets(conn, new PublicKey(id));
-          all.push(...found);
+          if (v17Err !== undefined) {
+            partial = found; // kept only if this program ends up failing; a retry replaces it
+            throw v17Err;
+          }
+          all.push(...v17Found, ...found);
           discovered = true;
           if (conn === fallbackConn) {
             logger.warn("discoverMarkets succeeded on fallback RPC after primary 429s", { programId: id });
@@ -247,6 +254,7 @@ export class MarketDiscovery {
           // Non-429 error or exhausted retries (including fallback)
           failedPrograms++;
           failedProgramIds.add(id);
+          all.push(...partial);
           logger.warn("Failed to discover on program", { programId: id, conn: connLabel, error: e, attempt: attempt + 1 });
           break;
         }
