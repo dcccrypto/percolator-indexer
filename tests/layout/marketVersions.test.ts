@@ -52,7 +52,7 @@ describe("noteMarketLayout / marketVersionOf / assetGenerationOf", () => {
 describe("noteMarketLayout edge branches", () => {
   const slotOff = (i: number) => LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + i * LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlotLen + ASSET_STATE_MARKET_ID_OFF;
 
-  it("a buffer cut inside a later slot's market_id records only the slots that fit", () => {
+  it("a buffer cut inside a later slot records only the slots the geometry counts as whole", () => {
     const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 2 }), LAYOUT_V22, 0, 3n);
     withGeneration(d, LAYOUT_V22, 1, 4n);
     noteMarketLayout("T", d.subarray(0, slotOff(1) + 4)); // 4 of slot 1's 8 bytes

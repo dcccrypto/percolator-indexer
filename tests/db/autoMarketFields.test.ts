@@ -380,3 +380,58 @@ describe("findSlabCreation history-walk and tx edge cases", () => {
     expect(creatorFromCreationTx(tx, SLAB, SYSTEM)).toBeNull();
   });
 });
+
+describe("findSlabCreation skip bookkeeping edge cases", () => {
+  it("a thrown non-Error poison value is skipped (stringified), and a non-creation tx is passed over to the next candidate", async () => {
+    const { existsSync, readFileSync, rmSync } = await import("node:fs");
+    const { resetSkippedSignatureDedupe } = await import("../../src/lib/skippedSignatures.js");
+    resetSkippedSignatureDedupe();
+    const file = `/tmp/creator-skip-str-${process.pid}.jsonl`;
+    process.env.SKIPPED_SIGNATURES_FILE = file;
+    rmSync(file, { force: true });
+    try {
+      const other = txResponse(CREATOR, [new TransactionInstruction({ programId: SYSTEM, keys: [{ pubkey: SLAB, isSigner: false, isWritable: true }], data: Buffer.from([2]) })]);
+      const page = [sig(1002), sig(1001), sig(1000)]; // oldest first: 1000 (unreadable, plain object), 1001 (not the creation), 1002 (creation)
+      const getTransaction = vi.fn(async (s: string) => {
+        if (s === "sig1000") throw { code: -32015 };
+        return s === "sig1001" ? other : creationTx();
+      });
+      await expect(findSlabCreation({ getSignaturesForAddress: vi.fn(async () => page), getTransaction }, SLAB, WRAPPER))
+        .resolves.toMatchObject({ creator: CREATOR.toBase58() });
+      expect(getTransaction).toHaveBeenCalledTimes(3);
+      expect(existsSync(file)).toBe(true);
+      const rec = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(rec).toHaveLength(1);
+      expect(rec[0]).toMatchObject({ signature: "sig1000", error: "[object Object]" });
+    } finally {
+      delete process.env.SKIPPED_SIGNATURES_FILE;
+      rmSync(file, { force: true });
+    }
+  });
+});
+
+describe("creatorFromCreationTx malformed / non-touching instructions", () => {
+  const withIxs = (ixs: Array<{ programIdIndex: number; accountKeyIndexes: number[] }>) => {
+    const tx = creationTx();
+    (tx.transaction.message as unknown as { compiledInstructions: unknown }).compiledInstructions = ixs.map((i) => ({ ...i, data: new Uint8Array() }));
+    return tx;
+  };
+  // creationTx account keys: 0 CREATOR, 1 SLAB, 2 MINT, 3 WRAPPER (static, in compile order)
+  const wrapperIdx = () => {
+    const keys = creationTx().transaction.message.getAccountKeys();
+    return keys.staticAccountKeys.findIndex((k) => k.equals(WRAPPER));
+  };
+
+  it("a wrapper ix that does not reference the slab is passed over", () => {
+    const w = wrapperIdx();
+    expect(creatorFromCreationTx(withIxs([{ programIdIndex: w, accountKeyIndexes: [0, 2] }]), SLAB, WRAPPER)).toBeNull();
+  });
+
+  it("an ix whose program index is out of range is passed over, and an out-of-range account index does not count as the slab", () => {
+    const w = wrapperIdx();
+    expect(creatorFromCreationTx(withIxs([{ programIdIndex: 99, accountKeyIndexes: [0, 1] }]), SLAB, WRAPPER)).toBeNull();
+    expect(creatorFromCreationTx(withIxs([{ programIdIndex: w, accountKeyIndexes: [98, 2] }]), SLAB, WRAPPER)).toBeNull();
+    // a later well-formed ix is still found after the malformed one
+    expect(creatorFromCreationTx(withIxs([{ programIdIndex: 99, accountKeyIndexes: [0, 1] }, { programIdIndex: w, accountKeyIndexes: [0, 1] }]), SLAB, WRAPPER)).toBe(CREATOR.toBase58());
+  });
+});
