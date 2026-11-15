@@ -91,9 +91,11 @@ describe("decodeOne guards: length, account count, tag", () => {
     expect(decode(tx([top(wrapperIx(data, accts, 1))]))[0]!.lpAmount).toBe(9n);
   });
 
-  it("execute: 2-byte data (domain truncated) is not decoded", () => {
+  it("execute: 2-byte data (domain truncated) or 12 accounts (no redeemer_rent_dest) is not decoded", () => {
     const accts = Array.from({ length: 13 }, pk);
     expect(decode(tx([top(wrapperIx([LP_VAULT_TAG.ExecuteRedemption, 1], accts, 1))]))).toEqual([]);
+    expect(decode(tx([top(wrapperIx([LP_VAULT_TAG.ExecuteRedemption, 1, 0], accts.slice(0, 12), 1))]))).toEqual([]);
+    expect(decode(tx([top(wrapperIx([LP_VAULT_TAG.ExecuteRedemption, 1, 0], accts, 1))]))[0]!.user).toBe(accts[12]);
   });
 
   it("cancel: 6 accounts is not decoded; the bare 1-byte tag with 7 accounts is", () => {
@@ -153,7 +155,7 @@ describe("integer fields: zero, max and byte order", () => {
 });
 
 describe("SPL CPI matching", () => {
-  it("TransferChecked (source a[0], dest a[2]) and MintToChecked are read like the plain forms", () => {
+  it("a matching TransferChecked keeps the deposit consistent and MintToChecked gives the shares", () => {
     const a = depositAccts();
     const xfer = splIx(12, [a.source, pk(), a.vaultToken, a.user], 50n, 2, [6]);
     const mint = splIx(14, [a.lpMint, a.lpAta, pk()], 40n, 2, [6]);
@@ -209,7 +211,7 @@ describe("CPI attribution for a wrapper instruction reached by CPI", () => {
     return decode(tx([router]));
   }
 
-  it("the wrapper ix has no stack height: the event is kept, its shares are unknown", () => {
+  it("the wrapper ix and its CPIs have no stack height: the event is kept, its shares are unknown", () => {
     const [ev] = nested((a) => [
       wrapperIx(depositData(50n, 2), depositAccounts(a), null),
       splIx(7, [a.lpMint, a.lpAta, pk()], 40n, null),
@@ -218,7 +220,12 @@ describe("CPI attribution for a wrapper instruction reached by CPI", () => {
   });
 
   it("a following entry without a stack height makes attribution a guess, so shares are unknown", () => {
-    const [ev] = nested((a, dep) => [dep, splIx(7, [a.lpMint, a.lpAta, pk()], 40n, null)]);
+    // The real child comes first, so a missing null check would collect it and read 40n.
+    const [ev] = nested((a, dep) => [
+      dep,
+      splIx(7, [a.lpMint, a.lpAta, pk()], 40n, 3),
+      { programId: pk(), accounts: [], data: Uint8Array.from([1]), stackHeight: null },
+    ]);
     expect(ev!.lpAmount).toBeNull();
   });
 
