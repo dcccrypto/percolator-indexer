@@ -92,15 +92,40 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
     expect(slabReads()).toBe(0);
   });
 
-  it("market unreadable (RPC error): no row is written (a lot-0 price would be permanent), the signature is recorded for re-index", async () => {
+  it("M1: market unreadable (RPC error): no row, answers 500 so Helius redelivers (not 200-and-dropped); the redelivery writes the right row", async () => {
     rpc("throw");
-    const { rows } = await deliver(enhanced[f.sig]);
+    const { status, rows } = await deliver(enhanced[f.sig]);
     expect(rows).toEqual([]);
-    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("lot_exp") })]);
-    // a later delivery with the RPC back writes the right row
+    expect(status).toBe(500);
+    expect(recordSkipped).not.toHaveBeenCalled();
+    // the redelivery with the RPC back writes the right row
     rpc(slabBytes(6));
     const again = await deliver(enhanced[f.sig]);
+    expect(again.status).toBe(200);
     expect(again.rows[0].price).toBeCloseTo(13.861751e-6, 18);
+  });
+
+  it("M1: a market that stays unreadable is bounded: after 5 redeliveries the signature is recorded for re-index and the delivery is answered 2xx", async () => {
+    rpc("throw");
+    for (let i = 0; i < 5; i++) expect((await deliver(enhanced[f.sig])).status).toBe(500);
+    const last = await deliver(enhanced[f.sig]);
+    expect(last.status).toBe(200);
+    expect(last.rows).toEqual([]);
+    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("lot_exp") })]);
+  });
+
+  it("low: the market read is bounded by the delivery deadline (an expired budget makes no market read)", async () => {
+    rpc(slabBytes(6));
+    const prev = process.env.TRADECPI_DELIVERY_BUDGET_MS;
+    process.env.TRADECPI_DELIVERY_BUDGET_MS = "-1000000";
+    try {
+      const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
+      const { rows } = await deliver(tx);
+      expect(rows).toEqual([]);
+      expect(slabReads()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.TRADECPI_DELIVERY_BUDGET_MS; else process.env.TRADECPI_DELIVERY_BUDGET_MS = prev;
+    }
   });
 
   it("lot_exp 0 is byte-identical to before: price is priceE6 / 1e6 exactly and the fee is unchanged", async () => {

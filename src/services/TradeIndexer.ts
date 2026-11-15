@@ -47,6 +47,8 @@ interface PassState {
   newCount?: number;
 }
 const FLUSH_AT = 200;
+/** Polls a signature may hold the cursor for an unreadable market account before it is recorded for re-index. */
+const MAX_LOT_READ_HOLDS = 5;
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
@@ -195,6 +197,8 @@ export class TradeIndexerPolling {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+  /** signature -> polls held because the market account (lot_exp) was unreadable. Bounded by MAX_LOT_READ_HOLDS. */
+  private lotReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   /** signature -> parsed transaction, shared by every slab whose window contains it (see TX_CACHE_MAX). */
   private txCache = new BoundedTtlMap<string, ParsedTransactionWithMeta>(TX_CACHE_MAX, TX_CACHE_TTL_MS);
   private rpcLimiter = new RpcLimiter({
@@ -749,6 +753,15 @@ export class TradeIndexerPolling {
       ? { programId: String(returnDataRaw.programId), data: Uint8Array.from(Buffer.from(returnDataRaw.data[0], "base64")) }
       : null;
     const unverified: string[] = [];
+    // An unreadable market account (temporary RPC failure) must not skip the fill for good: hold the cursor like a
+    // matcher-context read error (all-or-nothing per tx; later legs are not written, so the stored-count dedup cannot
+    // mistake the unwritten leg for stored). Bounded so a market that no longer exists cannot pin the cursor forever.
+    let lotReadFailed = false;
+    const holdForLotExp = (): boolean => {
+      if ((this.lotReadAttempts.get(signature) ?? 0) >= MAX_LOT_READ_HOLDS) return false;
+      retryNeeded = true; lotReadFailed = true;
+      return true;
+    };
 
     for (const [ixIdx, ix] of message.instructions.entries()) {
       // Skip parsed instructions (system, token, etc.)
@@ -895,7 +908,7 @@ export class TradeIndexerPolling {
             }
             if (r.kind === "fill") {
               const lot = await this.lotExpForCpi(slabAddress, leg.assetIndex);
-              if (lot === null) { unverified.push("lot_exp unreadable: market account not read"); continue; }
+              if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
               legSize = r.sizeValue;
               sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
               price = perTokenPrice(r.priceE6, lot);
@@ -966,7 +979,7 @@ export class TradeIndexerPolling {
         }
         if (r.kind === "fill") {
           const lot = await this.lotExpForCpi(slabAddress, decoded.assetIndex);
-          if (lot === null) { unverified.push("lot_exp unreadable: market account not read"); continue; }
+          if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
           sizeValue = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           price = perTokenPrice(r.priceE6, lot);
@@ -1022,10 +1035,12 @@ export class TradeIndexerPolling {
     if (retryNeeded) {
       // Transport failure reading the matcher context: do not write a size that can never be
       // corrected. Hold the cursor; the next pass re-reads (stored legs are skipped), then falls back.
-      this.ctxReadAttempts.set(signature, 1);
+      if (lotReadFailed) this.lotReadAttempts.set(signature, (this.lotReadAttempts.get(signature) ?? 0) + 1);
+      else this.ctxReadAttempts.set(signature, 1);
       throw new CtxReadRetry(signature);
     }
     this.ctxReadAttempts.delete(signature);
+    this.lotReadAttempts.delete(signature);
     return insertedAny;
   }
 

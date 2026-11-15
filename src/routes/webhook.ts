@@ -520,13 +520,14 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
         pending.push(trade);
       }
-      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); }
+      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); lotReadAttempts.delete(tx.signature); }
     } catch (err) {
       if (err instanceof MatcherContextRetry) {
         // Not an extraction bug: a transient RPC failure. Everything else in the delivery is still
         // written; this transaction is redelivered (its stored legs are skipped, then it falls back).
         ctxRetries++;
-        ctxReadAttempts.set(err.signature, 1);
+        if (err instanceof LotExpRetry) lotReadAttempts.set(err.signature, (lotReadAttempts.get(err.signature) ?? 0) + 1);
+        else ctxReadAttempts.set(err.signature, 1);
         delivery.incomplete = true;
         logger.warn("matcher context read failed; answering 500 so the delivery is retried", { signature: err.signature.slice(0, 16) });
         continue;
@@ -664,6 +665,11 @@ const ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 
 class MatcherContextRetry extends Error {
   constructor(readonly signature: string) { super("matcher context read failed; delivery will be retried"); }
 }
+
+/** The market account (lot_exp) could not be read: 500 so Helius redelivers, up to MAX_LOT_READ_REDELIVERIES times. */
+class LotExpRetry extends MatcherContextRetry {}
+const lotReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+const MAX_LOT_READ_REDELIVERIES = 5;
 
 async function extractTradesFromEnhancedTx(
   tx: ValidatedTransaction,
@@ -930,9 +936,13 @@ async function extractTradesFromEnhancedTx(
         if (r.kind === "fill") {
           // Never price a lot market at lot 0: slab post-state in this payload, else the cache, else one read.
           noteLotExpsFromAccountData(tx, slabAddress);
-          const lot = await resolveLotExp(slabAddress, leg.assetIndex, () => readSlabBytes(slabAddress));
+          // Bounded by the delivery deadline (a slow RPC must not eat Helius's window).
+          const lot = await resolveLotExp(slabAddress, leg.assetIndex, () => readSlabBytesWithin(slabAddress, delivery.ctxDeadlineAt));
           if (lot === null) {
-            // Written now it would be permanent (ignoreDuplicates): skip, keep the signature for re-index.
+            // Written now it would be permanent (ignoreDuplicates). Temporary RPC failure: fail the transaction so the
+            // delivery answers 500 and Helius redelivers (stored legs are skipped on redelivery); only after
+            // MAX_LOT_READ_REDELIVERIES is it recorded for re-index and skipped.
+            if ((lotReadAttempts.get(signature) ?? 0) < MAX_LOT_READ_REDELIVERIES) throw new LotExpRetry(signature);
             await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: "TradeCpi lot_exp unreadable: market account not read" }]);
             trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
             continue;
@@ -1101,7 +1111,7 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string, asset
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account: string): number {
   // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
@@ -1191,6 +1201,20 @@ async function readSlabBytes(slabAddress: string): Promise<Uint8Array | null> {
     { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
   );
   return info?.data ? new Uint8Array(info.data) : null;
+}
+
+/** readSlabBytes bounded by the delivery deadline: null (unreadable) when the budget is spent or runs out. */
+async function readSlabBytesWithin(slabAddress: string, deadlineAt: number | undefined): Promise<Uint8Array | null> {
+  if (deadlineAt === undefined) return readSlabBytes(slabAddress);
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), remaining); });
+  try {
+    return await Promise.race([readSlabBytes(slabAddress).catch(() => null), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
