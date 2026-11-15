@@ -71,7 +71,7 @@ const FLUSH_AT = 200;
 export const MAX_WRITE_HOLDS = Math.max(1, Number(process.env.INDEXER_MAX_WRITE_HOLDS) || 5);
 const WRITE_OUTAGE_ALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_ALERT_MS", 60_000);
 const WRITE_OUTAGE_REALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_REALERT_MS", 10 * 60_000);
-interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number>; sawWriteOk: boolean }
+interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number> }
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
@@ -557,12 +557,12 @@ export class TradeIndexerPolling {
   private holdAfterWriteFailure(slabAddress: string, pass: PassState): boolean {
     const now = Date.now();
     const failed = [...(pass.failedSigs ?? [])];
-    const hold = this.writeHolds.get(slabAddress) ?? { since: now, lastAlertAt: 0, sigFails: new Map<string, number>(), sawWriteOk: false };
-    // Writes work when one succeeded in this pass. A retry pass may write nothing (already-stored fills are skipped), so
-    // it also counts when a write succeeded in an earlier pass of this hold and this pass's reads answered. Reads alone
-    // are not enough: a write-only outage fails every write while reads still work.
-    if ((pass.writesOk ?? 0) > 0) hold.sawWriteOk = true;
-    const dbUp = (pass.writesOk ?? 0) > 0 || (hold.sawWriteOk && (pass.readsOk ?? 0) > 0);
+    const hold = this.writeHolds.get(slabAddress) ?? { since: now, lastAlertAt: 0, sigFails: new Map<string, number>() };
+    // Writes work only when one succeeded in THIS pass. Reads answering is not proof (a write-only outage, e.g. a full
+    // disk, fails every write while reads work), and neither is a write from an earlier pass. So a poison row on a quiet
+    // slab (a retry pass that writes nothing) stays held, with the outage alert, until a new fill's write succeeds:
+    // that can stall but never loses a row.
+    const dbUp = (pass.writesOk ?? 0) > 0;
     const sigFails = new Map<string, number>();
     for (const sig of failed) sigFails.set(sig, (hold.sigFails.get(sig) ?? 0) + (dbUp ? 1 : 0));
     hold.sigFails = sigFails;
@@ -583,7 +583,7 @@ export class TradeIndexerPolling {
     logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slab, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)), dbUp });
     if (!dbUp && now - hold.since >= WRITE_OUTAGE_ALERT_MS && now - hold.lastAlertAt >= WRITE_OUTAGE_REALERT_MS) {
       hold.lastAlertAt = now;
-      logger.error("ALERT: fill writes keep failing and nothing is being written (database down?); cursor held, nothing skipped", { slabAddress: slab, sinceMs: now - hold.since, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)) });
+      logger.error("ALERT: fill writes keep failing and nothing is being written (database down, or one bad row on a quiet slab?); cursor held, nothing skipped", { slabAddress: slab, sinceMs: now - hold.since, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)) });
       captureException(new Error(`indexer fill writes failing for ${Math.round((now - hold.since) / 1000)}s; cursor held (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-outage" }, extra: { slabAddress, sinceMs: now - hold.since } });
     }
     return true;

@@ -80,15 +80,31 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[1]) throw new Error("poison row");
       return put(r); }) as never);
+    // a busy slab: each poll brings a new fill whose write succeeds (that is what proves the database is up)
+    const all = [...sigs];
+    const addFresh = (n: number) => { const x = sigOf(20 + n); txBySig.set(x, mkTx(20 + n)); all.push(x); sigLists.set(MARKET, [...all].reverse().map((signature) => ({ signature, err: null }))); return x; };
     for (let p = 1; p <= MAX_WRITE_HOLDS; p++) {
       await idx.indexTradesForSlab(MARKET, 100);
-      expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
+      expect(idx.lastSignature.get(MARKET)).not.toBe(all[all.length - 1]);
+      addFresh(p);
     }
     await idx.indexTradesForSlab(MARKET, 100);
-    expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
+    expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
     expect(captureSpy).toHaveBeenCalledTimes(1);
+    expect(String(captureSpy.mock.calls[0][0].message)).toContain(sigs[1]);
+    expect(captureSpy.mock.calls[0][1].extra.failedSigs).toEqual([sigs[1]]);
     expect(store.has(sigs[1])).toBe(false);
     expect(store.has(sigs[0]) && store.has(sigs[2])).toBe(true);
+  });
+
+  it("quiet slab: a lone failing row with no other write in a pass is held, never skipped (no data loss)", async () => {
+    const { sigs, idx } = setup();
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === sigs[1]) throw new Error("bad row");
+      return put(r); }) as never);
+    for (let p = 0; p < MAX_WRITE_HOLDS * 3; p++) await idx.indexTradesForSlab(MARKET, 100);
+    expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    expect(captureSpy.mock.calls.some(([e]) => /skipped/.test(String(e.message)))).toBe(false);
   });
 
   it("a clean poll resets the hold count (no alert after fail, succeed, fail)", async () => {
@@ -181,6 +197,26 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     await idx.indexTradesForSlab(MARKET, 100);
     expect(idx.lastSignature.get(MARKET)).toBeUndefined();
     boom = false;
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(sigs.map((s) => store.has(s))).toEqual([true, true, true]);
+    expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
+  });
+
+  it("a write-only outage that starts after a successful write (reads keep answering) is never counted as poison", async () => {
+    const { sigs, idx } = setup();
+    let down = false;
+    let bad = true;
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if ((key(r) === sigs[1] && bad) || down) throw new Error("db write failed");
+      return put(r); }) as never);
+    await idx.indexTradesForSlab(MARKET, 100); // sigs[1] fails, 0 and 2 written: a hold with sawWrite
+    down = true;
+    for (let p = 0; p < MAX_WRITE_HOLDS * 3; p++) {
+      await idx.indexTradesForSlab(MARKET, 100);
+      expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    }
+    expect(captureSpy.mock.calls.some(([e]) => /skipped/.test(String(e.message)))).toBe(false);
+    down = false; bad = false;
     await idx.indexTradesForSlab(MARKET, 100);
     expect(sigs.map((s) => store.has(s))).toEqual([true, true, true]);
     expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
