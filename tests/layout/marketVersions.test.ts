@@ -68,7 +68,7 @@ describe("noteMarketLayout edge branches", () => {
     expect(assetGenerationOf("L", 0)).toBeNull();
   });
 
-  it("unknown slab and unknown asset index read as null", () => {
+  it("an unknown slab reads as null for VERSION and generation", () => {
     expect(marketVersionOf("never")).toBeNull();
     expect(assetGenerationOf("never", 0)).toBeNull();
     expect(assetGenerationOf("never", -1)).toBeNull();

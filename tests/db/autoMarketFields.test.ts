@@ -293,7 +293,7 @@ describe("resolveAutoMarketFields fallbacks", () => {
     }
   });
 
-  it("an all-zero (default) header.admin or oracleAuthority counts as unset; creator wins over everything", () => {
+  it("an all-zero (default) header.admin or oracleAuthority counts as unset; creator wins over header.admin", () => {
     const real = key();
     expect(resolveAutoMarketFields({ header: { admin: PublicKey.default }, config: { oracleAuthority: PublicKey.default } }, null))
       .toMatchObject({ deployer: null, oracle_authority: null });
@@ -372,7 +372,7 @@ describe("findSlabCreation history-walk and tx edge cases", () => {
     await expect(findSlabCreation(rpc, SLAB, WRAPPER)).rejects.toThrow("socket hang up");
   });
 
-  it("a creation tx whose wrapper ix has no creator-bearing account keeps scanning; v0 lookup addresses are accepted", async () => {
+  it("empty v0 loadedAddresses are accepted; a different program id finds no creation", async () => {
     const tx = creationTx();
     (tx as unknown as { meta: unknown }).meta = { loadedAddresses: { writable: [], readonly: [] } };
     expect(creatorFromCreationTx(tx, SLAB, WRAPPER)).toBe(CREATOR.toBase58());
