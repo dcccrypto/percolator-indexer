@@ -35,6 +35,14 @@ describe("S3-C11: the webhook rate limiter does not trust a caller-written X-For
     expect(clientIp({ header: h({ "x-forwarded-for": "203.0.113.7" }), depth: 3 })).toBe(UNKNOWN_IP);
   });
 
+  it("a chain exactly as long as the depth is trusted (boundary), and a valid XFF beats a rotating X-Real-IP", () => {
+    expect(clientIp({ header: h({ "x-forwarded-for": "203.0.113.7" }), remoteAddress: "10.0.0.1", depth: 1 })).toBe("203.0.113.7");
+    expect(clientIp({ header: h({ "x-forwarded-for": "6.6.6.6, 203.0.113.7" }), remoteAddress: "10.0.0.1", depth: 2 })).toBe("6.6.6.6");
+    expect(
+      clientIp({ header: h({ "x-forwarded-for": "203.0.113.7", "x-real-ip": "9.9.9.9" }), remoteAddress: "10.0.0.1", depth: 1 }),
+    ).toBe("203.0.113.7");
+  });
+
   it("X-Real-IP is caller-writable and never keys the limiter: rotating it yields ONE key", () => {
     const keys = new Set(
       ["1.1.1.1", "2.2.2.2", "3.3.3.3"].map((ip) =>
