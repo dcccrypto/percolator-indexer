@@ -125,3 +125,45 @@ describe("createHealthChecker", () => {
     });
   });
 });
+
+describe("createHealthChecker edge paths", () => {
+  it("an entry exactly at ttl is expired (uses <), one ms earlier is cached", async () => {
+    const { check, probeRpc, advance } = makeChecker({ ttlMs: 100 });
+    await check();
+    advance(99);
+    expect((await check()).cached).toBe(true);
+    advance(1); // now 100 after first probe
+    expect((await check()).cached).toBe(false);
+    expect(probeRpc).toHaveBeenCalledTimes(2);
+  });
+
+  it("ttlMs 0 disables caching", async () => {
+    const { check, probeDb } = makeChecker({ ttlMs: 0 });
+    await check();
+    await check();
+    expect(probeDb).toHaveBeenCalledTimes(2);
+  });
+
+  it("a rejected probe rejects every concurrent waiter, caches nothing, and the next call recovers", async () => {
+    let fail = true;
+    const probeRpc = vi.fn(async () => {
+      if (fail) throw new Error("rpc boom");
+      return true;
+    });
+    const probeDb = vi.fn(async () => true);
+    const check = createHealthChecker({ probeRpc, probeDb, now: () => 1 });
+    const results = await Promise.allSettled([check(), check()]);
+    expect(results.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+    fail = false;
+    const ok = await check();
+    expect(ok.status).toBe("ok");
+    expect(ok.cached).toBe(false);
+  });
+
+  it("concurrent waiters get cached:true while the leader gets cached:false", async () => {
+    const { check } = makeChecker();
+    const [a, b] = await Promise.all([check(), check()]);
+    expect(a.cached).toBe(false);
+    expect(b.cached).toBe(true);
+  });
+});
