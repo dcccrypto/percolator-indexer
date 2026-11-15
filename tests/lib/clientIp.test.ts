@@ -21,9 +21,27 @@ describe("S3-C11: the webhook rate limiter does not trust a caller-written X-For
     expect(b).toBe(a);
   });
 
-  it("depth 2 peels two hops; a depth past the chain clamps to the leftmost", () => {
+  it("depth 2 peels two hops", () => {
     expect(clientIp({ header: h({ "x-forwarded-for": "6.6.6.6, 203.0.113.7, 10.0.0.1" }), depth: 2 })).toBe("203.0.113.7");
-    expect(clientIp({ header: h({ "x-forwarded-for": "203.0.113.7" }), depth: 3 })).toBe("203.0.113.7");
+  });
+
+  it("a chain shorter than the depth is not trusted: a rotated caller-written entry yields ONE key, not many", () => {
+    const keys = new Set(
+      ["1.1.1.1", "2.2.2.2", "3.3.3.3"].map((ip) =>
+        clientIp({ header: h({ "x-forwarded-for": ip }), remoteAddress: "198.51.100.4", depth: 2 }),
+      ),
+    );
+    expect([...keys]).toEqual(["198.51.100.4"]);
+    expect(clientIp({ header: h({ "x-forwarded-for": "203.0.113.7" }), depth: 3 })).toBe(UNKNOWN_IP);
+  });
+
+  it("X-Real-IP is caller-writable and never keys the limiter: rotating it yields ONE key", () => {
+    const keys = new Set(
+      ["1.1.1.1", "2.2.2.2", "3.3.3.3"].map((ip) =>
+        clientIp({ header: h({ "x-real-ip": ip }), remoteAddress: "198.51.100.4", depth: 1 }),
+      ),
+    );
+    expect([...keys]).toEqual(["198.51.100.4"]);
   });
 
   it("depth 0 trusts no forwarded header and uses the socket address", () => {
@@ -33,8 +51,8 @@ describe("S3-C11: the webhook rate limiter does not trust a caller-written X-For
     expect(clientIp({ header: h({}), depth: 0 })).toBe(UNKNOWN_IP);
   });
 
-  it("a non-IP hop falls back to x-real-ip, then the socket address", () => {
-    expect(clientIp({ header: h({ "x-forwarded-for": "garbage", "x-real-ip": "203.0.113.9" }), depth: 1 })).toBe("203.0.113.9");
+  it("a non-IP hop falls back to the socket address, ignoring x-real-ip", () => {
+    expect(clientIp({ header: h({ "x-forwarded-for": "garbage", "x-real-ip": "203.0.113.9" }), depth: 1 })).toBe(UNKNOWN_IP);
     expect(clientIp({ header: h({ "x-forwarded-for": "garbage" }), remoteAddress: "::1", depth: 1 })).toBe("::1");
   });
 
