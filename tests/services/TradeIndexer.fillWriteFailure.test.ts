@@ -2,7 +2,7 @@
  * Data-loss regression (IDX-FILLLOSS): a failed fallback fill insert was log-only and the cursor still
  * committed, so the fill was never stored. The cursor is now held (capped) so the signatures are retried.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 const captureSpy = vi.hoisted(() => vi.fn());
@@ -13,7 +13,7 @@ const connection = {
   getSignaturesForAddress: vi.fn(async (pk: PublicKey, o?: any) => {
     const all = sigLists.get(pk.toBase58()) ?? [];
     if (o?.until) { const i = all.findIndex((s) => s.signature === o.until); return i < 0 ? all : all.slice(0, i); }
-    return all;
+    return o?.limit ? all.slice(0, o.limit) : all;
   }),
   getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => txBySig.get(s) ?? null)),
   getParsedTransaction: vi.fn(async (s: string) => txBySig.get(s) ?? null),
@@ -71,7 +71,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
   });
 
-  it("hold cap: a poison row holds the cursor MAX_WRITE_HOLDS polls, then the indexer moves on", async () => {
+  it("hold cap: a poison row (other writes succeed) holds the cursor MAX_WRITE_HOLDS polls, then only it is skipped, by name", async () => {
     const { sigs, idx } = setup();
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[1]) throw new Error("poison row");
@@ -101,5 +101,84 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
     expect(captureSpy).not.toHaveBeenCalled();
     expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
+  });
+
+  it("a DB outage far longer than MAX_WRITE_HOLDS polls drops nothing: every fill is written after recovery", async () => {
+    const { sigs, idx } = setup();
+    let down = true;
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (down) throw new Error("db down");
+      store.add(key(r)); return true; }) as never);
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    for (let p = 0; p < MAX_WRITE_HOLDS * 3; p++) {
+      await idx.indexTradesForSlab(MARKET, 100);
+      expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+      now += 30_000;
+    }
+    expect(store.size).toBe(0);
+    expect(captureSpy.mock.calls.every(([e]) => /outage|failing for/.test(String(e.message)))).toBe(true); // outage alert only, never a skip
+    expect(captureSpy).toHaveBeenCalled();
+    down = false;
+    await idx.indexTradesForSlab(MARKET, 100);
+    clock.mockRestore();
+    expect(sigs.map((s) => store.has(s))).toEqual([true, true, true]);
+    expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
+  });
+
+  it("writeHolds is per instance: another indexer's holds do not count toward this one's cap", async () => {
+    const a = setup();
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === a.sigs[1]) throw new Error("poison row");
+      store.add(key(r)); return true; }) as never);
+    for (let p = 0; p < MAX_WRITE_HOLDS; p++) await a.idx.indexTradesForSlab(MARKET, 100);
+    const b: any = new TradeIndexerPolling(); b._running = true;
+    await b.indexTradesForSlab(MARKET, 100);
+    expect(b.lastSignature.get(MARKET)).toBeUndefined();
+    expect(captureSpy).not.toHaveBeenCalled();
+  });
+
+  it("first poll without a cursor: a held failed signature that fell out of the newest-limit window is still retried", async () => {
+    const { sigs, idx } = setup();
+    let bad = true;
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === sigs[0] && bad) throw new Error("transient db");
+      store.add(key(r)); return true; }) as never);
+    await idx.indexTradesForSlab(MARKET, 3);
+    expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    const more = [4, 5, 6].map(sigOf);
+    more.forEach((s, i) => txBySig.set(s, mkTx(10 + i)));
+    sigLists.set(MARKET, [...[...sigs, ...more]].reverse().map((signature) => ({ signature, err: null })));
+    bad = false;
+    await idx.indexTradesForSlab(MARKET, 3); // newest 3 = more only; sigs[0] is outside it
+    expect(store.has(sigs[0])).toBe(true);
+    expect(idx.lastSignature.get(MARKET)).toBe(more[2]);
+  });
+
+  it("a failed direct write (no pending queue, e.g. a tag 44 row) marks the pass failed instead of throwing past the cursor", async () => {
+    const { sigs, idx } = setup();
+    vi.mocked(insertTradeRow).mockRejectedValue(new Error("db down") as never);
+    const pass: any = { earlier: new Set(), incomplete: false };
+    await idx.processTransaction(txBySig.get(sigs[0]), sigs[0], MARKET, new Set([PROGRAM]), pass);
+    expect(pass.writeFailed).toBe(true);
+    expect(pass.incomplete).toBe(true);
+    expect([...pass.failedSigs]).toEqual([sigs[0]]);
+  });
+
+  it("an unexpected throw inside processTransaction holds the cursor and is retried", async () => {
+    const { sigs, idx } = setup();
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => { store.add(key(r)); return true; }) as never);
+    const orig = idx.processTransaction.bind(idx);
+    let boom = true;
+    idx.processTransaction = async (tx: any, sig: string, ...rest: any[]) => {
+      if (sig === sigs[1] && boom) throw new Error("db read failed");
+      return orig(tx, sig, ...rest);
+    };
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(idx.lastSignature.get(MARKET)).toBeUndefined();
+    boom = false;
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(sigs.map((s) => store.has(s))).toEqual([true, true, true]);
+    expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
   });
 });
