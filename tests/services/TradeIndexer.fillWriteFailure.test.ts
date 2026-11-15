@@ -29,8 +29,12 @@ vi.mock("@percolatorct/shared", async (orig) => {
 vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: vi.fn(async () => undefined), assertSkippedSignatureSinkReady: vi.fn() }));
 vi.mock("../../src/db/tradeCursor.js", () => ({ loadTradeCursors: vi.fn(async () => new Map()), saveTradeCursor: vi.fn(async () => undefined) }));
 vi.mock("../../src/db/storedLegs.js", async (orig) => ({ ...(await orig<any>()),
-  fetchStoredLegs: vi.fn(async () => []), fetchStoredLegsMany: vi.fn(async (s: string[]) => new Map(s.map((x) => [x, []]))) }));
+  fetchStoredLegs: vi.fn(async (sig: string) => storedOf(sig)), fetchStoredLegsMany: vi.fn(async (s: string[]) => new Map(s.map((x) => [x, storedOf(x)]))) }));
 const store = new Set<string>();
+const rows = new Map<string, any>();
+// Like the real table: rows already written come back as stored legs, so a retry pass skips them (writes nothing).
+function storedOf(sig: string) { const r = rows.get(sig); return r ? [{ slab_address: r.slab_address, asset_index: r.asset_index, leg_index: r.leg_index, trader: r.trader, side: r.side, size: r.size }] : []; }
+const put = (r: any) => { store.add(r.tx_signature); rows.set(r.tx_signature, r); return true; };
 vi.mock("../../src/db/insertTradeRow.js", async (orig) => ({ ...(await orig<any>()), insertTradeRow: vi.fn(), insertTradeRows: vi.fn() }));
 import { insertTradeRow, insertTradeRows } from "../../src/db/insertTradeRow.js";
 import { TradeIndexerPolling, MAX_WRITE_HOLDS } from "../../src/services/TradeIndexer.js";
@@ -56,14 +60,14 @@ const setup = () => {
 };
 
 describe("poll path: a failed fill write must not lose the fill", () => {
-  beforeEach(() => { store.clear(); vi.clearAllMocks(); captureSpy.mockClear(); });
+  beforeEach(() => { store.clear(); rows.clear(); vi.clearAllMocks(); captureSpy.mockClear(); });
 
   it("fill 2 fails once: cursor is held, next poll stores it", async () => {
     const { sigs, idx } = setup();
     let failed = false;
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[1] && !failed) { failed = true; throw new Error("transient db"); }
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     await idx.indexTradesForSlab(MARKET, 100);
     expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
     await idx.indexTradesForSlab(MARKET, 100);
@@ -75,7 +79,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     const { sigs, idx } = setup();
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[1]) throw new Error("poison row");
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     for (let p = 1; p <= MAX_WRITE_HOLDS; p++) {
       await idx.indexTradesForSlab(MARKET, 100);
       expect(idx.lastSignature.get(MARKET)).not.toBe(sigs[2]);
@@ -92,11 +96,11 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     let bad = true;
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[1] && bad) throw new Error("db");
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
     bad = false;
     await idx.indexTradesForSlab(MARKET, 100);
-    bad = true; store.clear();
+    bad = true; store.clear(); rows.clear();
     idx.lastSignature.delete(MARKET);
     for (let p = 0; p < MAX_WRITE_HOLDS; p++) await idx.indexTradesForSlab(MARKET, 100);
     expect(captureSpy).not.toHaveBeenCalled();
@@ -108,7 +112,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     let down = true;
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (down) throw new Error("db down");
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     let now = 1_000_000;
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     for (let p = 0; p < MAX_WRITE_HOLDS * 3; p++) {
@@ -130,7 +134,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     const a = setup();
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === a.sigs[1]) throw new Error("poison row");
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     for (let p = 0; p < MAX_WRITE_HOLDS; p++) await a.idx.indexTradesForSlab(MARKET, 100);
     const b: any = new TradeIndexerPolling(); b._running = true;
     await b.indexTradesForSlab(MARKET, 100);
@@ -143,7 +147,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     let bad = true;
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
       if (key(r) === sigs[0] && bad) throw new Error("transient db");
-      store.add(key(r)); return true; }) as never);
+      return put(r); }) as never);
     await idx.indexTradesForSlab(MARKET, 3);
     expect(idx.lastSignature.get(MARKET)).toBeUndefined();
     const more = [4, 5, 6].map(sigOf);
@@ -167,7 +171,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
 
   it("an unexpected throw inside processTransaction holds the cursor and is retried", async () => {
     const { sigs, idx } = setup();
-    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => { store.add(key(r)); return true; }) as never);
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => { return put(r); }) as never);
     const orig = idx.processTransaction.bind(idx);
     let boom = true;
     idx.processTransaction = async (tx: any, sig: string, ...rest: any[]) => {

@@ -50,6 +50,8 @@ interface PassState {
   failedSigs?: Set<string>;
   /** Writes that completed without throwing (a duplicate counts): proves the database answered in this pass. */
   writesOk?: number;
+  /** Stored-leg reads that completed (also proves the database answered when a retry pass skips already-stored fills). */
+  readsOk?: number;
 }
 /** Mark one signature as failed in this pass: the cursor must not pass it. */
 function markFailed(pass: PassState, sig: string | null | undefined): void {
@@ -69,7 +71,7 @@ const FLUSH_AT = 200;
 export const MAX_WRITE_HOLDS = Math.max(1, Number(process.env.INDEXER_MAX_WRITE_HOLDS) || 5);
 const WRITE_OUTAGE_ALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_ALERT_MS", 60_000);
 const WRITE_OUTAGE_REALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_REALERT_MS", 10 * 60_000);
-interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number> }
+interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number>; sawWriteOk: boolean }
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
@@ -492,7 +494,7 @@ export class TradeIndexerPolling {
         if (!pass.stored || needStored.some((s) => !pass.stored!.has(s))) {
           const ahead = validSigs.slice(i, i + IN_CHUNK).filter((s) => !pass.stored?.has(s));
           const got = await fetchStoredLegsMany(ahead);
-          if (got) pass.stored = new Map([...(pass.stored ?? []), ...got]);
+          if (got) { pass.stored = new Map([...(pass.stored ?? []), ...got]); pass.readsOk = (pass.readsOk ?? 0) + 1; }
           else pass.stored = null;
         }
       }
@@ -549,17 +551,22 @@ export class TradeIndexerPolling {
 
   /**
    * Decide after a pass with failed writes. Returns true to hold the cursor (retry the same signatures next poll).
-   * Database down (nothing of the pass was written): hold, never skip, alert after a while. Database up: count each
+   * Database down (no write or read of the pass completed): hold, never skip, alert after a while. Database up: count each
    * failing signature, and skip only those that failed more than MAX_WRITE_HOLDS polls, with an alert naming them.
    */
   private holdAfterWriteFailure(slabAddress: string, pass: PassState): boolean {
     const now = Date.now();
     const failed = [...(pass.failedSigs ?? [])];
-    const hold = this.writeHolds.get(slabAddress) ?? { since: now, lastAlertAt: 0, sigFails: new Map<string, number>() };
-    const dbUp = (pass.writesOk ?? 0) > 0;
+    const hold = this.writeHolds.get(slabAddress) ?? { since: now, lastAlertAt: 0, sigFails: new Map<string, number>(), sawWriteOk: false };
+    // Writes work when one succeeded in this pass. A retry pass may write nothing (already-stored fills are skipped), so
+    // it also counts when a write succeeded in an earlier pass of this hold and this pass's reads answered. Reads alone
+    // are not enough: a write-only outage fails every write while reads still work.
+    if ((pass.writesOk ?? 0) > 0) hold.sawWriteOk = true;
+    const dbUp = (pass.writesOk ?? 0) > 0 || (hold.sawWriteOk && (pass.readsOk ?? 0) > 0);
     const sigFails = new Map<string, number>();
     for (const sig of failed) sigFails.set(sig, (hold.sigFails.get(sig) ?? 0) + (dbUp ? 1 : 0));
     hold.sigFails = sigFails;
+    if (dbUp) hold.since = now; // an outage is measured from its own start, not from earlier poison polls
     this.writeHolds.set(slabAddress, hold);
     const poison = dbUp ? failed.filter((sig) => (sigFails.get(sig) ?? 0) > MAX_WRITE_HOLDS) : [];
     const retry = failed.filter((sig) => !poison.includes(sig));
@@ -572,7 +579,7 @@ export class TradeIndexerPolling {
       captureException(new Error(`indexer write failed ${MAX_WRITE_HOLDS}+ polls for signature(s) ${names.join(",")}; skipped (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-poison" }, extra: { slabAddress, failedSigs: names } });
       return false;
     }
-    this.heldSigs.set(slabAddress, new Set(retry));
+    this.heldSigs.set(slabAddress, new Set(failed)); // poison sigs stay held too until all are over the cap, so none is dropped unnamed
     logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slab, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)), dbUp });
     if (!dbUp && now - hold.since >= WRITE_OUTAGE_ALERT_MS && now - hold.lastAlertAt >= WRITE_OUTAGE_REALERT_MS) {
       hold.lastAlertAt = now;
@@ -744,7 +751,10 @@ export class TradeIndexerPolling {
     // Batched rows are prefetched only for txs where mayReadStoredLegs() is true; a getStored() call added outside the
     // top-level trade / tag 44 path must widen that predicate too (otherwise it silently falls back to one query per tx).
     const getStored = async (): Promise<StoredLeg[] | null> => {
-      if (stored === undefined) stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
+      if (stored === undefined) {
+        stored = pass.stored?.get(signature) ?? (await fetchStoredLegs(signature));
+        if (stored) pass.readsOk = (pass.readsOk ?? 0) + 1;
+      }
       return stored;
     };
     // Write a fill now (no pass queue) or queue it for the window's batched upsert; `onNew` runs only for a row
