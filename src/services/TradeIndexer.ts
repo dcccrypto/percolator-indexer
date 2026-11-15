@@ -44,8 +44,17 @@ interface PassState {
   pending?: Array<{ row: IndexerTradeRow; onNew: () => void }>;
   /** Rows a flush actually wrote (duplicates excluded). */
   newCount?: number;
+  /** A fill / liquidation row could not be written (insert threw): the cursor must not pass this window. */
+  writeFailed?: boolean;
 }
 const FLUSH_AT = 200;
+
+/**
+ * Consecutive polls a slab's cursor may be held by a failed DB write before it moves on (so one poison row
+ * cannot stall the indexer forever). The skipped rows are then logged + alerted and left to manual backfill.
+ */
+export const MAX_WRITE_HOLDS = Math.max(1, Number(process.env.INDEXER_MAX_WRITE_HOLDS) || 5);
+const writeHolds = new Map<string, number>();
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
@@ -497,6 +506,20 @@ export class TradeIndexerPolling {
 
     // #147: Only commit the cursor after the full batch is fetched and processed.
     // If any batch fetch failed we leave the cursor in place so the next poll retries.
+    if (pass.writeFailed && !batchFailed && !holdCursor) {
+      const holds = (writeHolds.get(slabAddress) ?? 0) + 1;
+      if (holds <= MAX_WRITE_HOLDS) {
+        writeHolds.set(slabAddress, holds);
+        holdCursor = true;
+        logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slabAddress.slice(0, 8), hold: holds, max: MAX_WRITE_HOLDS });
+      } else {
+        writeHolds.delete(slabAddress);
+        logger.error("ALERT: fill write kept failing; hold cap reached, advancing the cursor and SKIPPING the unwritten rows (needs manual backfill)", { slabAddress: slabAddress.slice(0, 8), holds: MAX_WRITE_HOLDS });
+        captureException(new Error(`indexer fill write failed ${MAX_WRITE_HOLDS} consecutive polls; cursor advanced past unwritten rows (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-hold-cap" }, extra: { slabAddress, holds: MAX_WRITE_HOLDS } });
+      }
+    } else if (!pass.writeFailed && !batchFailed && !holdCursor) {
+      writeHolds.delete(slabAddress);
+    }
     if (!batchFailed && !holdCursor) {
       await this.commitCursor(slabAddress, signatures[0].signature);
     }
@@ -581,6 +604,7 @@ export class TradeIndexerPolling {
           isNew = await insertTradeRow(q.row);
         } catch (err) {
           pass.incomplete = true;
+          pass.writeFailed = true;
           logger.warn("Failed to process transaction", { signature: q.row.tx_signature?.slice(0, 12), error: err instanceof Error ? err.message : err });
           continue;
         }
@@ -642,6 +666,7 @@ export class TradeIndexerPolling {
           is_liquidation: true,
         });
       } catch (err) {
+        pass.writeFailed = true;
         logger.warn("liquidation insert failed", { signature: signature.slice(0, 12), err: String(err) });
       }
     }
