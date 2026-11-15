@@ -163,6 +163,16 @@ describe("LpVaultIndexer syncRegistry", () => {
     expect(store.positions.size).toBe(1);
   });
 
+  it("records a non-Error poison rejection by its string form", async () => {
+    const chain = new Chain();
+    chain.add("s1", "alice");
+    chain.add("s2", "bob");
+    chain.txErr.set("s2", "Transaction version (2) is not supported" as unknown as Error);
+    const { ix } = mk(chain);
+    await ix.syncRegistry(REG);
+    expect((recordSkipped.mock.calls[0]![0] as { error: string }[])[0]!.error).toMatch(/version \(2\)/);
+  });
+
   it("refuses a window where every transaction is unreadable and holds the cursor", async () => {
     const chain = new Chain();
     chain.add("s1", "alice");
