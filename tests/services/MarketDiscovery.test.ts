@@ -756,6 +756,51 @@ describe('IDX-SILENT2: a partially failed full pass must not drop the failed pro
     expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
   });
 
+  it('default mode: a failing v17 scan keeps that program\'s known markets (no empty-list drop)', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    expect(d.getMarkets().size).toBe(2);
+    // discoverV17Markets reports failure for program 2 (as the real one now does); v12 would succeed.
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('getProgramAccounts rejected');
+      return [] as any;
+    });
+    await full(d);
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('MARKETS_FILTER: a failing program keeps its known markets', async () => {
+    const slab = '11111111111111111111111111111111';
+    process.env.MARKETS_FILTER = slab;
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d); // seed via the default path
+    delete process.env.MARKETS_FILTER;
+    await full(d);
+    expect(d.getMarkets().size).toBe(2);
+    process.env.MARKETS_FILTER = slab;
+    vi.mocked(core.getMarketsByAddress).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : []) as any);
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('getMultipleAccounts down');
+      return [] as any;
+    });
+    await full(d);
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('429 exhaustion on every attempt for one program keeps its known markets', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('429 Too Many Requests');
+      return [] as any;
+    });
+    const p = d.discover(); await vi.advanceTimersByTimeAsync(300_000); await p;
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
   it('still removes a market from a program that scanned successfully', async () => {
     vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
     const d = new MarketDiscovery();

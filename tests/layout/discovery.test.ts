@@ -57,3 +57,22 @@ describe("discoverV17Markets: v2.1 and v2.2 side by side, an unknown VERSION ski
     expect(LAYOUT_V21.marketGroupLen).toBe(758); // the old literal; v2.2 would have read 48 B early
   });
 });
+
+describe("discoverV17Markets: an RPC failure is reported, never an empty list", () => {
+  it("scan path: a rejected getProgramAccounts rejects", async () => {
+    const c = { getProgramAccounts: vi.fn(async () => { throw new Error("scan rejected"); }) } as never;
+    await expect(discoverV17Markets(c, PROGRAM)).rejects.toThrow("scan rejected");
+  });
+  it("scan path: a 429 keeps its message so the caller can back off", async () => {
+    const c = { getProgramAccounts: vi.fn(async () => { throw new Error("429 Too Many Requests"); }) } as never;
+    await expect(discoverV17Markets(c, PROGRAM)).rejects.toThrow(/429/);
+  });
+  it("MARKETS_FILTER path: a rejected getMultipleAccountsInfo rejects", async () => {
+    const c = { getMultipleAccountsInfo: vi.fn(async () => { throw new Error("gma down"); }) } as never;
+    await expect(discoverV17Markets(c, PROGRAM, [pk()])).rejects.toThrow("gma down");
+  });
+  it("a genuinely empty program still returns []", async () => {
+    const c = { getProgramAccounts: vi.fn(async () => []) } as never;
+    await expect(discoverV17Markets(c, PROGRAM)).resolves.toEqual([]);
+  });
+});
