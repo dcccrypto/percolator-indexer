@@ -148,10 +148,10 @@ describe("resolveLotExp (never a guessed lot 0)", () => {
 describe("readMarkPriceE6 mark-EWMA fallback records lot_exp (consumers divide the per-lot EWMA the same way as effective_price)", () => {
   it("effective_price 0, lot 6: returns the per-lot EWMA and the cache knows lot 6", async () => {
     const { readMarkPriceE6 } = await import("../../src/parsers/markPrice.js");
-    const d = buildMarket(LAYOUT_V22, { slots: 1, markEwmaE6: 300_000n });
+    const d = buildMarket(LAYOUT_V22, { slots: 2, markEwmaE6: 300_000n });
     d[LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + LAYOUT_V22.wrapperSlot.profileLotExp] = 6;
-    const e6 = await readMarkPriceE6({ getAccountInfo: async () => ({ data: Buffer.from(d) }) } as any, "EwmaSlab1111111111111111111111111111111111", 0);
+    const e6 = await readMarkPriceE6({ getAccountInfo: async () => ({ data: Buffer.from(d) }) } as any, "So11111111111111111111111111111111111111112", 0);
     expect(e6).toBe(300_000);
-    expect(perTokenPrice(e6!, cachedLotExp("EwmaSlab1111111111111111111111111111111111", 0))).toBeCloseTo(3e-7, 20);
+    expect(perTokenPrice(e6!, cachedLotExp("So11111111111111111111111111111111111111112", 0))).toBeCloseTo(3e-7, 20);
   });
 });

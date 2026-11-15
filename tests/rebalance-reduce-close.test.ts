@@ -78,6 +78,11 @@ function fakeSupabase() {
 // These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
 // (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
 // wire size at a fixed price here.
+// Not about lot scale: a cold lot_exp cache reads as lot 0 here (see tests/lotScale-coldCache-*.test.ts for the real behaviour).
+vi.mock('../src/parsers/lotScale.js', async (orig) => {
+  const actual = await orig<typeof import('../src/parsers/lotScale.js')>();
+  return { ...actual, resolveLotExp: async (s: string, a: number) => actual.knownLotExp(s, a) ?? 0 };
+});
 vi.mock('../src/parsers/matcherFill.js', async (orig) => ({
   ...(await orig<typeof import('../src/parsers/matcherFill.js')>()),
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
