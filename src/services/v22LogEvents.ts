@@ -15,6 +15,38 @@ import { assetGenerationOf, marketVersionOf } from "../layout/marketVersions.js"
 import { decodeV22LogEvents, getLogEventStats, type EventGate, type UnknownReason } from "../parsers/v22FillEvents.js";
 import type { RawInstruction } from "../parsers/v22Events.js";
 import { insertV22Events } from "../db/insertV22Events.js";
+import { insertTradeRows, type IndexerTradeRow } from "../db/insertTradeRow.js";
+import type { V22EventRow } from "../parsers/v22Events.js";
+
+/** REDUCE reason 3 (`REDUCE_REASONS` in parsers/v22FillEvents.ts): the crank's forced close. */
+const REDUCE_REASON_LIQUIDATION = 3;
+
+/**
+ * `parseLiquidation` is a no-op (no v2.2 instruction declares a liquidation), so the liquidation REDUCE log event is the only
+ * signal. Turn each current-generation one into the size-less `is_liquidation` marker the trades readers expect
+ * (traderNetPosition's guard, volume rollups that exclude markers). leg_index 1000+ keeps clear of fill legs; the ordinal is the
+ * row's position among this transaction's liquidation events, so a re-delivery maps to the same key (insert ignores duplicates).
+ */
+export function liquidationMarkers(rows: readonly V22EventRow[]): IndexerTradeRow[] {
+  const out: IndexerTradeRow[] = [];
+  for (const r of rows) {
+    if (r.kind !== "reduce_event" || r.detail?.reason !== REDUCE_REASON_LIQUIDATION || r.detail?.gen_current === false) continue;
+    if (!r.slab_address || !r.actor || r.asset_index == null) continue;
+    out.push({
+      slab_address: r.slab_address,
+      trader: r.actor,
+      side: null,
+      size: null,
+      price: null,
+      fee: 0,
+      tx_signature: r.signature,
+      asset_index: r.asset_index,
+      leg_index: 1000 + out.length,
+      is_liquidation: true,
+    });
+  }
+  return out;
+}
 
 const logger = createLogger("indexer:v22-log-events");
 
@@ -71,6 +103,14 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
       }
     }
     if (res.rows.length > 0) await insertV22Events(res.rows);
+    const markers = liquidationMarkers(res.rows);
+    if (markers.length > 0) {
+      try {
+        await insertTradeRows(markers);
+      } catch (err) {
+        logger.warn("v2.2 liquidation marker write failed (event row kept)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : {}) };
   } catch (err) {
     logger.warn("v22 log-event recording failed (trades unaffected)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });
