@@ -1,5 +1,5 @@
 import { IX_TAG } from "@percolatorct/sdk";
-import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
+import { decodeBase58Fast as decodeBase58 } from "./fastBase58.js";
 import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
 import { cpiEvidence, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
@@ -129,16 +129,29 @@ export interface DecodedFill {
   execPriceE6?: bigint;
 }
 
-function readFeeBpsAt(data: Uint8Array, off: number): number | undefined {
+/**
+ * Same result as `parseTradeSize(data.slice(off, off + 16))` from @percolatorct/shared, without the slice copy, the
+ * 16-step BigInt loop, or the inverted-copy for shorts: a negative i128 magnitude is 2^128 - raw (two's complement).
+ * Caller guarantees `off + 16 <= data.length`.
+ */
+const TWO_128 = 1n << 128n;
+function readTradeSizeAt(dv: DataView, off: number): { sizeValue: bigint; side: "long" | "short" } {
+  const raw = (dv.getBigUint64(off + 8, true) << 64n) | dv.getBigUint64(off, true);
+  return dv.getUint8(off + 15) >= 128 ? { sizeValue: TWO_128 - raw, side: "short" } : { sizeValue: raw, side: "long" };
+}
+
+function viewOf(data: Uint8Array): DataView {
+  return new DataView(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function readFeeBpsAt(data: Uint8Array, off: number, dv: DataView = viewOf(data)): number | undefined {
   if (data.length < off + 8) return undefined;
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const raw = dv.getBigUint64(off, true);
   return raw <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(raw) : undefined;
 }
 
-function readExecPriceAt(data: Uint8Array, off: number): bigint | undefined {
+function readExecPriceAt(data: Uint8Array, off: number, dv: DataView = viewOf(data)): bigint | undefined {
   if (data.length < off + 8) return undefined;
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const raw = dv.getBigUint64(off, true);
   return raw > 0n ? raw : undefined;
 }
@@ -191,11 +204,12 @@ export function decodeV18SingleFill(tag: number, data: Uint8Array): DecodedFill 
   const off = V18_SINGLE_OFFSETS[tag];
   if (!off || data.length < off.minLen) return null;
   const assetIndex = (data[off.assetIdxOff] | (data[off.assetIdxOff + 1] << 8)) >>> 0;
-  const { sizeValue, side } = parseTradeSize(data.slice(off.sizeOff, off.sizeOff + 16));
+  const dv = viewOf(data);
+  const { sizeValue, side } = readTradeSizeAt(dv, off.sizeOff);
   if (sizeValue === 0n) return null;
-  const feeBps = readFeeBpsAt(data, V18_SINGLE_FEE_BPS_OFF);
+  const feeBps = readFeeBpsAt(data, V18_SINGLE_FEE_BPS_OFF, dv);
   const execPriceOff = V18_SINGLE_EXEC_PRICE_OFF[tag];
-  const execPriceE6 = execPriceOff !== undefined ? readExecPriceAt(data, execPriceOff) : undefined;
+  const execPriceE6 = execPriceOff !== undefined ? readExecPriceAt(data, execPriceOff, dv) : undefined;
   return { assetIndex, sizeValue, side, feeBps, execPriceE6 };
 }
 
@@ -216,19 +230,18 @@ export function decodeV18BatchLegs(
   if (data.length < V18_BATCH_HEADER_LEN) return out;
   const isNoCpi = tag === IX_TAG.BatchTradeNoCpi;
   const nLegs = data[1];
+  const dv = viewOf(data);
   for (let i = 0; i < nLegs; i++) {
     const legOff = V18_BATCH_HEADER_LEN + i * V18_BATCH_LEG_LEN;
     if (legOff + V18_BATCH_LEG_LEN > data.length) break;
     const assetIndex =
       (data[legOff + V18_BATCH_LEG_ASSET_OFF] | (data[legOff + V18_BATCH_LEG_ASSET_OFF + 1] << 8)) >>> 0;
-    const { sizeValue, side } = parseTradeSize(
-      data.slice(legOff + V18_BATCH_LEG_SIZE_OFF, legOff + V18_BATCH_LEG_SIZE_OFF + 16),
-    );
+    const { sizeValue, side } = readTradeSizeAt(dv, legOff + V18_BATCH_LEG_SIZE_OFF);
     if (sizeValue === 0n) continue;
     const trailerOff = legOff + V18_BATCH_LEG_TRAILER_OFF;
     // NoCpi: exec_price(8) then fee_bps(8). Cpi: fee_bps(8) then limit_price(8).
-    const feeBps = readFeeBpsAt(data, isNoCpi ? trailerOff + 8 : trailerOff);
-    const execPriceE6 = isNoCpi ? readExecPriceAt(data, trailerOff) : undefined;
+    const feeBps = readFeeBpsAt(data, isNoCpi ? trailerOff + 8 : trailerOff, dv);
+    const execPriceE6 = isNoCpi ? readExecPriceAt(data, trailerOff, dv) : undefined;
     out.push({ assetIndex, sizeValue, side, legIndex: i, feeBps, execPriceE6 });
   }
   return out;
