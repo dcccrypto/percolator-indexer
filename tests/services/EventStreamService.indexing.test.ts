@@ -316,7 +316,7 @@ describe("handle: batch write and fan-out", () => {
     expect(emitSpy).not.toHaveBeenCalled();
   });
 
-  it("records the signature for retry when the batch insert throws (poller disabled: no other recovery)", async () => {
+  it("records the signature in skipped_signatures when the batch insert throws (poller disabled: no other recovery)", async () => {
     const prev = process.env.INDEXER_RPC_POLLING_ENABLED;
     process.env.INDEXER_RPC_POLLING_ENABLED = "false";
     try {
