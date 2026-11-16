@@ -302,6 +302,15 @@ export const AUTOCLOSE_INTERVAL_MS: number = (() => {
  */
 const SWEEP_BATCH_SIZE = 25;
 
+/** Max slabs per `.in()` UPDATE: PostgREST puts the list in the URL, so bound its length (cf. storedLegs IN_CHUNK). */
+const WRITE_IN_CHUNK = 100;
+
+function chunked<T>(items: T[], size = WRITE_IN_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 /** Pause between sweep batches, to stay clear of RPC rate limits. */
 const SWEEP_BATCH_DELAY_MS = 250;
 
@@ -1013,7 +1022,7 @@ export class StatsCollector {
           try {
             infos = await getConnection().getMultipleAccountsInfo(chunk.map((s) => new PublicKey(s)));
           } catch (err) {
-            reportUnknownLayout(chunk[0], err, "StatsCollector.reenable");
+            logger.warn("Excluded-market slab read failed; leaving them excluded", { count: chunk.length, error: err instanceof Error ? err.message : err });
           }
           chunk.forEach((slab, j) => {
             let vault = 0n;
@@ -1034,16 +1043,16 @@ export class StatsCollector {
           });
         }
 
-        if (revive.length > 0) {
+        for (const group of chunked(revive)) {
           try {
-            // One UPDATE for the whole set; supabase-js reports a failed write as { error }.
+            // One UPDATE per chunk; supabase-js reports a failed write as { error }.
             const { error: reenableErr } = await getSupabase()
               .from("markets")
               .update({ indexer_excluded: false, status: "active" })
-              .in("slab_address", revive.map((r) => r.slab))
+              .in("slab_address", group.map((r) => r.slab))
               .eq("network", getNetwork());
             if (reenableErr) throw new Error(reenableErr.message);
-            for (const r of revive) {
+            for (const r of group) {
               this.closedSlabs.delete(r.slab);
               logger.info("Re-enabled previously excluded market (back in discovery and active)", {
                 slabAddress: r.slab.slice(0, 8),
@@ -1054,10 +1063,10 @@ export class StatsCollector {
           } catch (e) {
             // Non-fatal — will retry next cycle
             logger.warn("Failed to re-enable excluded markets", {
-              count: revive.length,
+              count: group.length,
               error: e instanceof Error ? e.message : e,
             });
-            for (const r of revive) excludedSlabs.add(r.slab);
+            for (const r of group) excludedSlabs.add(r.slab);
           }
         }
 
@@ -1173,37 +1182,37 @@ export class StatsCollector {
         }
       }
 
-      if (missingSlabs.length > 0) {
+      for (const group of chunked(missingSlabs)) {
         try {
           const { error: missErr } = await getSupabase()
             .from("markets")
             .update({ status: "closed", indexer_excluded: true })
-            .in("slab_address", missingSlabs)
+            .in("slab_address", group)
             .eq("network", getNetwork());
-          if (missErr) logger.warn("Auto-close of non-existent markets failed", { count: missingSlabs.length, error: missErr.message });
-          else for (const s of missingSlabs) logger.info("Auto-closed non-existent market", { slab: s.slice(0, 8) });
+          if (missErr) logger.warn("Auto-close of non-existent markets failed", { count: group.length, error: missErr.message });
+          else for (const s of group) logger.info("Auto-closed non-existent market", { slab: s.slice(0, 8) });
         } catch (e) {
-          logger.warn("Auto-close of non-existent markets error", { count: missingSlabs.length, error: e instanceof Error ? e.message : e });
+          logger.warn("Auto-close of non-existent markets error", { count: group.length, error: e instanceof Error ? e.message : e });
         }
       }
-      if (dustClosable.length > 0) {
+      for (const group of chunked(dustClosable)) {
         try {
           const { error: closeErr } = await getSupabase()
             .from("markets")
             .update({ status: "closed", indexer_excluded: true })
-            .in("slab_address", dustClosable.map((d) => d.slab))
+            .in("slab_address", group.map((d) => d.slab))
             .eq("network", getNetwork())
             .neq("status", "closed"); // only update if not already closed
           if (closeErr) {
-            logger.warn("Auto-close market failed", { count: dustClosable.length, error: closeErr.message });
+            logger.warn("Auto-close market failed", { count: group.length, error: closeErr.message });
           } else {
-            for (const d of dustClosable) {
+            for (const d of group) {
               this.recordClosedSlab(d.slab);
               logger.info("Auto-closed stale market", { slabAddress: d.slab, vault: d.vault, accounts: d.accounts });
             }
           }
         } catch (e) {
-          logger.warn("Auto-close market error", { count: dustClosable.length, error: e instanceof Error ? e.message : e });
+          logger.warn("Auto-close market error", { count: group.length, error: e instanceof Error ? e.message : e });
         }
       }
 

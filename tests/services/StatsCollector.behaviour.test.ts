@@ -18,6 +18,7 @@ const h = vi.hoisted(() => {
     updateThrows: false,
     updates: [] as Array<{ table: string; patch: unknown }>,
     upserts: [] as unknown[],
+    inLists: [] as unknown[][],
   };
   return {
     state,
@@ -54,7 +55,11 @@ vi.mock('@percolatorct/shared', () => {
   // Chainable + awaitable stand-in for the PostgREST builder.
   const chain = (table: string, op: { kind: string }) => {
     const c: any = {};
-    for (const m of ['select', 'eq', 'in', 'is', 'not', 'limit', 'neq']) c[m] = () => c;
+    for (const m of ['select', 'eq', 'is', 'not', 'limit', 'neq']) c[m] = () => c;
+    c.in = (_col: string, list: unknown[]) => {
+      h.state.inLists.push(list);
+      return c;
+    };
     c.update = (patch: unknown) => {
       op.kind = 'update';
       h.state.updates.push({ table, patch });
@@ -177,6 +182,7 @@ beforeEach(() => {
     updateThrows: false,
     updates: [],
     upserts: [],
+    inLists: [],
   });
   h.getConnection.mockReturnValue({
     getAccountInfo: h.getAccountInfo,
@@ -721,6 +727,19 @@ describe('collect(): sweep', () => {
     h.parseEngine.mockReturnValueOnce(engineDust).mockReturnValueOnce(engineLive);
     await sc.collect();
     expect(h.state.updates).toHaveLength(1);
+  });
+
+  it('chunks the close UPDATE at 100 slabs so the PostgREST URL stays bounded, and still closes all of them', async () => {
+    const markets = registered(130);
+    h.getMultipleAccountsInfo.mockImplementation(async (ks: unknown[]) => ks.map(() => ({ data: new Uint8Array(8) })));
+    h.parseEngine.mockReturnValue(engineDust);
+    const { sc } = make(markets);
+    const p = sc.collect();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+    expect(h.state.inLists.map((l) => l.length)).toEqual([100, 30]);
+    expect(sc.closedSlabs.size).toBe(130);
+    expect(new Set(h.state.inLists.flat())).toEqual(new Set(markets.keys()));
   });
 
   it('does not remember a slab when the close write errors, so it retries next sweep', async () => {
