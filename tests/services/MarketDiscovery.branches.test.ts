@@ -219,6 +219,8 @@ describe('MARKETS_FILTER full pass', () => {
     await drive(d.discover());
     expect(d.getMarkets().size).toBe(2);
     expect(loggerMock.warn).toHaveBeenCalledWith('MARKETS_FILTER discovery failed on program', expect.objectContaining({ error: 'boom' }));
+    expect(loggerMock.warn).toHaveBeenCalledWith('Kept known markets of programs whose scan failed this pass', expect.objectContaining({ kept: 1 }));
+    expect(loggerMock.info).toHaveBeenCalledWith('Market discovery complete', expect.objectContaining({ failedPrograms: 1 }));
   });
 
   it('records a non-Error failure by string and keeps the map when nothing is found', async () => {
@@ -318,7 +320,7 @@ describe('start() retry and timers', () => {
     vi.mocked(shared.getPrimaryConnection).mockReturnValue(primary as any);
     await drive(d2.start(60_000, 60_000));
     const calls = vi.mocked(v17disc.discoverV17Markets).mock.calls.filter((c) => (c as any)[3]?.light).length;
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(59_000);
     expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.filter((c) => (c as any)[3]?.light).length).toBe(calls);
     d2.stop();
   });
