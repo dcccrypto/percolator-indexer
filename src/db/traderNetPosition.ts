@@ -49,6 +49,7 @@ export interface TraderPositionEvidence {
  * The `trades` table has no slot/block time, only `created_at` (index time), and no
  * liquidation size. So the net is only trusted when:
  *  - the transaction's block time is known;
+ *  - every non-marker fill row has an exact size (null, negative, fractional or > 2^53 is unreadable) and a long/short side;
  *  - no liquidation marker exists for this (trader, slab, asset) (a forced close changes the
  *    position without any recorded size);
  *  - every OTHER fill row was indexed strictly before the transaction's block time (a row cannot
