@@ -53,8 +53,8 @@ export function readAssetEffectivePriceE6(data: Uint8Array, assetIndex: number):
  * Mirrors the parsing path in `StatsCollector.collect()` but narrowed to just mark_price.
  *
  * #221: pass the fill's `assetIndex` to price a FILL. On a v18 market that returns
- * the asset's `effective_price` — the price the engine booked the fill at — and only
- * falls back to the mark read below when that slot can't be read. Without it the
+ * the asset's `effective_price` — the price the engine booked the fill at — and, when that slot can't
+ * be read, falls back to the market-wide mark read below for asset 0 only (asset N>0 returns null). Without it the
  * function keeps its original mark-only behaviour.
  */
 export async function readMarkPriceE6(
@@ -78,8 +78,9 @@ export async function readMarkPriceE6(
     if (assetIndex !== undefined) {
       const effective = readAssetEffectivePriceE6(data, assetIndex);
       if (effective !== null) return effective;
-      // The fallbacks below are market-wide (oracle-profile EWMA / engine mark), i.e. asset 0's mark. Never
-      // answer a request for asset N > 0 with another asset's price.
+      // The fallbacks below are market-wide (config mark_ewma_e6 / engine mark), not per-asset. Never answer a
+      // request for asset N > 0 with a price that is not asset N's. Asset 0 keeps the legacy fallback (single-asset
+      // markets); whether that EWMA is asset 0's own mark on v2.2 is unverified.
       if (assetIndex !== 0) return null;
     }
 
