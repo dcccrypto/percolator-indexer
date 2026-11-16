@@ -84,7 +84,7 @@ describe("reportUnknownLayout", () => {
     expect(getUnknownLayoutCount()).toBe(2);
   });
 
-  it("a TOO_SHORT account has no VERSION: reported with the '?' key, deduped once, still counted", () => {
+  it("a TOO_SHORT account has no VERSION: reported under the '?' version key and counted", () => {
     resetUnknownLayoutState();
     const err = (() => { try { readMarketGroupFields(new Uint8Array(4), "t"); } catch (e) { return e; } return null; })();
     expect(err).toBeInstanceOf(UnknownLayoutError);

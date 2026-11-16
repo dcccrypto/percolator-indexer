@@ -42,7 +42,7 @@ describe("matcher context reader: transport error vs 'read fine'", () => {
   });
   it("a deadline shorter than timeoutMs cuts a hung call short", async () => {
     const r = await makeMatcherContextReader(conn(() => new Promise(() => {})), null, { deadlineAt: Date.now() + 25, timeoutMs: 5000 })(ADDR);
-    expect(r).toMatchObject({ kind: "error", detail: expect.stringContaining("timeout after") });
+    expect(r).toMatchObject({ kind: "error", detail: expect.stringMatching(/timeout after \d{1,2} ms/) });
   });
   it("retry waits the default 300 ms when retryDelayMs is unset", async () => {
     const spy = vi.spyOn(globalThis, "setTimeout");
