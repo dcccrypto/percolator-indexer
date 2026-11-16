@@ -49,10 +49,10 @@ describe("fetchParsedTxsTolerant fan-out", () => {
     };
     const r = await fetchParsedTxsTolerant(short, ["a", "b"], retry);
     expect(r.failed).toBe(false);
-    expect(r.txs).toHaveLength(1); // callers index txs[j] for j < batch.length and treat undefined as missing
+    expect(r.txs).toHaveLength(1); // NOTE: TradeIndexer loops j < txs.length, so a short array would leave the tail unexamined (not marked incomplete); whether a short RPC array is reachable is unproven, so this only pins the pass-through
   });
 
-  it("one poison with a good sibling is skipped; exactly MAX_SKIPS_ABSOLUTE skips pass, one more is refused", async () => {
+  it("up to MAX_SKIPS_ABSOLUTE skips pass with good siblings, one more is refused", async () => {
     const sigs = Array.from({ length: MAX_SKIPS_ABSOLUTE + 2 }, (_, i) => `s${i}`);
     const ok = await fetchParsedTxsTolerant(conn(async (s) => { if (s !== "s0" && s !== "s6") throw V2; return { sig: s }; }), sigs, retry);
     expect(ok.failed).toBe(false);
