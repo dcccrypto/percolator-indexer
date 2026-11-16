@@ -1103,6 +1103,8 @@ export function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: nu
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
   if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+  // The fallbacks below are market-wide, not per-asset (#302): never record another asset's price for asset N>0.
+  if (assetIndex !== 0) return 0;
 
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
