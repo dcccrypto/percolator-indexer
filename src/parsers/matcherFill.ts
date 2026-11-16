@@ -36,7 +36,7 @@ for (let i = 0; i < B58_ALPHABET.length; i++) B58_INDEX[B58_ALPHABET.charCodeAt(
 
 /**
  * Base58 decode, output identical to `decodeBase58` from @percolatorct/shared (null on any character
- * outside the alphabet or a non-string input; leading '1's are leading zero bytes). The shared one grows
+ * outside the alphabet; a non-string input also gives null, where the shared one would give an empty array; leading '1's are leading zero bytes). The shared one grows
  * a plain array with `unshift` per carry and does an `indexOf` per character: it was the top frame of
  * the matcher-fill parse profile. This one fills a preallocated Uint8Array from the end.
  */

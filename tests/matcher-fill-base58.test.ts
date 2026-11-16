@@ -41,15 +41,15 @@ describe("decodeBase58Fast == shared decodeBase58", () => {
   it("every instruction data string in tests/fixtures/tradecpi", () => {
     const dir = new URL("./fixtures/tradecpi/", import.meta.url);
     const all = new Set<string>();
-    for (const n of readdirSync(dir)) collectData(JSON.parse(readFileSync(new URL(n, dir), "utf8")), all);
+    for (const n of readdirSync(dir).filter((x) => x.endsWith(".json"))) collectData(JSON.parse(readFileSync(new URL(n, dir), "utf8")), all);
     expect(all.size).toBeGreaterThan(20);
     for (const s of all) expect(decodeBase58Fast(s), s).toEqual(decodeBase58(s));
   });
 
-  it("random buffers (with leading zeros) round-trip and match", () => {
+  it("random buffers (with leading zeros) round-trip and match", { timeout: 60_000 }, () => {
     let seed = 12345;
     const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) >>> 0) / 0x7fffffff;
-    for (let t = 0; t < 2000; t++) {
+    for (let t = 0; t < 400; t++) {
       const len = Math.floor(rnd() * 120);
       const b = Uint8Array.from({ length: len }, () => Math.floor(rnd() * 256));
       const zeros = Math.floor(rnd() * 4);

@@ -56,7 +56,8 @@ for (let r = 0; r < RUNS; r++) {
   times.push(performance.now() - t0);
 }
 times.sort((a, b) => a - b);
-const median = (times[RUNS / 2 - 1] + times[RUNS / 2]) / 2;
+const mid = Math.floor(RUNS / 2);
+const median = RUNS % 2 ? times[mid] : (times[mid - 1] + times[mid]) / 2;
 console.log(`fixtures=${fixtures.length} tx=${TX} fills/pass=${fills} runs=${RUNS}`);
 console.log(`median ${median.toFixed(1)} ms per ${TX} tx   (min ${times[0].toFixed(1)}, max ${times[RUNS - 1].toFixed(1)})`);
 console.log(`output sha256 ${h.digest("hex")}`);
