@@ -1,4 +1,5 @@
 import { IX_TAG } from "@percolatorct/sdk";
+import { parseTradeSize } from "@percolatorct/shared";
 import { decodeBase58Fast as decodeBase58 } from "./fastBase58.js";
 import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
@@ -129,17 +130,6 @@ export interface DecodedFill {
   execPriceE6?: bigint;
 }
 
-/**
- * Same result as `parseTradeSize(data.slice(off, off + 16))` from @percolatorct/shared, without the slice copy, the
- * 16-step BigInt loop, or the inverted-copy for shorts: a negative i128 magnitude is 2^128 - raw (two's complement).
- * Caller guarantees `off + 16 <= data.length`.
- */
-const TWO_128 = 1n << 128n;
-function readTradeSizeAt(dv: DataView, off: number): { sizeValue: bigint; side: "long" | "short" } {
-  const raw = (dv.getBigUint64(off + 8, true) << 64n) | dv.getBigUint64(off, true);
-  return dv.getUint8(off + 15) >= 128 ? { sizeValue: TWO_128 - raw, side: "short" } : { sizeValue: raw, side: "long" };
-}
-
 function viewOf(data: Uint8Array): DataView {
   return new DataView(data.buffer, data.byteOffset, data.byteLength);
 }
@@ -205,7 +195,7 @@ export function decodeV18SingleFill(tag: number, data: Uint8Array): DecodedFill 
   if (!off || data.length < off.minLen) return null;
   const assetIndex = (data[off.assetIdxOff] | (data[off.assetIdxOff + 1] << 8)) >>> 0;
   const dv = viewOf(data);
-  const { sizeValue, side } = readTradeSizeAt(dv, off.sizeOff);
+  const { sizeValue, side } = parseTradeSize(data.slice(off.sizeOff, off.sizeOff + 16));
   if (sizeValue === 0n) return null;
   const feeBps = readFeeBpsAt(data, V18_SINGLE_FEE_BPS_OFF, dv);
   const execPriceOff = V18_SINGLE_EXEC_PRICE_OFF[tag];
@@ -236,7 +226,9 @@ export function decodeV18BatchLegs(
     if (legOff + V18_BATCH_LEG_LEN > data.length) break;
     const assetIndex =
       (data[legOff + V18_BATCH_LEG_ASSET_OFF] | (data[legOff + V18_BATCH_LEG_ASSET_OFF + 1] << 8)) >>> 0;
-    const { sizeValue, side } = readTradeSizeAt(dv, legOff + V18_BATCH_LEG_SIZE_OFF);
+    const { sizeValue, side } = parseTradeSize(
+      data.slice(legOff + V18_BATCH_LEG_SIZE_OFF, legOff + V18_BATCH_LEG_SIZE_OFF + 16),
+    );
     if (sizeValue === 0n) continue;
     const trailerOff = legOff + V18_BATCH_LEG_TRAILER_OFF;
     // NoCpi: exec_price(8) then fee_bps(8). Cpi: fee_bps(8) then limit_price(8).

@@ -83,6 +83,12 @@ vi.mock('../src/parsers/matcherFill.js', async (orig) => ({
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
 
+// The parser decodes ix data with its own fast base58; route it back through the mocked shared decoder (h.data overrides).
+vi.mock('../src/parsers/fastBase58.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  return { decodeBase58Fast: (s: string) => shared.decodeBase58(s) };
+});
+
 vi.mock('@percolatorct/shared', () => ({
   config: {
     allProgramIds: ['ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB'],
