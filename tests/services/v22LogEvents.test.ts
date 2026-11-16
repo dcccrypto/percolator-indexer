@@ -88,7 +88,7 @@ describe("recordV22LogEvents", () => {
     const { slot: _s, blockTimeSec: _b, ...noCtx } = base;
     const r = await recordV22LogEvents({ ...noCtx, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
     expect(r).toEqual({ status: "ok", rows: 1 });
-    expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ slot: null });
+    expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ slot: null, block_time: null });
   });
 
   it("insert failure with a non-Error rejection is stringified", async () => {
