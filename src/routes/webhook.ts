@@ -877,6 +877,13 @@ async function extractTradesFromEnhancedTx(
     // L-5: Validate slabAddress against live known-slab set
     if (discovery && !discovery.getMarkets().has(slabAddress)) {
       logger.warn("Skipping trade: slab address not in known-slab set", { slabAddress, signature });
+      // Hold one leg number per skipped leg: EventStreamService numbers by position in the parser's
+      // fill list, which still contains this untracked-slab fill. Without the placeholder a tracked
+      // fill after it got leg_index N-1 here and N there, so the shared dedup key never collapsed
+      // the two and the fill was stored twice.
+      for (const _ of legs) {
+        trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: 0, leg_index: 0, is_liquidation: false, placeholder: true });
+      }
       continue;
     }
 
