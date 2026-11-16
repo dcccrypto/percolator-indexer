@@ -19,10 +19,16 @@ import { rebalanceReduceFill } from "../parsers/percolatorTxParser.js";
  */
 const PAGE = 1000;
 
+/**
+ * Exact non-negative integer value of a trades.size, or null when it cannot be read exactly.
+ * trades.size is NUMERIC, which PostgREST returns as a JSON number, so anything above 2^53 has
+ * already lost precision by the time it reaches here; strings are exact only as plain digits
+ * (optionally with an all-zero fraction). A null result must make the evidence uncertain.
+ */
 function toBigInt(v: unknown): bigint | null {
-  if (typeof v === "bigint") return v;
-  if (typeof v === "string" && /^\d+(\.\d+)?$/.test(v)) return BigInt(v.split(".")[0]);
-  if (typeof v === "number" && Number.isFinite(v) && v >= 0) return BigInt(Math.trunc(v));
+  if (typeof v === "bigint") return v >= 0n ? v : null;
+  if (typeof v === "string" && /^\d+(\.0*)?$/.test(v)) return BigInt(v.split(".")[0]);
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
   return null;
 }
 
@@ -69,6 +75,8 @@ export async function fetchTraderPositionEvidence(
   let net = 0n;
   let sawLiquidation = false;
   let sawNotProvablyEarlier = false;
+  let sawUnreadableSize = false;
+  let sawBadSide = false;
   const cutoffMs = txTimeSec == null ? null : txTimeSec * 1000;
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await getSupabase()
@@ -86,9 +94,10 @@ export async function fetchTraderPositionEvidence(
     for (const r of rows) {
       if (r.is_liquidation) { sawLiquidation = true; continue; }
       const size = toBigInt(r.size);
-      if (size === null) continue;
+      if (size === null) { sawUnreadableSize = true; continue; }
       if (r.side === "long") net += size;
       else if (r.side === "short") net -= size;
+      else sawBadSide = true;
       const created = r.created_at ? Date.parse(r.created_at) : NaN;
       if (cutoffMs !== null && !(Number.isFinite(created) && created < cutoffMs) && !(r.tx_signature && knownEarlier.has(r.tx_signature))) sawNotProvablyEarlier = true;
     }
@@ -97,6 +106,8 @@ export async function fetchTraderPositionEvidence(
   let uncertain: string | null = null;
   if (cutoffMs === null) uncertain = "transaction block time unknown: cannot order this close against indexed fills";
   else if (sawLiquidation) uncertain = "a liquidation marker exists for this position: the indexed net may be wrong";
+  else if (sawUnreadableSize) uncertain = "a fill row has a size that cannot be read exactly (null, negative, fractional or beyond 2^53): the indexed net may be wrong";
+  else if (sawBadSide) uncertain = "a fill row has a side that is neither long nor short: the indexed net may be wrong";
   else if (sawNotProvablyEarlier) uncertain = "indexed fills for this position are not provably earlier than this close (re-index/backfill after later fills)";
   return { netQ: net, uncertain };
 }
