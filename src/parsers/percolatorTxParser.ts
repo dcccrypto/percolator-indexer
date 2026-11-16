@@ -2,7 +2,7 @@ import { IX_TAG } from "@percolatorct/sdk";
 import { decodeBase58, parseTradeSize } from "@percolatorct/shared";
 import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { parseLiquidation, type LiquidationMarker } from "./liquidations.js";
-import { cpiEvidence, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
+import { cpiEvidence, decodeBase58Fast, type CpiEvidence, type InnerIxLike } from "./matcherFill.js";
 
 /**
  * v17 single-fill trade tags (TradeNoCpi=6, TradeCpi=10).
@@ -398,7 +398,7 @@ export function parsePercolatorFills(
     const programId = pubkeyToBase58(ix.programId);
     if (!programId || !programIdSet.has(programId)) continue;
 
-    const rawData = decodeBase58(ix.data);
+    const rawData = decodeBase58Fast(ix.data);
     if (!rawData || rawData.length < 1) continue;
 
     // v2.2 EvictAndTradeCpi (119) is a TradeCpi behind one prepended victim account: normalise it to the TradeCpi
