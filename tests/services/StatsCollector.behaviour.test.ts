@@ -54,7 +54,7 @@ vi.mock('@percolatorct/shared', () => {
   // Chainable + awaitable stand-in for the PostgREST builder.
   const chain = (table: string, op: { kind: string }) => {
     const c: any = {};
-    for (const m of ['select', 'eq', 'is', 'not', 'limit', 'neq']) c[m] = () => c;
+    for (const m of ['select', 'eq', 'in', 'is', 'not', 'limit', 'neq']) c[m] = () => c;
     c.update = (patch: unknown) => {
       op.kind = 'update';
       h.state.updates.push({ table, patch });
@@ -866,20 +866,19 @@ describe('collect(): re-enabling excluded markets', () => {
     h.hasWrapperMagic.mockReturnValue(true);
     h.parseWrapperConfigV17.mockReturnValue({ maxStalenessSecs: 1n, markEwmaE6: 0n, tradeFeeBps: 1, maintenanceFeePerSlot: 0n });
     h.readMarketGroupFields.mockReturnValue({ vault: 5_000_000n, insurance: 0n, cTot: 0n, asset0ProfileOff: null });
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(600) });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(600) }]);
     const { sc } = make(new Map([[s, market()]]));
     sc.closedSlabs.add(s);
     await sc.collect();
     expect(h.state.updates[0]).toEqual({ table: 'markets', patch: { indexer_excluded: false, status: 'active' } });
     expect(sc.closedSlabs.has(s)).toBe(false);
-    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // swept this very cycle
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2); // one batched exclusion read + the sweep this very cycle
+    expect(h.getAccountInfo).not.toHaveBeenCalled();
   });
 
   it('re-enables on open accounts alone (legacy layout)', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
     h.parseEngine.mockReturnValue({ vault: 0n, numUsedAccounts: 4 });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
     const { sc } = make(new Map([[s, market()]]));
@@ -890,12 +889,12 @@ describe('collect(): re-enabling excluded markets', () => {
   it('keeps a dusty excluded market hidden and does not sweep it', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 1n, numUsedAccounts: 0 });
     const { sc } = make(new Map([[s, market()]]));
     await sc.collect();
     expect(h.state.updates).toHaveLength(0);
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // the exclusion read only, no sweep
     expect(h.logger.info).toHaveBeenCalledWith('StatsCollector: skipping indexer_excluded slabs', { count: 1, slabs: [s] });
   });
 
@@ -904,10 +903,8 @@ describe('collect(): re-enabling excluded markets', () => {
     const b = slab();
     const c = slab();
     h.getMarketRows.mockResolvedValue([a, b, c].map((s) => ({ slab_address: s, indexer_excluded: true })));
-    h.getAccountInfo
-      .mockResolvedValueOnce(null) // account gone
-      .mockRejectedValueOnce(new Error('rpc'))
-      .mockResolvedValueOnce({ data: Buffer.alloc(10) });
+    // one batched read: first account gone, second and third unparseable
+    h.getMultipleAccountsInfo.mockResolvedValue([null, { data: Buffer.alloc(10) }, { data: Buffer.alloc(10) }]);
     h.parseEngine.mockImplementation(() => {
       throw new Error('unknown version');
     });
@@ -919,31 +916,43 @@ describe('collect(): re-enabling excluded markets', () => {
     expect(h.reportUnknownLayout).toHaveBeenCalledWith(c, expect.any(Error), 'StatsCollector.reenable');
   });
 
+  it('a failed batched exclusion read leaves every candidate excluded and never un-hides one unverified', async () => {
+    const a = slab();
+    const b = slab();
+    h.getMarketRows.mockResolvedValue([a, b].map((s) => ({ slab_address: s, indexer_excluded: true })));
+    h.getMultipleAccountsInfo.mockRejectedValue(new Error('rpc 503'));
+    const { sc } = make(new Map([[a, market()], [b, market()]]));
+    await sc.collect();
+    expect(h.state.updates).toHaveLength(0);
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    expect(h.logger.info).toHaveBeenCalledWith('StatsCollector: skipping indexer_excluded slabs', { count: 2, slabs: [a, b] });
+  });
+
   it('keeps it excluded when the re-enable write throws, so it is retried next cycle', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 9_000_000n, numUsedAccounts: 1 });
     h.state.updateThrows = true;
     const { sc } = make(new Map([[s, market()]]));
     await sc.collect();
-    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded market', expect.objectContaining({ error: 'db down' }));
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled();
+    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded markets', expect.objectContaining({ error: 'db down' }));
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // exclusion read only
   });
 
   it('keeps a market excluded when the re-enable write comes back with an error (not a throw)', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 9_000_000n, numUsedAccounts: 1 });
     h.state.updateResult = { error: { message: 'rls denied' } };
     const { sc } = make(new Map([[s, market()]]));
     sc.closedSlabs.add(s);
     await sc.collect();
-    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded market', expect.objectContaining({ error: 'rls denied' }));
+    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded markets', expect.objectContaining({ error: 'rls denied' }));
     expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('Re-enabled'), expect.anything());
     expect(sc.closedSlabs.has(s)).toBe(true);
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled(); // still excluded, so not swept
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // exclusion read only: still excluded, so not swept
   });
 
   it('an excluded market that left discovery stays excluded without any RPC read', async () => {
