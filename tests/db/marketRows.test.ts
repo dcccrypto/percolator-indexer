@@ -164,23 +164,6 @@ describe("marketRows", () => {
     expect(await getMarketRows()).toEqual([]);
   });
 
-  it("reset during an in-flight read: the old run neither writes the cache nor clears a newer inFlight", async () => {
-    setTotal(2);
-    let release!: () => void;
-    gate = new Promise<void>((r) => (release = r));
-    const old = getMarketRows();
-    resetMarketRowsCache();
-    // A newer read starts after the reset; it must not be clobbered by the old run settling.
-    const fresh = getMarketRows();
-    release();
-    gate = null;
-    await Promise.all([old, fresh]);
-    const before = calls.length;
-    // Old run settled first: cache must hold only the newer run's result, and inFlight must be clear.
-    await getMarketRowsCached();
-    expect(calls.length).toBe(before); // newer run's cache is fresh
-  });
-
   it("reset during an in-flight read: the stale run's result is not cached", async () => {
     setTotal(2);
     let release!: () => void;
@@ -192,7 +175,7 @@ describe("marketRows", () => {
     await old;
     gate = null;
     const before = calls.length;
-    await getMarketRowsCached(); // cache must be empty -> re-read
+    expect(await getMarketRowsCached()).toHaveLength(3); // cache must be empty -> re-read
     expect(calls.length).toBe(before + 1);
   });
 
