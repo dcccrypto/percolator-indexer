@@ -196,9 +196,9 @@ interface EventRow {
   lp_amount: string | null;
 }
 
-/** numeric columns are selected ::text so u128 values never pass through a JS number. */
 const PAGE_SIZE = 1_000;
 const MAX_EVENTS = 10_000;
+/** numeric columns are selected ::text so u128 values never pass through a JS number. */
 const POSITION_COLUMNS = [
   "network", "registry", "user_wallet", "market_slab", "lp_mint",
   "lp_shares::text", "pending_redeem_shares::text", "cost_basis_atoms::text",
