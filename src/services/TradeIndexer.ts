@@ -1184,6 +1184,8 @@ export class TradeIndexerPolling {
       // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
       const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
       if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+      // The fallbacks below are market-wide, not per-asset (#302): never record another asset's price for asset N>0.
+      if (assetIndex !== 0) return 0;
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (hasWrapperMagic(rawData)) {
