@@ -84,7 +84,7 @@ describe("start / stop", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(bf).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(poll).toHaveBeenCalled();
+    expect(poll).toHaveBeenCalledTimes(1);
     idx.stop();
     expect(idx.pollTimer).toBeNull();
     expect(idx._running).toBe(false);
@@ -149,10 +149,16 @@ describe("backfill", () => {
     await idx.runBackfill(); // attempt 1 -> retry in 20s
     expect(idx.hasBackfilled).toBe(false);
     expect(bf).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(20_000);
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(bf).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     expect(bf).toHaveBeenCalledTimes(1);
     await idx.runBackfill(); // attempt 2 -> retry in 40s
     expect(idx.hasBackfilled).toBe(false);
+    await vi.advanceTimersByTimeAsync(39_999);
+    expect(bf).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bf).toHaveBeenCalledTimes(2);
     await idx.runBackfill(); // attempt 3 -> exhausted
     expect(idx.hasBackfilled).toBe(true);
     expect(captureSpy).toHaveBeenCalledTimes(3);

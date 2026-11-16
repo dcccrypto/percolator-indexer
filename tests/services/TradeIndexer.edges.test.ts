@@ -46,6 +46,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   m.liqs = [];
   m.logEvents.mockResolvedValue(undefined);
+  m.insertTradeRows.mockImplementation(async (rows: unknown[]) => rows);
+  m.fetchTolerant.mockReset();
 });
 
 describe("fetchBatchCached partial paths", () => {
@@ -127,6 +129,7 @@ describe("processTransaction side paths", () => {
     m.logEvents.mockRejectedValueOnce(new Error("log sink down"));
     m.liqs = [{ slabAddress: SLAB, portfolio: "P1", assetIndex: 0 }];
     await run(tx(1));
+    expect(m.logEvents).toHaveBeenCalledTimes(1);
     expect(m.insertTradeRow).toHaveBeenCalledTimes(1);
   });
 });
