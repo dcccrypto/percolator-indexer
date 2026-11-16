@@ -23,7 +23,6 @@ vi.mock("../src/db/insertV22Events.js", () => ({ insertV22Events }));
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
 import { EventStreamService } from "../src/services/EventStreamService.js";
 import { recordV22LogEvents } from "../src/services/v22LogEvents.js";
-import { decodeBase58 } from "../src/lib/base58.js";
 import { resetMarketLayoutNotes } from "../src/layout/marketVersions.js";
 import { resetLogEventStats } from "../src/parsers/v22FillEvents.js";
 
@@ -94,7 +93,7 @@ describe("v2.2 liquidation (crank + REDUCE reason 3) leaves an is_liquidation ma
   it("webhook path (shared glue, logs present): marker row; two liquidations get distinct leg_index", async () => {
     await recordV22LogEvents({
       signature: "SIGHOOK", err: null, logMessages: logs(LIQ, LIQ),
-      wrapperInstructions: [{ programId: W, accounts: [TAKER, M], data: decodeBase58(crankData())!, ixIndex: 0, innerIndex: null } as any],
+      wrapperInstructions: [{ programId: W, accounts: [TAKER, M], data: new Uint8Array([CRANK_TAG, 7, 0, 0, 0, 0, 0, 0, 0, 0]), ixIndex: 0, innerIndex: null } as any],
       wrapperIds: new Set([W]), isKnownMarket: (s) => s === M,
     });
     const m = markers();
@@ -106,7 +105,7 @@ describe("v2.2 liquidation (crank + REDUCE reason 3) leaves an is_liquidation ma
     insertTradeRows.mockRejectedValueOnce(new Error("boom"));
     await expect(recordV22LogEvents({
       signature: "SIGERR", err: null, logMessages: logs(LIQ),
-      wrapperInstructions: [{ programId: W, accounts: [TAKER, M], data: decodeBase58(crankData())!, ixIndex: 0, innerIndex: null } as any],
+      wrapperInstructions: [{ programId: W, accounts: [TAKER, M], data: new Uint8Array([CRANK_TAG, 7, 0, 0, 0, 0, 0, 0, 0, 0]), ixIndex: 0, innerIndex: null } as any],
       wrapperIds: new Set([W]), isKnownMarket: (s) => s === M,
     })).resolves.toBeTruthy();
   });
