@@ -24,16 +24,24 @@ const REDUCE_REASON_LIQUIDATION = 3;
 /**
  * `parseLiquidation` is a no-op (no v2.2 instruction declares a liquidation), so the liquidation REDUCE log event is the only
  * signal. Turn each current-generation one into the size-less `is_liquidation` marker the trades readers expect
- * (traderNetPosition's guard, volume rollups that exclude markers). leg_index 1000+ keeps clear of fill legs; the ordinal is the
- * row's position among this transaction's liquidation events, so a re-delivery maps to the same key (insert ignores duplicates).
+ * (liquidation counts and trader history by portfolio; volume rollups already exclude markers). NOTE: traderNetPosition's guard is keyed by owner wallet, so it does not see these portfolio-keyed markers. leg_index 1000+ keeps clear of fill legs; the ordinal is the
+ * row's position among this transaction's liquidation events for the same (slab, asset), so every path and a re-delivery map to the same key (insert ignores duplicates).
  */
 export function liquidationMarkers(rows: readonly V22EventRow[]): IndexerTradeRow[] {
   const out: IndexerTradeRow[] = [];
+  // Ordinal per (slab, asset), counted over EVERY reason-3 event before the generation filter, so it does not depend on which
+  // markets a path's registry accepts or on whether the generation is known yet: poll, stream and webhook agree on the key.
+  const ordinals = new Map<string, number>();
   for (const r of rows) {
-    if (r.kind !== "reduce_event" || r.detail?.reason !== REDUCE_REASON_LIQUIDATION || r.detail?.gen_current === false) continue;
+    if (r.kind !== "reduce_event" || r.detail?.reason !== REDUCE_REASON_LIQUIDATION) continue;
     if (!r.slab_address || !r.actor || r.asset_index == null) continue;
+    const k = `${r.slab_address}|${r.asset_index}`;
+    const ord = ordinals.get(k) ?? 0;
+    ordinals.set(k, ord + 1);
+    if (r.detail?.gen_current === false) continue;
     out.push({
       slab_address: r.slab_address,
+      // The event names the liquidated PORTFOLIO, not its owner wallet (not derivable from the logs): the marker is keyed by it.
       trader: r.actor,
       side: null,
       size: null,
@@ -41,7 +49,7 @@ export function liquidationMarkers(rows: readonly V22EventRow[]): IndexerTradeRo
       fee: 0,
       tx_signature: r.signature,
       asset_index: r.asset_index,
-      leg_index: 1000 + out.length,
+      leg_index: 1000 + ord,
       is_liquidation: true,
     });
   }

@@ -101,6 +101,14 @@ describe("v2.2 liquidation (crank + REDUCE reason 3) leaves an is_liquidation ma
     expect(m.every((r) => r.tx_signature === "SIGHOOK" && r.slab_address === M)).toBe(true);
   });
 
+  it("leg_index is per (slab, asset): independent of other slabs in the same transaction", async () => {
+    const { liquidationMarkers } = await import("../src/services/v22LogEvents.js");
+    const row = (slab: string, extra: Record<string, unknown> = {}) => ({ signature: "S", kind: "reduce_event", slab_address: slab, asset_index: 0, actor: TAKER, detail: { reason: 3, ...extra } }) as any;
+    const m = liquidationMarkers([row(OTHER), row(M), row(M, { gen_current: false }), row(M)]);
+    expect(m.filter((r) => r.slab_address === M).map((r) => r.leg_index)).toEqual([1000, 1002]);
+    expect(m.find((r) => r.slab_address === OTHER)!.leg_index).toBe(1000);
+  });
+
   it("a marker-insert failure never throws out of the glue", async () => {
     insertTradeRows.mockRejectedValueOnce(new Error("boom"));
     await expect(recordV22LogEvents({
