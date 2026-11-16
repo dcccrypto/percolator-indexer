@@ -64,4 +64,29 @@ describe("insertV22Events", () => {
     await expect(insertV22Events([row(1)])).rejects.toThrow(/network down/);
     expect(getV22EventStats()).toMatchObject({ written: 0, writeFailed: 2 });
   });
+
+  it("error shapes without a code: classified by message alone, and an empty error is a write failure", async () => {
+    state.result = async () => ({ error: { message: 'relation "public.v22_events" does not exist' } });
+    expect(await insertV22Events([row(1)])).toBe(0);
+    state.result = async () => ({ error: { message: 'violates check constraint "v22_events_kind_check"' } });
+    expect(await insertV22Events([row(2)])).toBe(0);
+    expect(getV22EventStats()).toMatchObject({ droppedTableMissing: 1, droppedKindConstraint: 1, writeFailed: 0 });
+    state.result = async () => ({ error: {} as { message?: string } });
+    await expect(insertV22Events([row(3)])).rejects.toBeInstanceOf(V22EventWriteError);
+    expect(getV22EventStats().writeFailed).toBe(1);
+  });
+
+  it("a non-Error throw is stringified into a V22EventWriteError and counted", async () => {
+    state.result = async () => { throw "boom"; };
+    await expect(insertV22Events([row(1)])).rejects.toThrow(/boom/);
+    expect(getV22EventStats().writeFailed).toBe(1);
+  });
+
+  it("a large batch is one upsert (no row limit split) and a replayed batch is idempotent via ignoreDuplicates", async () => {
+    const big = Array.from({ length: 5000 }, (_, i) => row(i));
+    expect(await insertV22Events(big)).toBe(5000);
+    expect(await insertV22Events(big)).toBe(5000);
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(upsert.mock.calls[1][2]).toMatchObject({ ignoreDuplicates: true });
+  });
 });
