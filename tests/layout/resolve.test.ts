@@ -83,4 +83,15 @@ describe("reportUnknownLayout", () => {
     expect(reportUnknownLayout(a, new Error("rpc 429"), "t")).toBe(false);
     expect(getUnknownLayoutCount()).toBe(2);
   });
+
+  it("a TOO_SHORT account has no VERSION: reported with the '?' key, deduped once, still counted", () => {
+    resetUnknownLayoutState();
+    const err = (() => { try { readMarketGroupFields(new Uint8Array(4), "t"); } catch (e) { return e; } return null; })();
+    expect(err).toBeInstanceOf(UnknownLayoutError);
+    expect((err as UnknownLayoutError).version).toBeUndefined();
+    const a = pk().toBase58();
+    expect(reportUnknownLayout(a, err, "t")).toBe(true);
+    expect(reportUnknownLayout(a, err, "t")).toBe(true);
+    expect(getUnknownLayoutCount()).toBe(2);
+  });
 });

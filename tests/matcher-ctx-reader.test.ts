@@ -36,4 +36,23 @@ describe("matcher context reader: transport error vs 'read fine'", () => {
     await makeMatcherContextReader(conn(fn), 123)(ADDR);
     expect((fn.mock.calls[0] as any[])[1]).toMatchObject({ minContextSlot: 123 });
   });
+  it("a future deadline bounds the call; a non-Error rejection is stringified", async () => {
+    const r = await makeMatcherContextReader(conn(async () => { throw "plain-string"; }), null, { deadlineAt: Date.now() + 60_000 })(ADDR);
+    expect(r).toEqual({ kind: "error", detail: "plain-string" });
+  });
+  it("a deadline shorter than timeoutMs cuts a hung call short", async () => {
+    const r = await makeMatcherContextReader(conn(() => new Promise(() => {})), null, { deadlineAt: Date.now() + 25, timeoutMs: 5000 })(ADDR);
+    expect(r).toMatchObject({ kind: "error", detail: expect.stringContaining("timeout after") });
+  });
+  it("retry waits the default 300 ms when retryDelayMs is unset", async () => {
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    const fn = vi.fn().mockRejectedValueOnce(new Error("x")).mockResolvedValue(null);
+    const r = await makeMatcherContextReader(conn(fn), null, { retries: 1 })(ADDR);
+    expect(r).toEqual({ kind: "ok", ret: null });
+    expect(spy.mock.calls.some((c) => c[1] === 300)).toBe(true);
+    spy.mockRestore();
+  });
+  it("an account with no data field is 'not ours' (ok/null)", async () => {
+    expect(await makeMatcherContextReader(conn(async () => ({})))(ADDR)).toEqual({ kind: "ok", ret: null });
+  });
 });
