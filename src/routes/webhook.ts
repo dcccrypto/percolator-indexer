@@ -1098,7 +1098,7 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string, asset
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
+export function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
   // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
