@@ -187,4 +187,41 @@ describe('webhook leg_index parity with TradeIndexer / EventStreamService (GH#19
     const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
     expect(rows.filter((r) => !r.is_liquidation).map((r) => r.leg_index)).toEqual([0, 1, 2]);
   });
+
+  it('a fill on an untracked slab ahead of a tracked one still holds its leg number (the stream numbers the tracked fill 1)', async () => {
+    const mockDecode = vi.mocked(shared.decodeBase58);
+    mockDecode.mockReturnValue(tradeBytes());
+    const UNTRACKED = 'SysvarRent111111111111111111111111111111111';
+    await app.fetch(makeRequest([{
+      signature: SIG,
+      instructions: [
+        { programId: PROGRAM_ID, data: 't1', accounts: [TRADER, TRADER, UNTRACKED] },
+        { programId: PROGRAM_ID, data: 't2', accounts: [TRADER, TRADER, SLAB] },
+      ],
+      innerInstructions: [], accountData: [], logs: [],
+    }]));
+    const rows = vi.mocked(insertTradeRow).mock.calls.map((c) => c[0] as any);
+    // EventStreamService numbers by position in the parser's fill list => 1 (see
+    // tests/services/EventStreamService.legParity.test.ts); no row is written for the untracked leg.
+    expect(rows.map((r) => r.leg_index)).toEqual([1]);
+  });
+
+  it('redelivery: a failed write answers 500, the provider redelivery stores the fill (200)', async () => {
+    vi.mocked(shared.decodeBase58).mockReturnValue(tradeBytes());
+    const body = [{
+      signature: SIG,
+      instructions: [{ programId: PROGRAM_ID, data: 't1', accounts: [TRADER, TRADER, SLAB] }],
+      innerInstructions: [], accountData: [], logs: [],
+    }];
+    const write = vi.mocked(insertTradeRow);
+    write.mockRejectedValueOnce(new Error('db down'));
+    const first = await app.fetch(makeRequest(body));
+    expect(first.status).toBe(500);
+    write.mockResolvedValue(true as never);
+    const second = await app.fetch(makeRequest(body));
+    expect(second.status).toBe(200);
+    // Same key on both attempts: the redelivery re-attempts the SAME leg (idempotent upsert downstream).
+    const keys = write.mock.calls.map((c) => (c[0] as any).leg_index);
+    expect(keys).toEqual([0, 0]);
+  });
 });
