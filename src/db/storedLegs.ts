@@ -38,6 +38,8 @@ export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | 
 }
 
 export const IN_CHUNK = 100;
+/** Rows per page; must not exceed the PostgREST max_rows (1000 by default). */
+export const STORED_LEGS_PAGE = 1000;
 
 /**
  * Stored rows for MANY transactions in as few queries as possible (`in(tx_signature, [...])`, chunked
@@ -52,13 +54,22 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
   try {
     for (let i = 0; i < unique.length; i += IN_CHUNK) {
       const chunk = unique.slice(i, i + IN_CHUNK);
-      const { data, error } = await getSupabase()
-        .from("trades")
-        .select("tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
-        .in("tx_signature", chunk)
-        .eq("network", getNetwork());
-      if (error) throw new Error(error.message);
-      for (const r of (data ?? []) as Array<StoredLeg & { tx_signature: string }>) out.get(r.tx_signature)?.push(r);
+      // Page each chunk: PostgREST caps a response at max_rows (default 1000) and a chunk of
+      // split-order transactions can hold more rows than that. A silently truncated read would
+      // leave the cut-off signatures as "looked, none" and the legs would be inserted twice.
+      for (let from = 0; ; from += STORED_LEGS_PAGE) {
+        const { data, error } = await getSupabase()
+          .from("trades")
+          .select("tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
+          .in("tx_signature", chunk)
+          .eq("network", getNetwork())
+          .order("id", { ascending: true })
+          .range(from, from + STORED_LEGS_PAGE - 1);
+        if (error) throw new Error(error.message);
+        const rows = (data ?? []) as Array<StoredLeg & { tx_signature: string }>;
+        for (const r of rows) out.get(r.tx_signature)?.push(r);
+        if (rows.length < STORED_LEGS_PAGE) break;
+      }
     }
     return out;
   } catch (err) {
@@ -69,7 +80,7 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
 
 const sizeStr = (v: unknown): string => {
   if (typeof v === "bigint") return v.toString();
-  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v).toString();
+  if (typeof v === "number" && Number.isFinite(v)) return BigInt(Math.trunc(v)).toString(); // not Number#toString: it gives '1e+21' from 1e21 up
   if (typeof v === "string") return v.split(".")[0];
   return "";
 };

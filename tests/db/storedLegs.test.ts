@@ -5,6 +5,8 @@ const state = {
   throws: null as null | unknown,
   warns: [] as unknown[][],
   inCalls: [] as string[][],
+  ranges: [] as Array<[number, number]>,
+  maxRows: 0, // 0 = unlimited
   chunkResults: [] as Array<{ data: unknown; error: null | { message: string } }>,
 };
 
@@ -16,21 +18,35 @@ vi.mock("@percolatorct/shared", () => ({
       select: () => {
         const q: Record<string, unknown> = {};
         q.eq = () => q;
+        q.order = () => q;
+        // PostgREST max_rows: a response never holds more than MAX_ROWS rows, whatever range is asked
+        q.range = (from: number, to: number) => {
+          state.ranges.push([from, to]);
+          q.rangeFrom = from;
+          q.rangeTo = to;
+          return q;
+        };
         q.in = (_c: string, vals: string[]) => {
           state.inCalls.push(vals);
           return q;
         };
         // `.eq("network", ...)` is the last call; make the builder awaitable
-        q.then = (resolve: (v: unknown) => void, reject: (e: unknown) => void) => run().then(resolve, reject);
+        q.then = (resolve: (v: unknown) => void, reject: (e: unknown) => void) => run(q).then(resolve, reject);
         return q;
       },
     }),
   }),
 }));
 
-async function run() {
+async function run(q: Record<string, unknown>) {
   if (state.throws) throw state.throws;
   if (state.chunkResults.length) return state.chunkResults.shift()!;
+  if (state.maxRows && Array.isArray(state.result.data)) {
+    const from = (q.rangeFrom as number | undefined) ?? 0;
+    const to = (q.rangeTo as number | undefined) ?? Number.MAX_SAFE_INTEGER;
+    const n = Math.min(state.maxRows, to - from + 1);
+    return { data: (state.result.data as unknown[]).slice(from, from + n), error: null };
+  }
   return state.result;
 }
 
@@ -54,6 +70,8 @@ beforeEach(() => {
   state.warns = [];
   state.inCalls = [];
   state.chunkResults = [];
+  state.ranges = [];
+  state.maxRows = 0;
 });
 
 describe("fetchStoredLegs", () => {
@@ -116,6 +134,26 @@ describe("fetchStoredLegsMany", () => {
     state.result = { data: null, error: null };
     expect((await fetchStoredLegsMany(["a"]))!.get("a")).toEqual([]);
   });
+
+  it("pages past PostgREST max_rows: a chunk with more rows than max_rows is not truncated", async () => {
+    // 100 split-order txs x 12 identical legs = 1200 rows > max_rows (1000)
+    const sigs = Array.from({ length: IN_CHUNK }, (_, i) => `s${i}`);
+    const rows = sigs.flatMap((sig) => Array.from({ length: 12 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: sig })));
+    state.result = { data: rows, error: null };
+    state.maxRows = 1000;
+    const m = await fetchStoredLegsMany(sigs);
+    expect(m).not.toBeNull();
+    for (const sig of sigs) expect(m!.get(sig)).toHaveLength(12);
+  });
+
+  it("pages when a chunk returns exactly max_rows rows (a full page means more may follow)", async () => {
+    const rows = Array.from({ length: 1000 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: "a" }));
+    state.result = { data: rows, error: null };
+    state.maxRows = 1000;
+    const m = await fetchStoredLegsMany(["a"]);
+    expect(m!.get("a")).toHaveLength(1000);
+    expect(state.ranges.length).toBe(2);
+  });
 });
 
 describe("fillAlreadyStored", () => {
@@ -162,6 +200,22 @@ describe("fillAlreadyStored", () => {
     const stored = [leg({ leg_index: 2 })];
     expect(fillAlreadyStored(stored, f, new Set([2]))).toBe(false);
     expect(fillAlreadyStored(stored, f)).toBe(true);
+  });
+});
+
+describe("size identity", () => {
+  const f = (size: string) => ({ slab: "S", assetIndex: 0, legIndex: 5, trader: "T", side: "long" as const, size, ordinal: 1 });
+  it("matches a number size at or above 1e21 against its exact decimal string", () => {
+    expect(fillAlreadyStored([leg({ size: 1e21 })], f("1000000000000000000000"))).toBe(true);
+    expect(fillAlreadyStored([leg({ size: 1.5e25 })], f("15000000000000000000000000"))).toBe(true);
+  });
+  it("matches bigint, string and fractional-string sizes", () => {
+    expect(fillAlreadyStored([leg({ size: 12345678901234567890n })], f("12345678901234567890"))).toBe(true);
+    expect(fillAlreadyStored([leg({ size: "12345678901234567890" })], f("12345678901234567890"))).toBe(true);
+    expect(fillAlreadyStored([leg({ size: "100.000" })], f("100"))).toBe(true);
+  });
+  it("reduceAlreadyStored accepts a number size >= 1e21", () => {
+    expect(reduceAlreadyStored([leg({ size: 1e21, leg_index: 2 })], { slab: "S", assetIndex: 0, legIndex: 2, trader: "T", reduceQ: 10n ** 22n })).toBe(true);
   });
 });
 
