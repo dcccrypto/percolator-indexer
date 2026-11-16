@@ -316,6 +316,32 @@ describe("handle: batch write and fan-out", () => {
     expect(emitSpy).not.toHaveBeenCalled();
   });
 
+  it("records the signature for retry when the batch insert throws (poller disabled: no other recovery)", async () => {
+    const prev = process.env.INDEXER_RPC_POLLING_ENABLED;
+    process.env.INDEXER_RPC_POLLING_ENABLED = "false";
+    try {
+      m.fills.mockReturnValue([fill()]);
+      m.insertRows.mockRejectedValue(new Error("db down"));
+      const { handle } = setup();
+      await handle(note(tx()));
+      expect(m.skipped).toHaveBeenCalledTimes(1);
+      expect(m.skipped.mock.calls[0][0]).toEqual([
+        expect.objectContaining({ signature: "SIG1", source: "trade-indexer", slab: SLAB, error: expect.stringContaining("db down") }),
+      ]);
+    } finally {
+      if (prev === undefined) delete process.env.INDEXER_RPC_POLLING_ENABLED;
+      else process.env.INDEXER_RPC_POLLING_ENABLED = prev;
+    }
+  });
+
+  it("still returns cleanly if recording the skipped signature itself throws", async () => {
+    m.fills.mockReturnValue([fill()]);
+    m.insertRows.mockRejectedValue(new Error("db down"));
+    m.skipped.mockRejectedValue(new Error("sink down"));
+    const { handle } = setup();
+    await expect(handle(note(tx()))).resolves.toBeUndefined();
+  });
+
   it("emits only legs that were actually written (re-delivered legs are skipped)", async () => {
     m.fills.mockReturnValue([fill(), fill({ assetIndex: 1, trader: "TRADER2" })]);
     m.insertRows.mockImplementation(async (rows: any[]) => [rows[1]]);
