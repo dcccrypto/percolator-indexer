@@ -320,7 +320,7 @@ describe('start() retry and timers', () => {
     vi.mocked(shared.getPrimaryConnection).mockReturnValue(primary as any);
     await drive(d2.start(60_000, 60_000));
     const calls = vi.mocked(v17disc.discoverV17Markets).mock.calls.filter((c) => (c as any)[3]?.light).length;
-    await vi.advanceTimersByTimeAsync(59_000);
+    await vi.advanceTimersByTimeAsync(61_000);
     expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.filter((c) => (c as any)[3]?.light).length).toBe(calls);
     d2.stop();
   });
