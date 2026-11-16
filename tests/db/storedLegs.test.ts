@@ -207,7 +207,7 @@ describe("size identity", () => {
   const f = (size: string) => ({ slab: "S", assetIndex: 0, legIndex: 5, trader: "T", side: "long" as const, size, ordinal: 1 });
   it("matches a number size at or above 1e21 against its exact decimal string", () => {
     expect(fillAlreadyStored([leg({ size: 1e21 })], f("1000000000000000000000"))).toBe(true);
-    expect(fillAlreadyStored([leg({ size: 1.5e25 })], f("15000000000000000000000000"))).toBe(true);
+    expect(fillAlreadyStored([leg({ size: 2 ** 80 })], f("1208925819614629174706176"))).toBe(true);
   });
   it("matches bigint, string and fractional-string sizes", () => {
     expect(fillAlreadyStored([leg({ size: 12345678901234567890n })], f("12345678901234567890"))).toBe(true);
