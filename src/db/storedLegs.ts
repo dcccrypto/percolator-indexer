@@ -57,18 +57,23 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
       // Page each chunk: PostgREST caps a response at max_rows (default 1000) and a chunk of
       // split-order transactions can hold more rows than that. A silently truncated read would
       // leave the cut-off signatures as "looked, none" and the legs would be inserted twice.
-      for (let from = 0; ; from += STORED_LEGS_PAGE) {
-        const { data, error } = await getSupabase()
+      // Keyset paging on the unique `id` (not offset): a concurrent insert must not shift rows
+      // across a page boundary and count one twice (that would make a leg look stored).
+      let lastId: string | null = null;
+      for (;;) {
+        let q = getSupabase()
           .from("trades")
-          .select("tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
+          .select("id, tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
           .in("tx_signature", chunk)
-          .eq("network", getNetwork())
-          .order("id", { ascending: true })
-          .range(from, from + STORED_LEGS_PAGE - 1);
+          .eq("network", getNetwork());
+        if (lastId !== null) q = q.gt("id", lastId);
+        const { data, error } = await q.order("id", { ascending: true }).limit(STORED_LEGS_PAGE);
         if (error) throw new Error(error.message);
-        const rows = (data ?? []) as Array<StoredLeg & { tx_signature: string }>;
+        const rows = (data ?? []) as Array<StoredLeg & { tx_signature: string; id?: string }>;
         for (const r of rows) out.get(r.tx_signature)?.push(r);
-        if (rows.length < STORED_LEGS_PAGE) break;
+        const last = rows[rows.length - 1]?.id;
+        if (rows.length < STORED_LEGS_PAGE || last == null) break;
+        lastId = last;
       }
     }
     return out;

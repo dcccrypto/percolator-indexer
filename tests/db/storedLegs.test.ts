@@ -5,7 +5,7 @@ const state = {
   throws: null as null | unknown,
   warns: [] as unknown[][],
   inCalls: [] as string[][],
-  ranges: [] as Array<[number, number]>,
+  ranges: [] as unknown[],
   maxRows: 0, // 0 = unlimited
   chunkResults: [] as Array<{ data: unknown; error: null | { message: string } }>,
 };
@@ -20,10 +20,13 @@ vi.mock("@percolatorct/shared", () => ({
         q.eq = () => q;
         q.order = () => q;
         // PostgREST max_rows: a response never holds more than MAX_ROWS rows, whatever range is asked
-        q.range = (from: number, to: number) => {
-          state.ranges.push([from, to]);
-          q.rangeFrom = from;
-          q.rangeTo = to;
+        q.gt = (_c: string, v: string) => {
+          q.after = v;
+          return q;
+        };
+        q.limit = (n: number) => {
+          state.ranges.push([q.after as never, n as never] as never);
+          q.lim = n;
           return q;
         };
         q.in = (_c: string, vals: string[]) => {
@@ -42,10 +45,10 @@ async function run(q: Record<string, unknown>) {
   if (state.throws) throw state.throws;
   if (state.chunkResults.length) return state.chunkResults.shift()!;
   if (state.maxRows && Array.isArray(state.result.data)) {
-    const from = (q.rangeFrom as number | undefined) ?? 0;
-    const to = (q.rangeTo as number | undefined) ?? Number.MAX_SAFE_INTEGER;
-    const n = Math.min(state.maxRows, to - from + 1);
-    return { data: (state.result.data as unknown[]).slice(from, from + n), error: null };
+    const all = state.result.data as Array<{ id?: string }>;
+    const start = q.after === undefined ? 0 : all.findIndex((r) => r.id === q.after) + 1;
+    const n = Math.min(state.maxRows, (q.lim as number | undefined) ?? Infinity);
+    return { data: all.slice(start, start + n), error: null };
   }
   return state.result;
 }
@@ -138,7 +141,7 @@ describe("fetchStoredLegsMany", () => {
   it("pages past PostgREST max_rows: a chunk with more rows than max_rows is not truncated", async () => {
     // 100 split-order txs x 12 identical legs = 1200 rows > max_rows (1000)
     const sigs = Array.from({ length: IN_CHUNK }, (_, i) => `s${i}`);
-    const rows = sigs.flatMap((sig) => Array.from({ length: 12 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: sig })));
+    const rows = sigs.flatMap((sig) => Array.from({ length: 12 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: sig, id: `${sig}-${l}` })));
     state.result = { data: rows, error: null };
     state.maxRows = 1000;
     const m = await fetchStoredLegsMany(sigs);
@@ -147,7 +150,7 @@ describe("fetchStoredLegsMany", () => {
   });
 
   it("pages when a chunk returns exactly max_rows rows (a full page means more may follow)", async () => {
-    const rows = Array.from({ length: 1000 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: "a" }));
+    const rows = Array.from({ length: 1000 }, (_, l) => ({ ...leg({ leg_index: l }), tx_signature: "a", id: `a-${l}` }));
     state.result = { data: rows, error: null };
     state.maxRows = 1000;
     const m = await fetchStoredLegsMany(["a"]);
