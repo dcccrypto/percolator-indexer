@@ -391,6 +391,7 @@ describe('webhook route — extraction failures and RebalanceReduce (tag 44) hol
     const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, SLAB])] })]));
     expect(res.status).toBe(200);
     expect(insertTradeRows).not.toHaveBeenCalled();
+    expect((await import('../../src/db/traderNetPosition.js')).resolveRebalanceReduce).not.toHaveBeenCalled();
   });
 
   it('a tag 44 with an invalid account key is held, not written', async () => {
@@ -398,6 +399,7 @@ describe('webhook route — extraction failures and RebalanceReduce (tag 44) hol
     const res = await app.fetch(post([tx({ instructions: [reduceIx(['bad key', SLAB])] })]));
     expect(res.status).toBe(200);
     expect(insertTradeRows).not.toHaveBeenCalled();
+    expect((await import('../../src/db/traderNetPosition.js')).resolveRebalanceReduce).not.toHaveBeenCalled();
   });
 
   it('a tag 44 on an untracked market is held, not written', async () => {
@@ -405,9 +407,10 @@ describe('webhook route — extraction failures and RebalanceReduce (tag 44) hol
     const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, TRADER])] })]));
     expect(res.status).toBe(200);
     expect(insertTradeRows).not.toHaveBeenCalled();
+    expect((await import('../../src/db/traderNetPosition.js')).resolveRebalanceReduce).not.toHaveBeenCalled();
   });
 
-  it('a tag 44 that cannot be resolved is recorded as skipped and holds its leg number', async () => {
+  it('a tag 44 that cannot be resolved is recorded as skipped and not written', async () => {
     const { recordSkippedSignatures } = await import('../../src/lib/skippedSignatures.js');
     vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
     const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, SLAB])] })]));
