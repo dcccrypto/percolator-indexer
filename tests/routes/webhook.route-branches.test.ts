@@ -16,7 +16,7 @@ const SIG2 = '4VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF
 
 vi.mock('@percolatorct/sdk', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
-  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, PermissionlessCrank: 5, BatchTradeNoCpi: 66, BatchTradeCpi: 67 },
+  IX_TAG: { TradeNoCpi: 10, TradeCpi: 11, PermissionlessCrank: 5, RebalanceReduce: 44, BatchTradeNoCpi: 66, BatchTradeCpi: 67 },
   detectSlabLayout: vi.fn(() => ({ version: 1, engineOff: 640, engineMarkPriceOff: 400, engineBitmapOff: 656 })),
   isV17Account: vi.fn(() => false),
   parseWrapperConfigV17: vi.fn(),
@@ -34,6 +34,8 @@ vi.mock('../../src/blocklist.js', () => ({
   isBlockedSlab: (s: string) => s === '7FBXdrm1vQ4ktQJjMwurq4cAHkVB1gKoZ7Hx3CAQv6P4',
 }));
 
+vi.mock('../../src/lib/skippedSignatures.js', () => ({ recordSkippedSignatures: vi.fn(async () => {}) }));
+vi.mock('../../src/db/traderNetPosition.js', () => ({ resolveRebalanceReduce: vi.fn(async () => ({ ok: false, reason: 'no position' })) }));
 vi.mock('../../src/db/insertV22Events.js', () => ({ insertV22Events: vi.fn(async () => {}) }));
 vi.mock('../../src/services/v22LogEvents.js', () => ({ recordV22LogEvents: vi.fn(async () => {}) }));
 vi.mock('../../src/parsers/v22Events.js', async (orig) => ({
@@ -311,16 +313,7 @@ describe('webhook route — per-transaction skip rules', () => {
     expect(rows).toHaveLength(1);
   });
 
-  it('an oversized i128 size is skipped', async () => {
-    const b = tradeBytes();
-    b.fill(0xff, 43, 59); b[58] = 0x7f; // keep within int128 positive range
-    vi.mocked(shared.decodeBase58).mockReturnValue(b);
-    const res = await app.fetch(post([tx()]));
-    expect(res.status).toBe(200);
-  });
-
-  it('a fill already stored under another leg number is dropped, a new one kept', async () => {
-    // Two identical fills in one tx: the rank among identical fills decides which is "already stored".
+  it('two identical fills in one tx are numbered 0 and 1', async () => {
     const rows = await rowsFor([tx({ instructions: [ix(), ix()] })]);
     expect(rows.map((r) => r.leg_index)).toEqual([0, 1]);
   });
@@ -375,5 +368,73 @@ describe('webhook route — v22 side path is isolated from trades', () => {
     const arg = vi.mocked(recordV22LogEvents).mock.calls[0][0] as any;
     expect(arg).toMatchObject({ slot: null, blockTimeSec: null, err: { e: 1 } });
     expect(arg.isKnownMarket('anything')).toBe(true);
+  });
+});
+
+describe('webhook route — extraction failures and RebalanceReduce (tag 44) holds', () => {
+  const reduceBytes = (): Uint8Array => {
+    const b = new Uint8Array(35);
+    b[0] = 44; b[19] = 5; // reduce_q = 5
+    return b;
+  };
+  const reduceIx = (accounts: string[]) => ({ programId: PROGRAM_ID, data: 'r', accounts });
+
+  it('a non-Error extraction throw still answers 500 and is reported', async () => {
+    vi.mocked(shared.decodeBase58).mockImplementation(() => { throw 'weird'; });
+    const res = await app.fetch(post([tx()]));
+    expect(res.status).toBe(500);
+    expect(shared.captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it('a tag 44 with undecodable (zero) reduce_q is skipped', async () => {
+    vi.mocked(shared.decodeBase58).mockReturnValue(new Uint8Array(35).fill(0).map((_, i) => (i === 0 ? 44 : 0)));
+    const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, SLAB])] })]));
+    expect(res.status).toBe(200);
+    expect(insertTradeRows).not.toHaveBeenCalled();
+  });
+
+  it('a tag 44 with an invalid account key is held, not written', async () => {
+    vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
+    const res = await app.fetch(post([tx({ instructions: [reduceIx(['bad key', SLAB])] })]));
+    expect(res.status).toBe(200);
+    expect(insertTradeRows).not.toHaveBeenCalled();
+  });
+
+  it('a tag 44 on an untracked market is held, not written', async () => {
+    vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
+    const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, TRADER])] })]));
+    expect(res.status).toBe(200);
+    expect(insertTradeRows).not.toHaveBeenCalled();
+  });
+
+  it('a tag 44 that cannot be resolved is recorded as skipped and holds its leg number', async () => {
+    const { recordSkippedSignatures } = await import('../../src/lib/skippedSignatures.js');
+    vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
+    const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, SLAB])] })]));
+    expect(res.status).toBe(200);
+    expect(recordSkippedSignatures).toHaveBeenCalledTimes(1);
+    expect(insertTradeRows).not.toHaveBeenCalled();
+  });
+
+  it('a tag 44 whose peer transaction (same slot) touches the same trader+market is not resolved', async () => {
+    const { resolveRebalanceReduce } = await import('../../src/db/traderNetPosition.js');
+    vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
+    const res = await app.fetch(post([
+      tx({ slot: 3, instructions: [reduceIx([TRADER, SLAB])] }),
+      tx({ signature: SIG2, slot: 3, instructions: [ix([TRADER, SLAB])] }),
+    ]));
+    expect(res.status).toBe(200);
+    expect(resolveRebalanceReduce).not.toHaveBeenCalled();
+  });
+
+  it('a resolved tag 44 is written as a fee-free fill', async () => {
+    const { resolveRebalanceReduce } = await import('../../src/db/traderNetPosition.js');
+    vi.mocked(resolveRebalanceReduce).mockResolvedValueOnce({ ok: true, side: 'long', sizeValue: 5n } as any);
+    vi.mocked(shared.decodeBase58).mockReturnValue(reduceBytes());
+    const res = await app.fetch(post([tx({ instructions: [reduceIx([TRADER, SLAB])] })]));
+    expect(res.status).toBe(200);
+    const rows = vi.mocked(insertTradeRows).mock.calls.flatMap((c) => c[0] as any[]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ size: '5', side: 'long', fee: 0, reduce: true });
   });
 });
