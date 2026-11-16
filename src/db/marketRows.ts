@@ -21,6 +21,8 @@ export const MARKET_ROWS_TTL_MS = 60_000;
 
 let cache: { at: number; rows: MarketRowLite[] } | null = null;
 let inFlight: Promise<MarketRowLite[]> | null = null;
+/** Bumped by resetMarketRowsCache so a read that started before the reset cannot write the cache or clear a newer inFlight. */
+let generation = 0;
 
 /**
  * Every `markets` row for this network, ALL statuses (registration must see closed
@@ -29,13 +31,14 @@ let inFlight: Promise<MarketRowLite[]> | null = null;
  */
 export function getMarketRows(): Promise<MarketRowLite[]> {
   if (inFlight) return inFlight;
+  const gen = generation;
   const run = readAll()
     .then((rows) => {
-      cache = { at: Date.now(), rows };
+      if (gen === generation) cache = { at: Date.now(), rows };
       return rows;
     })
     .finally(() => {
-      inFlight = null;
+      if (gen === generation) inFlight = null;
     });
   inFlight = run;
   return run;
@@ -49,6 +52,7 @@ export function getMarketRowsCached(): Promise<MarketRowLite[]> {
 
 /** Test hook. */
 export function resetMarketRowsCache(): void {
+  generation++;
   cache = null;
   inFlight = null;
 }
