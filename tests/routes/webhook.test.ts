@@ -111,6 +111,7 @@ import * as shared from '@percolatorct/shared';
 import { insertTradeRow } from '../../src/db/insertTradeRow.js';
 import { readAssetEffectivePriceE6 } from '../../src/parsers/markPrice.js';
 import { webhookRoutes, verifyWebhookSignature } from '../../src/routes/webhook.js';
+import { buildMarket, LAYOUT_V22 } from '../helpers/v22Fixtures.js';
 
 const PROGRAM_ID = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
 const TRADER = 'So11111111111111111111111111111111111111112';
@@ -271,6 +272,29 @@ describe('POST /webhook/trades — price extraction', () => {
 
     expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ price: 13.614586 }));
     expect(vi.mocked(readAssetEffectivePriceE6).mock.calls.map((c) => c[1])).toEqual([0]);
+    vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => null);
+  });
+
+  it('lot scale: a non-default lot_exp market is stored as a per-token price; a default market is unchanged', async () => {
+    // The engine price is per 10^lot_exp units (prog tiny-price format). 300_000 atoms at lot_exp 6 is $3e-7 per
+    // token; the same atoms on a default (lot 0) market are $0.30, exactly as before.
+    vi.mocked(readAssetEffectivePriceE6).mockImplementation((_raw, assetIndex) => (assetIndex === 0 ? 300_000 : null));
+    for (const [lot, expected] of [[6, 3e-7], [0, 0.3]] as const) {
+      insertTradeRow.mockClear();
+      const slab = buildMarket(LAYOUT_V22, { slots: 1 });
+      slab[LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + LAYOUT_V22.wrapperSlot.profileLotExp] = lot;
+      const tx = {
+        signature: SIG,
+        instructions: makeBaseInstructions(),
+        innerInstructions: [],
+        accountData: [{ account: SLAB, data: Buffer.from(slab).toString('base64') }],
+        logs: [],
+      };
+      await app.fetch(makeRequest([tx]));
+      const row = insertTradeRow.mock.calls.at(-1)![0];
+      expect(row.price).toBeCloseTo(expected, 15);
+      if (lot === 0) expect(row.price).toBe(300_000 / 1_000_000);
+    }
     vi.mocked(readAssetEffectivePriceE6).mockImplementation(() => null);
   });
 
