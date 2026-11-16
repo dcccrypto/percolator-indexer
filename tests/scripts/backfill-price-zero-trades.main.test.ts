@@ -95,6 +95,8 @@ vi.mock("@percolatorct/sdk", () => ({
   detectSlabLayout: (len: number) => {
     if (len === 2048) return { engineOff: 640, engineMarkPriceOff: 400, configMarkEwmaOff: null };
     if (len === 1024) return { engineOff: 0, engineMarkPriceOff: -1, configMarkEwmaOff: 100 };
+    // ewma offset runs past the buffer end
+    if (len === 256) return { engineOff: 0, engineMarkPriceOff: -1, configMarkEwmaOff: 252 };
     if (len === 512) return { engineOff: 0, engineMarkPriceOff: 508, configMarkEwmaOff: null };
     return null;
   },
@@ -419,6 +421,64 @@ describe("backfill main()", () => {
     const out = logs.join("\n");
     expect(out).toContain("2 updated, 0 DB error(s), 0 skipped");
     expect(out).toContain("1 update(s) matched no row");
+  });
+
+  it("falls through to the ewma field only when it holds a plausible price", async () => {
+    trades = [
+      trade("noacc", "sigNoAcc"),
+      trade("ewzero", "sigEwZero"),
+      trade("ewhuge", "sigEwHuge"),
+      trade("ewok", "sigEwOk"),
+      trade("ewshort", "sigEwShort"),
+    ];
+    fetchMock.mockResolvedValue(
+      jsonResponse([
+        { signature: "sigNoAcc" }, // no accountData at all
+        enhanced("sigEwZero", blob(1024, 100, 0n)),
+        enhanced("sigEwHuge", blob(1024, 100, 1_000_000_000_000n)),
+        enhanced("sigEwOk", blob(1024, 100, 4_000_000n)),
+        enhanced("sigEwShort", blob(256, 0, 7n)),
+      ]),
+    );
+    const { main } = await loadMain();
+    await main();
+    expect(updateCalls.map((c) => [c.filters.find(([k]) => k === "id")![1], c.patch.price])).toEqual([
+      ["ewok", 4],
+    ]);
+    expect(logs.join("\n")).toContain("1 to update, 4 skipped");
+  });
+
+  it("counts an update returning null data as unmatched, and logs a message-less batch failure", async () => {
+    trades = [trade("t1", "sigA")];
+    fetchMock.mockResolvedValue(jsonResponse([enhanced("sigA", blob(2048, 1040, 1_000_000n))]));
+    updateOutcome = () => ({ error: null, data: null });
+    const { main } = await loadMain();
+    await main();
+    expect(updateCalls).toHaveLength(1);
+    expect(logs.join("\n")).toContain("0 updated, 0 DB error(s)");
+    expect(logs.join("\n")).toContain("1 update(s) matched no row");
+  });
+
+  it("logs a Helius batch rejection that carries no message", async () => {
+    trades = [trade("t1", "sigA")];
+    fetchMock.mockRejectedValue(undefined);
+    const { main } = await loadMain();
+    await main();
+    expect(logs.join("\n")).toContain("Helius batch fetch failed");
+    expect(updateCalls).toHaveLength(0);
+  });
+
+  it("auto-runs when invoked directly and exits 1 on a fatal error", async () => {
+    heliusKey = "";
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as any);
+    const { fileURLToPath } = await import("node:url");
+    const script = fileURLToPath(new URL("../../src/scripts/backfill-price-zero-trades.ts", import.meta.url));
+    vi.resetModules();
+    process.argv = ["node", script];
+    await import("../../src/scripts/backfill-price-zero-trades.js");
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(logs.join("\n")).toContain("Fatal: Error: HELIUS_API_KEY is required");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not auto-run when imported", async () => {
