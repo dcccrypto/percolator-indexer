@@ -71,4 +71,42 @@ describe("recordV22LogEvents", () => {
     insertV22Events.mockRejectedValueOnce(new Error("db down"));
     await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toMatchObject({ status: "not_applicable", rows: 0 });
   });
+
+  it("insert failure: warns once with the Error message, does NOT retry, and carries no counter metric (silent-drop pin)", async () => {
+    insertV22Events.mockRejectedValueOnce(new Error("db down"));
+    const r = await recordV22LogEvents({ ...base, signature: "SIGFAILED1234567890", logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(r).toEqual({ status: "not_applicable", rows: 0 });
+    expect(insertV22Events).toHaveBeenCalledTimes(1); // no retry
+    expect(logWarn).toHaveBeenCalledTimes(1);
+    const [msg, ctx] = logWarn.mock.calls[0];
+    expect(msg).toContain("trades unaffected");
+    expect(ctx).toEqual({ signature: "SIGFAILED1234567", error: "db down" });
+    expect(ctx).not.toHaveProperty("metric"); // visible only as a log line; nothing counts the dropped event
+  });
+
+  it("happy path without slot / blockTime: both default to null on the row", async () => {
+    const { slot: _s, blockTimeSec: _b, ...noCtx } = base;
+    const r = await recordV22LogEvents({ ...noCtx, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(r).toEqual({ status: "ok", rows: 1 });
+    expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ slot: null });
+  });
+
+  it("insert failure with a non-Error rejection is stringified", async () => {
+    insertV22Events.mockRejectedValueOnce("boom-string");
+    await recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(logWarn.mock.calls[0][1]).toMatchObject({ error: "boom-string" });
+  });
+
+  it("a failure on one transaction does not affect the next (the caller keeps going)", async () => {
+    insertV22Events.mockRejectedValueOnce(new Error("db down"));
+    const input = { ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] };
+    await recordV22LogEvents(input);
+    expect(await recordV22LogEvents({ ...input, signature: "SIG2" })).toEqual({ status: "ok", rows: 1 });
+  });
+
+  it("decoder throwing (hostile isKnownMarket) is also caught and the call resolves", async () => {
+    const r = await recordV22LogEvents({ ...base, isKnownMarket: () => { throw new Error("registry gone"); }, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(r).toEqual({ status: "not_applicable", rows: 0 });
+    expect(logWarn.mock.calls[0][1]).toMatchObject({ error: "registry gone" });
+  });
 });
