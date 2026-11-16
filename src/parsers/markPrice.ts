@@ -78,6 +78,9 @@ export async function readMarkPriceE6(
     if (assetIndex !== undefined) {
       const effective = readAssetEffectivePriceE6(data, assetIndex);
       if (effective !== null) return effective;
+      // The fallbacks below are market-wide (oracle-profile EWMA / engine mark), i.e. asset 0's mark. Never
+      // answer a request for asset N > 0 with another asset's price.
+      if (assetIndex !== 0) return null;
     }
 
     // Desync fix 9: v17 account — detectSlabLayout returns null for v17 account sizes
