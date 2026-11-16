@@ -448,7 +448,7 @@ describe("backfill main()", () => {
     expect(logs.join("\n")).toContain("1 to update, 4 skipped");
   });
 
-  it("counts an update returning null data as unmatched, and logs a message-less batch failure", async () => {
+  it("counts an update returning null data as unmatched", async () => {
     trades = [trade("t1", "sigA")];
     fetchMock.mockResolvedValue(jsonResponse([enhanced("sigA", blob(2048, 1040, 1_000_000n))]));
     updateOutcome = () => ({ error: null, data: null });
@@ -459,12 +459,13 @@ describe("backfill main()", () => {
     expect(logs.join("\n")).toContain("1 update(s) matched no row");
   });
 
-  it("logs a Helius batch rejection that carries no message", async () => {
+  it("wraps a non-Error Helius transport rejection and counts the failed batch", async () => {
     trades = [trade("t1", "sigA")];
     fetchMock.mockRejectedValue(undefined);
     const { main } = await loadMain();
     await main();
     expect(logs.join("\n")).toContain("Helius batch fetch failed");
+    expect(logs.join("\n")).toContain("failed: undefined");
     expect(updateCalls).toHaveLength(0);
   });
 
