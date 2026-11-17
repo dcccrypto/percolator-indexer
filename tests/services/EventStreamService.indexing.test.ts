@@ -36,7 +36,7 @@ vi.mock("../../src/parsers/v22Events.js", () => ({
   decodeV22Events: m.decodeV22,
   rawInstructionsFromParsedTx: m.rawIxs,
 }));
-vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events: m.insertV22 }));
+vi.mock("../../src/db/insertV22Events.js", async (orig) => ({ ...(await orig<typeof import("../../src/db/insertV22Events.js")>()), insertV22EventsWithRetry: m.insertV22 }));
 vi.mock("../../src/services/v22LogEvents.js", () => ({ recordV22LogEvents: m.recordLog }));
 vi.mock("../../src/parsers/matcherFill.js", () => ({ resolveCpiLeg: m.resolveCpi }));
 vi.mock("../../src/lib/matcherCtx.js", () => ({ makeMatcherContextReader: () => vi.fn() }));

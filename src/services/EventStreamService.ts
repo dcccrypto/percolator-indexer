@@ -9,7 +9,7 @@ import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/pe
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
 import { resolveLotExp, perTokenPrice, cachedLotExp } from "../parsers/lotScale.js";
 import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
-import { insertV22Events } from "../db/insertV22Events.js";
+import { insertV22EventsWithRetry, V22EventWriteError } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
@@ -121,6 +121,7 @@ export class EventStreamService {
 
     // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
     // a failure here must never cost the tx's fills below.
+    let v22WriteFailed = false;
     try {
       const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
       const events = decodeV22Events(wrapperIxs, {
@@ -128,9 +129,16 @@ export class EventStreamService {
         slot: typeof tx.slot === "number" ? tx.slot : null,
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
       }).filter((e) => !e.slab_address || (this.slabSet.has(e.slab_address) && !isBlockedSlab(e.slab_address)));
-      if (events.length > 0) await insertV22Events(events);
+      if (events.length > 0) {
+        try {
+          await insertV22EventsWithRetry(events);
+        } catch (err) {
+          if (!(err instanceof V22EventWriteError)) throw err;
+          v22WriteFailed = true; // retries exhausted (counted + alerted); surfaced after the fills are indexed
+        }
+      }
       // v2.2 wrapper LOG events (fills / reductions / moves), strict frame attribution; separate write, VERSION-keyed.
-      await recordV22LogEvents({
+      const logRes = await recordV22LogEvents({
         signature,
         err: tx.meta?.err ?? null,
         logMessages: tx.meta?.logMessages,
@@ -140,10 +148,18 @@ export class EventStreamService {
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
         isKnownMarket: (slab) => this.slabSet.has(slab),
       });
+      if (logRes.status === "write_failed") v22WriteFailed = true;
     } catch (err) {
       log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
     }
 
+    // The fills are indexed first and unconditionally; a v22 write that failed after its retries is surfaced AFTER them
+    // (the handler logs it as "handler failed"; the failure is counted and alerted in insertV22Events). Only the instruction events are retried here; the log events go through recordV22LogEvents, which reports "write_failed" once.
+    await this.indexFills(tx, signature);
+    if (v22WriteFailed) throw new Error(`v22_events write failed after retries for ${signature.slice(0, 16)}`);
+  }
+
+  private async indexFills(tx: any, signature: string): Promise<void> {
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
 
     // Collect this tx's rows and write them in one round-trip at the end, instead
