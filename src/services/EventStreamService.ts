@@ -315,6 +315,18 @@ export class EventStreamService {
     } catch (err) {
       // Whole batch failed — nothing was written, so emit nothing.
       log.warn("insertTradeRows failed", { sig: signature, count: rows.length, err: String(err) });
+      // Record the signature so it can be re-indexed by hand (recorded, not auto-retried): without this, with the RPC poller disabled
+      // (or the sig outside its look-back) the fill is lost silently.
+      try {
+        await recordSkippedSignatures([{
+          signature,
+          source: "trade-indexer",
+          slab: rows[0].slab_address,
+          error: `insertTradeRows failed: ${String(err)}`.slice(0, 480),
+        }]);
+      } catch (recErr) {
+        log.warn("recordSkippedSignatures failed", { sig: signature, err: String(recErr) });
+      }
       return;
     }
 
