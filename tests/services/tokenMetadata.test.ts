@@ -150,3 +150,23 @@ describe("placeholderIdentity", () => {
     expect(placeholderIdentity("ABCDEFGHIJKLMNOP")).toEqual({ symbol: "UNKNOWN", name: "Market ABCDEFGH" });
   });
 });
+
+describe("decimals and surrogate-safe truncation", () => {
+  it("accepts only integer decimals in 0..255 (u8)", async () => {
+    for (const bad of [-1, 6.5, 256, 300, 1e20]) {
+      mockFetch({ result: { token_info: { decimals: bad } } });
+      expect((await fetchDasTokenMetadata(HELIUS, MINT))?.decimals).toBeNull();
+    }
+    for (const good of [0, 9, 255]) {
+      mockFetch({ result: { token_info: { decimals: good } } });
+      expect((await fetchDasTokenMetadata(HELIUS, MINT))?.decimals).toBe(good);
+    }
+  });
+
+  it("never cuts a surrogate pair in half", () => {
+    const out = sanitizeText("a" + "😀".repeat(5), 4)!;
+    expect(out).toBe("a😀😀😀");
+    expect(Array.from(out)).toHaveLength(4);
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(sanitizeText("😀😀", 3)!)).toBe(false);
+  });
+});
