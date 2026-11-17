@@ -54,6 +54,18 @@ describe("noteLotExps == legacy per-slot loop", () => {
     same(new Uint8Array(4096));
     same(stampHeader(new Uint8Array(LAYOUT_V22.marketGroupOff + 4), 1, LAYOUT_V22.version));
   });
+  it("header/length edges: unknown version, cross-layout header, lengths around slotsBase and slot multiples", () => {
+    const base = LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen;
+    for (const len of [base - 1, base, base + 1, base + LAYOUT_V22.assetSlotStride - 1, base + LAYOUT_V22.assetSlotStride, base + LAYOUT_V22.assetSlotStride + 1]) {
+      const d = new Uint8Array(len).fill(3);
+      stampHeader(d, 1, LAYOUT_V22.version);
+      same(d);
+    }
+    for (const v of [0, 20, 65535]) same(stampHeader(new Uint8Array(base + 3 * LAYOUT_V22.assetSlotStride).fill(2), 1, v));
+    same(stampHeader(new Uint8Array(base + 3 * LAYOUT_V22.assetSlotStride).fill(2), 1, LAYOUT_V21.version));
+    same(stampHeader(new Uint8Array(base + 3 * LAYOUT_V22.assetSlotStride).fill(2), 3, LAYOUT_V22.version));
+    // SDK-mirroring note: noteLotExps copies resolveMarketGeometry/lotExpOfMarketV22 offsets; this file is the drift guard.
+  });
   it("random-byte buffers (random, and valid header + random body)", () => {
     let s = 0x9e3779b9;
     const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) >>> 0);
