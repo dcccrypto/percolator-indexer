@@ -23,6 +23,7 @@ import {
   LAYOUTS_BY_VERSION,
   V17_ASSET_ORACLE_PROFILE_LEN,
   V17_HEADER_LEN,
+  V17_WRAPPER_CONFIG_LEN,
   type LayoutTable,
   type MarketGeometry,
 } from "@percolatorct/sdk";
@@ -115,10 +116,15 @@ export function registrationSliceLen(): number {
  * `mark_ewma_e6` of a wrapper market account (the fill-price proxy), VERSION-guarded: the wrapper config block
  * is the same 576 B in v2.1 and v2.2, but it is only read once the VERSION is known. Returns the raw e6 value.
  *
- * @throws UnknownLayoutError for an unknown VERSION / wrong kind.
+ * @throws UnknownLayoutError for an unknown VERSION / wrong kind / buffer shorter than header + config.
  */
 export function readMarkEwmaE6(data: Uint8Array, parser: string): bigint {
-  resolveLayout(data, { parser, kind: ACCOUNT_KIND.Market });
+  const layout = resolveLayout(data, { parser, kind: ACCOUNT_KIND.Market });
+  // resolveLayout only needs the 16 B header; the config block is another 576 B. Typed, so a truncated buffer is loud per market.
+  const need = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN;
+  if (data.length < need) {
+    throw new UnknownLayoutError("TOO_SHORT", parser, `market too short for the wrapper config: ${data.length} < ${need}`, { version: layout.version, kind: ACCOUNT_KIND.Market });
+  }
   return parseWrapperConfigV17(data, V17_HEADER_LEN).markEwmaE6;
 }
 

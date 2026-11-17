@@ -73,6 +73,19 @@ describe("readMarkEwmaE6", () => {
   });
 });
 
+describe("readMarkEwmaE6: short buffers", () => {
+  it.each([[LAYOUT_V21], [LAYOUT_V22]])("a header-valid buffer shorter than header+576 B is a typed TOO_SHORT, not a plain Error", (L) => {
+    const full = buildMarket(L, { markEwmaE6: 5n });
+    for (const n of [16, 20, 591]) {
+      let caught: unknown = null;
+      try { readMarkEwmaE6(full.slice(0, n), "t"); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(UnknownLayoutError);
+      expect((caught as UnknownLayoutError).code).toBe("TOO_SHORT");
+    }
+    expect(readMarkEwmaE6(full.slice(0, 592), "t")).toBe(5n);
+  });
+});
+
 describe("reportUnknownLayout", () => {
   it("handles UnknownLayoutError (counted, deduped per account+code+version), returns false for anything else", () => {
     const err = (() => { try { readMarketGroupFields(buildMarket(LAYOUT_V22, {}, 20), "t"); } catch (e) { return e; } return null; })();
