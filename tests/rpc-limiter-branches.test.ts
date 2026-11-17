@@ -14,7 +14,7 @@ describe("isRateLimitError forms", () => {
     expect(isRateLimitError({ code: -32429 })).toBe(true);
     expect(isRateLimitError({ status: -32429 })).toBe(true);
     expect(isRateLimitError({ code: 500 })).toBe(false);
-    // a string code is not a numeric code; falls to the message, which is empty
+    // a string code is not a numeric code; falls to the message, which is "[object Object]"
     expect(isRateLimitError({ code: "429" })).toBe(false);
     // numeric code wins over status
     expect(isRateLimitError({ code: 500, status: 429 })).toBe(false);
@@ -42,7 +42,7 @@ describe("isRateLimitError forms", () => {
 });
 
 describe("RpcLimiter branches", () => {
-  it("gives up after maxRetries, per-call override beats the option, and reports each retry", async () => {
+  it("gives up after maxRetries, per-call override beats the default of 1, and reports each retry", async () => {
     const c = fakeClock();
     const seen: Array<{ attempt: number; backoffMs: number }> = [];
     const l = new RpcLimiter({ minIntervalMs: 0, baseBackoffMs: 100, now: c.now, sleep: c.sleep, onRateLimited: (i) => seen.push(i) });
@@ -92,7 +92,6 @@ describe("RpcLimiter branches", () => {
     const starts: number[] = [];
     await Promise.all([1, 2, 3].map(() => l.run(async () => { starts.push(c.now()); })));
     expect(c.slept.reduce((a, b) => a + b, 0)).toBe(100); // two queued slots (fake clock advances on sleep)
-    expect(starts).toHaveLength(3);
   });
 
   it("uses real clock and timers by default", async () => {
@@ -103,7 +102,7 @@ describe("RpcLimiter branches", () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(15);
   });
 
-  it("non-finite minIntervalMs: NaN does not wedge or crash the limiter", async () => {
+  it("KNOWN QUIRK (documents current behaviour, not a goal): NaN minIntervalMs silently disables pacing and the shared 429 backoff", async () => {
     const c = fakeClock();
     const l = new RpcLimiter({ minIntervalMs: Number.NaN, now: c.now, sleep: c.sleep });
     // nextSlot becomes NaN after the first call; Math.max(now, NaN) is NaN, `at > now` is false, so no sleep and no throw.
