@@ -172,8 +172,8 @@ describe("HeliusWebhookManager", () => {
 
     it("repeated reRegister during a list outage never POSTs", async () => {
       mockFetch.mockResolvedValue(mockResponse("down", { ok: false, status: 503 }));
-      await manager.reRegister();
-      await manager.reRegister();
+      expect((await manager.reRegister()).ok).toBe(false);
+      expect((await manager.reRegister()).ok).toBe(false);
       expect(posts()).toBe(0);
     });
   });
