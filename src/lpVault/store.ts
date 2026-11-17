@@ -196,6 +196,8 @@ interface EventRow {
   lp_amount: string | null;
 }
 
+const PAGE_SIZE = 1_000;
+const MAX_EVENTS = 10_000;
 /** numeric columns are selected ::text so u128 values never pass through a JS number. */
 const POSITION_COLUMNS = [
   "network", "registry", "user_wallet", "market_slab", "lp_mint",
@@ -233,19 +235,29 @@ export class SupabaseLpVaultStore implements LpVaultStore {
   }
 
   async loadEvents(network: string, registry: string, user: string): Promise<StoredEvent[]> {
-    const { data, error } = await this.db
-      .from("lp_vault_events")
-      .select("signature,ix_index,kind,slot,market_slab,lp_mint,collateral_atoms::text,lp_amount::text")
-      .eq("network", network)
-      .eq("registry", registry)
-      .eq("user_wallet", user)
-      .order("slot", { ascending: true })
-      .limit(10_000);
-    if (error) throw new Error(`lp_vault_events select: ${error.message}`);
-    const rows = (data ?? []) as unknown as EventRow[];
-    if (rows.length >= 10_000) {
-      // A fold over a truncated history would be silently wrong. Refuse instead.
-      throw new Error(`lp_vault_events: ${registry}/${user} has >= 10000 events; fold refused`);
+    // PostgREST silently caps every response at its max_rows (Supabase default 1000), so a
+    // single .limit() read can return a truncated history with no error. Page with .range()
+    // under a total order and advance by what the server actually returned.
+    const rows: EventRow[] = [];
+    for (;;) {
+      const { data, error } = await this.db
+        .from("lp_vault_events")
+        .select("signature,ix_index,kind,slot,market_slab,lp_mint,collateral_atoms::text,lp_amount::text")
+        .eq("network", network)
+        .eq("registry", registry)
+        .eq("user_wallet", user)
+        .order("slot", { ascending: true })
+        .order("signature", { ascending: true })
+        .order("ix_index", { ascending: true })
+        .range(rows.length, rows.length + PAGE_SIZE - 1);
+      if (error) throw new Error(`lp_vault_events select: ${error.message}`);
+      const page = (data ?? []) as unknown as EventRow[];
+      if (page.length === 0) break;
+      rows.push(...page);
+      if (rows.length >= MAX_EVENTS) {
+        // A fold over a truncated history would be silently wrong. Refuse instead.
+        throw new Error(`lp_vault_events: ${registry}/${user} has >= ${MAX_EVENTS} events; fold refused`);
+      }
     }
     return rows.map((r) => ({
       kind: r.kind,
@@ -279,15 +291,23 @@ export class SupabaseLpVaultStore implements LpVaultStore {
   }
 
   async listOpenPositions(network: string, registry: string): Promise<PositionRow[]> {
-    const { data, error } = await this.db
-      .from("lp_vault_positions")
-      .select(POSITION_COLUMNS)
-      .eq("network", network)
-      .eq("registry", registry)
-      .or("lp_shares.gt.0,onchain_lp_shares.gt.0")
-      .limit(5_000);
-    if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
-    return (data ?? []) as unknown as PositionRow[];
+    // Paged for the same max_rows reason as loadEvents; user_wallet is unique per (network, registry).
+    const out: PositionRow[] = [];
+    for (;;) {
+      const { data, error } = await this.db
+        .from("lp_vault_positions")
+        .select(POSITION_COLUMNS)
+        .eq("network", network)
+        .eq("registry", registry)
+        .or("lp_shares.gt.0,onchain_lp_shares.gt.0")
+        .order("user_wallet", { ascending: true })
+        .range(out.length, out.length + PAGE_SIZE - 1);
+      if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
+      const page = (data ?? []) as unknown as PositionRow[];
+      if (page.length === 0) break;
+      out.push(...page);
+    }
+    return out;
   }
 
   // GH#231: best-effort on purpose. `lp_vault_sync_cursor` is applied by hand like
