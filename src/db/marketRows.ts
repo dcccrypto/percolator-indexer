@@ -77,9 +77,10 @@ async function readAll(): Promise<MarketRowLite[]> {
     if (error) throw error;
     const rows = (data ?? []) as MarketRowLite[];
     out.push(...rows);
-    // A short page is the last one. (Assumes the project's PostgREST max_rows >= MARKET_ROWS_PAGE;
-    // Supabase's default is 1000. A lower cap would end the read after its first page.)
-    if (rows.length < MARKET_ROWS_PAGE) return out;
+    // Only an empty page ends the read. A short page is NOT the last one: if the project's
+    // PostgREST max_rows is below MARKET_ROWS_PAGE every response is capped short, and stopping
+    // there would silently drop every later market. Costs one extra (empty) read per call.
+    if (rows.length === 0) return out;
     after = rows[rows.length - 1].slab_address;
   }
 }
