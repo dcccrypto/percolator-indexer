@@ -48,7 +48,8 @@ export function noteMarketLayout(slab: string, data: Uint8Array): void {
     const prev = notes.get(slab);
     // A partial read (light slice, or a buffer cut inside a later slot) carries only some slots: merge over the
     // generations an earlier read of the SAME layout recorded. A different VERSION drops the old layout's slots.
-    const merged = prev && prev.version === g.layout.version ? new Map([...prev.generations, ...generations]) : generations;
+    if (prev && prev.version === g.layout.version) for (const [k, v] of prev.generations) if (!generations.has(k)) generations.set(k, v);
+    const merged = generations;
     if (prev) notes.delete(slab); // re-insert so Map order is least-recently-noted first
     else if (notes.size >= MAX_MARKET_NOTES) {
       const oldest = notes.keys().next().value;

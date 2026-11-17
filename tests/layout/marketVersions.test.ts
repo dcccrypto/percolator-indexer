@@ -86,7 +86,7 @@ describe("noteMarketLayout edge branches", () => {
 
   it("at the cap an already-noted slab is refreshed in place (no eviction) and kept as most recent", () => {
     const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 1n);
-    for (let i = 0; i < 20_000; i++) noteMarketLayout(`cap${i}`, d);
+    for (let i = 0; i < MAX_MARKET_NOTES; i++) noteMarketLayout(`cap${i}`, d);
     noteMarketLayout("cap0", d);
     expect(marketVersionOf("cap0")).toBe(19);
     expect(marketNotesEvicted()).toBe(0);
