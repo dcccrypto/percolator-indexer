@@ -33,7 +33,7 @@ type Out = { ok: true; v: unknown } | { ok: false; e: string };
 const run = (f: () => unknown): Out => {
   try { return { ok: true, v: f() }; } catch (e) { return { ok: false, e: `${(e as Error)?.name}: ${(e as Error)?.message}` }; }
 };
-// bigint-safe JSON so a deep-equal difference shows up as a string diff too
+// toEqual deep-compares bigint and Uint8Array too, so any output or error difference fails the test
 const same = (a: Out, b: Out): void => { expect(b).toEqual(a); };
 
 function both(parsed: unknown, enhanced: unknown, ids: string[]): void {

@@ -41,7 +41,8 @@ const B58_INDEX = new Int8Array(128).fill(-1);
 for (let i = 0; i < B58_ALPHABET.length; i++) B58_INDEX[B58_ALPHABET.charCodeAt(i)] = i;
 
 /**
- * Base58 decode with output identical to `decodeBase58` from @percolatorct/shared (null on a character outside the
+ * Base58 decode with output identical to `decodeBase58` from @percolatorct/shared ^1.1.0 (pinned by the differential and
+ * op-count tests; re-check if shared changes) (null on a character outside the
  * alphabet; leading '1's are leading zero bytes). The shared one grows a plain array with `unshift` and does an
  * `indexOf` per character; this one fills a preallocated Uint8Array from the end. Non-string input is delegated to the
  * shared function so odd inputs behave exactly as before.
