@@ -166,4 +166,20 @@ describe("createHealthChecker edge paths", () => {
     expect(a.cached).toBe(false);
     expect(b.cached).toBe(true);
   });
+
+  describe("clock stepped backwards", () => {
+    it("does not serve a stale 'ok' as cached after the clock steps back", async () => {
+      let clock = 1_000_000;
+      let dbUp = true;
+      const probeDb = vi.fn(async () => dbUp);
+      const check = createHealthChecker({ probeRpc: async () => true, probeDb, ttlMs: 5000, now: () => clock });
+      expect((await check()).status).toBe("ok");
+      dbUp = false;
+      clock -= 60_000; // NTP step back
+      const res = await check();
+      expect(res.cached).toBe(false);
+      expect(res.status).toBe("degraded");
+      expect(probeDb).toHaveBeenCalledTimes(2);
+    });
+  });
 });
