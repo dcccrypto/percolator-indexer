@@ -84,12 +84,15 @@ describe("noteMarketLayout edge branches", () => {
     }
   });
 
-  it("at the 20,000-note cap a NEW slab is dropped but an already-noted slab is still refreshed", () => {
+  it("at the cap an already-noted slab is refreshed in place (no eviction) and kept as most recent", () => {
     const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 1n);
     for (let i = 0; i < 20_000; i++) noteMarketLayout(`cap${i}`, d);
+    noteMarketLayout("cap0", d);
+    expect(marketVersionOf("cap0")).toBe(19);
+    expect(marketNotesEvicted()).toBe(0);
     noteMarketLayout("overflow", d);
-    expect(marketVersionOf("overflow")).toBeNull();
-    expect(marketVersionOf("cap19999")).toBe(19);
+    expect(marketVersionOf("cap0")).toBe(19);
+    expect(marketVersionOf("cap1")).toBeNull();
     noteMarketLayout("cap0", withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 2n));
     expect(assetGenerationOf("cap0", 0)).toBe(2n);
   });
