@@ -39,3 +39,35 @@ describe("BoundedTtlMap (replaces clear() at 2000 entries)", () => {
     expect(m.get("a")).toBeUndefined();
   });
 });
+
+describe("BoundedTtlMap characterization (J-20261117-IDX-BUG-TTLMAPCLOCK)", () => {
+  it("lead 1: a clock stepping back keeps the entry fresh until the clock catches up (age < 0)", () => {
+    let t = 10_000;
+    const m = new BoundedTtlMap<string, number>(4, 100, () => t);
+    m.set("a", 1);
+    t = 5_000; // step back 5s, far more than ttl
+    expect(m.get("a")).toBe(1);
+    t = 10_101; // real elapsed past ttl
+    expect(m.get("a")).toBeUndefined();
+  });
+  it("lead 2: NaN ttl never expires, NaN max never evicts, max<=0 evicts everything", () => {
+    let t = 0;
+    const n = new BoundedTtlMap<string, number>(4, NaN, () => t);
+    n.set("a", 1); t = 1e12;
+    expect(n.get("a")).toBe(1);
+    const u = new BoundedTtlMap<string, number>(NaN, 100);
+    for (let i = 0; i < 50; i++) u.set(String(i), i);
+    expect(u.size).toBe(50);
+    const z = new BoundedTtlMap<string, number>(-1, 100);
+    z.set("a", 1);
+    expect(z.get("a")).toBeUndefined();
+  });
+  it("lead 3: size includes expired entries until they are read", () => {
+    let t = 0;
+    const m = new BoundedTtlMap<string, number>(10, 100, () => t);
+    m.set("a", 1); m.set("b", 1); t = 500;
+    expect(m.size).toBe(2);
+    expect(m.get("a")).toBeUndefined();
+    expect(m.size).toBe(1);
+  });
+});
