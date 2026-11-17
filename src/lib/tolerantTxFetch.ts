@@ -71,6 +71,8 @@ export function createBreakerTracker(k: number, onAlert: (key: string, consecuti
   held(key: string): number;
   clear(key: string): void;
 } {
+  // k < 1 / NaN would make `n % k` NaN and the alert never fire: treat as 1 (alert on every held poll).
+  if (!(k >= 1)) k = 1;
   const counts = new Map<string, number>();
   return {
     held(key) {
@@ -87,8 +89,10 @@ export function createBreakerTracker(k: number, onAlert: (key: string, consecuti
 
 /** K from the environment (default 10). */
 export function breakerAlertPolls(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.INDEXER_BREAKER_ALERT_POLLS);
-  return Number.isInteger(n) && n >= 1 ? n : 10;
+  const raw = env.INDEXER_BREAKER_ALERT_POLLS;
+  if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) return 10;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 1 ? n : 10;
 }
 
 export interface TxFetcher<T> {
