@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { ASSET_STATE_MARKET_ID_OFF, assetGenerationOf, marketVersionOf, noteMarketLayout, resetMarketLayoutNotes } from "../../src/layout/marketVersions.js";
+import { ASSET_STATE_MARKET_ID_OFF, MAX_MARKET_NOTES, assetGenerationOf, marketNotesEvicted, marketVersionOf, noteMarketLayout, resetMarketLayoutNotes } from "../../src/layout/marketVersions.js";
 import { registrationSliceLen } from "../../src/layout/resolve.js";
 import { LAYOUT_V21, LAYOUT_V22, REAL_MARKET_V21, buildMarket, stampHeader } from "../helpers/v22Fixtures.js";
 
@@ -95,3 +95,39 @@ describe("noteMarketLayout edge branches", () => {
   });
 });
 
+
+describe("IDX-BUG-MARKETVERSIONSCAP leads", () => {
+  const slotOff = (i: number) => LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + i * LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlotLen + ASSET_STATE_MARKET_ID_OFF;
+
+  it("lead 2: a partial read holding fewer slots keeps the generations of the higher slots from an earlier full read", () => {
+    const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 3 }), LAYOUT_V22, 0, 3n);
+    withGeneration(d, LAYOUT_V22, 1, 4n);
+    withGeneration(d, LAYOUT_V22, 2, 5n);
+    noteMarketLayout("P", d);
+    const partial = withGeneration(buildMarket(LAYOUT_V22, { slots: 3 }), LAYOUT_V22, 0, 8n);
+    noteMarketLayout("P", partial.subarray(0, slotOff(1) - 4)); // slot 0 whole only
+    expect(assetGenerationOf("P", 0)).toBe(8n);
+    expect(assetGenerationOf("P", 1)).toBe(4n);
+    expect(assetGenerationOf("P", 2)).toBe(5n);
+  });
+
+  it("lead 3: a light read carrying a different VERSION does not keep generations of the old layout", () => {
+    noteMarketLayout("V", REAL_MARKET_V21);
+    expect(assetGenerationOf("V", 0)).not.toBeNull();
+    const d = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("V", d.subarray(0, registrationSliceLen()));
+    expect(marketVersionOf("V")).toBe(19);
+    expect(assetGenerationOf("V", 0)).toBeNull();
+  });
+
+  it("lead 1: at the cap a NEW slab is still noted (oldest evicted) and the eviction is counted", () => {
+    const d = buildMarket(LAYOUT_V22, { slots: 1 });
+    for (let i = 0; i < MAX_MARKET_NOTES; i++) noteMarketLayout(`s${i}`, d);
+    expect(marketNotesEvicted()).toBe(0);
+    noteMarketLayout("fresh", d);
+    expect(marketVersionOf("fresh")).toBe(19);
+    expect(marketVersionOf("s0")).toBeNull();
+    expect(marketVersionOf("s1")).toBe(19);
+    expect(marketNotesEvicted()).toBe(1);
+  });
+});
