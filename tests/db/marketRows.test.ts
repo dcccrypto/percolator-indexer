@@ -95,6 +95,7 @@ describe("marketRows", () => {
     setTotal(1000);
     const rows = await getMarketRows();
     expect(rows).toHaveLength(1000);
+    expect(calls).toHaveLength(5); // 4 capped pages + terminating empty page
     expect(new Set(rows.map((r) => r.slab_address)).size).toBe(1000);
     expect(rows.map((r) => r.slab_address)).toEqual([...table].sort());
   });
