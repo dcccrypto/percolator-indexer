@@ -27,15 +27,31 @@ function network(): string | null {
   }
 }
 
-/** slab -> newest fully processed signature. Empty on any failure. */
+/** Rows per read. Must be <= the project's PostgREST max_rows (1000 in supabase/config.toml), which caps a response whatever .limit asks for. */
+export const TRADE_CURSOR_PAGE = 1000;
+
+/**
+ * slab -> newest fully processed signature, paged with .range over a stable order (as traderNetPosition.ts does).
+ * Never throws: on a failed page it returns the cursors read so far. A missing cursor only makes that slab re-scan its
+ * newest window (RPC cost; trade writes are deduped by the unique leg index), so a partial map is safe.
+ */
 export async function loadTradeCursors(): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const net = network();
   if (!net) return out;
   try {
-    const { data, error } = await getSupabase().from("trade_indexer_cursor").select("slab_address,signature").eq("network", net).limit(10_000);
-    if (error) throw new Error(error.message);
-    for (const r of (data ?? []) as { slab_address: string; signature: string }[]) out.set(r.slab_address, r.signature);
+    for (let from = 0; ; from += TRADE_CURSOR_PAGE) {
+      const { data, error } = await getSupabase()
+        .from("trade_indexer_cursor")
+        .select("slab_address,signature")
+        .eq("network", net)
+        .order("slab_address", { ascending: true })
+        .range(from, from + TRADE_CURSOR_PAGE - 1);
+      if (error) throw new Error(error.message);
+      const rows = (data ?? []) as { slab_address: string; signature: string }[];
+      for (const r of rows) out.set(r.slab_address, r.signature);
+      if (rows.length < TRADE_CURSOR_PAGE) break;
+    }
   } catch (err) {
     unavailable("load", err instanceof Error ? err.message : String(err));
   }
