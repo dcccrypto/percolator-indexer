@@ -24,6 +24,7 @@ import { IN_CHUNK, fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiF
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
@@ -60,6 +61,8 @@ function markFailed(pass: PassState, sig: string | null | undefined): void {
   (pass.failedSigs ??= new Set()).add(sig ?? "?");
 }
 const FLUSH_AT = 200;
+/** Polls a signature may hold the cursor for an unreadable market account before it is recorded for re-index. */
+const MAX_LOT_READ_HOLDS = 5;
 
 /**
  * A failed DB write holds the slab's cursor so the same signatures are retried every poll. It never gives up on
@@ -231,6 +234,8 @@ export class TradeIndexerPolling {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+  /** signature -> polls held because the market account (lot_exp) was unreadable. Bounded by MAX_LOT_READ_HOLDS. */
+  private lotReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   /** signature -> parsed transaction, shared by every slab whose window contains it (see TX_CACHE_MAX). */
   private txCache = new BoundedTtlMap<string, ParsedTransactionWithMeta>(TX_CACHE_MAX, TX_CACHE_TTL_MS);
   private rpcLimiter = new RpcLimiter({
@@ -866,6 +871,15 @@ export class TradeIndexerPolling {
       ? { programId: String(returnDataRaw.programId), data: Uint8Array.from(Buffer.from(returnDataRaw.data[0], "base64")) }
       : null;
     const unverified: string[] = [];
+    // An unreadable market account (temporary RPC failure) must not skip the fill for good: hold the cursor like a
+    // matcher-context read error (all-or-nothing per tx; later legs are not written, so the stored-count dedup cannot
+    // mistake the unwritten leg for stored). Bounded so a market that no longer exists cannot pin the cursor forever.
+    let lotReadFailed = false;
+    const holdForLotExp = (): boolean => {
+      if ((this.lotReadAttempts.get(signature) ?? 0) >= MAX_LOT_READ_HOLDS) return false;
+      retryNeeded = true; lotReadFailed = true;
+      return true;
+    };
 
     for (const [ixIdx, ix] of message.instructions.entries()) {
       // Skip parsed instructions (system, token, etc.)
@@ -1011,14 +1025,16 @@ export class TradeIndexerPolling {
               continue;
             }
             if (r.kind === "fill") {
+              const lot = await this.lotExpForCpi(slabAddress, leg.assetIndex);
+              if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
               legSize = r.sizeValue;
               sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-              price = Number(r.priceE6) / 1_000_000;
+              price = perTokenPrice(r.priceE6, lot);
               if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
             } // "legacy": wire size + the existing price logic, exactly as before this parser
           }
           if (price === undefined) price = await resolvePrice(leg);
-          const fee = computeFeeUsd(legSize, price, leg.feeBps);
+          const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
           const legSizeStr = legSize.toString();
           await writeFill({
@@ -1080,14 +1096,16 @@ export class TradeIndexerPolling {
           continue; // zero fill: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          const lot = await this.lotExpForCpi(slabAddress, decoded.assetIndex);
+          if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
           sizeValue = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = Number(r.priceE6) / 1_000_000;
+          price = perTokenPrice(r.priceE6, lot);
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
       if (price === undefined) price = await resolveFallbackPrice(decoded.assetIndex);
-      const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
+      const fee = computeFeeUsd(sizeValue, perLotPrice(price, cachedLotExp(slabAddress, decoded.assetIndex)), decoded.feeBps);
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1135,10 +1153,12 @@ export class TradeIndexerPolling {
     if (retryNeeded) {
       // Transport failure reading the matcher context: do not write a size that can never be
       // corrected. Hold the cursor; the next pass re-reads (stored legs are skipped), then falls back.
-      this.ctxReadAttempts.set(signature, 1);
+      if (lotReadFailed) this.lotReadAttempts.set(signature, (this.lotReadAttempts.get(signature) ?? 0) + 1);
+      else this.ctxReadAttempts.set(signature, 1);
       throw new CtxReadRetry(signature);
     }
     this.ctxReadAttempts.delete(signature);
+    this.lotReadAttempts.delete(signature);
     return insertedAny;
   }
 
@@ -1167,6 +1187,17 @@ export class TradeIndexerPolling {
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
+  /** lot_exp for pricing a CPI fill: cache, else one slab read (primes the cache); null = unreadable, skip + retry. */
+  private lotExpForCpi(slabAddress: string, assetIndex: number): Promise<number | null> {
+    return resolveLotExp(slabAddress, assetIndex, async () => {
+      const info = await withRetry(
+        () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+        { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+      );
+      return info?.data ? new Uint8Array(info.data) : null;
+    });
+  }
+
   private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
@@ -1183,14 +1214,19 @@ export class TradeIndexerPolling {
 
       // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
       const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
-      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+      if (effectiveE6 !== null) {
+        noteLotExps(slabAddress, rawData);
+        return perTokenPrice(effectiveE6, lotExpOfSlabData(rawData, assetIndex)); // per-token: the engine price is per 10^lot_exp units
+      }
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (hasWrapperMagic(rawData)) {
         try {
           const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-            return Number(markEwmaE6) / 1_000_000;
+            // The EWMA is per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
+            noteLotExps(slabAddress, rawData);
+            return perTokenPrice(markEwmaE6, lotExpOfSlabData(rawData, assetIndex));
           }
         } catch (err) {
           // Unknown VERSION is loud (per market); the fill is skipped, never guessed.

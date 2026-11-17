@@ -17,6 +17,7 @@ import {
 type Result = { data?: unknown; error?: { message: string } | null };
 function fakeDb(result: Result) {
   const log: Array<{ table: string; op: string; args: unknown[] }> = [];
+  let pages = 0;
   const db = {
     from(table: string) {
       const q: Record<string, unknown> = {};
@@ -30,6 +31,12 @@ function fakeDb(result: Result) {
         return Promise.resolve({ data: null, error: null, ...result });
       };
       q.limit = done("limit");
+      // Paged reads: the canned result is the first page, every later page is empty.
+      q.range = (...args: unknown[]) => {
+        log.push({ table, op: "range", args });
+        const data = pages++ === 0 ? result.data ?? null : [];
+        return Promise.resolve({ data, error: null, ...(result.error ? { error: result.error } : {}) });
+      };
       q.maybeSingle = done("maybeSingle");
       q.upsert = done("upsert");
       return q;
@@ -103,7 +110,7 @@ describe("SupabaseLpVaultStore", () => {
       collateralAtoms: 2n ** 64n - 1n, lpAmount: 9n, marketSlab: "S", lpMint: "M",
     });
     expect(out[1].lpAmount).toBeNull();
-    const eqs = log.filter((l) => l.op === "eq").map((l) => l.args);
+    const eqs = log.filter((l) => l.op === "eq").map((l) => l.args).slice(0, 3);
     expect(eqs).toEqual([["network", "devnet"], ["registry", REG], ["user_wallet", USER]]);
   });
 

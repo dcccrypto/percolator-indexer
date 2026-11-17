@@ -5,6 +5,10 @@ const calls: Array<{ select: string; network: string; after: string | null; limi
 let table: string[] = [];
 /** Runs after each page is served (to simulate a concurrent write between page reads). */
 let afterPage: ((pageIndex: number) => void) | null = null;
+/** When set, the next page read resolves to this error / null data instead of the table. */
+let nextResult: { data: null; error: unknown } | null = null;
+/** When set, each page read waits on it before answering (to hold a read in flight). */
+let gate: Promise<void> | null = null;
 const slab = (i: number) => `slab${String(i).padStart(6, "0")}`;
 const setTotal = (n: number) => {
   table = Array.from({ length: n }, (_, i) => slab(i));
@@ -24,6 +28,12 @@ vi.mock("@percolatorct/shared", () => ({
       q.order = () => q;
       q.limit = async (n: number) => {
         calls.push({ select, network, after, limit: n });
+        if (gate) await gate;
+        if (nextResult) {
+          const r = nextResult;
+          nextResult = null;
+          return r;
+        }
         const page = [...table]
           .sort()
           .filter((a) => after === null || a > after)
@@ -49,6 +59,8 @@ describe("marketRows", () => {
   beforeEach(() => {
     calls.length = 0;
     afterPage = null;
+    nextResult = null;
+    gate = null;
     resetMarketRowsCache();
   });
   afterEach(() => vi.useRealTimers());
@@ -124,5 +136,66 @@ describe("marketRows", () => {
     for (let i = 0; i < 2 * MARKET_ROWS_PAGE + 5; i++) {
       if (slab(i) !== deleted) expect(rows.has(slab(i))).toBe(true);
     }
+  });
+
+  it("a rejected read clears inFlight and leaves the cache unwritten", async () => {
+    setTotal(2);
+    nextResult = { data: null, error: new Error("pg down") };
+    await expect(getMarketRows()).rejects.toThrow("pg down");
+    // Not cached: the cached variant must hit the DB again, and a new read must start (inFlight cleared).
+    expect(await getMarketRowsCached()).toHaveLength(2);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("a cached read exactly at the TTL is stale (strict < comparison)", async () => {
+    vi.useFakeTimers();
+    setTotal(2);
+    await getMarketRows();
+    vi.advanceTimersByTime(MARKET_ROWS_TTL_MS - 1);
+    await getMarketRowsCached();
+    expect(calls).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    await getMarketRowsCached();
+    expect(calls).toHaveLength(2);
+  });
+
+  it("null data with no error is treated as an empty table", async () => {
+    nextResult = { data: null, error: null };
+    expect(await getMarketRows()).toEqual([]);
+  });
+
+  it("reset during an in-flight read: the stale run's result is not cached", async () => {
+    setTotal(2);
+    let release!: () => void;
+    gate = new Promise<void>((r) => (release = r));
+    const old = getMarketRows();
+    resetMarketRowsCache();
+    table = [slab(0), slab(1), slab(2)]; // DB changed after the reset
+    release();
+    await old;
+    gate = null;
+    const before = calls.length;
+    expect(await getMarketRowsCached()).toHaveLength(3); // cache must be empty -> re-read
+    expect(calls.length).toBe(before + 1);
+  });
+
+  it("reset during an in-flight read: a newer inFlight survives the old run's finally", async () => {
+    setTotal(2);
+    let releaseOld!: () => void;
+    gate = new Promise<void>((r) => (releaseOld = r));
+    const old = getMarketRows();
+    resetMarketRowsCache();
+    let releaseNew!: () => void;
+    gate = new Promise<void>((r) => (releaseNew = r));
+    const fresh = getMarketRows();
+    releaseOld();
+    await old;
+    // fresh is still pending; a concurrent caller must share it, not start a third read.
+    const callsBefore = calls.length;
+    const shared = getMarketRows();
+    expect(shared).toBe(fresh);
+    expect(calls.length).toBe(callsBefore);
+    releaseNew();
+    await fresh;
   });
 });
