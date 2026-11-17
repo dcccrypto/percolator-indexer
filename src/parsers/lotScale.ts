@@ -104,5 +104,13 @@ export async function resolveLotExp(
   }
   if (!data) return null;
   noteLotExps(slabAddress, data);
-  return knownLotExp(slabAddress, assetIndex) ?? 0;
+  const after = knownLotExp(slabAddress, assetIndex);
+  if (after !== undefined) return after;
+  // The slot exists but its lot_exp byte is above the cap: the true scale is unknown, so defer (never price it as lot 0).
+  try {
+    lotExpOfMarketV22(data, assetIndex);
+  } catch (err) {
+    if (err instanceof RangeError && /lot_exp byte/.test(err.message)) return null;
+  }
+  return 0;
 }
