@@ -64,7 +64,7 @@ function fakeSupabase() {
       }
       const q: any = {};
       let sigs: string[] | null = null;
-      for (const m of ['select', 'neq', 'order']) q[m] = () => q;
+      for (const m of ['select', 'neq', 'order', 'gt', 'limit']) q[m] = () => q;
       q.eq = (col: string, val: unknown) => { if (col === 'tx_signature') { sigs = [String(val)]; h.storedReads.push(1); } return q; };
       q.in = (col: string, vals: string[]) => { if (col === 'tx_signature') { sigs = vals; h.storedReads.push(vals.length); } return q; };
       // Awaiting the chain without .range() is a stored-legs read (per tx via eq, or batched via in).
