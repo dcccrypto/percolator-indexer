@@ -37,7 +37,7 @@ async function load(name: string, v: string) {
 afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
 
 describe('interval env parsing', () => {
-  it.each(['0x10', '1e3', '1.5', '2147483648', '99999999999', '-5', '0', 'abc', ' '])('rejects %j', async (v) => {
+  it.each(['0x10', '1e3', '1.5', '2147483648', '86400001', '99999999999', '-5', '0', 'abc', ' '])('rejects %j', async (v) => {
     const m = await load('STATS_COLLECT_INTERVAL_MS', v);
     expect(m.COLLECT_INTERVAL_MS).toBe(60_000);
     const a = await load('STATS_AUTOCLOSE_INTERVAL_MS', v);
