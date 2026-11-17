@@ -385,3 +385,55 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
     ix.stop();
   });
 });
+
+// J-20261117-IDX-BUG-LPVAULTFAILEDWINDOW: three suspected stall leads, pinned. None is a defect (see each comment).
+describe("LpVaultIndexer failed-signature leads", () => {
+  it("lead 1: a poison tx beside only on-chain-failed txs holds the cursor, and one readable tx releases it", async () => {
+    const chain = new Chain();
+    chain.add("f1", undefined, {}, true);
+    chain.add("p1", "alice");
+    chain.txErr.set("p1", poison);
+    chain.add("f2", undefined, {}, true);
+    const { ix, store } = mk(chain);
+    // A failed tx comes from getSignatures, not a getTransaction read, so it is no evidence the reader works.
+    await expect(ix.syncRegistry(REG)).rejects.toThrow(/1 unreadable, 0 read ok/);
+    expect(store.syncCursors.size).toBe(0);
+    // Any readable sibling proves the reader is healthy: the poison tx is skipped and the cursor moves past all of it.
+    chain.add("ok", "bob");
+    const r = await ix.syncRegistry(REG);
+    expect(r.signatures).toBe(4);
+    expect([...store.syncCursors.values()][0]!.signature).toBe("ok");
+    expect(recordSkipped).toHaveBeenCalledTimes(1);
+  });
+
+  it("lead 2: a registry missing from a later discovery stays registered, and its poll is an empty no-op", async () => {
+    const chain = new Chain();
+    const { ix } = mk(chain);
+    await ix.refreshRegistries();
+    chain.registries = [];
+    await ix.refreshRegistries();
+    expect(ix.getRegistries()).toEqual([REG]);
+    // Cost of keeping it: one empty getSignatures per poll, no events, no cursor, no error.
+    chain.sigCalls.length = 0;
+    const r = await ix.syncRegistry(REG);
+    expect([r.signatures, r.events]).toEqual([0, 0]);
+    expect(chain.sigCalls).toHaveLength(1);
+  });
+
+  it("lead 3: a failed tx landing after the sync defers one reconcile; the next sync's cursor covers it and reconcile runs", async () => {
+    const chain = new Chain();
+    chain.add("s1", "alice");
+    const orig = chain.getClaim.bind(chain);
+    let spammed = false;
+    chain.getClaim = async () => { if (!spammed) { spammed = true; chain.add("spam", undefined, {}, true); } return orig(); };
+    const { ix, store } = mk(chain);
+    const a = await ix.syncRegistry(REG);
+    expect([a.reconciled, a.reconcileSkipped]).toEqual([0, 1]);
+    // The cursor window includes failed signatures, so the next pass compares against "spam" and the basis is checked.
+    const b = await ix.syncRegistry(REG);
+    expect([b.signatures, b.reconciled, b.reconcileSkipped]).toEqual([1, 0, 0]);
+    expect([...store.syncCursors.values()][0]!.signature).toBe("spam");
+    const rec = await ix.reconcileOpenPositions(REG);
+    expect(rec).toEqual({ reconciled: 1, skipped: 0 });
+  });
+});
