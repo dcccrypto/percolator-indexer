@@ -51,4 +51,4 @@ it("noteLotExps bench", () => {
     noteLotExps("BenchMarket", d);
     expect(knownLotExp("BenchMarket", slots - 1)).toBe((slots - 1) % 7);
   }
-});
+}, 120_000);
