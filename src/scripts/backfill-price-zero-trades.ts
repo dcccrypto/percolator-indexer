@@ -32,7 +32,7 @@ import { detectSlabLayout } from "@percolatorct/sdk";
 // Helius Parse Transactions batch limit
 const HELIUS_BATCH_SIZE = 100;
 
-// Rows per select page (Supabase's default max-rows is 1000)
+// Rows requested per select page. The server may return fewer (PostgREST max_rows).
 const FETCH_PAGE_SIZE = 1000;
 
 // Max concurrent Helius batches in-flight
@@ -198,7 +198,10 @@ export async function main() {
     tx_signature: string;
     price: number;
   }[] = [];
-  for (let from = 0; ; from += FETCH_PAGE_SIZE) {
+  // The server may cap a response below FETCH_PAGE_SIZE (PostgREST max_rows), so a
+  // short page does not mean the end: advance by the rows returned and stop only
+  // on an empty page.
+  for (let from = 0; ; from = trades.length) {
     const { data: page, error: fetchErr } = await supabase
       .from("trades")
       .select("id, slab_address, tx_signature, price")
@@ -212,7 +215,7 @@ export async function main() {
     if (fetchErr) throw fetchErr;
     const rows = (page ?? []) as typeof trades;
     trades.push(...rows);
-    if (rows.length < FETCH_PAGE_SIZE) break;
+    if (rows.length === 0) break;
   }
 
   console.log(`Found ${trades.length} price=0 trade(s) with tx signatures.\n`);
