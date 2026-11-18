@@ -198,6 +198,7 @@ interface EventRow {
 
 const PAGE_SIZE = 1_000;
 const MAX_EVENTS = 10_000;
+const MAX_OPEN_POSITIONS = 500_000;
 /** numeric columns are selected ::text so u128 values never pass through a JS number. */
 const POSITION_COLUMNS = [
   "network", "registry", "user_wallet", "market_slab", "lp_mint",
@@ -291,21 +292,32 @@ export class SupabaseLpVaultStore implements LpVaultStore {
   }
 
   async listOpenPositions(network: string, registry: string): Promise<PositionRow[]> {
-    // Paged for the same max_rows reason as loadEvents; user_wallet is unique per (network, registry).
+    // Paged for the same max_rows reason as loadEvents. Keyset (user_wallet > last) rather than
+    // offset: writePosition can zero a row mid-read, and an offset page would then skip a live one.
+    // user_wallet is unique per (network, registry), so it is a total order.
     const out: PositionRow[] = [];
+    let last: string | null = null;
     for (;;) {
-      const { data, error } = await this.db
+      let q = this.db
         .from("lp_vault_positions")
         .select(POSITION_COLUMNS)
         .eq("network", network)
         .eq("registry", registry)
-        .or("lp_shares.gt.0,onchain_lp_shares.gt.0")
-        .order("user_wallet", { ascending: true })
-        .range(out.length, out.length + PAGE_SIZE - 1);
+        .or("lp_shares.gt.0,onchain_lp_shares.gt.0");
+      if (last !== null) q = q.gt("user_wallet", last);
+      const { data, error } = await q.order("user_wallet", { ascending: true }).range(0, PAGE_SIZE - 1);
       if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
       const page = (data ?? []) as unknown as PositionRow[];
       if (page.length === 0) break;
+      const tail: string = page[page.length - 1]!.user_wallet;
+      if (last !== null && tail <= last) {
+        throw new Error(`lp_vault_positions list: cursor did not advance past ${last}; refused`);
+      }
+      last = tail;
       out.push(...page);
+      if (out.length >= MAX_OPEN_POSITIONS) {
+        throw new Error(`lp_vault_positions list: ${registry} has >= ${MAX_OPEN_POSITIONS} open positions; refused`);
+      }
     }
     return out;
   }
