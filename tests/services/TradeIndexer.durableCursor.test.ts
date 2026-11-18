@@ -124,8 +124,14 @@ describe("TradeIndexerPolling durable cursor", () => {
     vi.mocked(loadTradeCursors).mockImplementationOnce(async (onIncomplete?: () => void) => { onIncomplete?.(); return new Map(); });
     sigLists.set(slab, mk("s2", "s1"));
     const idx = newIndexer();
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValue(1_000_000);
     await idx.indexTradesForSlab(slab, 50); // load 1 is partial: slab has no cursor yet
+    await idx.indexTradesForSlab(slab, 50); // inside the backoff: no new load (no query per slab)
+    expect(loadTradeCursors).toHaveBeenCalledTimes(1);
+    now.mockReturnValue(1_000_000 + 61_000);
     await idx.indexTradesForSlab(slab, 50); // load 2 is complete and supplies the cursor
+    now.mockRestore();
     expect(loadTradeCursors).toHaveBeenCalledTimes(2);
     await idx.indexTradesForSlab(slab, 50);
     expect(loadTradeCursors).toHaveBeenCalledTimes(2); // complete load is cached again
