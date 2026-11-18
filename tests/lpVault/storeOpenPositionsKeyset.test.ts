@@ -8,7 +8,7 @@ type Row = Record<string, unknown>;
  * Fake PostgREST for lp_vault_positions: order/range/gt, max_rows cap, and a hook that runs
  * before each query is answered (to mutate the table between pages, like a concurrent writePosition).
  */
-function fakeDb(all: Row[], opts: { maxRows?: number; beforeQuery?: (n: number, rows: Row[]) => void; source?: (n: number) => Row[]; ignoreGt?: boolean } = {}) {
+function fakeDb(all: Row[], opts: { maxRows?: number; beforeQuery?: (n: number, rows: Row[]) => void; source?: (n: number) => Row[]; ignoreGt?: boolean; collate?: boolean } = {}) {
   let n = 0;
   const db = {
     from() {
@@ -24,8 +24,9 @@ function fakeDb(all: Row[], opts: { maxRows?: number; beforeQuery?: (n: number, 
         opts.beforeQuery?.(n, all);
         let rows = opts.source ? opts.source(n) : [...all];
         n++;
-        rows.sort((x, y) => String(x.user_wallet).localeCompare(String(y.user_wallet)));
-        if (gt && !opts.ignoreGt) rows = rows.filter((r) => String(r[gt![0]]) > gt![1]);
+        const cmp = (a: string, b: string) => a.localeCompare(b);
+        rows.sort((x, y) => cmp(String(x.user_wallet), String(y.user_wallet)));
+        if (gt && !opts.ignoreGt) rows = rows.filter((r) => cmp(String(r[gt![0]]), gt![1]) > 0);
         rows = rows.slice(from, Math.min(to, from + (opts.maxRows ?? 1e9) - 1) + 1);
         return Promise.resolve({ data: rows, error: null }).then(res);
       };
@@ -52,12 +53,18 @@ describe("listOpenPositions under concurrent change", () => {
 
   it("refuses a page source that never advances instead of looping forever", async () => {
     const db = fakeDb([], { source: () => [pos(1), pos(2)], ignoreGt: true });
-    await expect(new SupabaseLpVaultStore(db).listOpenPositions("devnet", "R")).rejects.toThrow();
+    await expect(new SupabaseLpVaultStore(db).listOpenPositions("devnet", "R")).rejects.toThrow(/did not advance/);
   });
 
   it("refuses an endless stream of distinct pages", async () => {
     let k = 0;
     const db = fakeDb([], { source: () => Array.from({ length: 1000 }, () => pos(k++)) });
-    await expect(new SupabaseLpVaultStore(db).listOpenPositions("devnet", "R")).rejects.toThrow();
+    await expect(new SupabaseLpVaultStore(db).listOpenPositions("devnet", "R")).rejects.toThrow(/open positions; refused/);
+  });
+
+  it("does not reject a page boundary that is ordered by server collation, not JS code points", async () => {
+    const db = fakeDb(["aZ", "Bb", "cc"].map((w) => ({ user_wallet: w, lp_shares: "1" })), { maxRows: 2, collate: true });
+    const out = await new SupabaseLpVaultStore(db).listOpenPositions("devnet", "R");
+    expect(out.map((r) => r.user_wallet)).toEqual(["aZ", "Bb", "cc"]);
   });
 });

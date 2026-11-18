@@ -297,6 +297,7 @@ export class SupabaseLpVaultStore implements LpVaultStore {
     // user_wallet is unique per (network, registry), so it is a total order.
     const out: PositionRow[] = [];
     let last: string | null = null;
+    const seen = new Set<string>();
     for (;;) {
       let q = this.db
         .from("lp_vault_positions")
@@ -309,11 +310,14 @@ export class SupabaseLpVaultStore implements LpVaultStore {
       if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
       const page = (data ?? []) as unknown as PositionRow[];
       if (page.length === 0) break;
-      const tail: string = page[page.length - 1]!.user_wallet;
-      if (last !== null && tail <= last) {
-        throw new Error(`lp_vault_positions list: cursor did not advance past ${last}; refused`);
+      // Order is the server collation, not JS string order, so detect a stuck cursor by repeat.
+      for (const r of page) {
+        if (seen.has(r.user_wallet)) {
+          throw new Error(`lp_vault_positions list: cursor did not advance past ${last}; refused`);
+        }
+        seen.add(r.user_wallet);
       }
-      last = tail;
+      last = page[page.length - 1]!.user_wallet;
       out.push(...page);
       if (out.length >= MAX_OPEN_POSITIONS) {
         throw new Error(`lp_vault_positions list: ${registry} has >= ${MAX_OPEN_POSITIONS} open positions; refused`);
