@@ -697,6 +697,7 @@ async function extractTradesFromEnhancedTx(
   /** Delivery state: signatures already extracted before this tx (chain order), and whether an earlier one failed. */
   delivery: DeliveryState = { earlier: new Set(), incomplete: false },
 ): Promise<TradeData[]> {
+  decodedSlabCache.delete(tx); // fresh decode memo per extract call
   const trades: TradeData[] = [];
   const signature = tx.signature ?? "";
   if (!signature) return trades;
@@ -1195,18 +1196,36 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
 }
 
 /**
- * Read mark_price_e6 from the slab account's post-state data.
- * Helius enhanced transactions include `accountData[]` with each account's
- * post-state as a base64-encoded `data` field.
+ * Decoded slab post-state per (transaction, slab address), for the lifetime of one
+ * extractTradesFromEnhancedTx call (which resets its tx's entry on entry). `candidates` are every
+ * decodable accountData entry for the slab in payload order (price scan walks them all);
+ * `first` is the first entry with a non-empty base64 string (what lot_exp reads).
  */
-function slabBytesFromAccountData(tx: ValidatedTransaction, slabAddress: string): Uint8Array | null {
+type DecodedSlab = { candidates: Uint8Array[]; first: Uint8Array | null };
+const decodedSlabCache = new WeakMap<object, Map<string, DecodedSlab>>();
+
+function decodedSlab(tx: ValidatedTransaction, slabAddress: string): DecodedSlab {
+  let perTx = decodedSlabCache.get(tx);
+  if (!perTx) { perTx = new Map(); decodedSlabCache.set(tx, perTx); }
+  let d = perTx.get(slabAddress);
+  if (d) return d;
+  d = { candidates: [], first: null };
   for (const acc of (tx.accountData ?? []) as any[]) {
     if (acc.account !== slabAddress) continue;
+    // Helius provides data as base64 string or [base64, "base64"]
     const b64 = typeof acc.data === "string" ? acc.data : Array.isArray(acc.data) && typeof acc.data[0] === "string" ? acc.data[0] : null;
-    if (!b64) continue;
-    try { return Uint8Array.from(Buffer.from(b64, "base64")); } catch { /* skip */ }
+    if (b64 === null) continue;
+    let raw: Uint8Array;
+    try { raw = Uint8Array.from(Buffer.from(b64, "base64")); } catch { continue; }
+    d.candidates.push(raw);
+    if (b64 && !d.first) d.first = raw;
   }
-  return null;
+  perTx.set(slabAddress, d);
+  return d;
+}
+
+function slabBytesFromAccountData(tx: ValidatedTransaction, slabAddress: string): Uint8Array | null {
+  return decodedSlab(tx, slabAddress).first;
 }
 
 /** Record lot_exp from the slab post-state already in the payload (no RPC). */
@@ -1239,18 +1258,7 @@ async function readSlabBytesWithin(slabAddress: string, deadlineAt: number | und
 }
 
 function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
-  const accountData: any[] = tx.accountData ?? [];
-  for (const acc of accountData) {
-    if (acc.account !== slabAddress) continue;
-    // Helius provides data as base64 string or { data: [base64, "base64"] }
-    let raw: Uint8Array | null = null;
-    if (typeof acc.data === "string") {
-      try { raw = Uint8Array.from(Buffer.from(acc.data, "base64")); } catch { /* skip */ }
-    } else if (Array.isArray(acc.data) && typeof acc.data[0] === "string") {
-      try { raw = Uint8Array.from(Buffer.from(acc.data[0], "base64")); } catch { /* skip */ }
-    }
-    if (!raw) continue;
-
+  for (const raw of decodedSlab(tx, slabAddress).candidates) {
     const price = parseMarkPriceE6FromAccountBytes(raw, assetIndex, slabAddress);
     if (price > 0) return price;
   }
