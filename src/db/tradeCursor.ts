@@ -7,10 +7,14 @@ const logger = createLogger("indexer:trade-cursor");
  * hand). Best effort on purpose and never throws: without the table the poller is back to its in-memory cursor, which
  * costs a re-fetch after a restart but must never stop indexing.
  */
-const warned = new Set<string>();
+/** Re-log a still-failing op this often, so a cursor table that keeps failing stays visible (not only its first error). */
+export const TRADE_CURSOR_WARN_INTERVAL_MS = 10 * 60_000;
+const warned = new Map<string, number>();
 function unavailable(op: "load" | "save", message: string): void {
-  if (warned.has(op)) return;
-  warned.add(op);
+  const now = Date.now();
+  const last = warned.get(op);
+  if (last !== undefined && now - last < TRADE_CURSOR_WARN_INTERVAL_MS) return;
+  warned.set(op, now);
   logger.error("trade_indexer_cursor unavailable: using the in-memory cursor (apply supabase/migrations/20261114120000_trade_indexer_cursor.sql)", { op, error: message });
 }
 
@@ -66,6 +70,7 @@ export async function saveTradeCursor(slab: string, signature: string): Promise<
       .from("trade_indexer_cursor")
       .upsert({ network: net, slab_address: slab, signature, updated_at: new Date().toISOString() }, { onConflict: "network,slab_address" });
     if (error) throw new Error(error.message);
+    warned.delete("save"); // recovered: a later failure is a new incident and logs again
   } catch (err) {
     unavailable("save", err instanceof Error ? err.message : String(err));
   }
