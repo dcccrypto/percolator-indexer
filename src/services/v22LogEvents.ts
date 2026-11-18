@@ -5,7 +5,7 @@
  * `logMessages` only when the delivery carries them (the enhanced payload normally does not, and then nothing is attempted
  * and nothing is claimed).
  *
- * BEST EFFORT and ISOLATED: never throws (a failed DB write is reported as status "write_failed"), and the rows go through their own `insertV22Events` call, so a problem here can
+ * BEST EFFORT and ISOLATED: never throws (a failed DB write, or any unexpected error while decoding/writing, is reported as status "write_failed"), and the rows go through their own `insertV22Events` call, so a problem here can
  * never cost an instruction event or a trade row (a failed DB write does make the webhook answer 5xx, deliberately). VERSION-keyed: only markets known to be wrapper
  * VERSION 19 (or not yet read) get events, and only a market known to be VERSION 19 gets an unknown marker.
  */
@@ -83,6 +83,9 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
     return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : {}) };
   } catch (err) {
     logger.warn("v22 log-event recording failed (trades unaffected)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });
-    return { status: "not_applicable", rows: 0 };
+    // An unexpected error (a non-V22EventWriteError from insertV22Events, or a throw inside the decode) means this transaction's
+    // events were NOT recorded. "not_applicable" would tell the callers there was nothing to record (webhook 2xx, never
+    // redelivered), so report the retryable "write_failed" instead.
+    return { status: "write_failed", rows: 0 };
   }
 }
