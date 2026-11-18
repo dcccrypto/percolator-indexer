@@ -68,7 +68,7 @@ describe("loadTradeCursors", () => {
     expect(m.get("slabA")).toBe("sig1");
     expect(m.get("slabB")).toBe("sig2");
     expect(m.size).toBe(2);
-    expect(state.eqCalls).toEqual([["network", "devnet"]]);
+    expect(state.eqCalls).toEqual([["network", "devnet"], ["network", "devnet"]]); // data page + the empty page that ends the read
   });
 
   it("treats a null data payload as no cursors", async () => {
