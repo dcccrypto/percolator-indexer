@@ -75,6 +75,15 @@ export interface SyncResult {
 
 const PAGE = 1000;
 
+/**
+ * True when `intervalMs` has elapsed since `last`. A negative age (wall clock stepped back by NTP or a
+ * VM resume) or a non-finite `last` counts as due, so a clock step cannot stall discovery/reconcile.
+ */
+function isDue(last: number, intervalMs: number): boolean {
+  const age = Date.now() - last;
+  return !(age >= 0) || age > intervalMs;
+}
+
 export class LpVaultIndexer {
   private readonly registries = new Map<string, RegistryInfo>();
   private readonly cursors = new Map<string, string>();
@@ -122,10 +131,10 @@ export class LpVaultIndexer {
     if (this.busy) return;
     this.busy = true;
     try {
-      if (Date.now() - this.lastDiscovery > (this.opts.discoveryIntervalMs ?? 300_000)) {
+      if (isDue(this.lastDiscovery, this.opts.discoveryIntervalMs ?? 300_000)) {
         await this.refreshRegistries();
       }
-      const fullReconcile = Date.now() - this.lastFullReconcile > (this.opts.reconcileIntervalMs ?? 600_000);
+      const fullReconcile = isDue(this.lastFullReconcile, this.opts.reconcileIntervalMs ?? 600_000);
       for (const reg of this.registries.values()) {
         try {
           const r = await this.syncRegistry(reg);
