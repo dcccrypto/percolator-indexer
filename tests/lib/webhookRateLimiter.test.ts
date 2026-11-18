@@ -144,3 +144,36 @@ describe("window boundary and prune", () => {
     expect(rl.buckets.get(HELIUS_IP)!.resetTime).toBeGreaterThan(Date.now());
   });
 });
+
+describe("backwards wall-clock step (NTP correction, VM resume)", () => {
+  const HOUR = 3_600_000;
+
+  it("a bucket spent before a 1 h backwards step resets within one window of real elapsed time", async () => {
+    let t = 10 * HOUR;
+    const { post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) await post(HELIUS_IP);
+    expect((await post(HELIUS_IP)).status).toBe(429);
+    t -= HOUR; // clock steps back
+    // The step itself may still be inside the old window; after one real window it must be served.
+    t += 60_001;
+    expect((await post(HELIUS_IP)).status).toBe(200);
+  });
+
+  it("Retry-After never exceeds the window after a backwards step", async () => {
+    let t = 10 * HOUR;
+    const { post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) await post(HELIUS_IP);
+    t -= HOUR;
+    const res = await post(HELIUS_IP);
+    expect(Number(res.headers.get("retry-after") ?? "0")).toBeLessThanOrEqual(60);
+  });
+
+  it("pruneExpired drops a bucket whose resetTime is more than one window ahead of now", async () => {
+    let t = 10 * HOUR;
+    const { rl, post } = appWith({ now: () => t });
+    await post(HELIUS_IP);
+    t -= HOUR;
+    rl.pruneExpired();
+    expect(rl.buckets.size).toBe(0);
+  });
+});

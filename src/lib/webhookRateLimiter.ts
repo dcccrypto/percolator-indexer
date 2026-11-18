@@ -68,12 +68,16 @@ export function createWebhookRateLimiter(opts: WebhookRateLimiterOptions): Webho
   const { maxRequests, windowMs, keyOf } = opts;
   const now = opts.now ?? (() => Date.now());
   const buckets = new Map<string, RateLimitBucket>();
+  // A bucket is stale once its window passed, or when resetTime is more than one window ahead of
+  // now: a live bucket never is, so the wall clock must have stepped back (NTP, VM resume) and
+  // waiting for it to catch up would 429 a genuine sender for the length of the step.
+  const isStale = (b: RateLimitBucket, t: number): boolean => t > b.resetTime || b.resetTime - t > windowMs;
 
   const middleware: MiddlewareHandler = async (c, next) => {
     const ip = keyOf(c);
     const t = now();
     const existing = buckets.get(ip);
-    const bucket = !existing || t > existing.resetTime ? { count: 0, resetTime: t + windowMs } : existing;
+    const bucket = !existing || isStale(existing, t) ? { count: 0, resetTime: t + windowMs } : existing;
     buckets.set(ip, bucket);
     bucket.count++;
 
@@ -88,7 +92,7 @@ export function createWebhookRateLimiter(opts: WebhookRateLimiterOptions): Webho
   const pruneExpired = (): void => {
     const t = now();
     for (const [ip, data] of buckets.entries()) {
-      if (t > data.resetTime) buckets.delete(ip);
+      if (isStale(data, t)) buckets.delete(ip);
     }
   };
 
