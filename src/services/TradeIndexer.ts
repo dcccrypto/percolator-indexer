@@ -208,7 +208,12 @@ export class TradeIndexerPolling {
   /** The durable cursors are read once per process, before the first window of the first slab. */
   private cursorsLoaded: Promise<void> | null = null;
   private loadDurableCursors(): Promise<void> {
-    this.cursorsLoaded ??= loadTradeCursors().then((m) => {
+    let incomplete = false;
+    this.cursorsLoaded ??= loadTradeCursors(() => {
+      incomplete = true;
+    }).then((m) => {
+      // A page failed: some slabs have no cursor yet. Drop the cached load so the next window reads them again.
+      if (incomplete) this.cursorsLoaded = null;
       // Never overwrite a cursor this process already moved.
       for (const [slab, sig] of m) if (!this.lastSignature.has(slab)) this.lastSignature.set(slab, sig);
     });
