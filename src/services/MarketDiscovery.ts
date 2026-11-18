@@ -95,6 +95,8 @@ export class MarketDiscovery {
     if (this._discovering) return [];
     this._discovering = true;
     const fresh: DiscoveredMarket[] = [];
+    const freshKeys = new Set<string>();
+    const freshKeyList: string[] = []; // base58 of fresh[i], reused for the map swap
     try {
       const conn = getPrimaryConnection();
       const filter = (process.env.MARKETS_FILTER ?? "").trim();
@@ -103,8 +105,12 @@ export class MarketDiscovery {
         try {
           const found = await discoverV17Markets(conn, new PublicKey(id), addresses, { light: true });
           for (const m of found) {
-            const key = m.slabAddress.toBase58();
-            if (!this.markets.has(key) && !fresh.some((f) => f.slabAddress.toBase58() === key)) fresh.push(m);
+            const key = m.slabAddress.toBase58(); // encode once per market
+            if (!this.markets.has(key) && !freshKeys.has(key)) {
+              freshKeys.add(key);
+              fresh.push(m);
+              freshKeyList.push(key);
+            }
           }
         } catch (e) {
           logger.warn("Light discovery failed on program", { programId: id, error: e instanceof Error ? e.message : String(e) });
@@ -113,7 +119,7 @@ export class MarketDiscovery {
       if (fresh.length > 0) {
         // Atomic swap on a copy: readers never see a partial map, and nothing is removed.
         const next = new Map(this.markets);
-        for (const m of fresh) next.set(m.slabAddress.toBase58(), { market: m });
+        for (let i = 0; i < fresh.length; i++) next.set(freshKeyList[i], { market: fresh[i] });
         this.markets = next;
       }
     } finally {
