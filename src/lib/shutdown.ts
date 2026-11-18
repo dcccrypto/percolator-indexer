@@ -6,12 +6,12 @@
 /**
  * Parse a positive decimal-integer env value. Number() accepts "1e3", "0x10", "", " " and
  * NaN, and setInterval(fn, NaN|0) is a tight loop, so anything that is not plain digits
- * (or is 0 / unsafe) falls back.
+ * (or is below `min`, default 1 / unsafe) falls back.
  */
-export function parseDecimalIntEnv(raw: string | undefined, fallback: number): number {
+export function parseDecimalIntEnv(raw: string | undefined, fallback: number, min = 1): number {
   if (raw === undefined || !/^[0-9]+$/.test(raw.trim())) return fallback;
   const n = Number(raw.trim());
-  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+  return Number.isSafeInteger(n) && n >= min ? n : fallback;
 }
 
 /** Run an async step, never throwing and never waiting longer than timeoutMs. */

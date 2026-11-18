@@ -30,7 +30,7 @@ assertSkippedSignatureSinkReady();
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 /** #163: health probe cache window. Short so a real outage still surfaces fast. */
-const HEALTH_CACHE_TTL_MS = parseDecimalIntEnv(process.env.HEALTH_CACHE_TTL_MS, 5000);
+const HEALTH_CACHE_TTL_MS = parseDecimalIntEnv(process.env.HEALTH_CACHE_TTL_MS, 5000, 0);
 // Restored: the HTTPS-enforcement guards in start() (WEBHOOK_URL / RPC_URL) reference this.
 // It was dropped during the H-1 fix while two usages remained — a runtime ReferenceError
 // on any non-HTTPS URL. The webhook auth fix itself now keys off NETWORK (see webhook.ts),

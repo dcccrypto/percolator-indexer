@@ -22,6 +22,13 @@ describe("parseDecimalIntEnv", () => {
   });
 });
 
+describe("parseDecimalIntEnv min", () => {
+  it("allows 0 when min is 0", () => {
+    expect(parseDecimalIntEnv("0", 5000, 0)).toBe(0);
+    expect(parseDecimalIntEnv("1e3", 5000, 0)).toBe(5000);
+  });
+});
+
 describe("runShutdown", () => {
   function deps(over: Partial<Parameters<typeof runShutdown>[0]> = {}) {
     const order: string[] = [];
