@@ -9,6 +9,7 @@ export class BoundedTtlMap<K, V> {
   get(k: K): V | undefined {
     const e = this.m.get(k);
     if (!e) return undefined;
+    if (this.ttlMs === Infinity) return e.v; // never-expiring maps (lotScale) ignore the clock entirely
     const age = this.now() - e.at;
     // A negative (backwards wall-clock step) or non-finite age is expired, not "young".
     if (!(age >= 0 && age <= this.ttlMs)) { this.m.delete(k); return undefined; }

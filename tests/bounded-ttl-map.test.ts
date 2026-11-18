@@ -61,4 +61,13 @@ describe("BoundedTtlMap (replaces clear() at 2000 entries)", () => {
     t = 110;
     expect(m.get("a")).toBe(1);
   });
+  it("an infinite-TTL map ignores a backwards or NaN clock", () => {
+    let t = 1_000_000;
+    const m = new BoundedTtlMap<string, number>(10, Number.POSITIVE_INFINITY, () => t);
+    m.set("a", 1);
+    t = 5;
+    expect(m.get("a")).toBe(1);
+    t = NaN;
+    expect(m.get("a")).toBe(1);
+  });
 });
