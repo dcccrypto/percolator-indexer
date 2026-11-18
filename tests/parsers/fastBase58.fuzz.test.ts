@@ -46,4 +46,13 @@ describe("decodeBase58Fast fuzz vs shared decodeBase58", { timeout: 300_000 }, (
     }
     expect(mismatches).toBe(0);
   });
+
+  it("very long worst-case input (scratch sizing), checked against BigInt", () => {
+    const n = 126_236; // first length where an undersized scratch lost the top limb
+    const s = "z".repeat(n);
+    const v = 58n ** BigInt(n) - 1n; // every digit is 57
+    const hex = v.toString(16);
+    const expected = Uint8Array.from(Buffer.from(hex.length % 2 ? "0" + hex : hex, "hex"));
+    expect(decodeBase58Fast(s)).toStrictEqual(expected);
+  });
 });

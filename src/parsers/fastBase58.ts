@@ -23,7 +23,7 @@ export function decodeBase58Fast(str: string): Uint8Array | null {
   let zeros = 0;
   while (zeros < n && str.charCodeAt(zeros) === 49) zeros++; // "1"
   const rest = n - zeros;
-  const need = Math.ceil((rest * 0.7322) / 3) + 2; // 24-bit limbs: log2(58)/24 < 0.2442 per char
+  const need = Math.ceil(rest * 0.2441) + 2; // 24-bit limbs: log2(58)/24 = 0.244083 per char, so 0.2441 is an upper bound
   if (scratch.length < need) scratch = new Int32Array(need);
   const limbs = scratch; // little-endian, 24 bits each
   let len = 0;
