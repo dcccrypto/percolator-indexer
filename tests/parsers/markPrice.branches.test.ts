@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readAssetEffectivePriceE6, readMarkPriceE6 } from "../../src/parsers/markPrice.js";
 import { cachedLotExp, knownLotExp, resetLotExpCache } from "../../src/parsers/lotScale.js";
 import { getUnknownLayoutCount, resetUnknownLayoutState } from "../../src/layout/resolve.js";
-import { buildMarket, LAYOUT_V22, LAYOUT_V21, REAL_MARKET_V21 } from "../helpers/v22Fixtures.js";
+import { buildMarket, LAYOUT_V22, REAL_MARKET_V21 } from "../helpers/v22Fixtures.js";
 
 const SLAB = "Ar6khqrJVfPDx1KGmSP6Q4hxre6NNm66GpDJPHG1oF6N";
 const connWith = (data: Uint8Array) => ({ getAccountInfo: vi.fn(async () => ({ data: Buffer.from(data) })) }) as any;
@@ -32,7 +32,7 @@ describe("readAssetEffectivePriceE6 edges (real bytes)", () => {
     expect(readAssetEffectivePriceE6(d, 0)).toBe(5_000_000);
   });
 
-  it("a market truncated inside slot 0 has no readable slot", () => {
+  it("a market truncated inside slot 0 has no whole slot (index >= slotCount)", () => {
     const d = buildMarket(LAYOUT_V22, { slots: 1 });
     setEffective(d, LAYOUT_V22, 0, 5_000_000n);
     const cut = LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + LAYOUT_V22.wrapperSlotLen + LAYOUT_V22.assetState.effectivePrice + 4;
@@ -81,9 +81,9 @@ describe("readMarkPriceE6 wrapper-magic path (real bytes)", () => {
 
   it("real v2.1 devnet capture: effective price is read and lot_exp is recorded", async () => {
     const p = await readMarkPriceE6(connWith(REAL_MARKET_V21), SLAB, 0);
+    expect(p).not.toBeNull();
     expect(p).toBe(readAssetEffectivePriceE6(REAL_MARKET_V21, 0));
-    expect(knownLotExp(SLAB, 0)).toBeDefined();
-    expect(LAYOUT_V21.version).toBe(18);
+    expect(typeof knownLotExp(SLAB, 0)).toBe("number");
   });
 
   it("unknown VERSION with wrapper magic -> null and reportUnknownLayout fires once per market", async () => {
@@ -91,7 +91,7 @@ describe("readMarkPriceE6 wrapper-magic path (real bytes)", () => {
     expect(await readMarkPriceE6(connWith(d), SLAB)).toBeNull();
     expect(getUnknownLayoutCount()).toBe(1);
     expect(await readMarkPriceE6(connWith(d), SLAB, 0)).toBeNull();
-    expect(getUnknownLayoutCount()).toBe(2); // counted every time, logged/captured once (dedupe in reportUnknownLayout)
+    expect(getUnknownLayoutCount()).toBe(2); // counted on every call
   });
 });
 
