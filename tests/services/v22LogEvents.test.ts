@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { LAYOUT_V22 } from "@percolatorct/sdk";
 
-const { insertV22Events, logWarn, blocked } = vi.hoisted(() => ({ insertV22Events: vi.fn(async (rows: unknown[]) => rows.length), logWarn: vi.fn(), blocked: new Set<string>() }));
-vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events }));
+const { insertV22Events, logWarn, blocked, V22EventWriteError } = vi.hoisted(() => ({ V22EventWriteError: class V22EventWriteError extends Error {}, insertV22Events: vi.fn(async (rows: unknown[]) => rows.length), logWarn: vi.fn(), blocked: new Set<string>() }));
+vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events, V22EventWriteError }));
 vi.mock("../../src/blocklist.js", () => ({ isBlockedSlab: (s: string) => blocked.has(s) }));
 vi.mock("@percolatorct/shared", () => ({ createLogger: () => ({ info: vi.fn(), warn: logWarn, debug: vi.fn(), error: vi.fn() }) }));
 
@@ -67,8 +67,27 @@ describe("recordV22LogEvents", () => {
     expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ kind: "events_unknown", slab_address: M, detail: { reason: "unlisted_tag" } });
   });
 
-  it("NEVER throws: an insert failure is swallowed", async () => {
-    insertV22Events.mockRejectedValueOnce(new Error("db down"));
-    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toMatchObject({ status: "not_applicable", rows: 0 });
+  it("NEVER throws, and an unexpected insert error is a retryable write_failed, not not_applicable (a plain Error and a TypeError)", async () => {
+    for (const e of [new Error("db down"), new TypeError("Cannot read properties of undefined")]) {
+      logWarn.mockClear();
+      insertV22Events.mockRejectedValueOnce(e);
+      await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toEqual({ status: "write_failed", rows: 0 });
+      expect(logWarn).toHaveBeenCalledWith(expect.stringContaining("failed"), expect.objectContaining({ error: e.message }));
+    }
+  });
+
+  it("a V22EventWriteError is still write_failed", async () => {
+    insertV22Events.mockRejectedValueOnce(new V22EventWriteError("x", 1));
+    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toEqual({ status: "write_failed", rows: 1 });
+  });
+
+  it("a throw inside the decode is write_failed, not not_applicable, and is logged (non-Error values too)", async () => {
+    for (const thrown of [new Error("boom"), "string-thrown"]) {
+      logWarn.mockClear();
+      const input = { ...base, wrapperInstructions: [ix(10)], get logMessages(): unknown { throw thrown; } };
+      await expect(recordV22LogEvents(input)).resolves.toEqual({ status: "write_failed", rows: 0 });
+      expect(logWarn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ error: thrown instanceof Error ? thrown.message : thrown }));
+    }
+    expect(insertV22Events).not.toHaveBeenCalled();
   });
 });
