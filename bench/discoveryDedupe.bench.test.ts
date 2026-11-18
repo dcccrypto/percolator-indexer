@@ -48,9 +48,11 @@ describe("discoverLight dedupe bench", () => {
       const runs = Number(process.env[`RUNS_${n}`] ?? 20); // override per N with RUNS_<n> (the quadratic pre-fix code is very slow at 2k/10k)
       for (let r = 0; r < runs; r++) {
         const d = new MarketDiscovery();
-        const t0 = performance.now();
+        // CPU time (user+system), not wall clock: the dev box is often heavily loaded and wall time is then noise.
+        const c0 = process.cpuUsage();
         const fresh = await d.discoverLight();
-        times.push(performance.now() - t0);
+        const c1 = process.cpuUsage(c0);
+        times.push((c1.user + c1.system) / 1000);
         count = fresh.length;
       }
       times.sort((a, b) => a - b);
