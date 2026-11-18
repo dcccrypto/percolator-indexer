@@ -79,7 +79,8 @@ export async function fetchTraderPositionEvidence(
   let sawUnreadableSize = false;
   let sawBadSide = false;
   const cutoffMs = txTimeSec == null ? null : txTimeSec * 1000;
-  for (let from = 0; ; from += PAGE) {
+  // Advance by rows actually returned: a PostgREST max_rows below PAGE returns short pages that are not the end.
+  for (let from = 0; ; ) {
     const { data, error } = await getSupabase()
       .from("trades")
       .select("side, size, is_liquidation, created_at, tx_signature")
@@ -102,7 +103,8 @@ export async function fetchTraderPositionEvidence(
       const created = r.created_at ? Date.parse(r.created_at) : NaN;
       if (cutoffMs !== null && !(Number.isFinite(created) && created < cutoffMs) && !(r.tx_signature && knownEarlier.has(r.tx_signature))) sawNotProvablyEarlier = true;
     }
-    if (rows.length < PAGE) break;
+    if (rows.length === 0) break;
+    from += rows.length;
   }
   let uncertain: string | null = null;
   if (cutoffMs === null) uncertain = "transaction block time unknown: cannot order this close against indexed fills";
