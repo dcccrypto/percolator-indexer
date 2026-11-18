@@ -35,6 +35,7 @@ export function isRateLimitError(err: unknown): boolean {
 
 export class RpcLimiter {
   private nextSlot = 0;
+  private lastNow = -Infinity;
   /** Number of rate-limit errors seen (each retry counts). */
   rateLimited = 0;
   private readonly opts: Required<Omit<RpcLimiterOptions, "onRateLimited">> & Pick<RpcLimiterOptions, "onRateLimited">;
@@ -50,12 +51,23 @@ export class RpcLimiter {
     };
   }
 
+  /** Read the clock; if it stepped backwards (NTP), shift the reserved slot by the same amount so waits stay relative. */
+  private readNow(): number {
+    const now = this.opts.now();
+    if (now < this.lastNow) this.nextSlot = Math.max(0, this.nextSlot - (this.lastNow - now));
+    this.lastNow = now;
+    return now;
+  }
+
   /** Reserve the next slot (synchronously, so concurrent callers queue in order) and wait for it. */
   private async acquire(): Promise<void> {
-    const now = this.opts.now();
+    const now = this.readNow();
     const at = Math.max(now, this.nextSlot);
     this.nextSlot = at + this.opts.minIntervalMs;
-    if (at > now) await this.opts.sleep(at - now);
+    if (at > now) {
+      await this.opts.sleep(at - now);
+      this.lastNow = Math.max(this.lastNow, this.opts.now()); // keep the step detector current across the sleep
+    }
   }
 
   async run<T>(fn: () => Promise<T>, maxRetries = this.opts.maxRateLimitRetries): Promise<T> {
@@ -68,7 +80,7 @@ export class RpcLimiter {
         this.rateLimited++;
         const backoffMs = Math.min(this.opts.maxBackoffMs, this.opts.baseBackoffMs * 2 ** attempt);
         // Everyone waits, not just this call, including when this call gives up (the caller's own retry then starts late too).
-        this.nextSlot = Math.max(this.nextSlot, this.opts.now() + backoffMs);
+        this.nextSlot = Math.max(this.nextSlot, this.readNow() + backoffMs);
         if (attempt >= maxRetries) throw err;
         this.opts.onRateLimited?.({ attempt: attempt + 1, backoffMs });
       }
