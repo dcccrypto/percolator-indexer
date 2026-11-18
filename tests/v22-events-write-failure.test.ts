@@ -70,13 +70,13 @@ describe("webhook: v22_events write failure", () => {
 
 describe("webhook: unexpected error while recording LOG events", () => {
   // A delivery that carries logMessages (a fill). insertV22Events (real) gets a plain TypeError from the client instead of
-  // a { error } result: that is not a V22EventWriteError, and used to come back as not_applicable (200, never redelivered).
+  // a { error } result: that is not a V22EventWriteError, and is reported write_failed by recordV22LogEvents.
   const fixture = JSON.parse(readFileSync(new URL("./fixtures/v22-fill-events-doc-examples.json", import.meta.url), "utf8")).examples as Record<string, { b64: string }>;
   const logTx = { ...enhancedTx, signature: "SIGLOGS", instructions: [{ programId: PROGRAM, accounts: [SLAB], data: encodeBase58(new Uint8Array([10])), innerInstructions: [] }],
     logMessages: [`Program ${PROGRAM} invoke [1]`, `Program data: ${fixture.fill_clipped_tradecpi.b64}`, `Program ${PROGRAM} success`] };
   const post = () => webhookRoutes().fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body: JSON.stringify([logTx]) }));
 
-  it("answers 5xx so the provider redelivers (BEFORE the fix: 200, the fill events lost)", async () => {
+  it("answers 5xx so the provider redelivers", async () => {
     db.error = null;
     db.upsert.mockImplementation(() => { throw new TypeError("fetch failed"); });
     const res = await post();
