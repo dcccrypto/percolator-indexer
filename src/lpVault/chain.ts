@@ -98,7 +98,8 @@ export function parseRedemptionShares(data: Uint8Array | null, registry: string,
   return v;
 }
 
-const pdaCache = new Map<string, PublicKey>();
+/** Memoised PDAs are shared: callers must treat the returned PublicKey as read-only. */
+const pdaCache =new Map<string, PublicKey>();
 const REDEMPTION_SEED = Buffer.from("lp_redemption");
 
 export function deriveRedemptionPda(programId: string, registry: string, user: string): PublicKey {
