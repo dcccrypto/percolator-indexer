@@ -1,5 +1,5 @@
-import { envInt } from "./lib/envNumbers.js";
 import "dotenv/config";
+import { envInt } from "./lib/envNumbers.js";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
