@@ -256,6 +256,41 @@ describe('syncVolumeForAllDBMarkets (volume traders see)', () => {
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('MAX_SAFE_INTEGER'), expect.anything());
   });
 
+  it.each(['NaN', 'Infinity', '-Infinity', '-5'])('never writes a non-finite or negative volume (%s); the row is left untouched', async (bad) => {
+    h.state.rpcResult = {
+      data: [
+        { slab_address: 'AAAAAAAAAAAA', volume_24h: bad, trade_count_24h: 3 },
+        { slab_address: 'BBBBBBBBBBBB', volume_24h: '40', trade_count_24h: 2 },
+      ],
+      error: null,
+    };
+    const { sc } = make();
+    await sc.syncVolumeForAllDBMarkets();
+    const rows = h.state.upserts[0] as any[];
+    expect(rows.map((r) => r.slab_address)).toEqual(['BBBBBBBBBBBB']);
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('invalid volume'), expect.anything());
+  });
+
+  it('writes a trade count of 0 when the count is NaN or negative', async () => {
+    h.state.rpcResult = {
+      data: [
+        { slab_address: 'AAAAAAAAAAAA', volume_24h: '10', trade_count_24h: 'abc' },
+        { slab_address: 'BBBBBBBBBBBB', volume_24h: '10', trade_count_24h: -4 },
+      ],
+      error: null,
+    };
+    const { sc } = make();
+    await sc.syncVolumeForAllDBMarkets();
+    expect((h.state.upserts[0] as any[]).map((r) => r.trade_count_24h)).toEqual([0, 0]);
+  });
+
+  it('does not upsert when every row has an invalid volume', async () => {
+    h.state.rpcResult = { data: [{ slab_address: 'AAAAAAAAAAAA', volume_24h: 'NaN', trade_count_24h: 1 }], error: null };
+    const { sc } = make();
+    await sc.syncVolumeForAllDBMarkets();
+    expect(h.state.upserts).toHaveLength(0);
+  });
+
   it('skips the upsert when the rollup RPC errors', async () => {
     h.state.rpcResult = { data: null, error: { message: 'boom' } };
     const { sc } = make();
