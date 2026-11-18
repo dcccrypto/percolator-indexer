@@ -64,6 +64,7 @@ export interface EventStreamDeps {
  */
 export class EventStreamService {
   private started = false;
+  private stopped = false;
   private slabSet: Set<string>;
 
   constructor(private deps: EventStreamDeps) {
@@ -96,12 +97,18 @@ export class EventStreamService {
     });
   }
 
+  /** Stop handling notifications (socket close is the caller's job). Idempotent. */
+  stop(): void {
+    this.stopped = true;
+  }
+
   /** Add a slab to the filter set at runtime (as new markets are discovered). */
   addKnownSlab(slab: string): void {
     this.slabSet.add(slab);
   }
 
   private async handle(msg: AtlasNotification): Promise<void> {
+    if (this.stopped) return;
     if (msg.method !== "transactionNotification") return;
     const tx = (msg.params as any)?.result;
     if (!tx) return;

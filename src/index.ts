@@ -12,6 +12,7 @@ import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
+import { parseDecimalIntEnv, runShutdown } from "./lib/shutdown.js";
 import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
 import { getTradecpiCounters } from "./parsers/matcherFill.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
@@ -29,7 +30,7 @@ assertSkippedSignatureSinkReady();
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 /** #163: health probe cache window. Short so a real outage still surfaces fast. */
-const HEALTH_CACHE_TTL_MS = Number(process.env.HEALTH_CACHE_TTL_MS ?? 5000);
+const HEALTH_CACHE_TTL_MS = parseDecimalIntEnv(process.env.HEALTH_CACHE_TTL_MS, 5000);
 // Restored: the HTTPS-enforcement guards in start() (WEBHOOK_URL / RPC_URL) reference this.
 // It was dropped during the H-1 fix while two usages remained — a runtime ReferenceError
 // on any non-HTTPS URL. The webhook auth fix itself now keys off NETWORK (see webhook.ts),
@@ -98,6 +99,7 @@ let eventStream: EventStreamService | null = null;
 /** HTTP server handle — assigned in start(), closed in shutdown(). */
 let httpServer: ReturnType<typeof serve> | undefined;
 let isShuttingDown = false;
+let slabRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
 const app = new Hono();
 
@@ -311,7 +313,7 @@ async function start() {
       store: new SupabaseLpVaultStore(getSupabase()),
       network: CURRENT_NETWORK,
       programIds: config.allProgramIds,
-      pollIntervalMs: Number(process.env.LP_VAULT_POLL_INTERVAL_MS ?? 30_000),
+      pollIntervalMs: parseDecimalIntEnv(process.env.LP_VAULT_POLL_INTERVAL_MS, 30_000),
     });
     lpVaultIndexer.start();
   } else {
@@ -335,7 +337,7 @@ async function start() {
       logger.info("Atlas WS event-stream started", { slabCount: knownSlabs.length });
 
       // Pick up new slabs as discovery finds them (MarketDiscovery polls on interval).
-      setInterval(() => {
+      slabRefreshTimer = setInterval(() => {
         if (!eventStream) return;
         for (const slab of discovery.getMarkets().keys()) {
           eventStream.addKnownSlab(slab);
@@ -372,6 +374,8 @@ start().catch((err) => {
 
 /** Grace period for in-flight DB operations to complete after stopping services. */
 const SHUTDOWN_DRAIN_MS = 3_000;
+/** Upper bound on the shutdown alert webhook so it cannot delay service stops/exit. */
+const SHUTDOWN_ALERT_TIMEOUT_MS = 2_000;
 
 async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) {
@@ -383,43 +387,45 @@ async function shutdown(signal: string): Promise<void> {
   logger.info("Shutdown initiated", { signal });
 
   try {
-    // Send shutdown alert
-    await sendInfoAlert("Indexer service shutting down", [
-      { name: "Signal", value: signal, inline: true },
-    ]);
-
-    // Close HTTP server first — stop accepting new webhook/health requests
-    // while in-flight requests finish normally.
-    if (httpServer) {
-      httpServer.close();
-      logger.info("HTTP server closed");
-    }
-
-    // Stop all services (clears timers and intervals — no new work starts)
-    logger.info("Stopping market discovery");
-    discovery.stop();
-
-    logger.info("Stopping stats collector");
-    statsCollector.stop();
-
-    logger.info("Stopping trade indexer");
-    tradeIndexer.stop();
-    lpVaultIndexer?.stop();
-
-    logger.info("Stopping webhook manager");
-    webhookManager.stop();
-
-    logger.info("Stopping DB connection monitor");
-    clearInterval(dbMonitorInterval);
-
-    // Drain: give in-flight DB writes (webhook trade inserts, stats upserts)
-    // time to complete before exiting. Without this, process.exit() kills
-    // pending Supabase HTTP requests mid-flight.
-    logger.info("Draining in-flight operations", { drainMs: SHUTDOWN_DRAIN_MS });
-    await new Promise((r) => setTimeout(r, SHUTDOWN_DRAIN_MS));
-
-    logger.info("Shutdown complete");
-    process.exit(0);
+    // Stop intake and services first; the alert is best-effort with a timeout so a
+    // hung or failing webhook can never leave services running or skip the drain.
+    await runShutdown({
+      stopSteps: [
+        () => {
+          if (httpServer) {
+            httpServer.close();
+            logger.info("HTTP server closed");
+          }
+        },
+        () => {
+          logger.info("Stopping Atlas event stream");
+          if (slabRefreshTimer) clearInterval(slabRefreshTimer);
+          eventStream?.stop();
+          atlasWs?.close();
+        },
+        () => { logger.info("Stopping market discovery"); discovery.stop(); },
+        () => { logger.info("Stopping stats collector"); statsCollector.stop(); },
+        () => { logger.info("Stopping trade indexer"); tradeIndexer.stop(); },
+        () => { lpVaultIndexer?.stop(); },
+        () => { logger.info("Stopping webhook manager"); webhookManager.stop(); },
+        () => { logger.info("Stopping DB connection monitor"); clearInterval(dbMonitorInterval); },
+      ],
+      alert: () => sendInfoAlert("Indexer service shutting down", [
+        { name: "Signal", value: signal, inline: true },
+      ]),
+      alertTimeoutMs: SHUTDOWN_ALERT_TIMEOUT_MS,
+      // Drain: give in-flight DB writes time to complete before exiting.
+      drainMs: SHUTDOWN_DRAIN_MS,
+      onAlertError: (err) => logger.warn("Shutdown alert failed or timed out", { error: err instanceof Error ? err.message : String(err) }),
+      onStepError: (err) => {
+        logger.error("Error stopping a service during shutdown", { error: err });
+        captureException(err, { tags: { context: "indexer-shutdown" } });
+      },
+      exit: (code) => {
+        logger.info("Shutdown complete");
+        process.exit(code);
+      },
+    });
   } catch (err) {
     logger.error("Error during shutdown", { error: err });
     captureException(err, { tags: { context: "indexer-shutdown" } });
