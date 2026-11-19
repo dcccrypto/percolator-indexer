@@ -3,7 +3,7 @@
  * priced at lot 0 because the sweep has not seen the market yet, and the EWMA fallback must be per-token with a
  * fee that does not inflate. lot_exp 0 must come out exactly as before.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 
 const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
@@ -67,10 +67,21 @@ function rpc(slab: Buffer | null | "throw") {
     return slab ? { data: slab } : null;
   });
 }
+/**
+ * The shared logger prints through console.log. Silence it for every case and assert on the WARN/ERROR lines the
+ * webhook is expected to emit instead of letting them flood the gate log (and hide real errors there).
+ */
+let logSpy: ReturnType<typeof vi.spyOn>;
+const quietLogger = () => { logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined); };
+const loggedLines = (level: "WARN" | "ERROR") =>
+  logSpy.mock.calls.map((c) => String(c[0])).filter((l) => new RegExp(`\\] ${level}\\s+\\[indexer:webhook\\] `).test(l));
+const MATCHER_WARN = "matcher context read failed; answering 500 so the delivery is retried";
+const REDELIVERY_ERROR = "Webhook processing error — returning 500 for Helius retry";
 const slabReads = () => getAccountInfo.mock.calls.filter((c) => c[0].toBase58() === SLAB).length;
 
 describe("webhook TradeCpi on a cold lot_exp cache", () => {
-  beforeEach(() => { resetLotExpCache(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  beforeEach(() => { quietLogger(); resetLotExpCache(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  afterEach(() => { logSpy.mockRestore(); });
 
   it("lot 6, nothing cached: the market is read once and the row is per-token, never the 10^6 too high lot-0 price", async () => {
     rpc(slabBytes(6));
@@ -98,11 +109,15 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
     expect(rows).toEqual([]);
     expect(status).toBe(500);
     expect(recordSkipped).not.toHaveBeenCalled();
+    expect(loggedLines("WARN")).toEqual([expect.stringContaining(MATCHER_WARN)]);
+    expect(loggedLines("ERROR")).toEqual([expect.stringContaining(REDELIVERY_ERROR)]);
     // the redelivery with the RPC back writes the right row
     rpc(slabBytes(6));
     const again = await deliver(enhanced[f.sig]);
     expect(again.status).toBe(200);
     expect(again.rows[0].price).toBeCloseTo(13.861751e-6, 18);
+    expect(loggedLines("WARN")).toHaveLength(1); // the redelivery logged nothing further
+    expect(loggedLines("ERROR")).toHaveLength(1);
   });
 
   it("M1: a market that stays unreadable is bounded: after 5 redeliveries the signature is recorded for re-index and the delivery is answered 2xx", async () => {
@@ -112,6 +127,12 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
     expect(last.status).toBe(200);
     expect(last.rows).toEqual([]);
     expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("lot_exp") })]);
+    // each of the 5 retried deliveries warned and answered 500 with an ERROR; the bounded 6th is a quiet 2xx
+    const warns = loggedLines("WARN"), errors = loggedLines("ERROR");
+    expect(warns.length).toBeGreaterThanOrEqual(5);
+    expect(warns.every((l) => l.includes(MATCHER_WARN))).toBe(true);
+    expect(errors.length).toBeGreaterThanOrEqual(5);
+    expect(errors.every((l) => l.includes(REDELIVERY_ERROR))).toBe(true);
   });
 
   it("low: the market read is bounded by the delivery deadline (an expired budget makes no market read)", async () => {
@@ -142,7 +163,8 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
 });
 
 describe("webhook mark-EWMA fallback (legacy leg, effective_price 0)", () => {
-  beforeEach(() => { resetLotExpCache(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  beforeEach(() => { quietLogger(); resetLotExpCache(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  afterEach(() => { logSpy.mockRestore(); });
 
   function legacyTx(slab: Buffer) {
     const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
