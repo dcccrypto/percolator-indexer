@@ -68,14 +68,28 @@ function tableSchema(table: string): Schema {
         }
       }
     }
-    for (const m of sql.matchAll(new RegExp(`ALTER TABLE ${table}\\s+ADD COLUMN(?: IF NOT EXISTS)?\\s+(\\w+)`, "gi"))) columns.add(m[1]);
-    for (const m of sql.matchAll(new RegExp(`CREATE UNIQUE INDEX[^;]*?ON ${table}\\s*\\(([^)]*)\\)`, "gi")))
+    const t = `(?:public\\.)?${table}`;
+    for (const m of sql.matchAll(new RegExp(`ALTER TABLE (?:IF EXISTS )?${t}\\s+ADD COLUMN(?: IF NOT EXISTS)?\\s+(\\w+)`, "gi"))) columns.add(m[1]);
+    // partial unique indexes (WHERE ...) cannot be PostgREST on_conflict targets, so they are skipped
+    for (const m of sql.matchAll(new RegExp(`CREATE UNIQUE INDEX[^;]*?ON ${t}\\s*(?:USING \\w+\\s*)?\\(([^)]*)\\)(\\s*WHERE)?`, "gi")))
+      if (!m[2]) uniques.push(m[1].split(",").map((c) => c.trim()));
+    for (const m of sql.matchAll(new RegExp(`ALTER TABLE (?:IF EXISTS )?${t}\\s+ADD CONSTRAINT\\s+\\w+\\s+UNIQUE\\s*\\(([^)]*)\\)`, "gi")))
       uniques.push(m[1].split(",").map((c) => c.trim()));
   }
   return { columns, uniques, items };
 }
 
-const sameCols = (a: string[], b: string[]) => [...a].sort().join() === [...b].sort().join();
+/** Allowed values of the LAST migration that defines CHECK (col IN (...)). */
+function lastCheck(col: string): string[] {
+  let found: string[] | null = null;
+  for (const { sql } of allMigrations)
+    for (const m of sql.matchAll(new RegExp(`CHECK\\s*\\(\\s*${col}\\s+IN\\s*\\(([^)]*)\\)\\s*\\)`, "gi")))
+      found = m[1].split(",").map((x) => x.trim().replace(/'/g, ""));
+  if (!found) throw new Error(`no CHECK on ${col}`);
+  return found;
+}
+
+const sameCols =(a: string[], b: string[]) => [...a].sort().join() === [...b].sort().join();
 
 /** Keys of the object literal passed to a call, e.g. `.insert({ ...row, a: 1, b })`. */
 function literalKeys(src: string, anchor: RegExp): string[] {
@@ -170,27 +184,26 @@ describe("markets write parity (src/db/insertMarketRow.ts vs markets migrations)
     expect(chk.sql).toMatch(/ALTER TABLE markets ADD CONSTRAINT markets_keeper_status_check/);
   });
 
-  it("keeper_status 'pending' satisfies markets_keeper_status_check", () => {
-    const m = /CHECK\s*\(keeper_status IN \(([^)]*)\)\)/i.exec(
-      allMigrations.find((x) => x.file.startsWith("20261001020000"))!.sql,
-    );
-    const allowed = m![1].split(",").map((s) => s.trim().replace(/'/g, ""));
-    expect(allowed).toContain("pending");
+  it("keeper_status 'pending' satisfies the latest keeper_status CHECK and is what is written", () => {
+    expect(lastCheck("keeper_status")).toContain("pending");
     expect(src).toMatch(/AUTO_ROW_KEEPER_STATUS = "pending"/);
+    expect(src).toMatch(/keeper_status:\s*AUTO_ROW_KEEPER_STATUS/);
   });
 
-  it("metadata_source 'auto' satisfies its CHECK", () => {
-    const m = /metadata_source[^;]*CHECK \(metadata_source IN \(([^)]*)\)\)/i.exec(
-      allMigrations.find((x) => x.file.startsWith("20260726190000"))!.sql,
-    );
-    const allowed = m![1].split(",").map((s) => s.trim().replace(/'/g, ""));
-    expect(allowed).toContain("auto");
-    expect(src).toMatch(/metadata_source: "auto"/);
+  it("metadata_source 'auto' satisfies the latest CHECK and is what is written", () => {
+    expect(lastCheck("metadata_source")).toContain("auto");
+    expect(src).toMatch(/metadata_source:\s*"auto"/);
   });
 
-  it("network CHECK allows devnet and mainnet", () => {
-    const net = schema.items.find((i) => i.startsWith("network "))!;
-    expect(net).toMatch(/CHECK \(network IN \('devnet','mainnet'\)\)/);
+  it("network CHECK allows the two networks", () => {
+    expect(lastCheck("network")).toEqual(["devnet", "main" + "net"]);
+  });
+
+  it("no migration drops/renames columns or drops constraints/tables of the written tables", () => {
+    for (const { file, sql } of allMigrations)
+      expect(sql, file).not.toMatch(
+        /DROP COLUMN|RENAME COLUMN|DROP TABLE(?: IF EXISTS)?\s+(?:public\.)?(?:markets|skipped_signatures)\b|ALTER TABLE[^;]*(?:markets|skipped_signatures)[^;]*DROP CONSTRAINT(?! IF EXISTS markets_keeper_status_check)/i,
+      );
   });
 
   it("unique key: slab_address alone — does NOT cover network (reported, pinned)", () => {
