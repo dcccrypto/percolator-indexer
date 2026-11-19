@@ -274,4 +274,23 @@ describe("write-outage alert under a wall-clock step back", () => {
       expect(captureSpy).toHaveBeenCalledTimes(2); // fails today: silenced until the clock catches up
     } finally { vi.useRealTimers(); }
   });
+
+  it("a step back before any alert restarts the outage clock instead of alerting early, then alerts after the threshold; no spam", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-16T00:00:10Z"));
+      captureSpy.mockClear();
+      const idx: any = new TradeIndexerPolling();
+      const pass = { failedSigs: ["sigA"], writesOk: 0 };
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      vi.setSystemTime(new Date("2026-11-16T00:00:00Z")); // 10s back, outage younger than 60s
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(0);
+      vi.setSystemTime(new Date("2026-11-16T00:01:05Z"));
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
 });
