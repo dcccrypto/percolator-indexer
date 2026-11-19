@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { isDeepStrictEqual } from "node:util";
 import { decodeBase58 as sharedDecodeBase58 } from "@percolatorct/shared";
 import { IX_TAG } from "@percolatorct/sdk";
 import * as next from "../../src/parsers/percolatorTxParser.js";
@@ -73,8 +74,12 @@ describe("decodeBase58Fast == shared decodeBase58", { timeout: 60_000 }, () => {
     for (let len = 0; len <= 300; len++) {
       const bytes = Uint8Array.from({ length: len }, () => (r() < 0.15 ? 0 : Math.floor(r() * 256)));
       const s = encodeBase58(bytes);
-      expect(decodeBase58Fast(s)).toStrictEqual(sharedDecodeBase58(s));
-      expect(decodeBase58Fast(s)).toStrictEqual(bytes);
+      // Fast path: isDeepStrictEqual is at least as strict as toStrictEqual and far cheaper than expect() per iteration;
+      // only a mismatch falls through to expect, so pass/fail semantics and failure diffs are unchanged. All 301 lengths still run.
+      const fast = decodeBase58Fast(s);
+      const shared = sharedDecodeBase58(s);
+      if (!isDeepStrictEqual(fast, shared)) expect(fast).toStrictEqual(shared);
+      if (!isDeepStrictEqual(fast, bytes)) expect(fast).toStrictEqual(bytes);
     }
   });
 
