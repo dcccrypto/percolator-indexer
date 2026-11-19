@@ -1,4 +1,5 @@
 import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, type TolerantFetchResult } from "../lib/tolerantTxFetch.js";
+import { parseMaxWriteHolds, parsePollIntervalMs, parseRpcMinIntervalMs, parseWriteOutageAlertMs, parseWriteOutageRealertMs } from "../lib/indexerEnv.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
@@ -71,9 +72,9 @@ const MAX_LOT_READ_HOLDS = 5;
  * on its own while other writes of the same pass succeed (the database is up: a poison row) is counted, and
  * after MAX_WRITE_HOLDS such polls that one signature is skipped with an alert naming it (manual backfill).
  */
-export const MAX_WRITE_HOLDS = Math.max(1, Number(process.env.INDEXER_MAX_WRITE_HOLDS) || 5);
-const WRITE_OUTAGE_ALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_ALERT_MS", 60_000);
-const WRITE_OUTAGE_REALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_REALERT_MS", 10 * 60_000);
+export const MAX_WRITE_HOLDS = parseMaxWriteHolds(process.env.INDEXER_MAX_WRITE_HOLDS, (m, c) => logger.warn(m, c));
+const WRITE_OUTAGE_ALERT_MS = parseWriteOutageAlertMs(process.env.INDEXER_WRITE_OUTAGE_ALERT_MS, (m, c) => logger.warn(m, c));
+const WRITE_OUTAGE_REALERT_MS = parseWriteOutageRealertMs(process.env.INDEXER_WRITE_OUTAGE_REALERT_MS, (m, c) => logger.warn(m, c));
 interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number> }
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
@@ -164,7 +165,7 @@ const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
 const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 20, 1_000);
 
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
-const POLL_INTERVAL_MS = readPositiveIntEnv("TRADE_POLL_INTERVAL_MS", 5 * 60_000);
+const POLL_INTERVAL_MS = parsePollIntervalMs(process.env.TRADE_POLL_INTERVAL_MS, (m, c) => logger.warn(m, c));
 
 /** Initial backfill: fetch more signatures on first run */
 const BACKFILL_SIGNATURES = readPositiveIntEnv("TRADE_BACKFILL_SIGNATURES", 100, 100);
@@ -186,10 +187,7 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
  * poll. Replaces the fixed 1 s / 0.5 s sleep per market. 125 ms = 8 calls/s, under the 10 req/s of a free Helius plan.
  * 0 disables pacing.
  */
-const RPC_MIN_INTERVAL_MS = (() => {
-  const n = Number(process.env.TRADE_RPC_MIN_INTERVAL_MS);
-  return !!process.env.TRADE_RPC_MIN_INTERVAL_MS && Number.isFinite(n) && n >= 0 ? n : 125;
-})();
+const RPC_MIN_INTERVAL_MS = parseRpcMinIntervalMs(process.env.TRADE_RPC_MIN_INTERVAL_MS, (m, c) => logger.warn(m, c));
 const TX_CACHE_MAX = readPositiveIntEnv("INDEXER_TX_CACHE_MAX", 1_000, 10_000);
 const TX_CACHE_TTL_MS = 10 * 60_000;
 const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";

@@ -137,8 +137,11 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
 
   it("low: the market read is bounded by the delivery deadline (an expired budget makes no market read)", async () => {
     rpc(slabBytes(6));
-    const prev = process.env.TRADECPI_DELIVERY_BUDGET_MS;
-    process.env.TRADECPI_DELIVERY_BUDGET_MS = "-1000000";
+    // A negative TRADECPI_DELIVERY_BUDGET_MS is no longer accepted (it fell back to 8000), so expire the deadline
+    // by making the clock advance a day per read.
+    const real = Date.now();
+    let calls = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => real + 86_400_000 * calls++);
     try {
       const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
       const { rows } = await deliver(tx);
@@ -147,7 +150,7 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
       expect(loggedLines("WARN")).toEqual([expect.stringContaining(MATCHER_WARN)]);
       expect(loggedLines("ERROR")).toEqual([expect.stringContaining(REDELIVERY_ERROR)]);
     } finally {
-      if (prev === undefined) delete process.env.TRADECPI_DELIVERY_BUDGET_MS; else process.env.TRADECPI_DELIVERY_BUDGET_MS = prev;
+      spy.mockRestore();
     }
   });
 
