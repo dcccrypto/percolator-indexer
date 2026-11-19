@@ -56,8 +56,8 @@ interface PassState {
   readsOk?: number;
 }
 /** Mark one signature as failed in this pass: the cursor must not pass it. */
-function markFailed(pass: PassState, sig: string | null | undefined): void {
-  pass.incomplete = true;
+function markFailed(pass: PassState, sig: string | null | undefined, opts: { keepComplete?: boolean } = {}): void {
+  if (!opts.keepComplete) pass.incomplete = true;
   pass.writeFailed = true;
   (pass.failedSigs ??= new Set()).add(sig ?? "?");
 }
@@ -736,7 +736,8 @@ export class TradeIndexerPolling {
       // bounded by the poison-row logic (holdAfterWriteFailure): after MAX_WRITE_HOLDS polls with other writes succeeding the
       // signature is skipped into skipped_signatures with an alert; with no writes succeeding it is held with an outage alert.
       if (v22.status === "write_failed") {
-        markFailed(pass, signature);
+        // keepComplete: the trade path of this tx is unaffected, so later tag 44 closes stay resolvable.
+        markFailed(pass, signature, { keepComplete: true });
         logger.warn("v22 log event write failed; holding the cursor so the signature is retried", { signature: signature.slice(0, 12) });
       }
     } catch (err) {

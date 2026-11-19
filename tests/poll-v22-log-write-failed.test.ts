@@ -1,10 +1,10 @@
 /**
- * DRAFT (report J-20261119-IDX-REPORT-SUPABASEERRORUNCHECKED, hit H1): the poll path drops a v2.2 log-event write failure.
+ * Regression (report J-20261119-IDX-REPORT-SUPABASEERRORUNCHECKED, hit H1): the poll path drops a v2.2 log-event write failure.
  *
  * supabase-js returns { error } on a failed `v22_events` upsert; insertV22Events turns it into V22EventWriteError and
  * recordV22LogEvents reports status "write_failed". TradeIndexer.processTransaction ignores that status, so the pass is
  * not marked failed and the slab cursor commits past the signature: the fill / reduce / move rows are never retried.
- * Expected (fails today): the signature is marked failed in the pass (cursor held), as a failed trade write is.
+ * Expected: the signature is marked failed in the pass (cursor held), as a failed trade write is.
  */
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -44,10 +44,11 @@ describe("H1: poll path, v22_events upsert returns { error }", () => {
       meta: { err: null, logMessages: logs(EX.fill_clipped_tradecpi.b64), innerInstructions: [] },
       transaction: { message: { instructions: [{ programId: new PublicKey(W), accounts: [TAKER, M].map((k) => new PublicKey(k)), data: encodeBase58(new Uint8Array([10, 0, 0, 0])) }] } },
     };
-    const pass = { earlier: new Set<string>(), incomplete: false };
+    const pass: any = { earlier: new Set<string>(), incomplete: false };
     await (new TradeIndexerPolling() as any).processTransaction(tx, "SIGPOLL", M, new Set([W]), pass).catch(() => undefined);
     expect(upsert).toHaveBeenCalled(); // the v22_events write was attempted and returned { error }
     expect(pass).toMatchObject({ writeFailed: true }); // FAILS today: writeFailed is undefined, the cursor commits
+    expect(pass.incomplete).toBe(false); // trade path unaffected: later tag 44 closes must not be refused
     expect([...((pass as { failedSigs?: Set<string> }).failedSigs ?? [])]).toContain("SIGPOLL");
   });
 
