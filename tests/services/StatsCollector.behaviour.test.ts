@@ -722,6 +722,17 @@ describe('collect(): sweep', () => {
     expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
   });
 
+  it('sweeps again when the wall clock stepped back (negative age is due)', async () => {
+    const markets = registered();
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
+    const { sc } = make(markets);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() - 86_400_000);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
+  });
+
   it('marks a slab that no longer exists on chain closed + excluded', async () => {
     const markets = registered();
     h.getMultipleAccountsInfo.mockResolvedValue([null]);
