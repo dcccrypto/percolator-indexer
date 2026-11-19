@@ -20,14 +20,17 @@ import { EventStreamService } from "../src/services/EventStreamService.js";
 
 const fx = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
 
-async function run(f: any, getAccountInfo: any, waitMs = 50) {
+async function run(f: any, getAccountInfo: any, waitMs = 50, untilRows = false) {
   let cb: (m: any) => void = () => {};
   const ws: any = { sub: () => {}, onNotification: (c: any) => { cb = c; }, close: () => {}, isOpen: true };
   const wrapperIx = f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
   const svc = new EventStreamService({ ws, programId: PROGRAM, connection: { getAccountInfo } as any, autoIndex: true, knownSlabs: [wrapperIx.accounts[1]] });
   await svc.start();
   cb({ method: "transactionNotification", params: { result: f.tx } });
-  await new Promise((r) => setTimeout(r, waitMs));
+  if (untilRows) {
+    // Retries use real 300 ms timers: poll for the row (10 s cap) instead of racing a fixed sleep under load.
+    for (const t0 = Date.now(); rowsOut.length === 0 && Date.now() - t0 < 10_000; ) await new Promise((r) => setTimeout(r, 10));
+  } else await new Promise((r) => setTimeout(r, waitMs));
   return rowsOut.splice(0);
 }
 
@@ -76,7 +79,7 @@ describe("event stream: TradeCpi rows", () => {
     const get = vi.fn()
       .mockRejectedValueOnce(new Error("429"))
       .mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
-    const rows = await run(f, get, 1500);
+    const rows = await run(f, get, 1500, true);
     expect(get).toHaveBeenCalledTimes(2);
     expect(rows.map((r) => r.size)).toEqual(["483"]);
   });
@@ -84,7 +87,7 @@ describe("event stream: TradeCpi rows", () => {
   it("F2: persistent failures fall back to the post-clip request after the retries", async () => {
     const f = fx("clipFull");
     const get = vi.fn(async () => { throw new Error("timeout"); });
-    const rows = await run(f, get, 1500);
+    const rows = await run(f, get, 1500, true);
     expect(get).toHaveBeenCalledTimes(3);
     expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
   });
