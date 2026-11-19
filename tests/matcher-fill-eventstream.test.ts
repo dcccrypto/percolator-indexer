@@ -1,5 +1,5 @@
 /** #213 / #221 on the event-stream path, real jsonParsed transactions. */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 
 const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
@@ -20,19 +20,22 @@ import { EventStreamService } from "../src/services/EventStreamService.js";
 
 const fx = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
 
-async function run(f: any, getAccountInfo: any, waitMs = 50) {
+// `wait` is a real-time ms delay, or (fake-timer tests) a function that drives the clock.
+async function run(f: any, getAccountInfo: any, wait: number | (() => Promise<void>) = 50) {
   let cb: (m: any) => void = () => {};
   const ws: any = { sub: () => {}, onNotification: (c: any) => { cb = c; }, close: () => {}, isOpen: true };
   const wrapperIx = f.tx.transaction.message.instructions.find((i: any) => i.programId === PROGRAM && i.data.length > 100);
   const svc = new EventStreamService({ ws, programId: PROGRAM, connection: { getAccountInfo } as any, autoIndex: true, knownSlabs: [wrapperIx.accounts[1]] });
   await svc.start();
   cb({ method: "transactionNotification", params: { result: f.tx } });
-  await new Promise((r) => setTimeout(r, waitMs));
+  if (typeof wait === "function") await wait();
+  else await new Promise((r) => setTimeout(r, wait));
   return rowsOut.splice(0);
 }
 
 describe("event stream: TradeCpi rows", () => {
   beforeEach(() => { rowsOut.length = 0; recordSkipped.mockClear(); });
+  afterEach(() => { vi.useRealTimers(); });
 
   it("partial fill: executed size and booked price; the slab is never read", async () => {
     const f = fx("partial");
@@ -71,21 +74,35 @@ describe("event stream: TradeCpi rows", () => {
     expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
   });
 
+  // The retry backoff (2 x 300 ms) is a hard-coded setTimeout in the service, so these run on a fake clock:
+  // the call count, the exact 300 ms spacing between attempts and the written size are all still asserted.
   it("F2: a transport error is retried briefly (2 x 300 ms) and then the exact size is used when a retry succeeds", async () => {
+    vi.useFakeTimers();
     const f = fx("partial");
-    const get = vi.fn()
-      .mockRejectedValueOnce(new Error("429"))
-      .mockResolvedValue({ data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") });
-    const rows = await run(f, get, 1500);
+    const t0 = Date.now();
+    const at: number[] = [];
+    const get = vi.fn(async () => {
+      at.push(Date.now() - t0);
+      if (at.length === 1) throw new Error("429");
+      return { data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") };
+    });
+    const rows = await run(f, get, () => vi.advanceTimersByTimeAsync(600));
     expect(get).toHaveBeenCalledTimes(2);
+    expect(at).toEqual([0, 300]);
+    expect(Date.now() - t0).toBe(600);
     expect(rows.map((r) => r.size)).toEqual(["483"]);
   });
 
   it("F2: persistent failures fall back to the post-clip request after the retries", async () => {
+    vi.useFakeTimers();
     const f = fx("clipFull");
-    const get = vi.fn(async () => { throw new Error("timeout"); });
-    const rows = await run(f, get, 1500);
+    const t0 = Date.now();
+    const at: number[] = [];
+    const get = vi.fn(async () => { at.push(Date.now() - t0); throw new Error("timeout"); });
+    const rows = await run(f, get, () => vi.advanceTimersByTimeAsync(600));
     expect(get).toHaveBeenCalledTimes(3);
+    expect(at).toEqual([0, 300, 600]);
+    expect(Date.now() - t0).toBe(600);
     expect(rows.map((r) => r.size)).toEqual(["189226154805"]);
   });
 });
