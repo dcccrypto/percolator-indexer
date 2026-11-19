@@ -111,3 +111,36 @@ describe("GH#234: webhook limiter behaviour on the S3-C11 key", () => {
     expect(rl.buckets.size).toBe(0);
   });
 });
+
+describe("window boundary and prune", () => {
+  it("a request at exactly resetTime still belongs to the window; one ms later opens a new one", async () => {
+    let t = 5_000;
+    const { rl, post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) await post(HELIUS_IP);
+    t = 5_000 + 60_000; // exactly resetTime: t > resetTime is false
+    expect((await post(HELIUS_IP)).status).toBe(429);
+    t += 1;
+    expect((await post(HELIUS_IP)).status).toBe(200);
+    expect(rl.buckets.get(HELIUS_IP)?.count).toBe(1);
+  });
+
+  it("pruneExpired keeps live buckets (incl. exactly at resetTime) and drops only expired ones", async () => {
+    let t = 0;
+    const { rl, post } = appWith({ now: () => t });
+    await post("10.0.0.1");
+    t = 30_000;
+    await post("10.0.0.2");
+    t = 60_000;
+    rl.pruneExpired();
+    expect([...rl.buckets.keys()].sort()).toEqual(["10.0.0.1", "10.0.0.2"]);
+    t = 60_001;
+    rl.pruneExpired();
+    expect([...rl.buckets.keys()]).toEqual(["10.0.0.2"]);
+  });
+
+  it("defaults to the wall clock when no now() is injected", async () => {
+    const { rl, post } = appWith();
+    await post(HELIUS_IP);
+    expect(rl.buckets.get(HELIUS_IP)!.resetTime).toBeGreaterThan(Date.now());
+  });
+});

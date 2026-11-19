@@ -93,27 +93,41 @@ function assertHasSignature(row: IndexerTradeRow): void {
  * indexing. So the first such rejection switches this process to writing without the column
  * (provenance is then simply unrecorded, i.e. NULL, as for historical rows) and logs once.
  */
-let provenanceColumnMissing = false;
+let provenanceColumnMissingSince: number | null = null;
 
+/** After this long without the column, send it again so an applied migration is picked up without a restart. */
+const PROVENANCE_REPROBE_MS = 5 * 60_000;
+
+function provenanceColumnMissing(): boolean {
+  return provenanceColumnMissingSince !== null && Date.now() - provenanceColumnMissingSince < PROVENANCE_REPROBE_MS;
+}
+
+/**
+ * True when `error` is the missing-column rejection, i.e. the request wrote nothing and should be retried
+ * without the column. Also true when another in-flight write already flagged the column (concurrent writers
+ * that were sent with the column before the flag flipped), and for a failed re-probe.
+ */
 function noteMissingProvenanceColumn(error: { code?: string; message?: string }): boolean {
-  if (provenanceColumnMissing) return false;
   if (error.code !== "PGRST204" || !/size_provenance/.test(error.message ?? "")) return false;
-  provenanceColumnMissing = true;
-  logger.error(
-    "trades.size_provenance is missing (migration 20261012090000 not applied); writing trades without it",
-    { code: error.code, error: error.message },
-  );
+  const first = provenanceColumnMissingSince === null;
+  provenanceColumnMissingSince = Date.now();
+  if (first) {
+    logger.error(
+      "trades.size_provenance is missing (migration 20261012090000 not applied); writing trades without it",
+      { code: error.code, error: error.message },
+    );
+  }
   return true;
 }
 
 /** Test hook: forget a previously detected missing column. */
 export function resetProvenanceColumnProbe(): void {
-  provenanceColumnMissing = false;
+  provenanceColumnMissingSince = null;
 }
 
 function toDbRow(row: IndexerTradeRow) {
   assertHasSignature(row);
-  const provenance = provenanceColumnMissing ? {} : { size_provenance: row.size_provenance ?? null };
+  const provenance = provenanceColumnMissing() ? {} : { size_provenance: row.size_provenance ?? null };
   return {
     slab_address: row.slab_address,
     trader: row.trader,

@@ -28,7 +28,48 @@
  *    from `meta.returnData` when present.
  */
 
-import { decodeBase58, createLogger } from "@percolatorct/shared";
+import { createLogger } from "@percolatorct/shared";
+
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const B58_INDEX = new Int8Array(128).fill(-1);
+for (let i = 0; i < B58_ALPHABET.length; i++) B58_INDEX[B58_ALPHABET.charCodeAt(i)] = i;
+
+/**
+ * Base58 decode, output identical to `decodeBase58` from @percolatorct/shared (null on any character
+ * outside the alphabet; a non-string input also gives null, where the shared one would give an empty array; leading '1's are leading zero bytes). The shared one grows
+ * a plain array with `unshift` per carry and does an `indexOf` per character: it was the top frame of
+ * the matcher-fill parse profile. This one fills a preallocated Uint8Array from the end.
+ */
+export function decodeBase58Fast(str: string): Uint8Array | null {
+  if (typeof str !== "string") return null;
+  const n = str.length;
+  let zeros = 0;
+  while (zeros < n && str.charCodeAt(zeros) === 49) zeros++;
+  // log(58)/log(256) < 0.7322: an upper bound on the value bytes
+  const buf = new Uint8Array(Math.ceil(((n - zeros) * 733) / 1000) + 1);
+  let used = 0; // value bytes, right-aligned in buf
+  const last = buf.length - 1;
+  for (let i = zeros; i < n; i++) {
+    const c = str.charCodeAt(i);
+    const d = c < 128 ? B58_INDEX[c] : -1;
+    if (d < 0) return null;
+    let carry = d;
+    let j = last;
+    for (let k = 0; k < used; k++, j--) {
+      carry += buf[j] * 58;
+      buf[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      buf[j--] = carry & 0xff;
+      carry >>= 8;
+      used++;
+    }
+  }
+  const out = new Uint8Array(zeros + used);
+  out.set(buf.subarray(buf.length - used), zeros);
+  return out;
+}
 
 let _logger: ReturnType<typeof createLogger> | null = null;
 const summaryLogger = () => (_logger ??= createLogger("indexer:tradecpi-fill"));
@@ -160,7 +201,7 @@ export function cpiEvidence(
   if (!matcherProgram) return unknown;
   for (const ix of inner) {
     if (ix.programId !== matcherProgram) continue;
-    const bytes = decodeBase58(ix.data);
+    const bytes = decodeBase58Fast(ix.data);
     const call = bytes ? decodeMatcherCall(bytes) : null;
     if (!call || call.batch !== isBatch) return unknown;
     let batchReturns: MatcherReturn[] | null = null;
@@ -258,8 +299,16 @@ function note(kind: keyof TradecpiCounters, alsoReadError = false, alsoLegacyBat
  */
 export type UnverifiedSizePolicy = "skip" | "request";
 
+const warnedUnverifiedPolicy = new Set<string>();
+
 export function unverifiedSizePolicy(env: Record<string, string | undefined> = process.env): UnverifiedSizePolicy {
-  return env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase() === "skip" ? "skip" : "request";
+  const v = env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase();
+  if (v === "skip") return "skip";
+  if (v && v !== "request" && !warnedUnverifiedPolicy.has(v)) {
+    warnedUnverifiedPolicy.add(v);
+    summaryLogger().error("Unrecognised TRADECPI_UNVERIFIED_SIZE; using 'request' (valid: 'skip' | 'request')", { value: v });
+  }
+  return "request";
 }
 
 function abs(n: bigint): bigint {
