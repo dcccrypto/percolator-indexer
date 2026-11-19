@@ -15,4 +15,7 @@
 -- markets_with_stats from m.*, so the view picks the column up. Added any later, the baseline's
 -- CREATE OR REPLACE VIEW markets_with_stats (m.*) fails on a second apply with "cannot change name
 -- of view column".
+--
+-- This version sorts before versions a hosted DB may already record; the hosted DBs apply by hand
+-- today, but a `supabase db push` there would need --include-all (a no-op for this file).
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS keeper_status TEXT NOT NULL DEFAULT 'retired';
