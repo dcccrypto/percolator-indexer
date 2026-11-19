@@ -34,6 +34,7 @@ vi.mock("../src/db/storedLegs.js", async (orig) => ({
 }));
 import { insertTradeRow } from "../src/db/insertTradeRow.js";
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
+import { resetTradeCursorWarnings } from "../src/db/tradeCursor.js";
 
 const fx = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
 const pk = (s: string) => new PublicKey(s);
@@ -56,10 +57,10 @@ async function poll(f: any) {
 // in-memory-cursor ERROR (no Supabase in unit tests) are EXPECTED here, and the tests that expect them assert on them.
 let logSpy: ReturnType<typeof vi.spyOn>;
 const logged = () => logSpy.mock.calls.map((c) => String(c[0]));
-const heldWarns = () => logged().filter((l) => l.includes("WARN") && l.includes("matcher context read failed; holding the cursor"));
+const heldWarns = () => logged().filter((l) => l.includes("matcher context read failed; holding the cursor"));
 
 describe("poll path: TradeCpi rows", () => {
-  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); logSpy = vi.spyOn(console, "log").mockImplementation(() => {}); });
+  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); resetTradeCursorWarnings(); logSpy = vi.spyOn(console, "log").mockImplementation(() => {}); });
   afterEach(() => { logSpy.mockRestore(); });
 
   it("partial fill: executed size, booked price, fee on the executed notional", async () => {
@@ -173,7 +174,7 @@ describe("poll path: TradeCpi rows", () => {
       expect(await poll1(idx, slabOf(f))).toBeUndefined();
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(heldWarns()).toHaveLength(1); // the hold is logged, once
-      expect(logged().some((l) => l.includes("ERROR") && l.includes("trade_indexer_cursor unavailable"))).toBe(true); // no Supabase: in-memory cursor, said loudly
+      expect(logged().some((l) => l.includes("trade_indexer_cursor unavailable"))).toBe(true); // no Supabase: in-memory cursor, said loudly
       expect(await poll1(idx, slabOf(f))).toBe(f.sig); // retry falls back (cannot hold again) and the cursor moves
       expect(sizes()).toEqual(["0:189226154805"]);
       await poll1(idx, slabOf(f));
