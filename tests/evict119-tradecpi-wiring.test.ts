@@ -19,7 +19,7 @@ const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 const getAccountInfo = vi.fn();
 // Narrow mock: the barrel pulls sentry, supabase, the Solana send utils and the alerts stack (~10 s of import under
 // load, the cause of the "Failed to start forks worker" flake). This file needs only the real config, logger, event bus
-// and binary decoders, so those come from their own light modules; everything else is a stub that throws if
+// and binary decoders, so those come from their own light modules; everything else is a stub (captureException a silent vi.fn, as Sentry was uninitialised here) that throws if
 // it is ever reached, so a new dependency on it fails loudly instead of silently no-op-ing.
 vi.mock("@percolatorct/shared", async () => {
   const dist = "@percolatorct/shared/dist";
