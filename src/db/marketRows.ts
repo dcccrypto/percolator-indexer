@@ -46,7 +46,11 @@ export function getMarketRows(): Promise<MarketRowLite[]> {
 
 /** Same rows, reusing a read younger than MARKET_ROWS_TTL_MS. For callers that tolerate a minute of staleness. */
 export function getMarketRowsCached(): Promise<MarketRowLite[]> {
-  if (cache && Date.now() - cache.at < MARKET_ROWS_TTL_MS) return Promise.resolve(cache.rows);
+  if (cache) {
+    // A negative age (wall clock stepped back) is expired, not fresh.
+    const age = Date.now() - cache.at;
+    if (age >= 0 && age < MARKET_ROWS_TTL_MS) return Promise.resolve(cache.rows);
+  }
   return getMarketRows();
 }
 

@@ -604,8 +604,15 @@ export class TradeIndexerPolling {
     }
     this.heldSigs.set(slabAddress, new Set(failed)); // poison sigs stay held too until all are over the cap, so none is dropped unnamed
     logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slab, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)), dbUp });
-    if (!dbUp && now - hold.since >= WRITE_OUTAGE_ALERT_MS && now - hold.lastAlertAt >= WRITE_OUTAGE_REALERT_MS) {
+    // A negative age (wall clock stepped back) counts as elapsed, so the alert is never silenced by a step.
+    const outageAge = now - hold.since;
+    const sinceAlert = now - hold.lastAlertAt;
+    // Step back before any alert: restart the outage clock (alert at most ALERT_MS late). Step back after one: it is already a known long outage, so it is due.
+    const stepped = outageAge < 0;
+    if (stepped && hold.lastAlertAt === 0) hold.since = now;
+    if (!dbUp && (stepped ? hold.lastAlertAt > 0 : outageAge >= WRITE_OUTAGE_ALERT_MS) && (sinceAlert < 0 || sinceAlert >= WRITE_OUTAGE_REALERT_MS)) {
       hold.lastAlertAt = now;
+      if (stepped) hold.since = now;
       logger.error("ALERT: fill writes keep failing and nothing is being written (database down, or one bad row on a quiet slab?); cursor held, nothing skipped", { slabAddress: slab, sinceMs: now - hold.since, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)) });
       captureException(new Error(`indexer fill writes failing for ${Math.round((now - hold.since) / 1000)}s; cursor held (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-outage" }, extra: { slabAddress, sinceMs: now - hold.since } });
     }

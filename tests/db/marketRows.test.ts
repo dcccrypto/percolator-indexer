@@ -100,6 +100,17 @@ describe("marketRows", () => {
     expect(rows.map((r) => r.slab_address)).toEqual([...table].sort());
   });
 
+  it("re-reads when the wall clock steps back (negative age is expired, not fresh)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-16T00:00:00Z"));
+    setTotal(3);
+    await getMarketRowsCached();
+    const first = calls.length;
+    vi.setSystemTime(new Date("2026-11-15T00:00:00Z")); // NTP step back 1 day
+    await getMarketRowsCached();
+    expect(calls.length).toBeGreaterThan(first);
+  });
+
   it("the read ends on an empty page: one extra read after the last row", async () => {
     setTotal(MARKET_ROWS_PAGE);
     expect(await getMarketRows()).toHaveLength(MARKET_ROWS_PAGE);

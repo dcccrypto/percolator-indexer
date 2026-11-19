@@ -996,7 +996,9 @@ export class StatsCollector {
       // one RPC round-trip per SWEEP_BATCH_SIZE markets. Registration above already
       // ran; skip the sweep until it's due.
       const now = Date.now();
-      if (now - this._lastSweepAt < AUTOCLOSE_INTERVAL_MS) return;
+      // A negative age (wall clock stepped back) is due, not "recent".
+      const sweepAge = now - this._lastSweepAt;
+      if (sweepAge >= 0 && sweepAge < AUTOCLOSE_INTERVAL_MS) return;
       this._lastSweepAt = now;
 
       logger.info("StatsCollector sweep started", { marketCount: markets.size });
