@@ -71,7 +71,7 @@ export async function recordSkippedSignatures(allRows: readonly SkippedSignature
   for (const r of rows) {
     const msg =
       r.source === "v22-events"
-        ? "SKIPPED v2.2 events: this transaction's v22_events rows are NOT indexed until re-indexed (its trades were)"
+        ? "SKIPPED v2.2 events: this transaction's v22_events rows are NOT indexed until re-indexed"
         : "SKIPPED unreadable transaction: trades in it are NOT indexed until re-indexed";
     logger.error(msg, {
       metric: "indexer_skipped_signatures_total",
@@ -82,7 +82,7 @@ export async function recordSkippedSignatures(allRows: readonly SkippedSignature
     });
   }
   try {
-    captureException(new Error(`indexer skipped ${rows.length} unreadable transaction(s)`), {
+    captureException(new Error(`indexer skipped ${rows.length} transaction(s) (unreadable, or their v2.2 events unwritten)`), {
       tags: { context: "indexer-skipped-signature" },
       extra: { signatures: rows.map((r) => r.signature), slabs: [...new Set(rows.map((r) => r.slab))] },
     });
