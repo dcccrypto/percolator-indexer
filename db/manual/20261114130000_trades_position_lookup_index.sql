@@ -1,4 +1,8 @@
 -- NOT APPLIED: review and run by hand against a non-production database first.
+-- Lives in db/manual/, not supabase/migrations/: CREATE INDEX CONCURRENTLY cannot run in the
+-- per-file transaction the Supabase CLI uses. supabase/migrations/20261114130000_trades_position_lookup_index.sql
+-- is the transaction-safe stand-in (builds this index only on an empty trades table, else warns).
+-- Run: psql -v ON_ERROR_STOP=1 -f db/manual/20261114130000_trades_position_lookup_index.sql
 -- fetchTraderPositionEvidence (src/db/traderNetPosition.ts) reads every fill of one
 -- (trader, slab, asset, network), ordered by id, a page of 1000 at a time.
 -- The existing indexes lead with (trader, created_at), so Postgres reads all of the
@@ -9,5 +13,5 @@
 -- CONCURRENTLY cannot run inside a transaction block: apply it by hand as a single statement,
 -- not through a transactional runner. If a build fails it leaves an INVALID index; check
 -- pg_index.indisvalid and DROP INDEX CONCURRENTLY idx_trades_position_lookup before retrying.
-CREATE INDEX CONCURRENTLY idx_trades_position_lookup
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_position_lookup
   ON trades (trader, slab_address, asset_index, network, id);
