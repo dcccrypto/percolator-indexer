@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { LAYOUT_V22 } from "@percolatorct/sdk";
 
-const { insertV22Events, logWarn, blocked } = vi.hoisted(() => ({ insertV22Events: vi.fn(async (rows: unknown[]) => rows.length), logWarn: vi.fn(), blocked: new Set<string>() }));
-vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events }));
+const { insertV22Events, logWarn, blocked, V22EventWriteError } = vi.hoisted(() => ({ insertV22Events: vi.fn(async (rows: unknown[]) => rows.length), logWarn: vi.fn(), blocked: new Set<string>(), V22EventWriteError: class V22EventWriteError extends Error {} }));
+vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events, V22EventWriteError }));
 vi.mock("../../src/blocklist.js", () => ({ isBlockedSlab: (s: string) => blocked.has(s) }));
 vi.mock("@percolatorct/shared", () => ({ createLogger: () => ({ info: vi.fn(), warn: logWarn, debug: vi.fn(), error: vi.fn() }) }));
 
@@ -70,5 +70,11 @@ describe("recordV22LogEvents", () => {
   it("NEVER throws: an insert failure is swallowed", async () => {
     insertV22Events.mockRejectedValueOnce(new Error("db down"));
     await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toMatchObject({ status: "not_applicable", rows: 0 });
+  });
+
+  it("a failed DB write (V22EventWriteError) is reported as write_failed with the market of the lost rows", async () => {
+    insertV22Events.mockRejectedValueOnce(new V22EventWriteError("connection reset"));
+    const r = await recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(r).toEqual({ status: "write_failed", rows: 1, slab: M });
   });
 });

@@ -79,7 +79,7 @@ describe("event stream: v22_events write failure", () => {
   it("retries the write and then fails the handler (no silent success)", async () => {
     const err = await (svc() as any).handle(msg).then(() => null, (e: unknown) => e); // BEFORE the fix: resolves, 1 attempt
     expect(db.upsert.mock.calls.length).toBeGreaterThanOrEqual(3);
-    expect(String(err)).toMatch(/v22_events write failed/);
+    expect(String(err)).toMatch(/v22 instruction events \(\d+\) write failed after retries/);
   });
 
   it("a transient failure that recovers on retry succeeds with no error", async () => {

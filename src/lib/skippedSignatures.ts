@@ -7,7 +7,13 @@ const logger = createLogger("indexer:skipped-signatures");
 export interface SkippedSignature {
   /** FULL signature (never truncated: this is the re-index handle). */
   signature: string;
-  source: "trade-indexer" | "lp-vault" | "creator-lookup";
+  /**
+   * Which writer lost data, i.e. which re-index restores it. "v22-events": the trade rows of the tx WERE indexed, but its
+   * v2.2 `v22_events` rows (instruction and/or log events, see `error`) were not; re-indexing a "trade-indexer" row does
+   * not write instruction events, so these get their own source (and their own (signature, source) dedupe key: a trade-path
+   * record of the same signature never swallows them).
+   */
+  source: "trade-indexer" | "lp-vault" | "creator-lookup" | "v22-events";
   /** Slab (or LP-vault registry) whose signature window contained it. */
   slab: string;
   error: string;
@@ -63,7 +69,11 @@ export async function recordSkippedSignatures(allRows: readonly SkippedSignature
   if (rows.length === 0) return;
   skippedTotal += rows.length;
   for (const r of rows) {
-    logger.error("SKIPPED unreadable transaction: trades in it are NOT indexed until re-indexed", {
+    const msg =
+      r.source === "v22-events"
+        ? "SKIPPED v2.2 events: this transaction's v22_events rows are NOT indexed until re-indexed (its trades were)"
+        : "SKIPPED unreadable transaction: trades in it are NOT indexed until re-indexed";
+    logger.error(msg, {
       metric: "indexer_skipped_signatures_total",
       signature: r.signature,
       slab: r.slab,
