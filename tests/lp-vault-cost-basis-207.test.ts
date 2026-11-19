@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Keypair, Message, PublicKey, type VersionedTransactionResponse } from "@solana/web3.js";
@@ -665,8 +665,26 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
     return c;
   }
 
+  // The 20_001-junk history is read-only for both big cases (the indexer only reads sigs/txs; claim, reads and
+  // raceSig are per-chain state), so it is built once. Each case gets its own FakeChain view over the shared
+  // signature list and transaction map: its own claim/read counter, nothing else.
+  const SPAM_N = 20_001;
+  let spamBase: FakeChain;
+  beforeAll(() => {
+    const t0 = performance.now();
+    spamBase = spammed(SPAM_N);
+    Object.freeze(spamBase.sigs);
+    console.log(`GH#231 fixture: built ${spamBase.sigs.length} signatures (${SPAM_N} junk) once in ${(performance.now() - t0).toFixed(0)} ms`);
+  });
+  function spammedView(): FakeChain {
+    const c = new FakeChain();
+    c.sigs = spamBase.sigs; // frozen, never mutated by the indexer (raceSig is unused here)
+    c.txs = spamBase.txs;
+    return c;
+  }
+
   it("drains 20_001 junk signatures over several passes and still reaches the exact basis", async () => {
-    const chain = spammed(20_001);
+    const chain = spammedView();
     chain.claim = claimOfRecord();
     const store = new MemoryLpVaultStore();
     const ix = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
@@ -686,6 +704,7 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
       expect(passes).toBeLessThan(50); // it must converge, not spin
     }
     expect(passes).toBeGreaterThan(1);
+    console.log(`GH#231 drain: ${passes} passes, ${chain.reads} transactions read, final backlog ${r.backlog} (junk ${SPAM_N})`);
     // The pass that exits the loop is the one that folded everything still outstanding.
     expect(r.backlog).toBe(r.signatures);
     expect((await ix.syncRegistry(FXUC)).backlog).toBe(0); // and then there is nothing left
@@ -703,7 +722,7 @@ describe("GH#231 a long or spammed signature history drains instead of wedging t
   }, SLOW_MS);
 
   it("does not reconcile against a chain head it has not caught up to yet", async () => {
-    const chain = spammed(20_001);
+    const chain = spammedView();
     chain.claim = claimOfRecord();
     const store = new MemoryLpVaultStore();
     const ix = new LpVaultIndexer({ chain, store, network: "devnet", programIds: [WRAPPER] });
