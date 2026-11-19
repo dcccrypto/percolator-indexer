@@ -722,7 +722,7 @@ export class TradeIndexerPolling {
     // v2.2 wrapper LOG events of this slab (fills / reductions / moves; strict frame attribution; VERSION-keyed). Best effort and
     // isolated: it never throws and never touches the trade path below.
     try {
-      await recordV22LogEvents({
+      const v22 = await recordV22LogEvents({
         signature,
         err: tx.meta.err,
         logMessages: tx.meta.logMessages,
@@ -732,6 +732,13 @@ export class TradeIndexerPolling {
         blockTimeSec: tx.blockTime ?? null,
         isKnownMarket: (slab) => slab === slabAddress,
       });
+      // A failed v22_events write must hold the cursor like a failed trade write, else the events are lost for good. It is
+      // bounded by the poison-row logic (holdAfterWriteFailure): after MAX_WRITE_HOLDS polls with other writes succeeding the
+      // signature is skipped into skipped_signatures with an alert; with no writes succeeding it is held with an outage alert.
+      if (v22.status === "write_failed") {
+        markFailed(pass, signature);
+        logger.warn("v22 log event write failed; holding the cursor so the signature is retried", { signature: signature.slice(0, 12) });
+      }
     } catch (err) {
       logger.warn("v22 log events skipped for a transaction (trades unaffected)", { signature: signature.slice(0, 12), err: String(err) });
     }
