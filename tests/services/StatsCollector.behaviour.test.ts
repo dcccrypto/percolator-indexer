@@ -422,10 +422,29 @@ describe('start / stop timers', () => {
 });
 
 describe('registration (doSyncMarkets)', () => {
-  it('reads nothing when discovery is empty', async () => {
+  it('registers nothing when discovery is empty, but still refreshes the DB-retired blocklist', async () => {
+    h.getMarketRows.mockResolvedValue([
+      { slab_address: 'RETIRED', keeper_status: 'retired' },
+      { slab_address: 'LIVE', keeper_status: 'active' },
+    ]);
     const { sc } = make();
     expect(await sc.registerNewMarkets()).toBeUndefined();
-    expect(h.getMarketRows).not.toHaveBeenCalled();
+    expect(h.setDbRetiredSlabs).toHaveBeenCalledWith(['RETIRED']);
+    expect(h.insertMarketRow).not.toHaveBeenCalled();
+  });
+
+  it('un-retiring in the DB clears the set even while discovery is empty', async () => {
+    h.getMarketRows.mockResolvedValue([{ slab_address: 'LIVE', keeper_status: 'active' }]);
+    const { sc } = make();
+    await sc.registerNewMarkets();
+    expect(h.setDbRetiredSlabs).toHaveBeenCalledWith([]);
+  });
+
+  it('keeps the previous retired set when the row read throws', async () => {
+    h.getMarketRows.mockRejectedValue(new Error('db down'));
+    const { sc } = make(new Map([[slab(), market()]]));
+    await sc.registerNewMarkets();
+    expect(h.setDbRetiredSlabs).not.toHaveBeenCalled();
   });
 
   it('feeds keeper_status=retired rows to the blocklist and never registers a blocked slab', async () => {
@@ -699,6 +718,17 @@ describe('collect(): sweep', () => {
     await sc.collect();
     expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
     vi.setSystemTime(Date.now() + AUTOCLOSE_INTERVAL_MS + 1);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it('sweeps again when the wall clock stepped back (negative age is due)', async () => {
+    const markets = registered();
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
+    const { sc } = make(markets);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() - 86_400_000);
     await sc.collect();
     expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
   });

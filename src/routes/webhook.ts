@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { parseDeliveryBudgetMs } from "../lib/indexerEnv.js";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
@@ -500,7 +501,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
   // before it. Stable, so transactions without a slot keep their delivery order.
   const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
-  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + (Number(process.env.TRADECPI_DELIVERY_BUDGET_MS) || CTX_DELIVERY_BUDGET_MS) };
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + parseDeliveryBudgetMs(process.env.TRADECPI_DELIVERY_BUDGET_MS, CTX_DELIVERY_BUDGET_MS) };
   const ordered = [...transactions].sort((x, y) => {
     const sx = slotOf(x), sy = slotOf(y);
     return sx === sy ? 0 : sx < sy ? -1 : 1;

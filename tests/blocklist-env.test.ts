@@ -7,8 +7,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const info = vi.fn();
+const warn = vi.fn();
 vi.mock("@percolatorct/shared", () => ({
-  createLogger: () => ({ debug() {}, info, warn() {}, error() {} }),
+  createLogger: () => ({ debug() {}, info, warn, error() {} }),
 }));
 
 const HARDCODED = "6CFMN29zPgsczCQUjeZZiWxVPDUKN52RJqBLvRsTTERn";
@@ -22,7 +23,7 @@ async function load() {
   return import("../src/blocklist.js");
 }
 
-beforeEach(() => info.mockClear());
+beforeEach(() => { info.mockClear(); warn.mockClear(); });
 afterEach(() => {
   if (saved === undefined) delete process.env.INDEXER_BLOCKED_SLABS;
   else process.env.INDEXER_BLOCKED_SLABS = saved;
@@ -80,5 +81,13 @@ describe("INDEXER_BLOCKED_SLABS", () => {
     expect(m.isBlockedSlab(ENV_A)).toBe(false);
     expect(m.isBlockedSlab(null)).toBe(false);
     expect(m.isBlockedSlab(undefined)).toBe(false);
+  });
+
+  it("warns on a malformed entry (typo) but valid entries stay silent", async () => {
+    process.env.INDEXER_BLOCKED_SLABS = `${ENV_A}, notapubkey0O`;
+    const m = await load();
+    expect(m.isBlockedSlab(ENV_A)).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: "notapubkey0O" });
   });
 });

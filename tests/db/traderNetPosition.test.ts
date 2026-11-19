@@ -171,4 +171,22 @@ describe('resolveRebalanceReduce', () => {
     expect((await resolveRebalanceReduce({ ...args, repeatInTx: true })).ok).toBe(false);
     expect(calls).toHaveLength(0);
   });
+
+  it('a thrown non-Error lookup failure is stringified into the refusal reason', async () => {
+    const shared = await import('@percolatorct/shared');
+    vi.mocked(shared.getSupabase).mockImplementationOnce(() => { throw 'conn reset'; });
+    const r = await resolveRebalanceReduce(args);
+    expect(r).toEqual({ ok: false, reason: 'RebalanceReduce (tag 44): position lookup failed (conn reset)' });
+  });
+});
+
+describe('trades.size as bigint', () => {
+  beforeEach(() => { pages.length = 0; calls.length = 0; });
+
+  it('reads a non-negative bigint exactly and treats a negative bigint as unreadable', async () => {
+    pages.push({ data: [row('long', 7n)], error: null });
+    expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).toEqual({ netQ: 7n, uncertain: null });
+    pages.push({ data: [row('long', -1n)], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).not.toBeNull();
+  });
 });

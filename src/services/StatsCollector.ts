@@ -254,6 +254,17 @@ export interface MarketProvider {
   getMarkets(): Map<string, { market: DiscoveredMarket }>;
 }
 
+/** Max interval: Node's setInterval overflows (fires after 1 ms) above 2^31-1; cap at 24 h. */
+export const MAX_INTERVAL_MS = 24 * 60 * 60_000;
+
+/** Decimal-only positive integer in [1, MAX_INTERVAL_MS]; anything else (hex, exponent, fraction) -> null. */
+export function parseIntervalEnv(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 1 && n <= MAX_INTERVAL_MS ? n : null;
+}
+
 /**
  * How often the collect cycle runs. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
  *
@@ -266,13 +277,10 @@ export interface MarketProvider {
 export const COLLECT_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_COLLECT_INTERVAL_MS;
   if (!raw) return 60_000;
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) {
-    return n;
-  } else {
-    logger.warn("Invalid STATS_COLLECT_INTERVAL_MS env var, falling back to 60000ms", { raw });
-    return 60_000;
-  }
+  const n = parseIntervalEnv(raw);
+  if (n !== null) return n;
+  logger.warn("Invalid STATS_COLLECT_INTERVAL_MS env var, falling back to 60000ms", { raw });
+  return 60_000;
 })();
 
 /**
@@ -290,8 +298,8 @@ export const COLLECT_INTERVAL_MS: number = (() => {
 export const AUTOCLOSE_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_AUTOCLOSE_INTERVAL_MS;
   if (!raw) return 10 * 60_000;
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) return n;
+  const n = parseIntervalEnv(raw);
+  if (n !== null) return n;
   logger.warn("Invalid STATS_AUTOCLOSE_INTERVAL_MS env var, falling back to 600000ms", { raw });
   return 10 * 60_000;
 })();
@@ -658,9 +666,10 @@ export class StatsCollector {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
-      if (onChainMarkets.size === 0) return null;
 
-      // Get existing markets from DB
+      // Get existing markets from DB. Read BEFORE the empty-discovery bail-out below so the
+      // DB-retired blocklist is refreshed even when discovery has nothing (cold start, RPC
+      // outage): otherwise a retired market keeps being ingested and an un-retired one stays blocked.
       const dbMarkets = await getMarketRows();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
 
@@ -673,6 +682,8 @@ export class StatsCollector {
           .filter((m) => (m as { keeper_status?: string }).keeper_status === "retired")
           .map((m) => m.slab_address),
       );
+
+      if (onChainMarkets.size === 0) return null;
 
       // Find missing markets. Blocked slabs are skipped here rather than
       // deleted afterwards: discovery sees them on chain every cycle, so
@@ -985,7 +996,9 @@ export class StatsCollector {
       // one RPC round-trip per SWEEP_BATCH_SIZE markets. Registration above already
       // ran; skip the sweep until it's due.
       const now = Date.now();
-      if (now - this._lastSweepAt < AUTOCLOSE_INTERVAL_MS) return;
+      // A negative age (wall clock stepped back) is due, not "recent".
+      const sweepAge = now - this._lastSweepAt;
+      if (sweepAge >= 0 && sweepAge < AUTOCLOSE_INTERVAL_MS) return;
       this._lastSweepAt = now;
 
       logger.info("StatsCollector sweep started", { marketCount: markets.size });

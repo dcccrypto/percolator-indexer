@@ -22,8 +22,14 @@ interface MarketLayoutNote {
 }
 
 const notes = new Map<string, MarketLayoutNote>();
-/** A slab is a few KB of notes; the cap is a backstop against an unbounded set of garbage accounts. */
-const MAX_NOTES = 20_000;
+/** A slab is a few KB of notes; the cap is a backstop; at the cap the least-recently-noted slab is evicted (counted) so new markets are still gated. */
+export const MAX_MARKET_NOTES = 20_000;
+let evicted = 0;
+
+/** Notes dropped to make room at the cap (oldest first). A non-zero value means the cap is being hit. */
+export function marketNotesEvicted(): number {
+  return evicted;
+}
 
 /**
  * Record a market account's VERSION and the generations of the asset slots present in `data`. Best effort: bytes that
@@ -39,10 +45,18 @@ export function noteMarketLayout(slab: string, data: Uint8Array): void {
       if (off + 8 > data.length) break;
       generations.set(i, dv.getBigUint64(off, true));
     }
-    if (notes.size >= MAX_NOTES && !notes.has(slab)) return;
     const prev = notes.get(slab);
-    // A light (sliced) read carries the version but no slots: keep the generations an earlier full read recorded.
-    notes.set(slab, { version: g.layout.version, generations: generations.size > 0 || !prev ? generations : prev.generations });
+    // A partial read (light slice, or a buffer cut inside a later slot) carries only some slots: merge over the
+    // generations an earlier read of the SAME layout recorded. A different VERSION drops the old layout's slots.
+    if (prev && prev.version === g.layout.version) for (const [k, v] of prev.generations) if (!generations.has(k)) generations.set(k, v);
+    const merged = generations;
+    if (prev) notes.delete(slab); // re-insert so Map order is least-recently-noted first
+    else if (notes.size >= MAX_MARKET_NOTES) {
+      const oldest = notes.keys().next().value;
+      if (oldest !== undefined) notes.delete(oldest);
+      evicted++;
+    }
+    notes.set(slab, { version: g.layout.version, generations: merged });
   } catch {
     /* not a market this build understands: nothing to note */
   }
@@ -61,4 +75,5 @@ export function assetGenerationOf(slab: string, assetIndex: number): bigint | nu
 /** Test hook. */
 export function resetMarketLayoutNotes(): void {
   notes.clear();
+  evicted = 0;
 }

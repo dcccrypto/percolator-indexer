@@ -149,7 +149,16 @@ function fromEnv(): string[] {
     .filter((s) => s.length > 0);
 }
 
-const blocked = new Set<string>([...BLOCKED, ...fromEnv()]);
+const envSlabs = fromEnv();
+const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+for (const s of envSlabs) {
+  // Still accepted (never drop an operator's entry), but a typo blocks nothing, so say so.
+  if (!BASE58_PUBKEY.test(s)) {
+    logger.warn("INDEXER_BLOCKED_SLABS entry is not a valid base58 pubkey; it will block nothing", { entry: s });
+  }
+}
+
+const blocked = new Set<string>([...BLOCKED, ...envSlabs]);
 
 if (blocked.size !== BLOCKED.length) {
   logger.info("Blocklist extended from INDEXER_BLOCKED_SLABS", {

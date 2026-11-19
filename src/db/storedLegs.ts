@@ -38,7 +38,7 @@ export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | 
 }
 
 export const IN_CHUNK = 100;
-/** Rows per page; must not exceed the PostgREST max_rows (1000 by default). */
+/** Rows requested per page. PostgREST may cap a response lower (max_rows); paging runs until an empty page. */
 export const STORED_LEGS_PAGE = 1000;
 
 /**
@@ -72,7 +72,9 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
         const rows = (data ?? []) as Array<StoredLeg & { tx_signature: string; id?: string }>;
         for (const r of rows) out.get(r.tx_signature)?.push(r);
         const last = rows[rows.length - 1]?.id;
-        if (rows.length < STORED_LEGS_PAGE || last == null) break;
+        // Only an empty page ends the read: if PostgREST max_rows is below STORED_LEGS_PAGE every
+        // response is capped short, and stopping on a short page would drop the remaining legs.
+        if (rows.length === 0 || last == null || last === lastId) break;
         lastId = last;
       }
     }
