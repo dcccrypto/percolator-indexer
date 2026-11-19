@@ -2,6 +2,7 @@
  * Differential: the current src/parsers/v22Events.ts vs the FROZEN pre-speedup copy (tests/helpers/v22Events.legacy.ts).
  * Every SDK-built fixture plus 2,000 seeded random/malformed inputs must give deep-equal output and identical errors.
  */
+import { isDeepStrictEqual } from "node:util";
 import { describe, expect, it } from "vitest";
 import { BackstopMode, buildBondDepositIxV22, buildBondExecuteWithdrawIxV22, buildBondRequestWithdrawIxV22, buildEvictAndTradeCpiIxV22,
   buildInitInsuranceUnitsIxV22, buildInsuranceBackstopDrawIxV22, buildRescueDepositIxV22, buildSettleHoldingRentIxV22, buildSweepBandDustLegIxV22, encodeTradeCpi } from "@percolatorct/sdk";
@@ -34,7 +35,9 @@ const run = (f: () => unknown): Out => {
   try { return { ok: true, v: f() }; } catch (e) { return { ok: false, e: `${(e as Error)?.name}: ${(e as Error)?.message}` }; }
 };
 // toEqual deep-compares bigint and Uint8Array too, so any output or error difference fails the test
-const same = (a: Out, b: Out): void => { expect(b).toEqual(a); };
+// Fast path: node's isDeepStrictEqual (strictly stricter than toEqual, ~10x cheaper than expect().toEqual); only a strict
+// mismatch falls through to toEqual, so pass/fail semantics and failure diffs are unchanged.
+const same = (a: Out, b: Out): void => { if (!isDeepStrictEqual(a, b)) expect(b).toEqual(a); };
 
 function both(parsed: unknown, enhanced: unknown, ids: string[]): void {
   const set = new Set(ids);
@@ -119,7 +122,8 @@ describe("v22Events differential (old vs new)", () => {
       const ids = rnd() < 0.9 ? [P] : pick([[], [P, keys[1]], ["x"]]);
       both(randParsed(), randEnh(), ids);
     }
-  });
+    // ~2-5 s of pure CPU alone (2,000 cases x 4 comparisons); 4-10x slower on the shared Mac mini (load 30-80), so the 10 s default is not a safe bound.
+  }, 60_000);
 
   it("decodeV22Event on random byte strings (all tags, every length) is identical", () => {
     let s = 12345;
