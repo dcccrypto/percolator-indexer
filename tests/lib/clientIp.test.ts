@@ -74,3 +74,39 @@ describe("S3-C11: the webhook rate limiter does not trust a caller-written X-For
     expect(log).toHaveBeenCalledTimes(4);
   });
 });
+
+describe("clientIp / trustedProxyDepth: remaining edges", () => {
+  it("an invalid depth logs through the default console.error sink (once per distinct value)", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(trustedProxyDepth("not-a-depth-xyz")).toBe(1);
+      expect(trustedProxyDepth("not-a-depth-xyz")).toBe(1);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reads TRUSTED_PROXY_DEPTH from the environment by default", () => {
+    const prev = process.env.TRUSTED_PROXY_DEPTH;
+    process.env.TRUSTED_PROXY_DEPTH = " 3 ";
+    try {
+      expect(trustedProxyDepth()).toBe(3);
+    } finally {
+      if (prev === undefined) delete process.env.TRUSTED_PROXY_DEPTH;
+      else process.env.TRUSTED_PROXY_DEPTH = prev;
+    }
+  });
+
+  it("an empty or whitespace/comma-only X-Forwarded-For falls back to the socket address", () => {
+    for (const xff of ["", " , ,"]) {
+      expect(clientIp({ header: h({ "x-forwarded-for": xff }), remoteAddress: "198.51.100.4", depth: 1 })).toBe("198.51.100.4");
+    }
+  });
+
+  it("IPv6 hops are accepted; a non-IP chosen hop or bad socket address is not", () => {
+    expect(clientIp({ header: h({ "x-forwarded-for": "1.1.1.1, 2001:db8::1" }), depth: 1 })).toBe("2001:db8::1");
+    expect(clientIp({ header: h({ "x-forwarded-for": "1.1.1.1, evil" }), remoteAddress: "::1", depth: 1 })).toBe("::1");
+    expect(clientIp({ header: h({ "x-forwarded-for": "1.1.1.1, evil" }), remoteAddress: "garbage", depth: 1 })).toBe(UNKNOWN_IP);
+  });
+});

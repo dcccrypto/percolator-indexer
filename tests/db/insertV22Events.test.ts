@@ -10,7 +10,7 @@ vi.mock("@percolatorct/shared", () => ({
   getSupabase: () => ({ from: (t: string) => ({ upsert: (rows: unknown, opts: unknown) => { upsert(t, rows, opts); return state.result(); } }) }),
 }));
 
-import { getV22EventStats, insertV22Events, resetV22EventStats } from "../../src/db/insertV22Events.js";
+import { getV22EventStats, insertV22Events, resetV22EventStats, V22EventWriteError } from "../../src/db/insertV22Events.js";
 
 const row = (n: number): V22EventRow => ({
   signature: `sig${n}`, ix_index: 0, inner_index: -1, kind: "bond_deposit", slab_address: "S", asset_index: null, actor: "A", subject: null,
@@ -39,7 +39,7 @@ describe("insertV22Events", () => {
     expect(await insertV22Events([row(1)])).toBe(0);
     expect(await insertV22Events([row(2), row(3)])).toBe(0);
     expect(logError).toHaveBeenCalledTimes(1);
-    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 3, droppedKindConstraint: 0 });
+    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 3, droppedKindConstraint: 0, writeFailed: 0 });
   });
 
   it("PostgREST schema-cache miss is recognised as table-missing too", async () => {
@@ -54,14 +54,14 @@ describe("insertV22Events", () => {
     expect(await insertV22Events([{ ...row(2), kind: "move_event" }, { ...row(3), kind: "reduce_event" }])).toBe(0);
     expect(logError).toHaveBeenCalledTimes(1);
     expect(String(logError.mock.calls[0][0])).toMatch(/20261009120000_v22_log_events\.sql/);
-    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 0, droppedKindConstraint: 3 });
+    expect(getV22EventStats()).toEqual({ written: 0, droppedTableMissing: 0, droppedKindConstraint: 3, writeFailed: 0 });
   });
 
-  it("any other DB error or a thrown exception is swallowed (an events problem must never fail a trade batch)", async () => {
+  it("any other DB error or a thrown exception is counted and THROWN (IDX-V22EVFIX: swallowing it lost the events)", async () => {
     state.result = async () => ({ error: { code: "22003", message: "numeric field overflow" } });
-    await expect(insertV22Events([row(1)])).resolves.toBe(0);
+    await expect(insertV22Events([row(1)])).rejects.toBeInstanceOf(V22EventWriteError);
     state.result = async () => { throw new Error("network down"); };
-    await expect(insertV22Events([row(1)])).resolves.toBe(0);
-    expect(getV22EventStats().written).toBe(0);
+    await expect(insertV22Events([row(1)])).rejects.toThrow(/network down/);
+    expect(getV22EventStats()).toMatchObject({ written: 0, writeFailed: 2 });
   });
 });

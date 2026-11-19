@@ -1,4 +1,5 @@
 import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, type TolerantFetchResult } from "../lib/tolerantTxFetch.js";
+import { parseMaxWriteHolds, parsePollIntervalMs, parseRpcMinIntervalMs, parseWriteOutageAlertMs, parseWriteOutageRealertMs } from "../lib/indexerEnv.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
@@ -24,6 +25,7 @@ import { IN_CHUNK, fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiF
 import { cpiEvidenceFromParsed } from "../parsers/percolatorTxParser.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
@@ -54,12 +56,14 @@ interface PassState {
   readsOk?: number;
 }
 /** Mark one signature as failed in this pass: the cursor must not pass it. */
-function markFailed(pass: PassState, sig: string | null | undefined): void {
-  pass.incomplete = true;
+function markFailed(pass: PassState, sig: string | null | undefined, opts: { keepComplete?: boolean } = {}): void {
+  if (!opts.keepComplete) pass.incomplete = true;
   pass.writeFailed = true;
   (pass.failedSigs ??= new Set()).add(sig ?? "?");
 }
 const FLUSH_AT = 200;
+/** Polls a signature may hold the cursor for an unreadable market account before it is recorded for re-index. */
+const MAX_LOT_READ_HOLDS = 5;
 
 /**
  * A failed DB write holds the slab's cursor so the same signatures are retried every poll. It never gives up on
@@ -68,9 +72,9 @@ const FLUSH_AT = 200;
  * on its own while other writes of the same pass succeed (the database is up: a poison row) is counted, and
  * after MAX_WRITE_HOLDS such polls that one signature is skipped with an alert naming it (manual backfill).
  */
-export const MAX_WRITE_HOLDS = Math.max(1, Number(process.env.INDEXER_MAX_WRITE_HOLDS) || 5);
-const WRITE_OUTAGE_ALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_ALERT_MS", 60_000);
-const WRITE_OUTAGE_REALERT_MS = readPositiveIntEnv("INDEXER_WRITE_OUTAGE_REALERT_MS", 10 * 60_000);
+export const MAX_WRITE_HOLDS = parseMaxWriteHolds(process.env.INDEXER_MAX_WRITE_HOLDS, (m, c) => logger.warn(m, c));
+const WRITE_OUTAGE_ALERT_MS = parseWriteOutageAlertMs(process.env.INDEXER_WRITE_OUTAGE_ALERT_MS, (m, c) => logger.warn(m, c));
+const WRITE_OUTAGE_REALERT_MS = parseWriteOutageRealertMs(process.env.INDEXER_WRITE_OUTAGE_REALERT_MS, (m, c) => logger.warn(m, c));
 interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number> }
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
@@ -161,7 +165,7 @@ const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
 const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 20, 1_000);
 
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
-const POLL_INTERVAL_MS = readPositiveIntEnv("TRADE_POLL_INTERVAL_MS", 5 * 60_000);
+const POLL_INTERVAL_MS = parsePollIntervalMs(process.env.TRADE_POLL_INTERVAL_MS, (m, c) => logger.warn(m, c));
 
 /** Initial backfill: fetch more signatures on first run */
 const BACKFILL_SIGNATURES = readPositiveIntEnv("TRADE_BACKFILL_SIGNATURES", 100, 100);
@@ -183,10 +187,7 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
  * poll. Replaces the fixed 1 s / 0.5 s sleep per market. 125 ms = 8 calls/s, under the 10 req/s of a free Helius plan.
  * 0 disables pacing.
  */
-const RPC_MIN_INTERVAL_MS = (() => {
-  const n = Number(process.env.TRADE_RPC_MIN_INTERVAL_MS);
-  return !!process.env.TRADE_RPC_MIN_INTERVAL_MS && Number.isFinite(n) && n >= 0 ? n : 125;
-})();
+const RPC_MIN_INTERVAL_MS = parseRpcMinIntervalMs(process.env.TRADE_RPC_MIN_INTERVAL_MS, (m, c) => logger.warn(m, c));
 const TX_CACHE_MAX = readPositiveIntEnv("INDEXER_TX_CACHE_MAX", 1_000, 10_000);
 const TX_CACHE_TTL_MS = 10 * 60_000;
 const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
@@ -231,6 +232,8 @@ export class TradeIndexerPolling {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
   private ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+  /** signature -> polls held because the market account (lot_exp) was unreadable. Bounded by MAX_LOT_READ_HOLDS. */
+  private lotReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
   /** signature -> parsed transaction, shared by every slab whose window contains it (see TX_CACHE_MAX). */
   private txCache = new BoundedTtlMap<string, ParsedTransactionWithMeta>(TX_CACHE_MAX, TX_CACHE_TTL_MS);
   private rpcLimiter = new RpcLimiter({
@@ -601,8 +604,15 @@ export class TradeIndexerPolling {
     }
     this.heldSigs.set(slabAddress, new Set(failed)); // poison sigs stay held too until all are over the cap, so none is dropped unnamed
     logger.warn("fill write failed; holding the cursor so the same signatures are retried next poll", { slabAddress: slab, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)), dbUp });
-    if (!dbUp && now - hold.since >= WRITE_OUTAGE_ALERT_MS && now - hold.lastAlertAt >= WRITE_OUTAGE_REALERT_MS) {
+    // A negative age (wall clock stepped back) counts as elapsed, so the alert is never silenced by a step.
+    const outageAge = now - hold.since;
+    const sinceAlert = now - hold.lastAlertAt;
+    // Step back before any alert: restart the outage clock (alert at most ALERT_MS late). Step back after one: it is already a known long outage, so it is due.
+    const stepped = outageAge < 0;
+    if (stepped && hold.lastAlertAt === 0) hold.since = now;
+    if (!dbUp && (stepped ? hold.lastAlertAt > 0 : outageAge >= WRITE_OUTAGE_ALERT_MS) && (sinceAlert < 0 || sinceAlert >= WRITE_OUTAGE_REALERT_MS)) {
       hold.lastAlertAt = now;
+      if (stepped) hold.since = now;
       logger.error("ALERT: fill writes keep failing and nothing is being written (database down, or one bad row on a quiet slab?); cursor held, nothing skipped", { slabAddress: slab, sinceMs: now - hold.since, failedSigs: retry.slice(0, 20).map((x) => x.slice(0, 12)) });
       captureException(new Error(`indexer fill writes failing for ${Math.round((now - hold.since) / 1000)}s; cursor held (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-outage" }, extra: { slabAddress, sinceMs: now - hold.since } });
     }
@@ -712,7 +722,7 @@ export class TradeIndexerPolling {
     // v2.2 wrapper LOG events of this slab (fills / reductions / moves; strict frame attribution; VERSION-keyed). Best effort and
     // isolated: it never throws and never touches the trade path below.
     try {
-      await recordV22LogEvents({
+      const v22 = await recordV22LogEvents({
         signature,
         err: tx.meta.err,
         logMessages: tx.meta.logMessages,
@@ -722,6 +732,14 @@ export class TradeIndexerPolling {
         blockTimeSec: tx.blockTime ?? null,
         isKnownMarket: (slab) => slab === slabAddress,
       });
+      // A failed v22_events write must hold the cursor like a failed trade write, else the events are lost for good. It is
+      // bounded by the poison-row logic (holdAfterWriteFailure): after MAX_WRITE_HOLDS polls with other writes succeeding the
+      // signature is skipped into skipped_signatures with an alert; with no writes succeeding it is held with an outage alert.
+      if (v22.status === "write_failed") {
+        // keepComplete: the trade path of this tx is unaffected, so later tag 44 closes stay resolvable.
+        markFailed(pass, signature, { keepComplete: true });
+        logger.warn("v22 log event write failed; holding the cursor so the signature is retried", { signature: signature.slice(0, 12) });
+      }
     } catch (err) {
       logger.warn("v22 log events skipped for a transaction (trades unaffected)", { signature: signature.slice(0, 12), err: String(err) });
     }
@@ -866,6 +884,15 @@ export class TradeIndexerPolling {
       ? { programId: String(returnDataRaw.programId), data: Uint8Array.from(Buffer.from(returnDataRaw.data[0], "base64")) }
       : null;
     const unverified: string[] = [];
+    // An unreadable market account (temporary RPC failure) must not skip the fill for good: hold the cursor like a
+    // matcher-context read error (all-or-nothing per tx; later legs are not written, so the stored-count dedup cannot
+    // mistake the unwritten leg for stored). Bounded so a market that no longer exists cannot pin the cursor forever.
+    let lotReadFailed = false;
+    const holdForLotExp = (): boolean => {
+      if ((this.lotReadAttempts.get(signature) ?? 0) >= MAX_LOT_READ_HOLDS) return false;
+      retryNeeded = true; lotReadFailed = true;
+      return true;
+    };
 
     for (const [ixIdx, ix] of message.instructions.entries()) {
       // Skip parsed instructions (system, token, etc.)
@@ -1011,14 +1038,16 @@ export class TradeIndexerPolling {
               continue;
             }
             if (r.kind === "fill") {
+              const lot = await this.lotExpForCpi(slabAddress, leg.assetIndex);
+              if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
               legSize = r.sizeValue;
               sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-              price = Number(r.priceE6) / 1_000_000;
+              price = perTokenPrice(r.priceE6, lot);
               if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
             } // "legacy": wire size + the existing price logic, exactly as before this parser
           }
           if (price === undefined) price = await resolvePrice(leg);
-          const fee = computeFeeUsd(legSize, price, leg.feeBps);
+          const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
           const legSizeStr = legSize.toString();
           await writeFill({
@@ -1080,14 +1109,16 @@ export class TradeIndexerPolling {
           continue; // zero fill: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          const lot = await this.lotExpForCpi(slabAddress, decoded.assetIndex);
+          if (lot === null) { if (holdForLotExp()) continue; unverified.push("lot_exp unreadable: market account not read (retries exhausted)"); continue; }
           sizeValue = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = Number(r.priceE6) / 1_000_000;
+          price = perTokenPrice(r.priceE6, lot);
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
       if (price === undefined) price = await resolveFallbackPrice(decoded.assetIndex);
-      const fee = computeFeeUsd(sizeValue, price, decoded.feeBps);
+      const fee = computeFeeUsd(sizeValue, perLotPrice(price, cachedLotExp(slabAddress, decoded.assetIndex)), decoded.feeBps);
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1135,10 +1166,12 @@ export class TradeIndexerPolling {
     if (retryNeeded) {
       // Transport failure reading the matcher context: do not write a size that can never be
       // corrected. Hold the cursor; the next pass re-reads (stored legs are skipped), then falls back.
-      this.ctxReadAttempts.set(signature, 1);
+      if (lotReadFailed) this.lotReadAttempts.set(signature, (this.lotReadAttempts.get(signature) ?? 0) + 1);
+      else this.ctxReadAttempts.set(signature, 1);
       throw new CtxReadRetry(signature);
     }
     this.ctxReadAttempts.delete(signature);
+    this.lotReadAttempts.delete(signature);
     return insertedAny;
   }
 
@@ -1167,6 +1200,17 @@ export class TradeIndexerPolling {
    * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
+  /** lot_exp for pricing a CPI fill: cache, else one slab read (primes the cache); null = unreadable, skip + retry. */
+  private lotExpForCpi(slabAddress: string, assetIndex: number): Promise<number | null> {
+    return resolveLotExp(slabAddress, assetIndex, async () => {
+      const info = await withRetry(
+        () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+        { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+      );
+      return info?.data ? new Uint8Array(info.data) : null;
+    });
+  }
+
   private async readMarkPriceFromSlab(connection: Connection, slabAddress: string, assetIndex: number): Promise<number> {
     try {
       const info = await withRetry(
@@ -1183,14 +1227,19 @@ export class TradeIndexerPolling {
 
       // #221: the asset's booked effective_price (v18); the mark EWMA below is only the fallback.
       const effectiveE6 = readAssetEffectivePriceE6(rawData, assetIndex);
-      if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+      if (effectiveE6 !== null) {
+        noteLotExps(slabAddress, rawData);
+        return perTokenPrice(effectiveE6, lotExpOfSlabData(rawData, assetIndex)); // per-token: the engine price is per 10^lot_exp units
+      }
 
       // v17 path: read mark_ewma_e6 from WrapperConfigV17
       if (hasWrapperMagic(rawData)) {
         try {
           const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-            return Number(markEwmaE6) / 1_000_000;
+            // The EWMA is per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
+            noteLotExps(slabAddress, rawData);
+            return perTokenPrice(markEwmaE6, lotExpOfSlabData(rawData, assetIndex));
           }
         } catch (err) {
           // Unknown VERSION is loud (per market); the fill is skipped, never guessed.

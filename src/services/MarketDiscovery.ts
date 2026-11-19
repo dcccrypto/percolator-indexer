@@ -144,6 +144,7 @@ export class MarketDiscovery {
     const fallbackConn = getFallbackConnection();
     const all: DiscoveredMarket[] = [];
     let failedPrograms = 0;
+    const failedProgramIds = new Set<string>();
 
     const marketsFilter = (process.env.MARKETS_FILTER ?? "").trim();
     if (marketsFilter) {
@@ -177,6 +178,7 @@ export class MarketDiscovery {
           all.push(...found);
         } catch (e) {
           failedPrograms++;
+          failedProgramIds.add(id);
           logger.warn("MARKETS_FILTER discovery failed on program", {
             programId: id,
             error: e instanceof Error ? e.message : String(e),
@@ -189,6 +191,7 @@ export class MarketDiscovery {
         for (const market of all) {
           newMarkets.set(market.slabAddress.toBase58(), { market });
         }
+        this.carryOver(newMarkets, failedProgramIds);
         this.markets = newMarkets;
         this.consecutiveFailures = 0;
       } else {
@@ -243,6 +246,7 @@ export class MarketDiscovery {
           }
           // Non-429 error or exhausted retries (including fallback)
           failedPrograms++;
+          failedProgramIds.add(id);
           logger.warn("Failed to discover on program", { programId: id, conn: connLabel, error: e, attempt: attempt + 1 });
           break;
         }
@@ -288,6 +292,7 @@ export class MarketDiscovery {
       for (const market of all) {
         newMarkets.set(market.slabAddress.toBase58(), { market });
       }
+      this.carryOver(newMarkets, failedProgramIds);
       this.markets = newMarkets;
       this.consecutiveFailures = 0;
     }
@@ -300,6 +305,21 @@ export class MarketDiscovery {
     return all;
   }
   
+  /**
+   * A program whose scan failed this pass told us nothing about its markets: keep the ones we already
+   * know. Without this, one failing program silently drops all of its markets from the live map, and
+   * every webhook trade / stats row for them is discarded as "unknown slab" until the next good pass.
+   */
+  private carryOver(next: Map<string, { market: DiscoveredMarket }>, failedProgramIds: Set<string>): void {
+    if (failedProgramIds.size === 0) return;
+    let kept = 0;
+    for (const [key, entry] of this.markets) {
+      if (next.has(key)) continue;
+      if (failedProgramIds.has(entry.market.programId.toBase58())) { next.set(key, entry); kept++; }
+    }
+    if (kept > 0) logger.warn("Kept known markets of programs whose scan failed this pass", { kept, programs: [...failedProgramIds] });
+  }
+
   getMarkets() {
     return this.markets;
   }

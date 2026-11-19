@@ -27,7 +27,10 @@ export function isRateLimitError(err: unknown): boolean {
   const code = typeof e?.code === "number" ? e.code : typeof e?.status === "number" ? e.status : undefined;
   if (code === 429 || code === -32429) return true;
   const msg = err instanceof Error ? err.message : typeof e?.message === "string" ? e.message : String(err);
-  return /\b429\b|too many requests|rate.?limit/i.test(msg);
+  // web3.js throws `${status} ${statusText}: ${body}` for an HTTP 429 (no code field; statusText is empty over HTTP/2), so
+  // a bare 429 only counts at the start of the message or after "responded with". A 429 elsewhere is just a number
+  // ("Slot 429 was skipped") and must reach the caller's hold-the-cursor path, not the backoff.
+  return /^\s*429\b|responded with 429\b|too many requests|rate.?limit/i.test(msg);
 }
 
 export class RpcLimiter {

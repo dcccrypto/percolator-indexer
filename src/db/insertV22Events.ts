@@ -10,10 +10,23 @@ let lastKindLog = 0;
 let missingTotal = 0;
 let kindTotal = 0;
 let writtenTotal = 0;
+let failedTotal = 0;
+
+/**
+ * A v22_events write failed for a reason that may be transient (DB down, timeout, 5xx). Thrown so the caller can answer
+ * 500 (the webhook provider redelivers) / retry (the event stream). The permanent "migration not applied" conditions
+ * below are NOT this error: they are counted and logged loudly, and redelivery could never fix them.
+ */
+export class V22EventWriteError extends Error {
+  constructor(message: string, readonly count: number, readonly code?: string) {
+    super(message);
+    this.name = "V22EventWriteError";
+  }
+}
 
 /** Test hooks / metrics. */
-export function getV22EventStats(): { written: number; droppedTableMissing: number; droppedKindConstraint: number } {
-  return { written: writtenTotal, droppedTableMissing: missingTotal, droppedKindConstraint: kindTotal };
+export function getV22EventStats(): { written: number; droppedTableMissing: number; droppedKindConstraint: number; writeFailed: number } {
+  return { written: writtenTotal, droppedTableMissing: missingTotal, droppedKindConstraint: kindTotal, writeFailed: failedTotal };
 }
 export function resetV22EventStats(): void {
   lastMissingLog = 0;
@@ -21,6 +34,7 @@ export function resetV22EventStats(): void {
   missingTotal = 0;
   kindTotal = 0;
   writtenTotal = 0;
+  failedTotal = 0;
 }
 
 /** Postgres check_violation on the kind constraint: the log-event migration (20261009120000_v22_log_events.sql) is not applied. */
@@ -34,12 +48,15 @@ function isTableMissing(error: { code?: string; message?: string }): boolean {
 }
 
 /**
- * Write v2.2 events. Idempotent (upsert on (signature, ix_index, inner_index, network), duplicates ignored) and
- * BEST EFFORT: it never throws, so an events problem can never fail a trade batch or a webhook delivery. If the
- * `v22_events` migration has not been applied the rows are dropped with one loud error per 10 minutes (and counted),
- * not retried forever.
+ * Write v2.2 events. Idempotent (upsert on (signature, ix_index, inner_index, network), duplicates ignored).
  *
- * @returns the number of rows submitted successfully (0 on any failure).
+ * If the `v22_events` migration has not been applied the rows are dropped with one loud error per 10 minutes (and
+ * counted), not retried forever. Any OTHER write failure (DB down, timeout) is counted, alerted and THROWN as a
+ * V22EventWriteError: swallowing it silently lost the events, because the caller answered 200 / acked and the provider
+ * never redelivered. Successful writes behave exactly as before.
+ *
+ * @returns the number of rows submitted successfully (0 for an empty batch or a permanent migration drop).
+ * @throws V22EventWriteError on a possibly-transient write failure.
  */
 export async function insertV22Events(rows: readonly V22EventRow[]): Promise<number> {
   if (rows.length === 0) return 0;
@@ -78,18 +95,45 @@ export async function insertV22Events(rows: readonly V22EventRow[]): Promise<num
         }
         return 0;
       }
-      logger.warn("insertV22Events failed", { count: rows.length, code: error.code, error: error.message });
-      return 0;
+      throw writeFailed(rows.length, error.message, error.code, error);
     }
     writtenTotal += rows.length;
     return rows.length;
   } catch (err) {
-    logger.warn("insertV22Events threw", { count: rows.length, error: err instanceof Error ? err.message : String(err) });
-    try {
-      captureException(err instanceof Error ? err : new Error(String(err)), { tags: { context: "v22-events" } });
-    } catch {
-      /* alerting must not break ingestion */
-    }
-    return 0;
+    if (err instanceof V22EventWriteError) throw err;
+    throw writeFailed(rows.length, err instanceof Error ? err.message : String(err), undefined, err);
   }
+}
+
+/** Count + alert a failed write and build the error to throw. */
+function writeFailed(count: number, message: string, code: string | undefined, cause: unknown): V22EventWriteError {
+  failedTotal += count;
+  logger.error("v22_events write FAILED: v2.2 events not recorded for this batch (caller will 500 / retry)", {
+    metric: "indexer_v22_events_write_failed_total",
+    count,
+    total: failedTotal,
+    code,
+    error: message,
+  });
+  try {
+    captureException(cause instanceof Error ? cause : new Error(message), { tags: { context: "v22-events-write-failed" } });
+  } catch {
+    /* alerting must not break ingestion */
+  }
+  return new V22EventWriteError(`v22_events write failed: ${message}`, count, code);
+}
+
+/** insertV22Events with a bounded retry on V22EventWriteError (for paths with no provider redelivery, i.e. the stream). Rethrows the last error. */
+export async function insertV22EventsWithRetry(rows: readonly V22EventRow[], attempts = 3, delayMs = 250): Promise<number> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await insertV22Events(rows);
+    } catch (err) {
+      if (!(err instanceof V22EventWriteError)) throw err;
+      last = err;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+  throw last;
 }
