@@ -127,11 +127,11 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
     expect(last.status).toBe(200);
     expect(last.rows).toEqual([]);
     expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("lot_exp") })]);
-    // each of the 5 retried deliveries warned and answered 500 with an ERROR; the bounded 6th is a quiet 2xx
+    // each of the 5 retried (500) deliveries logged one WARN and one ERROR; the bounded 2xx logs neither
     const warns = loggedLines("WARN"), errors = loggedLines("ERROR");
-    expect(warns.length).toBeGreaterThanOrEqual(5);
+    expect(warns).toHaveLength(5);
     expect(warns.every((l) => l.includes(MATCHER_WARN))).toBe(true);
-    expect(errors.length).toBeGreaterThanOrEqual(5);
+    expect(errors).toHaveLength(5);
     expect(errors.every((l) => l.includes(REDELIVERY_ERROR))).toBe(true);
   });
 
@@ -144,6 +144,8 @@ describe("webhook TradeCpi on a cold lot_exp cache", () => {
       const { rows } = await deliver(tx);
       expect(rows).toEqual([]);
       expect(slabReads()).toBe(0);
+      expect(loggedLines("WARN")).toEqual([expect.stringContaining(MATCHER_WARN)]);
+      expect(loggedLines("ERROR")).toEqual([expect.stringContaining(REDELIVERY_ERROR)]);
     } finally {
       if (prev === undefined) delete process.env.TRADECPI_DELIVERY_BUDGET_MS; else process.env.TRADECPI_DELIVERY_BUDGET_MS = prev;
     }
