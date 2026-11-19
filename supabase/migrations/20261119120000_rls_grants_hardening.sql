@@ -5,7 +5,13 @@
 -- the hosted default ACL (read only):
 --   SELECT pg_get_userbyid(defaclrole), defaclobjtype, defaclacl
 --   FROM pg_default_acl WHERE defaclnamespace = 'public'::regnamespace;
--- Every statement is safe whether or not those default privileges exist.
+-- Every statement is safe whether or not those default privileges exist. Needs PG15+
+-- (security_invoker). Apply as the owner of the objects: a non-owner REVOKE only warns and
+-- does nothing. Afterwards these must all return false:
+--   SELECT has_table_privilege('anon', 'faucet_claims', 'TRUNCATE'),
+--          has_function_privilege('anon', 'public.cleanup_old_trades(integer)', 'EXECUTE'),
+--          has_function_privilege('authenticated', 'public.volume_24h_by_slab(text)', 'EXECUTE'),
+--          has_column_privilege('authenticated', 'trades', 'tx_signature', 'SELECT');
 --
 -- What the launch app reads with the anon key is unchanged:
 --   * markets_with_stats (symbol, name, ...): anon keeps SELECT on the view and on both base
