@@ -92,9 +92,7 @@ export function foldPosition(events: readonly FoldEvent[]): FoldedPosition {
     while (j < sorted.length && sorted[j]!.slot === sorted[i]!.slot) j++;
     const grp = sorted.slice(i, j);
     const sigs = new Set(grp.map((g) => g.signature));
-    const moves = grp.filter((g) => g.kind === "deposit" || g.kind === "execute_redeem");
-    if (sigs.size > 1 && grp.some((g) => g.kind === "execute_redeem") && moves.length > 1
-      && new Set(moves.map((g) => g.signature)).size > 1) {
+    if (sigs.size > 1 && grp.some((g) => g.kind === "execute_redeem")) {
       ambiguousSlots.add(sorted[i]!.slot);
     }
     i = j;

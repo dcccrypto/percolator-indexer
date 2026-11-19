@@ -48,4 +48,21 @@ describe("same-slot events from different signatures (no tx index in source rows
     ]);
     expect(g.eventsConsistent).toBe(true);
   });
+
+  it("execute_redeem sorting before its request in one slot is flagged (pending would be wrong)", () => {
+    const f = foldPosition([
+      e("deposit", "s0", 1, 100n, 100n),
+      e("execute_redeem", "a-exe", 10, 100n, 100n),
+      e("request_redeem", "b-req", 10, 0n, 100n),
+    ]);
+    expect(f.eventsConsistent).toBe(false);
+  });
+
+  it("over-burn is not re-marked consistent by a same-slot deposit (same signature)", () => {
+    const f = foldPosition([
+      { ...e("execute_redeem", "a", 10, 100n, 100n), ixIndex: 0 },
+      { ...e("deposit", "a", 10, 50n, 50n), ixIndex: 1 },
+    ]);
+    expect(f.eventsConsistent).toBe(false);
+  });
 });
