@@ -1,0 +1,18 @@
+-- markets.keeper_status for databases built from this directory.
+--
+-- No other SQL in this repo creates the column: the hosted databases got it by hand (the "047"
+-- migration named in 20261001020000_markets_keeper_status_pending.sql was never brought in). On a
+-- fresh database 20261001020000 failed with 42703, and the indexer could not run at all:
+-- src/db/marketRows.ts selects keeper_status and src/db/insertMarketRow.ts writes it.
+--
+-- IF NOT EXISTS: a no-op wherever the column already exists (the hosted databases).
+-- DEFAULT 'retired' is the column default 20261001020000 documents ("The column DEFAULT stays
+-- 'retired' for any other writer"); the indexer itself always writes 'pending'
+-- (AUTO_ROW_KEEPER_STATUS) and StatsCollector treats 'retired' as stop-ingesting. The CHECK
+-- constraint (active | retired | pending) is added by 20261001020000.
+--
+-- Ordered before 20260726192000_view_metadata_source.sql on purpose: that file drops and recreates
+-- markets_with_stats from m.*, so the view picks the column up. Added any later, the baseline's
+-- CREATE OR REPLACE VIEW markets_with_stats (m.*) fails on a second apply with "cannot change name
+-- of view column".
+ALTER TABLE markets ADD COLUMN IF NOT EXISTS keeper_status TEXT NOT NULL DEFAULT 'retired';
