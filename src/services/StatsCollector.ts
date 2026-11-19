@@ -658,9 +658,10 @@ export class StatsCollector {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
-      if (onChainMarkets.size === 0) return null;
 
-      // Get existing markets from DB
+      // Get existing markets from DB. Read BEFORE the empty-discovery bail-out below so the
+      // DB-retired blocklist is refreshed even when discovery has nothing (cold start, RPC
+      // outage): otherwise a retired market keeps being ingested and an un-retired one stays blocked.
       const dbMarkets = await getMarketRows();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
 
@@ -673,6 +674,8 @@ export class StatsCollector {
           .filter((m) => (m as { keeper_status?: string }).keeper_status === "retired")
           .map((m) => m.slab_address),
       );
+
+      if (onChainMarkets.size === 0) return null;
 
       // Find missing markets. Blocked slabs are skipped here rather than
       // deleted afterwards: discovery sees them on chain every cycle, so
