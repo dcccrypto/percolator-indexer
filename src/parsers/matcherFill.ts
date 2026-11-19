@@ -299,8 +299,16 @@ function note(kind: keyof TradecpiCounters, alsoReadError = false, alsoLegacyBat
  */
 export type UnverifiedSizePolicy = "skip" | "request";
 
+const warnedUnverifiedPolicy = new Set<string>();
+
 export function unverifiedSizePolicy(env: Record<string, string | undefined> = process.env): UnverifiedSizePolicy {
-  return env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase() === "skip" ? "skip" : "request";
+  const v = env.TRADECPI_UNVERIFIED_SIZE?.trim().toLowerCase();
+  if (v === "skip") return "skip";
+  if (v && v !== "request" && !warnedUnverifiedPolicy.has(v)) {
+    warnedUnverifiedPolicy.add(v);
+    summaryLogger().error("Unrecognised TRADECPI_UNVERIFIED_SIZE; using 'request' (valid: 'skip' | 'request')", { value: v });
+  }
+  return "request";
 }
 
 function abs(n: bigint): bigint {
