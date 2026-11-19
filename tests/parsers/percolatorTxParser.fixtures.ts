@@ -11,25 +11,39 @@ import {
 
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+// Limbs in base 58^5 (656_356_768 < 2^30): 5x fewer inner iterations than one base-58 digit per limb, same output.
+const LIMB = 58 ** 5;
+
 export function encodeBase58(bytes: Uint8Array): string {
   let zeros = 0;
   while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
-  const digits: number[] = [];
+  const limbs: number[] = []; // little-endian base 58^5
   for (let i = zeros; i < bytes.length; i++) {
     let carry = bytes[i];
-    for (let j = 0; j < digits.length; j++) {
-      carry += digits[j] << 8;
-      digits[j] = carry % 58;
-      carry = (carry / 58) | 0;
+    for (let j = 0; j < limbs.length; j++) {
+      carry += limbs[j] * 256;
+      limbs[j] = carry % LIMB;
+      carry = Math.floor(carry / LIMB);
     }
     while (carry > 0) {
-      digits.push(carry % 58);
-      carry = (carry / 58) | 0;
+      limbs.push(carry % LIMB);
+      carry = Math.floor(carry / LIMB);
     }
   }
-  let out = "1".repeat(zeros);
-  for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]];
-  return out;
+  let out = "";
+  for (let i = limbs.length - 1; i >= 0; i--) {
+    let l = limbs[i];
+    let chunk = "";
+    for (let k = 0; k < 5; k++) {
+      chunk = ALPHABET[l % 58] + chunk;
+      l = Math.floor(l / 58);
+    }
+    out += chunk;
+  }
+  // drop the zero-padding of the most significant limb
+  let lead = 0;
+  while (lead < out.length && out[lead] === "1") lead++;
+  return "1".repeat(zeros) + out.slice(lead);
 }
 
 /** mulberry32 */
@@ -115,14 +129,27 @@ export interface FixtureTx {
 }
 
 /** One transaction. `objects` selects PublicKey objects (getParsedTransaction shape) vs plain strings (webhook shape). */
+const b58Cache = new WeakMap<PublicKey, string>();
+const toB58 = (k: PublicKey): string => {
+  let v = b58Cache.get(k);
+  if (v === undefined) b58Cache.set(k, (v = k.toBase58()));
+  return v;
+};
+const keyCache = new Map<string, PublicKey>();
+const keyOf = (s: string): PublicKey => {
+  let v = keyCache.get(s);
+  if (!v) keyCache.set(s, (v = new PublicKey(s)));
+  return v;
+};
+
 export function makeTx(r: () => number, pool: PublicKey[], programIds: string[], i: number): FixtureTx {
   const objects = r() < 0.5;
   const wrap = (k: PublicKey): unknown => {
     const m = r();
-    if (!objects) return k.toBase58();
+    if (!objects) return toB58(k);
     return m < 0.8 ? k : { pubkey: k, isSigner: false, isWritable: true };
   };
-  const perc = new PublicKey(programIds[0]);
+  const perc = keyOf(programIds[0]);
   const nIx = 1 + Math.floor(r() * 4);
   const instructions: any[] = [];
   const innerGroups: any[] = [];
