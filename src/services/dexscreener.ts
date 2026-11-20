@@ -32,6 +32,11 @@ interface DexPair {
   liquidity?: { usd?: number };
 }
 
+function safeLiquidity(p: DexPair): number {
+  const v: unknown = p.liquidity?.usd;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 /**
  * Pick the pair that best identifies `ca` and read the identity off it.
  *
@@ -50,7 +55,10 @@ function identityFromPairs(ca: string, pairs: DexPair[]): DexScreenerIdentity | 
   );
   if (asBase.length === 0) return null;
 
-  asBase.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+  // Non-number or non-finite liquidity (NaN, Infinity, string, object) counts as 0:
+  // a NaN comparator result makes the sort order engine-defined, letting a
+  // shallow spoofed pair win. Array.prototype.sort is stable, so ties keep API order.
+  asBase.sort((a, b) => safeLiquidity(b) - safeLiquidity(a));
 
   // The deepest pair may still lack an image while a shallower one has it, so
   // fall back through the ranked list for the logo specifically.

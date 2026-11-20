@@ -71,4 +71,29 @@ describe("fetchPortfolios", () => {
     expect(filters[2].memcmp).toEqual({ offset: 10, bytes: "3" });
     expect(f22.versionMemcmp.bytes).not.toBe(portfolioFilterForLayout(LAYOUT_V21).versionMemcmp.bytes);
   });
+
+  it("a non-Error throw in the decode/push block is stringified into skipped", async () => {
+    const good = buildPortfolio(LAYOUT_V22);
+    const k = Keypair.generate().publicKey;
+    const id = k.toBase58();
+    let calls = 0;
+    const pubkey = { toBase58: () => { if (calls++ === 0) throw "boom-string"; return id; } };
+    const getProgramAccounts = vi.fn(async () => [{ pubkey, account: { data: Buffer.from(good) } }]);
+    const r = await fetchPortfolios({ getProgramAccounts } as never, new PublicKey("11111111111111111111111111111111"), LAYOUT_V22);
+    expect(r.portfolios).toEqual([]);
+    expect(r.skipped).toEqual([{ pubkey: id, error: "boom-string" }]);
+  });
+
+  it("a wrong-size portfolio is skipped with a length error; a buffer with no wrapper magic is dropped silently", async () => {
+    const good = buildPortfolio(LAYOUT_V22);
+    const k1 = Keypair.generate().publicKey, k2 = Keypair.generate().publicKey;
+    const getProgramAccounts = vi.fn(async () => [
+      { pubkey: k1, account: { data: Buffer.from(good.subarray(0, good.length - 1)) } },
+      { pubkey: k2, account: { data: Buffer.from(good.subarray(0, 8)) } },
+    ]);
+    const r = await fetchPortfolios({ getProgramAccounts } as never, new PublicKey("11111111111111111111111111111111"), LAYOUT_V22);
+    expect(r.portfolios).toEqual([]);
+    expect(r.skipped[0].error.length).toBeGreaterThan(0);
+    expect(r.skipped.map((x) => x.pubkey)).toEqual([k1.toBase58()]); // 8 B has no wrapper magic: decodePortfolio returns null
+  });
 });

@@ -210,6 +210,7 @@ import {
   type AutoRowMarketInput,
 } from "../db/autoMarketFields.js";
 import { hasWrapperMagic, readMarketGroupFields, reportUnknownLayout } from "../layout/resolve.js";
+import { noteLotExps } from "../parsers/lotScale.js";
 import { noteMarketLayout } from "../layout/marketVersions.js";
 import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
 import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } from "./dexscreener.js";
@@ -253,6 +254,17 @@ export interface MarketProvider {
   getMarkets(): Map<string, { market: DiscoveredMarket }>;
 }
 
+/** Max interval: Node's setInterval overflows (fires after 1 ms) above 2^31-1; cap at 24 h. */
+export const MAX_INTERVAL_MS = 24 * 60 * 60_000;
+
+/** Decimal-only positive integer in [1, MAX_INTERVAL_MS]; anything else (hex, exponent, fraction) -> null. */
+export function parseIntervalEnv(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 1 && n <= MAX_INTERVAL_MS ? n : null;
+}
+
 /**
  * How often the collect cycle runs. Configurable via `STATS_COLLECT_INTERVAL_MS` (ms).
  *
@@ -265,13 +277,10 @@ export interface MarketProvider {
 export const COLLECT_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_COLLECT_INTERVAL_MS;
   if (!raw) return 60_000;
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) {
-    return n;
-  } else {
-    logger.warn("Invalid STATS_COLLECT_INTERVAL_MS env var, falling back to 60000ms", { raw });
-    return 60_000;
-  }
+  const n = parseIntervalEnv(raw);
+  if (n !== null) return n;
+  logger.warn("Invalid STATS_COLLECT_INTERVAL_MS env var, falling back to 60000ms", { raw });
+  return 60_000;
 })();
 
 /**
@@ -289,8 +298,8 @@ export const COLLECT_INTERVAL_MS: number = (() => {
 export const AUTOCLOSE_INTERVAL_MS: number = (() => {
   const raw = process.env.STATS_AUTOCLOSE_INTERVAL_MS;
   if (!raw) return 10 * 60_000;
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) return n;
+  const n = parseIntervalEnv(raw);
+  if (n !== null) return n;
   logger.warn("Invalid STATS_AUTOCLOSE_INTERVAL_MS env var, falling back to 600000ms", { raw });
   return 10 * 60_000;
 })();
@@ -301,6 +310,15 @@ export const AUTOCLOSE_INTERVAL_MS: number = (() => {
  * previous batch of 5.
  */
 const SWEEP_BATCH_SIZE = 25;
+
+/** Max slabs per `.in()` UPDATE: PostgREST puts the list in the URL, so bound its length (cf. storedLegs IN_CHUNK). */
+const WRITE_IN_CHUNK = 100;
+
+function chunked<T>(items: T[], size = WRITE_IN_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
 
 /** Pause between sweep batches, to stay clear of RPC rate limits. */
 const SWEEP_BATCH_DELAY_MS = 250;
@@ -648,9 +666,10 @@ export class StatsCollector {
     try {
       // Get on-chain markets from market provider
       const onChainMarkets = this.marketProvider.getMarkets();
-      if (onChainMarkets.size === 0) return null;
 
-      // Get existing markets from DB
+      // Get existing markets from DB. Read BEFORE the empty-discovery bail-out below so the
+      // DB-retired blocklist is refreshed even when discovery has nothing (cold start, RPC
+      // outage): otherwise a retired market keeps being ingested and an un-retired one stays blocked.
       const dbMarkets = await getMarketRows();
       const dbSlabAddresses = new Set(dbMarkets.map(m => m.slab_address));
 
@@ -663,6 +682,8 @@ export class StatsCollector {
           .filter((m) => (m as { keeper_status?: string }).keeper_status === "retired")
           .map((m) => m.slab_address),
       );
+
+      if (onChainMarkets.size === 0) return null;
 
       // Find missing markets. Blocked slabs are skipped here rather than
       // deleted afterwards: discovery sees them on chain every cycle, so
@@ -975,7 +996,9 @@ export class StatsCollector {
       // one RPC round-trip per SWEEP_BATCH_SIZE markets. Registration above already
       // ran; skip the sweep until it's due.
       const now = Date.now();
-      if (now - this._lastSweepAt < AUTOCLOSE_INTERVAL_MS) return;
+      // A negative age (wall clock stepped back) is due, not "recent".
+      const sweepAge = now - this._lastSweepAt;
+      if (sweepAge >= 0 && sweepAge < AUTOCLOSE_INTERVAL_MS) return;
       this._lastSweepAt = now;
 
       logger.info("StatsCollector sweep started", { marketCount: markets.size });
@@ -993,25 +1016,33 @@ export class StatsCollector {
         const dbMarkets = syncedDbMarkets ?? (await getMarketRows());
         const excludedDbMarkets = dbMarkets.filter((m) => m.indexer_excluded === true);
 
+        // Excluded markets that are back in the live discovery map may have recovered.
+        // Read their slabs in batched getMultipleAccountsInfo calls (one per
+        // SWEEP_BATCH_SIZE) instead of one getAccountInfo per market.
+        const candidates: string[] = [];
         for (const m of excludedDbMarkets) {
-          // If the market is back in the live discovery map, it may have recovered.
-          // Re-enable it so collect() processes it this cycle.
-          if (markets.has(m.slab_address)) {
-            // DiscoveredMarket.engine is a v12 field — the SDK documents it as
-            // "Absent (undefined) for v17 market group accounts". Reading it
-            // here made `vault` 0 for EVERY v17 market, so isLive was always
-            // false and a market auto-closed once could never be re-enabled: a
-            // launch that stalled between InitMarket and its funding step got
-            // closed by the sweep, and stayed hidden forever even after the
-            // creator completed the deposit and the vault held real collateral.
-            //
-            // Read the vault from chain instead, v17-aware, the same way the
-            // sweep below does (parseV17AccountStats). One account read per
-            // excluded market, and the excluded set is normally tiny.
+          if (markets.has(m.slab_address)) candidates.push(m.slab_address);
+          else excludedSlabs.add(m.slab_address);
+        }
+
+        // DiscoveredMarket.engine is a v12 field (absent for v17), so the vault is
+        // read from chain, v17-aware, the same way the sweep below does
+        // (parseV17AccountStats). Unreadable slabs stay excluded and are retried next
+        // cycle rather than un-hidden unverified.
+        const revive: Array<{ slab: string; vault: bigint; numUsedAccounts: number }> = [];
+        for (let i = 0; i < candidates.length; i += SWEEP_BATCH_SIZE) {
+          const chunk = candidates.slice(i, i + SWEEP_BATCH_SIZE);
+          let infos: Array<{ data: Uint8Array | Buffer } | null> = [];
+          try {
+            infos = await getConnection().getMultipleAccountsInfo(chunk.map((s) => new PublicKey(s)));
+          } catch (err) {
+            logger.warn("Excluded-market slab read failed; leaving them excluded", { count: chunk.length, error: err instanceof Error ? err.message : err });
+          }
+          chunk.forEach((slab, j) => {
             let vault = 0n;
             let numUsedAccounts = 0;
             try {
-              const info = await getConnection().getAccountInfo(new PublicKey(m.slab_address));
+              const info = infos[j];
               if (info?.data) {
                 const data = new Uint8Array(info.data);
                 const eng = hasWrapperMagic(data) ? parseV17AccountStats(data).engine : parseEngine(data);
@@ -1019,40 +1050,37 @@ export class StatsCollector {
                 numUsedAccounts = eng.numUsedAccounts;
               }
             } catch (err) {
-              // Unreadable — leave it excluded and try again next cycle rather
-              // than un-hiding a market we cannot verify. An unknown VERSION is loud (per market).
-              reportUnknownLayout(m.slab_address, err, "StatsCollector.reenable");
+              reportUnknownLayout(slab, err, "StatsCollector.reenable");
             }
-            const isLive = vault > 1_000_000n || numUsedAccounts > 0;
+            if (vault > 1_000_000n || numUsedAccounts > 0) revive.push({ slab, vault, numUsedAccounts });
+            else excludedSlabs.add(slab);
+          });
+        }
 
-            if (isLive) {
-              try {
-                // supabase-js reports a failed write as { error }, it does not throw.
-                const { error: reenableErr } = await getSupabase()
-                  .from("markets")
-                  .update({ indexer_excluded: false, status: "active" })
-                  .eq("slab_address", m.slab_address)
-                  .eq("network", getNetwork());
-                if (reenableErr) throw new Error(reenableErr.message);
-                this.closedSlabs.delete(m.slab_address);
-                logger.info("Re-enabled previously excluded market (back in discovery and active)", {
-                  slabAddress: m.slab_address.slice(0, 8),
-                  vault: vault.toString(),
-                  numUsedAccounts,
-                });
-              } catch (e) {
-                // Non-fatal — will retry next cycle
-                logger.warn("Failed to re-enable excluded market", {
-                  slabAddress: m.slab_address.slice(0, 8),
-                  error: e instanceof Error ? e.message : e,
-                });
-                excludedSlabs.add(m.slab_address);
-              }
-            } else {
-              excludedSlabs.add(m.slab_address);
+        for (const group of chunked(revive)) {
+          try {
+            // One UPDATE per chunk; supabase-js reports a failed write as { error }.
+            const { error: reenableErr } = await getSupabase()
+              .from("markets")
+              .update({ indexer_excluded: false, status: "active" })
+              .in("slab_address", group.map((r) => r.slab))
+              .eq("network", getNetwork());
+            if (reenableErr) throw new Error(reenableErr.message);
+            for (const r of group) {
+              this.closedSlabs.delete(r.slab);
+              logger.info("Re-enabled previously excluded market (back in discovery and active)", {
+                slabAddress: r.slab.slice(0, 8),
+                vault: r.vault.toString(),
+                numUsedAccounts: r.numUsedAccounts,
+              });
             }
-          } else {
-            excludedSlabs.add(m.slab_address);
+          } catch (e) {
+            // Non-fatal — will retry next cycle
+            logger.warn("Failed to re-enable excluded markets", {
+              count: group.length,
+              error: e instanceof Error ? e.message : e,
+            });
+            for (const r of group) excludedSlabs.add(r.slab);
           }
         }
 
@@ -1066,6 +1094,9 @@ export class StatsCollector {
       const connection = getConnection();
       let updated = 0;
       let errors = 0;
+      // Closes are collected during the sweep and written as one UPDATE each, not one per market.
+      const missingSlabs: string[] = [];
+      const dustClosable: Array<{ slab: string; vault: number; accounts: number }> = [];
 
       // Batch the account reads: getMultipleAccountsInfo takes up to 100 keys, so
       // SWEEP_BATCH_SIZE keys per call instead of one call per market.
@@ -1090,16 +1121,15 @@ export class StatsCollector {
             try {
               const accountInfo = accountInfos[batchIndex];
               if (!accountInfo?.data) {
-                // Account doesn't exist on-chain — mark as closed + excluded
-                const db = getSupabase();
-                await db.from("markets").update({ status: "closed", indexer_excluded: true }).eq("slab_address", slabAddress).eq("network", getNetwork());
-                logger.info("Auto-closed non-existent market", { slab: slabAddress.slice(0, 8) });
+                // Account doesn't exist on-chain — mark as closed + excluded (one UPDATE after the sweep)
+                missingSlabs.push(slabAddress);
                 return;
               }
 
             const data = new Uint8Array(accountInfo.data);
             // Remember this market's wrapper VERSION and asset generations (v2.2 log events are VERSION-gated; never throws).
             noteMarketLayout(slabAddress, data);
+            noteLotExps(slabAddress, data); // per-token pricing of CPI fills (no slab read on that path)
 
             // Parse engine state — v17 dispatch (desync fixes 2, 3, 4).
             // marketConfig/params are intentionally NOT read here anymore: the only
@@ -1136,22 +1166,7 @@ export class StatsCollector {
             // Auto-close detection: if vault is dust and no accounts, mark market as closed.
             // This hides stale/abandoned slabs from the frontend without manual DB edits.
             if (hasDustVault && hasNoAccounts && !this.closedSlabs.has(slabAddress)) {
-              try {
-                const { error: closeErr } = await getSupabase()
-                  .from("markets")
-                  .update({ status: "closed", indexer_excluded: true })
-                  .eq("slab_address", slabAddress)
-                  .eq("network", getNetwork())
-                  .neq("status", "closed"); // only update if not already closed
-                if (closeErr) {
-                  logger.warn("Auto-close market failed", { slabAddress, error: closeErr.message });
-                } else {
-                  this.recordClosedSlab(slabAddress);
-                  logger.info("Auto-closed stale market", { slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
-                }
-              } catch (e) {
-                logger.warn("Auto-close market error", { slabAddress, error: e instanceof Error ? e.message : e });
-              }
+              dustClosable.push({ slab: slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
             }
 
             // REDUCTION (2026-07-26): market_stats is no longer written from collect().
@@ -1179,6 +1194,40 @@ export class StatsCollector {
         // Small delay between batches
         if (i + SWEEP_BATCH_SIZE < entries.length) {
           await new Promise((r) => setTimeout(r, SWEEP_BATCH_DELAY_MS));
+        }
+      }
+
+      for (const group of chunked(missingSlabs)) {
+        try {
+          const { error: missErr } = await getSupabase()
+            .from("markets")
+            .update({ status: "closed", indexer_excluded: true })
+            .in("slab_address", group)
+            .eq("network", getNetwork());
+          if (missErr) logger.warn("Auto-close of non-existent markets failed", { count: group.length, error: missErr.message });
+          else for (const s of group) logger.info("Auto-closed non-existent market", { slab: s.slice(0, 8) });
+        } catch (e) {
+          logger.warn("Auto-close of non-existent markets error", { count: group.length, error: e instanceof Error ? e.message : e });
+        }
+      }
+      for (const group of chunked(dustClosable)) {
+        try {
+          const { error: closeErr } = await getSupabase()
+            .from("markets")
+            .update({ status: "closed", indexer_excluded: true })
+            .in("slab_address", group.map((d) => d.slab))
+            .eq("network", getNetwork())
+            .neq("status", "closed"); // only update if not already closed
+          if (closeErr) {
+            logger.warn("Auto-close market failed", { count: group.length, error: closeErr.message });
+          } else {
+            for (const d of group) {
+              this.recordClosedSlab(d.slab);
+              logger.info("Auto-closed stale market", { slabAddress: d.slab, vault: d.vault, accounts: d.accounts });
+            }
+          }
+        } catch (e) {
+          logger.warn("Auto-close market error", { count: group.length, error: e instanceof Error ? e.message : e });
         }
       }
 

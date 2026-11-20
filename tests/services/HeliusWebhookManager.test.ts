@@ -146,14 +146,35 @@ describe("HeliusWebhookManager", () => {
       expect(manager.getStatus().status).toBe("failed");
     });
 
-    it("should proceed to create if findExistingWebhook GET fails", async () => {
-      mockFetch.mockResolvedValueOnce(mockResponse("Unauthorized", { ok: false, status: 401 }));
-      mockFetch.mockResolvedValueOnce(mockResponse({ webhookID: "fallback-create" }));
+    const posts = () => mockFetch.mock.calls.filter((c) => c[1]?.method === "POST").length;
 
+    it("does NOT create a webhook when the list call returns non-2xx (no duplicate)", async () => {
+      mockFetch.mockResolvedValue(mockResponse("Unauthorized", { ok: false, status: 401 }));
       await manager.start();
+      expect(posts()).toBe(0);
+      expect(manager.getStatus().status).toBe("failed");
+      expect(manager.getStatus().error).toMatch(/list/i);
+    });
 
-      expect(manager.getStatus().status).toBe("active");
-      expect(manager.getStatus().webhookId).toBe("fallback-create");
+    it("does NOT create a webhook when the list call fails with a network error", async () => {
+      mockFetch.mockRejectedValue(new Error("ECONNRESET"));
+      await manager.start();
+      expect(posts()).toBe(0);
+      expect(manager.getStatus().status).toBe("failed");
+    });
+
+    it("does NOT create a webhook when the list body is not an array (error object)", async () => {
+      mockFetch.mockResolvedValue(mockResponse({ error: "rate limited" }));
+      await manager.start();
+      expect(posts()).toBe(0);
+      expect(manager.getStatus().status).toBe("failed");
+    });
+
+    it("repeated reRegister during a list outage never POSTs", async () => {
+      mockFetch.mockResolvedValue(mockResponse("down", { ok: false, status: 503 }));
+      expect((await manager.reRegister()).ok).toBe(false);
+      expect((await manager.reRegister()).ok).toBe(false);
+      expect(posts()).toBe(0);
     });
   });
 
@@ -243,6 +264,92 @@ describe("HeliusWebhookManager", () => {
       expect(() => resolveWebhookApiBase("http://evil.example.com")).toThrow();
       expect(() => resolveWebhookApiBase("https://api.helius.xyz/v0")).toThrow();
       expect(resolveWebhookApiBase("")).toBe(DEFAULT_HELIUS_WEBHOOK_API_BASE);
+    });
+  });
+  describe("additional branch coverage", () => {
+    it("records a failed status when the PUT update fails", async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse([{ webhookID: "wh-1", webhookURL: "https://my-server.example.com/webhook/trades" }]),
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse("boom", { ok: false, status: 500 }));
+      await manager.start();
+      expect(manager.getStatus().status).toBe("failed");
+      expect(manager.getStatus().error).toContain("Helius webhook update failed: 500 boom");
+      expect(manager.getStatus().webhookId).toBeNull();
+    });
+
+    it("stringifies non-Error throws and survives a failing critical alert", async () => {
+      const shared = await import("@percolatorct/shared");
+      mockFetch.mockResolvedValueOnce(mockResponse([]));
+      mockFetch.mockRejectedValueOnce("plain string failure");
+      vi.mocked(shared.sendCriticalAlert).mockRejectedValueOnce(new Error("discord down"));
+      await manager.start();
+      expect(manager.getStatus()).toEqual({ status: "failed", webhookId: null, error: "plain string failure" });
+      expect(sharedMock.logger.error).toHaveBeenCalledWith(
+        "Failed to send webhook registration alert",
+        expect.anything(),
+      );
+    });
+
+    it("redacts the api key from fetch errors, logs the cause, and handles non-Error rejections", async () => {
+      const err = new Error("fetch failed for https://x/v0/webhooks?api-key=SECRET123 now", {
+        cause: new Error("ECONNRESET"),
+      });
+      mockFetch.mockRejectedValueOnce(err);
+      await manager.start();
+      const call = sharedMock.logger.error.mock.calls.find((c) => c[0] === "Fetch to Helius API failed")!;
+      expect(call[1].message).toContain("api-key=REDACTED");
+      expect(call[1].message).not.toContain("SECRET123");
+      expect(call[1].cause).toBe("ECONNRESET");
+
+      mockFetch.mockRejectedValueOnce("string rejection");
+      await manager.start();
+      const second = sharedMock.logger.error.mock.calls.filter((c) => c[0] === "Fetch to Helius API failed")[1];
+      expect(second[1]).toEqual({ message: "string rejection", cause: undefined });
+    });
+
+    it("treats a non-Error cause as absent and tolerates an unreadable error body on list failure", async () => {
+      const err = new Error("net down", { cause: "not-an-error" });
+      mockFetch.mockRejectedValueOnce(err);
+      await manager.start();
+      const call = sharedMock.logger.error.mock.calls.find((c) => c[0] === "Fetch to Helius API failed")!;
+      expect(call[1].cause).toBeUndefined();
+
+      const bad = mockResponse("x", { ok: false, status: 503 });
+      (bad.text as any).mockRejectedValueOnce(new Error("stream broke"));
+      mockFetch.mockResolvedValueOnce(bad);
+      await manager.start();
+      expect(sharedMock.logger.warn).toHaveBeenCalledWith("Failed to list webhooks", { status: 503, body: "" });
+    });
+
+    it("omits authHeader when no webhook secret is configured", async () => {
+      sharedMock.config.webhookSecret = "";
+      mockFetch.mockResolvedValueOnce(mockResponse([]));
+      mockFetch.mockResolvedValueOnce(mockResponse({ webhookID: "n5" }));
+      await manager.start();
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+      expect(body.authHeader).toBeUndefined();
+    });
+
+    it("listWebhooks returns null on a non-ok response", async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse("nope", { ok: false, status: 401 }));
+      expect(await manager.listWebhooks()).toBeNull();
+    });
+
+    it("reRegister reports ok:false with the message (or string) when start() throws", async () => {
+      const spy = vi.spyOn(manager, "start");
+      spy.mockRejectedValueOnce(new Error("kaboom"));
+      expect(await manager.reRegister()).toEqual({ ok: false, error: "kaboom" });
+      spy.mockRejectedValueOnce("str");
+      expect(await manager.reRegister()).toEqual({ ok: false, error: "str" });
+    });
+
+    it("reRegister returns ok:false without throwing when registration fails", async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse([]));
+      mockFetch.mockResolvedValueOnce(mockResponse("bad", { ok: false, status: 400 }));
+      const r = await manager.reRegister();
+      expect(r.ok).toBe(false);
+      expect(r.webhookId).toBeUndefined();
     });
   });
 });

@@ -1,3 +1,4 @@
+import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import type { AtlasWs, AtlasNotification } from "@percolatorct/shared";
 import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
@@ -6,8 +7,9 @@ import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
 import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
+import { resolveLotExp, perTokenPrice, cachedLotExp } from "../parsers/lotScale.js";
 import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
-import { insertV22Events } from "../db/insertV22Events.js";
+import { insertV22EventsWithRetry, V22EventWriteError } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
@@ -119,6 +121,7 @@ export class EventStreamService {
 
     // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
     // a failure here must never cost the tx's fills below.
+    let v22WriteFailed = false;
     try {
       const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
       const events = decodeV22Events(wrapperIxs, {
@@ -126,9 +129,16 @@ export class EventStreamService {
         slot: typeof tx.slot === "number" ? tx.slot : null,
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
       }).filter((e) => !e.slab_address || (this.slabSet.has(e.slab_address) && !isBlockedSlab(e.slab_address)));
-      if (events.length > 0) await insertV22Events(events);
+      if (events.length > 0) {
+        try {
+          await insertV22EventsWithRetry(events);
+        } catch (err) {
+          if (!(err instanceof V22EventWriteError)) throw err;
+          v22WriteFailed = true; // retries exhausted (counted + alerted); surfaced after the fills are indexed
+        }
+      }
       // v2.2 wrapper LOG events (fills / reductions / moves), strict frame attribution; separate write, VERSION-keyed.
-      await recordV22LogEvents({
+      const logRes = await recordV22LogEvents({
         signature,
         err: tx.meta?.err ?? null,
         logMessages: tx.meta?.logMessages,
@@ -138,10 +148,18 @@ export class EventStreamService {
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
         isKnownMarket: (slab) => this.slabSet.has(slab),
       });
+      if (logRes.status === "write_failed") v22WriteFailed = true;
     } catch (err) {
       log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
     }
 
+    // The fills are indexed first and unconditionally; a v22 write that failed after its retries is surfaced AFTER them
+    // (the handler logs it as "handler failed"; the failure is counted and alerted in insertV22Events). Only the instruction events are retried here; the log events go through recordV22LogEvents, which reports "write_failed" once.
+    await this.indexFills(tx, signature);
+    if (v22WriteFailed) throw new Error(`v22_events write failed after retries for ${signature.slice(0, 16)}`);
+  }
+
+  private async indexFills(tx: any, signature: string): Promise<void> {
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
 
     // Collect this tx's rows and write them in one round-trip at the end, instead
@@ -178,6 +196,7 @@ export class EventStreamService {
       let priceE6Value = fill.priceE6 ?? 0;
       let sizeAbs = fill.sizeAbs;
       let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
+      let matcherPriced = false; // price came from the matcher CPI (no slab read), so lot_exp may not be cached yet
       if (fill.cpi) {
         // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
         const r = await resolveCpiLeg({
@@ -191,6 +210,7 @@ export class EventStreamService {
           continue; // zero fill / strict skip: no row (the leg number is already consumed)
         }
         if (r.kind === "fill") {
+          matcherPriced = true;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
           sizeAbs = r.sizeValue;
           priceE6Value = Number(r.priceE6);
@@ -225,7 +245,33 @@ export class EventStreamService {
       // `priceE6` field name on the fill — returns the raw e6 integer, so it must
       // be divided here too. Previously this raw e6 value was stored directly
       // into `trades.price`, inflating every Atlas-indexed fill 1,000,000x.
-      const price = priceE6Value / 1_000_000;
+      // per-token: the engine/matcher price is per 10^lot_exp units (lot 0 == / 1_000_000, unchanged).
+      // Never guessed: cache (filled by the slab reads above), else one read of the market account. Unreadable: skip
+      // the fill and keep the signature for re-index, since a lot-0 price would be stored permanently.
+      // Only a matcher-priced fill can have a cold cache (every other price came from a slab read that filled it), so
+      // legacy / lot 0 fills make no extra RPC and cannot be dropped by this read (cache, else 0, as before).
+      let lot: number | null;
+      if (matcherPriced) {
+        const readSlab = async () => {
+          const info = await this.deps.connection.getAccountInfo(new PublicKey(slab));
+          return info?.data ? new Uint8Array(info.data) : null;
+        };
+        lot = await resolveLotExp(slab, fill.assetIndex, readSlab);
+        if (lot === null) { // one retry after a short pause (a single failed read must not drop the fill)
+          await new Promise((r) => setTimeout(r, 300));
+          lot = await resolveLotExp(slab, fill.assetIndex, readSlab);
+        }
+      } else {
+        lot = cachedLotExp(slab, fill.assetIndex);
+      }
+      if (lot === null) {
+        // Nothing is written (a lot-0 price would be stored permanently). The poll path (TradeIndexer) holds its
+        // cursor on the same unreadable market and re-indexes this tx, so the fill is retried there, not lost.
+        log.warn("skipping fill for now — lot_exp unreadable; the poller retries it", { sig: signature, slab });
+        await recordSkippedSignatures([{ signature, source: "trade-indexer", slab, error: "TradeCpi lot_exp unreadable: market account not read" }]);
+        continue;
+      }
+      const price = perTokenPrice(priceE6Value, lot);
 
       rows.push({
         slab_address: slab,
@@ -285,6 +331,18 @@ export class EventStreamService {
     } catch (err) {
       // Whole batch failed — nothing was written, so emit nothing.
       log.warn("insertTradeRows failed", { sig: signature, count: rows.length, err: String(err) });
+      // Record the signature so it can be re-indexed by hand (recorded, not auto-retried): without this, with the RPC poller disabled
+      // (or the sig outside its look-back) the fill is lost silently.
+      try {
+        await recordSkippedSignatures([{
+          signature,
+          source: "trade-indexer",
+          slab: rows[0].slab_address,
+          error: `insertTradeRows failed: ${String(err)}`.slice(0, 480),
+        }]);
+      } catch (recErr) {
+        log.warn("recordSkippedSignatures failed", { sig: signature, err: String(recErr) });
+      }
       return;
     }
 

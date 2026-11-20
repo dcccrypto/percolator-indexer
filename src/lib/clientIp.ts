@@ -12,8 +12,9 @@
  *   anything else                         -> 1, logged once per distinct value
  *
  * Depth 0 means no proxy in front, so no forwarded header is trusted at all and the socket's
- * remote address is used. The depth must equal the real number of proxies: a larger one lands
- * on a left-hand entry the caller wrote.
+ * remote address is used. The depth must equal the real number of proxies. A chain shorter than the depth, or a
+ * non-IP chosen hop, is not trusted: the key falls back to the socket address (fail closed).
+ * X-Real-IP is never used; the caller can set it.
  */
 import { isIPv4, isIPv6 } from "node:net";
 
@@ -60,13 +61,14 @@ export function clientIp({ header, remoteAddress, depth }: ClientIpInput): strin
     const forwarded = header("x-forwarded-for");
     if (forwarded) {
       const ips = forwarded.split(",").map((s) => s.trim()).filter(Boolean);
-      if (ips.length > 0) {
-        const candidate = ips[Math.max(0, ips.length - depth)];
+      // Fail closed: a chain shorter than the depth skipped a proxy (or the depth is set too
+      // high), so every entry was written by the caller. Never clamp to ips[0]. X-Real-IP is
+      // caller-writable too, so it is never consulted; fall through to the socket address.
+      if (ips.length >= depth) {
+        const candidate = ips[ips.length - depth];
         if (isValidIp(candidate)) return candidate;
       }
     }
-    const realIp = header("x-real-ip")?.trim();
-    if (isValidIp(realIp)) return realIp;
   }
   return isValidIp(remoteAddress) ? remoteAddress : UNKNOWN_IP;
 }
