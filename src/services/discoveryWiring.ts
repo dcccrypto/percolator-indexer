@@ -9,11 +9,16 @@ export interface DiscoveryEnv {
   DISCOVERY_LIGHT_INTERVAL_MS?: string;
 }
 
+const MIN_INTERVAL_MS = 1_000;
+const MAX_INTERVAL_MS = 2 ** 31 - 1; // setInterval overflows (fires after 1 ms) above this
+
+/** Decimal digits only; sub-minimum values floor to 1 s, huge ones cap at 2^31-1. */
 function positiveOr(raw: string | undefined, fallback: number, allowZero = false): number {
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0 || (n === 0 && !allowZero)) return fallback;
-  return n;
+  const t = raw?.trim();
+  if (t === undefined || !/^\d+$/.test(t)) return fallback;
+  const n = Number(t);
+  if (n === 0) return allowZero ? 0 : fallback;
+  return Math.min(Math.max(n, MIN_INTERVAL_MS), MAX_INTERVAL_MS);
 }
 
 /**
