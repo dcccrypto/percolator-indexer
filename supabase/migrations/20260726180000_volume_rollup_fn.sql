@@ -8,7 +8,7 @@
 --
 -- This does the same aggregation in Postgres and returns one row per market.
 --
--- Correctness (see db/v17_baseline.sql, trades): is_liquidation rows are MARKERS.
+-- Correctness (see 20260726120000_v17_baseline.sql, trades): is_liquidation rows are MARKERS.
 -- v17 liquidations run through PermissionlessCrank (tag 5 / action 1), which
 -- carries no size/price/side, so those rows have NULL size. The old JS path did
 -- not filter them: BigInt(null) threw, the fallback Number(null) === 0 passed

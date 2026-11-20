@@ -4,7 +4,7 @@
 -- at the time it was written (2026-10-18).
 --
 -- PR #228 (Bayyan16) added public.trades.size_provenance. anon is column-restricted on trades
--- (20260726120000_v17_baseline.sql:207, db/v17_baseline.sql: GRANT SELECT (trader, size,
+-- (20260726120000_v17_baseline.sql:207: GRANT SELECT (trader, size,
 -- created_at) ON trades TO anon), so a new column is invisible to anon until it is granted by
 -- name. `authenticated` and `service_role` hold table-level SELECT, which already covers it.
 --
