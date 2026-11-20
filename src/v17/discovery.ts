@@ -33,6 +33,7 @@ import {
 import { createLogger } from "@percolatorct/shared";
 import { encodeBase58 } from "../lib/base58.js";
 import { noteMarketLayout } from "../layout/marketVersions.js";
+import { v17InitialMarginBps } from "../db/autoMarketFields.js";
 import { isWrapperKind, readMarketGroupFields, registrationSliceLen, reportUnknownLayout, type MarketGroupFields } from "../layout/resolve.js";
 
 /**
@@ -186,7 +187,7 @@ function makeV17SlabHeader(data: Uint8Array, _programId: PublicKey): SlabHeader 
  *   - authorityPriceE6 → read from AssetOracleProfileV17.oracleTargetPriceE6
  *   - dexPool → null
  */
-function makeV17MarketConfig(data: Uint8Array, fields: MarketGroupFields): MarketConfig {
+function makeV17MarketConfig(data: Uint8Array, fields: MarketGroupFields): { config: MarketConfig; tradeFeeBps: bigint } {
   const cfg = parseWrapperConfigV17(data, V17_HEADER_LEN);
 
   // Asset-0 oracle profile: the start of slot 0 of THIS account's VERSION (group offset + group length).
@@ -207,7 +208,7 @@ function makeV17MarketConfig(data: Uint8Array, fields: MarketGroupFields): Marke
   // markEwmaE6 in WrapperConfigV17 is at offset 232 within the config block (absolute: 16+232=248)
   const lastEffectivePriceE6 = cfg.markEwmaE6;
 
-  return {
+  const config: MarketConfig = {
     collateralMint: cfg.collateralMint,
     vaultPubkey: ZERO_PUBKEY,         // no separate vault pubkey in v17
     indexFeedId: ZERO_PUBKEY,         // no global index feed in v17; treat as hyperp-mode stub
@@ -248,20 +249,27 @@ function makeV17MarketConfig(data: Uint8Array, fields: MarketGroupFields): Marke
     phase2DeltaSlots: 0,
     dexPool: null,
   };
+  return { config, tradeFeeBps: cfg.tradeFeeBps };
 }
 
 /**
- * Stub RiskParams for v17 accounts.
- * v17 risk params are encoded in WrapperConfigV17 fields and per-asset oracle profiles.
- * StatsCollector reads params.warmupPeriodSlots, params.liquidationFeeBps, etc. —
- * these are zeroed for v17 (devnet bring-up only; full param extraction is a Phase 7 item).
+ * RiskParams for v17/v18/v2.2 accounts, mapped to the v12 shape registration reads.
+ *
+ * Two fields are real, read from the bytes discovery already holds (no extra RPC):
+ *   - tradingFeeBps    = WrapperConfigV17 trade_fee_base_bps (config +128). autoMarketFields reads it for
+ *                        `markets.trading_fee_bps`; the old stub 0n wrote 0 bps for every v2.2 market.
+ *   - initialMarginBps = engine config initial_margin_bps (market group + group.config + 62, VERSION-keyed via
+ *                        v17InitialMarginBps). StatsCollector turns it into `max_leverage`; the old stub 500n
+ *                        wrote 20x for every market. Both offsets sit inside V17_REGISTRATION_SLICE_LEN.
+ * initialMarginBps keeps the 500n fallback only when the account holds no positive value.
+ * Everything else is still zeroed (devnet bring-up; full param extraction is a Phase 7 item).
  */
-function makeV17RiskParamsStub(): RiskParams {
+function makeV17RiskParams(data: Uint8Array, config: { tradeFeeBps: bigint }, account: string): RiskParams {
   return {
     warmupPeriodSlots: 0n,
     maintenanceMarginBps: 0n,
-    initialMarginBps: 500n,   // default 20x (500 bps) — used for maxLeverage calc in syncMarkets
-    tradingFeeBps: 0n,
+    initialMarginBps: v17InitialMarginBps(data, account) ?? 500n, // 500n (20x) only if the account has no value
+    tradingFeeBps: config.tradeFeeBps,
     maxAccounts: 0n,
     newAccountFee: 0n,
     riskReductionThreshold: 0n,
@@ -308,9 +316,9 @@ function parseV17Account(
     const fields = readMarketGroupFields(data, "discoverV17Markets");
     noteMarketLayout(pubkey.toBase58(), data);
     const header = makeV17SlabHeader(data, programId);
-    const config = makeV17MarketConfig(data, fields);
+    const { config, tradeFeeBps } = makeV17MarketConfig(data, fields);
     const engine = makeV17EngineStub(fields);
-    const params = makeV17RiskParamsStub();
+    const params = makeV17RiskParams(data, { tradeFeeBps }, pubkey.toBase58());
 
     return { slabAddress: pubkey, programId, header, config, engine, params };
   } catch (err) {
