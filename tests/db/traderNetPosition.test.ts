@@ -33,7 +33,6 @@ describe('fetchTraderPositionEvidence', () => {
       row('short', 1658210),       // NUMERIC as a JSON number
       row('long', '400000'),       // or as a string
       row('short', '100000.000'),
-      row(null, null),             // never counted
     ], error: null });
     expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).toEqual({ netQ: -1358210n, uncertain: null });
     const eqs = calls.filter(([m]) => m === 'eq').map(([, a]) => a);
@@ -85,16 +84,39 @@ describe('fetchTraderPositionEvidence', () => {
     expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/not provably earlier/);
   });
 
-  it('reads bigint and numeric sizes, skips negative, NaN and non-numeric ones', async () => {
-    pages.push({ data: [
-      row('long', 7n),
-      row('long', 3.9),            // truncated
-      row('long', -4),             // negative: skipped
-      row('long', NaN),
-      row('long', 'abc'),
-      row('long', {}),
-    ], error: null });
-    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).netQ).toBe(10n);
+  it('reads bigint, safe-integer and decimal-string sizes exactly', async () => {
+    pages.push({ data: [row('long', 7n), row('long', 3), row('long', '5.000'), row('short', Number.MAX_SAFE_INTEGER)], error: null });
+    expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).toEqual({ netQ: 15n - BigInt(Number.MAX_SAFE_INTEGER), uncertain: null });
+  });
+
+  // trades.size is NUMERIC (PostgREST returns a JSON number): a value this code cannot read exactly must
+  // make the evidence uncertain, never be skipped while the net stays trusted.
+  it.each([
+    ['negative number', -4],
+    ['NaN', NaN],
+    ['non-numeric string', 'abc'],
+    ['object', {}],
+    ['null size on a fill', null],
+    ['exponent string', '1e+21'],
+    ['negative string', '-5'],
+    ['number above 2^53', 1e21],
+    ['unsafe integer', 2 ** 53],
+    ['fractional number', 3.9],
+    ['fractional string', '3.5'],
+  ])('is uncertain for an unreadable size: %s', async (_n, size) => {
+    pages.push({ data: [row('long', 7n), row('long', size)], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/size/);
+  });
+
+  it.each([null, 'flat', 'LONG'])('is uncertain for a fill whose side is %s (counted nowhere)', async (side) => {
+    pages.push({ data: [row('long', 7n), row(side, 3)], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).toMatch(/side/);
+  });
+
+  it('an unreadable size makes resolveRebalanceReduce refuse instead of writing a wrong-size close', async () => {
+    pages.push({ data: [row('long', 100), row('long', '1e+21')], error: null });
+    const r = await resolveRebalanceReduce({ trader: 'T', slabAddress: 'S', assetIndex: 0, reduceQ: 10n, signature: 'SIG', txTimeSec: T0, repeatInTx: false });
+    expect(r.ok).toBe(false);
   });
 
   it('a null data page is an empty position', async () => {
@@ -148,5 +170,23 @@ describe('resolveRebalanceReduce', () => {
   it('a repeat on the same position in one tx is unresolved without a lookup', async () => {
     expect((await resolveRebalanceReduce({ ...args, repeatInTx: true })).ok).toBe(false);
     expect(calls).toHaveLength(0);
+  });
+
+  it('a thrown non-Error lookup failure is stringified into the refusal reason', async () => {
+    const shared = await import('@percolatorct/shared');
+    vi.mocked(shared.getSupabase).mockImplementationOnce(() => { throw 'conn reset'; });
+    const r = await resolveRebalanceReduce(args);
+    expect(r).toEqual({ ok: false, reason: 'RebalanceReduce (tag 44): position lookup failed (conn reset)' });
+  });
+});
+
+describe('trades.size as bigint', () => {
+  beforeEach(() => { pages.length = 0; calls.length = 0; });
+
+  it('reads a non-negative bigint exactly and treats a negative bigint as unreadable', async () => {
+    pages.push({ data: [row('long', 7n)], error: null });
+    expect(await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).toEqual({ netQ: 7n, uncertain: null });
+    pages.push({ data: [row('long', -1n)], error: null });
+    expect((await fetchTraderPositionEvidence('T', 'S', 0, 'SIG', T0)).uncertain).not.toBeNull();
   });
 });

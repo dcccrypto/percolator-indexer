@@ -64,7 +64,7 @@ function fakeSupabase() {
       }
       const q: any = {};
       let sigs: string[] | null = null;
-      for (const m of ['select', 'neq', 'order']) q[m] = () => q;
+      for (const m of ['select', 'neq', 'order', 'gt', 'limit']) q[m] = () => q;
       q.eq = (col: string, val: unknown) => { if (col === 'tx_signature') { sigs = [String(val)]; h.storedReads.push(1); } return q; };
       q.in = (col: string, vals: string[]) => { if (col === 'tx_signature') { sigs = vals; h.storedReads.push(vals.length); } return q; };
       // Awaiting the chain without .range() is a stored-legs read (per tx via eq, or batched via in).
@@ -78,10 +78,21 @@ function fakeSupabase() {
 // These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
 // (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
 // wire size at a fixed price here.
+// Not about lot scale: a cold lot_exp cache reads as lot 0 here (see tests/lotScale-coldCache-*.test.ts for the real behaviour).
+vi.mock('../src/parsers/lotScale.js', async (orig) => {
+  const actual = await orig<typeof import('../src/parsers/lotScale.js')>();
+  return { ...actual, resolveLotExp: async (s: string, a: number) => actual.knownLotExp(s, a) ?? 0 };
+});
 vi.mock('../src/parsers/matcherFill.js', async (orig) => ({
   ...(await orig<typeof import('../src/parsers/matcherFill.js')>()),
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),
 }));
+
+// The parser decodes ix data with its own fast base58; route it back through the mocked shared decoder (h.data overrides).
+vi.mock('../src/parsers/fastBase58.js', async () => {
+  const shared = await import('@percolatorct/shared');
+  return { decodeBase58Fast: (s: string) => shared.decodeBase58(s) };
+});
 
 vi.mock('@percolatorct/shared', () => ({
   config: {

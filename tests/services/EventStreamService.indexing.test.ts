@@ -21,6 +21,12 @@ const m = vi.hoisted(() => ({
   blocked: vi.fn(),
 }));
 
+// These tests are about sizes/prices/dedup, not lot scale: a cold lot_exp cache reads as lot 0 here (the pre-fix
+// behaviour) instead of triggering a slab read. The cold-cache behaviour is covered in tests/lotScale-coldCache-*.test.ts.
+vi.mock("../../src/parsers/lotScale.js", async (orig) => {
+  const actual = await orig<typeof import("../../src/parsers/lotScale.js")>();
+  return { ...actual, resolveLotExp: async (s: string, a: number) => actual.knownLotExp(s, a) ?? 0 };
+});
 vi.mock("../../src/parsers/percolatorTxParser.js", () => ({
   parsePercolatorFills: m.fills,
   parsePercolatorLiquidations: m.liqs,
@@ -30,7 +36,7 @@ vi.mock("../../src/parsers/v22Events.js", () => ({
   decodeV22Events: m.decodeV22,
   rawInstructionsFromParsedTx: m.rawIxs,
 }));
-vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events: m.insertV22 }));
+vi.mock("../../src/db/insertV22Events.js", async (orig) => ({ ...(await orig<typeof import("../../src/db/insertV22Events.js")>()), insertV22EventsWithRetry: m.insertV22 }));
 vi.mock("../../src/services/v22LogEvents.js", () => ({ recordV22LogEvents: m.recordLog }));
 vi.mock("../../src/parsers/matcherFill.js", () => ({ resolveCpiLeg: m.resolveCpi }));
 vi.mock("../../src/lib/matcherCtx.js", () => ({ makeMatcherContextReader: () => vi.fn() }));
@@ -314,6 +320,32 @@ describe("handle: batch write and fan-out", () => {
     const { handle } = setup();
     await expect(handle(note(tx()))).resolves.toBeUndefined();
     expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it("records the signature in skipped_signatures when the batch insert throws (poller disabled: no other recovery)", async () => {
+    const prev = process.env.INDEXER_RPC_POLLING_ENABLED;
+    process.env.INDEXER_RPC_POLLING_ENABLED = "false";
+    try {
+      m.fills.mockReturnValue([fill()]);
+      m.insertRows.mockRejectedValue(new Error("db down"));
+      const { handle } = setup();
+      await handle(note(tx()));
+      expect(m.skipped).toHaveBeenCalledTimes(1);
+      expect(m.skipped.mock.calls[0][0]).toEqual([
+        expect.objectContaining({ signature: "SIG1", source: "trade-indexer", slab: SLAB, error: expect.stringContaining("db down") }),
+      ]);
+    } finally {
+      if (prev === undefined) delete process.env.INDEXER_RPC_POLLING_ENABLED;
+      else process.env.INDEXER_RPC_POLLING_ENABLED = prev;
+    }
+  });
+
+  it("still returns cleanly if recording the skipped signature itself throws", async () => {
+    m.fills.mockReturnValue([fill()]);
+    m.insertRows.mockRejectedValue(new Error("db down"));
+    m.skipped.mockRejectedValue(new Error("sink down"));
+    const { handle } = setup();
+    await expect(handle(note(tx()))).resolves.toBeUndefined();
   });
 
   it("emits only legs that were actually written (re-delivered legs are skipped)", async () => {

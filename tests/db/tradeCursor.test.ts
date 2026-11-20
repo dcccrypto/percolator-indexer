@@ -25,10 +25,12 @@ vi.mock("@percolatorct/shared", () => ({
           eq: (col: string, val: string) => {
             state.eqCalls.push([col, val]);
             return {
-              limit: async () => {
-                if (state.selectThrows) throw state.selectThrows;
-                return state.selectResult;
-              },
+              order: () => ({
+                range: async () => {
+                  if (state.selectThrows) throw state.selectThrows;
+                  return state.selectResult;
+                },
+              }),
             };
           },
         }),

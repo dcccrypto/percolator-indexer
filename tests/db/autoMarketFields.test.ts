@@ -312,6 +312,15 @@ describe("resolveAutoMarketFields fallbacks", () => {
     expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: 10n ** 400n } }, null).initial_price_e6).toBeNull();
   });
 
+  it("a u64 price above 2^53 is unset rather than stored rounded; 2^53-1 is exact", () => {
+    const big = 2n ** 53n + 1n; // Number(big) === 2^53: silently rounded
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: big } }, null).initial_price_e6).toBeNull();
+    expect(resolveAutoMarketFields({ config: { authorityPriceE6: 2n ** 64n - 1n } }, null).initial_price_e6).toBeNull();
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: 2n ** 53n - 1n } }, null).initial_price_e6).toBe(Number.MAX_SAFE_INTEGER);
+    // an unsafe primary falls through to a safe fallback
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: big, markEwmaE6: 7n } }, null).initial_price_e6).toBe(7);
+  });
+
   it("fee bounds: 0 and 10000 are kept; 10001 and negative fall back to 10; null falls back; v12 reads params", () => {
     const f = (tradeFeeBps: bigint | null | undefined) => resolveAutoMarketFields({ configV17: { tradeFeeBps: tradeFeeBps as bigint } }, null).trading_fee_bps;
     expect([f(0n), f(10_000n), f(10_001n), f(-1n), f(null), f(undefined)]).toEqual([0, 10_000, 10, 10, 10, 10]);

@@ -168,20 +168,24 @@ export class HeliusWebhookManager {
       const msg = rawMsg.replace(/api-key=[^&\s]+/g, "api-key=REDACTED");
       const cause = fetchErr instanceof Error && fetchErr.cause instanceof Error ? fetchErr.cause : undefined;
       logger.error("Fetch to Helius API failed", { message: msg, cause: cause?.message });
-      return null;
+      // A failed list is NOT "no webhook": creating here would duplicate the registration.
+      throw new Error(`Helius webhook list failed: ${msg}`);
     }
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       logger.warn("Failed to list webhooks", { status: res.status, body });
-      return null;
+      throw new Error(`Helius webhook list failed: ${res.status}`);
     }
 
-    const webhooks: any[] = await res.json();
+    const webhooks: unknown = await res.json();
+    if (!Array.isArray(webhooks)) {
+      throw new Error("Helius webhook list failed: response was not an array");
+    }
     const targetURL = `${config.webhookUrl}/webhook/trades`;
 
     // Find webhook matching our URL
-    return webhooks.find((w) => w.webhookURL === targetURL) ?? null;
+    return webhooks.find((w: any) => w?.webhookURL === targetURL) ?? null;
   }
 
   private async createWebhook(): Promise<string> {
