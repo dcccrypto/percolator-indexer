@@ -57,7 +57,7 @@ vi.mock("../../src/db/storedLegs.js", async (orig) => ({
   fetchStoredLegsMany: vi.fn(async () => null),
 }));
 vi.mock("../../src/db/tradeCursor.js", () => ({
-  loadTradeCursors: vi.fn(async () => new Map(table)),
+  loadTradeCursors: vi.fn(async (_onIncomplete?: () => void) => new Map(table)),
   saveTradeCursor: vi.fn(async (slab: string, sig: string) => { saves.push([slab, sig]); table.set(slab, sig); }),
 }));
 
@@ -115,5 +115,25 @@ describe("TradeIndexerPolling durable cursor", () => {
     await idx.indexTradesForSlab(slab, 50);
     expect(fetched.sort()).toEqual(["s2", "s3"]);
     expect(table.get(slab)).toBe("s3");
+  });
+
+  it("a partial cursor load (page error) is retried on the next window instead of cached for the process", async () => {
+    const { loadTradeCursors } = await import("../../src/db/tradeCursor.js");
+    vi.mocked(loadTradeCursors).mockClear();
+    table.set(slab, "s1");
+    vi.mocked(loadTradeCursors).mockImplementationOnce(async (onIncomplete?: () => void) => { onIncomplete?.(); return new Map(); });
+    sigLists.set(slab, mk("s2", "s1"));
+    const idx = newIndexer();
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValue(1_000_000);
+    await idx.indexTradesForSlab(slab, 50); // load 1 is partial: slab has no cursor yet
+    await idx.indexTradesForSlab(slab, 50); // inside the backoff: no new load (no query per slab)
+    expect(loadTradeCursors).toHaveBeenCalledTimes(1);
+    now.mockReturnValue(1_000_000 + 61_000);
+    await idx.indexTradesForSlab(slab, 50); // load 2 is complete and supplies the cursor
+    now.mockRestore();
+    expect(loadTradeCursors).toHaveBeenCalledTimes(2);
+    await idx.indexTradesForSlab(slab, 50);
+    expect(loadTradeCursors).toHaveBeenCalledTimes(2); // complete load is cached again
   });
 });

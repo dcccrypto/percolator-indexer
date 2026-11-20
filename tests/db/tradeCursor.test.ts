@@ -9,6 +9,7 @@ const state = {
   upserts: [] as { row: Record<string, unknown>; opts: unknown }[],
   eqCalls: [] as [string, string][],
   errorLogs: [] as unknown[][],
+  rangeCalls: 0,
 };
 
 vi.mock("@percolatorct/shared", () => ({
@@ -28,7 +29,8 @@ vi.mock("@percolatorct/shared", () => ({
               order: () => ({
                 range: async () => {
                   if (state.selectThrows) throw state.selectThrows;
-                  return state.selectResult;
+                  // A table has one result set: the first page returns it, later pages are empty (the loader stops on an empty page).
+                  return state.rangeCalls++ === 0 ? state.selectResult : { data: [], error: null };
                 },
               }),
             };
@@ -56,6 +58,7 @@ beforeEach(() => {
   state.upserts = [];
   state.eqCalls = [];
   state.errorLogs = [];
+  state.rangeCalls = 0;
 });
 
 describe("loadTradeCursors", () => {
@@ -65,7 +68,7 @@ describe("loadTradeCursors", () => {
     expect(m.get("slabA")).toBe("sig1");
     expect(m.get("slabB")).toBe("sig2");
     expect(m.size).toBe(2);
-    expect(state.eqCalls).toEqual([["network", "devnet"]]);
+    expect(state.eqCalls).toEqual([["network", "devnet"], ["network", "devnet"]]); // data page + the empty page that ends the read
   });
 
   it("treats a null data payload as no cursors", async () => {

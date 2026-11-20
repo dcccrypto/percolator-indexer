@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 
 // A PostgREST stand-in that enforces max_rows = 1000 (supabase/config.toml) on every read, like the real server:
 // the cap applies to the response size regardless of .limit()/.range().
-const MAX_ROWS = 1000;
+let MAX_ROWS = 1000;
 const TOTAL = 2500;
 const table = Array.from({ length: TOTAL }, (_, i) => ({ slab_address: `slab${String(i).padStart(5, "0")}`, signature: `sig${i}` }));
 const state = { failOnCall: null as number | null, calls: 0 };
@@ -49,5 +49,37 @@ describe("loadTradeCursors vs PostgREST max_rows", () => {
     state.failOnCall = 2;
     const m = await loadTradeCursors();
     expect(m.size).toBe(1000);
+  });
+});
+
+describe("loadTradeCursors with a PostgREST max_rows below the page size", () => {
+  it("loads every cursor when the server caps pages at 500", async () => {
+    MAX_ROWS = 500;
+    try {
+      state.calls = 0;
+      state.failOnCall = null;
+      const m = await loadTradeCursors();
+      expect(m.size).toBe(TOTAL);
+      expect(m.get("slab02499")).toBe("sig2499");
+    } finally {
+      MAX_ROWS = 1000;
+    }
+  });
+
+  it("reports an incomplete load when a later page fails", async () => {
+    state.calls = 0;
+    state.failOnCall = 2;
+    const onIncomplete = vi.fn();
+    const m = await loadTradeCursors(onIncomplete);
+    expect(m.size).toBe(1000);
+    expect(onIncomplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report incomplete on a clean load", async () => {
+    state.calls = 0;
+    state.failOnCall = null;
+    const onIncomplete = vi.fn();
+    await loadTradeCursors(onIncomplete);
+    expect(onIncomplete).not.toHaveBeenCalled();
   });
 });
