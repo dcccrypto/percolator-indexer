@@ -124,7 +124,12 @@ export function resolveAutoMarketFields(
     realKey(v17?.marketauth) ??
     null;
 
-  const oracle_authority = v17 ? null : realKey(market.config?.oracleAuthority);
+  // Where the oracle authority lives depends on the wrapper VERSION: v12 keeps it in MarketConfig, v2.1/v2.2
+  // (VERSION 18/19) in the asset-0 AssetOracleProfile, never in WrapperConfigV17. The indexer's own discovery
+  // decodes that profile with the account's VERSION-keyed layout into `config.oracleAuthority`, so read it there
+  // for every VERSION. Do NOT null it just because `configV17` is present: that dropped the real profile
+  // authority of every v2.2 market. The SDK's v17 shape (`config: {}`) still gives NULL.
+  const oracle_authority = realKey(market.config?.oracleAuthority);
 
   const initial_price_e6 = v17
     ? positiveNumber(v17.oracleTargetPriceE6) ?? positiveNumber(v17.markEwmaE6)

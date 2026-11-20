@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PublicKey } from "@solana/web3.js";
-import { discoverV17Markets } from "../../src/v17/discovery.js";
+import { discoverV17Markets, V17_REGISTRATION_SLICE_LEN } from "../../src/v17/discovery.js";
 import { getUnknownLayoutCount, resetUnknownLayoutState } from "../../src/layout/resolve.js";
 import { LAYOUT_V21, LAYOUT_V22, REAL_MARKET_V21, REAL_PORTFOLIO_V21, buildMarket, buildPortfolio, pk } from "../helpers/v22Fixtures.js";
 
@@ -55,5 +55,25 @@ describe("discoverV17Markets: v2.1 and v2.2 side by side, an unknown VERSION ski
     const [d] = await discoverV17Markets(conn([m]), PROGRAM, [m.key]);
     expect(d.config.oracleAuthority.toBase58()).toBe(authority.toBase58());
     expect(LAYOUT_V21.marketGroupLen).toBe(758); // the old literal; v2.2 would have read 48 B early
+  });
+
+  it("params carry the account's trade_fee_base_bps and initial_margin_bps, also from the light registration slice", async () => {
+    const data = buildMarket(LAYOUT_V22, { slots: 1, initialMarginBps: 2000n });
+    new DataView(data.buffer, data.byteOffset).setBigUint64(16 + 128, 5n, true); // WrapperConfigV17 trade_fee_base_bps
+    const full = { key: pk(), data };
+    const sliced = { key: pk(), data: data.slice(0, V17_REGISTRATION_SLICE_LEN) };
+    const out = await discoverV17Markets(conn([full, sliced]), PROGRAM);
+    expect(out).toHaveLength(2);
+    for (const d of out) {
+      expect(d.params?.tradingFeeBps).toBe(5n);
+      expect(d.params?.initialMarginBps).toBe(2000n);
+    }
+  });
+
+  it("initialMarginBps falls back to 500n only when the account holds no positive value", async () => {
+    const m = { key: pk(), data: buildMarket(LAYOUT_V22, { slots: 1 }) };
+    const [d] = await discoverV17Markets(conn([m]), PROGRAM, [m.key]);
+    expect(d.params?.initialMarginBps).toBe(500n);
+    expect(d.params?.tradingFeeBps).toBe(0n);
   });
 });

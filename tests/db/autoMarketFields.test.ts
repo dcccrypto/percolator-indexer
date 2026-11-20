@@ -65,6 +65,13 @@ describe("resolveAutoMarketFields (9EPm8nB8 real case)", () => {
     expect(resolveAutoMarketFields(v17Market, null).oracle_authority).toBeNull();
   });
 
+  it("keeps a v2.2 asset-0 profile oracle authority even when configV17 is set (not nulled)", () => {
+    const profileAuth = new PublicKey("FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7");
+    const v22 = { ...v17Market, config: { oracleAuthority: profileAuth } };
+    expect(resolveAutoMarketFields(v22, null).oracle_authority).toBe(profileAuth.toBase58());
+    expect(resolveAutoMarketFields({ ...v17Market, config: { oracleAuthority: PublicKey.default } }, null).oracle_authority).toBeNull();
+  });
+
   it("takes initial_price_e6 from oracleTargetPriceE6, and NULL rather than 0 when unset", () => {
     expect(resolveAutoMarketFields(v17Market, null).initial_price_e6).toBe(3630);
     const unpriced = { ...v17Market, configV17: { ...v17Market.configV17, oracleTargetPriceE6: 0n } };
