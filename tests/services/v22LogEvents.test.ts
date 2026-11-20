@@ -77,13 +77,13 @@ describe("recordV22LogEvents", () => {
 
   it("NEVER throws: a V22EventWriteError is reported as write_failed (not swallowed as not_applicable) so a redeliverable caller can 5xx", async () => {
     insertV22Events.mockRejectedValueOnce(new V22EventWriteError("db down", 1));
-    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toEqual({ status: "write_failed", rows: 1 });
+    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toEqual({ status: "write_failed", rows: 1, slab: M });
   });
 
   it("V22EventWriteError: no retry, and no warn from this layer (insertV22Events already counted + alerted it)", async () => {
     insertV22Events.mockRejectedValueOnce(new V22EventWriteError("db down", 1, "57P01"));
     const r = await recordV22LogEvents({ ...base, signature: "SIGFAILED1234567890", logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
-    expect(r).toEqual({ status: "write_failed", rows: 1 });
+    expect(r).toEqual({ status: "write_failed", rows: 1, slab: M });
     expect(insertV22Events).toHaveBeenCalledTimes(1); // no retry
     expect(logWarn).not.toHaveBeenCalled();
   });
