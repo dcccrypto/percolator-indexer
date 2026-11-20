@@ -34,6 +34,9 @@ export function readAssetEffectivePriceE6(data: Uint8Array, assetIndex: number):
   } catch {
     return null;
   }
+  // Defensive only: resolveMarketGeometry floors slotCount to whole slots, so a slot it accepts always contains this
+  // u64 and no real buffer reaches this branch (checked with truncations at every byte of slot 0).
+  /* v8 ignore next */
   if (off + 8 > data.length) return null;
   const v = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(off, true);
   if (v <= 0n || v >= 1_000_000_000_000n) return null;
