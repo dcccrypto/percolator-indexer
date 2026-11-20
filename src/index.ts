@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { envInt } from "./lib/envNumbers.js";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
@@ -29,7 +30,9 @@ assertSkippedSignatureSinkReady();
 const logger = createLogger("indexer");
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 /** #163: health probe cache window. Short so a real outage still surfaces fast. */
-const HEALTH_CACHE_TTL_MS = Number(process.env.HEALTH_CACHE_TTL_MS ?? 5000);
+const HEALTH_CACHE_TTL_MS = envInt(process.env.HEALTH_CACHE_TTL_MS, {
+  name: "HEALTH_CACHE_TTL_MS", fallback: 5000, min: 0, max: 60_000, warn: (m, c) => logger.warn(m, c),
+});
 // Restored: the HTTPS-enforcement guards in start() (WEBHOOK_URL / RPC_URL) reference this.
 // It was dropped during the H-1 fix while two usages remained — a runtime ReferenceError
 // on any non-HTTPS URL. The webhook auth fix itself now keys off NETWORK (see webhook.ts),
@@ -188,11 +191,9 @@ app.route("/", webhookRoutes(discovery));
 
 // SEC: Validate and sanitize port number at startup to prevent binding to
 // unexpected ports or crashing on NaN.
-const rawPort = Number(process.env.INDEXER_PORT ?? 3002);
-const port = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 3002;
-if (port !== rawPort) {
-  logger.warn("Invalid INDEXER_PORT, falling back to default", { raw: process.env.INDEXER_PORT, fallback: port });
-}
+const port = envInt(process.env.INDEXER_PORT, {
+  name: "INDEXER_PORT", fallback: 3002, min: 1, max: 65535, warn: (m, c) => logger.warn(m, c),
+});
 
 // DB connection monitoring
 let dbConnectionLost = false;
@@ -311,7 +312,9 @@ async function start() {
       store: new SupabaseLpVaultStore(getSupabase()),
       network: CURRENT_NETWORK,
       programIds: config.allProgramIds,
-      pollIntervalMs: Number(process.env.LP_VAULT_POLL_INTERVAL_MS ?? 30_000),
+      pollIntervalMs: envInt(process.env.LP_VAULT_POLL_INTERVAL_MS, {
+        name: "LP_VAULT_POLL_INTERVAL_MS", fallback: 30_000, min: 1_000, max: 3_600_000, warn: (m, c) => logger.warn(m, c),
+      }),
     });
     lpVaultIndexer.start();
   } else {
