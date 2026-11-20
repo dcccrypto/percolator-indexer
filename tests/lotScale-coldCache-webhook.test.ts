@@ -188,3 +188,16 @@ describe("webhook mark-EWMA fallback (legacy leg, effective_price 0)", () => {
     expect(lot6.fee).toBeCloseTo(lot0.fee, 12); // was inflated 10^6 when the unscaled EWMA met a warm lot cache
   });
 });
+
+describe("J-20261120 price_lot_exp: each webhook row says which unit its price is in", () => {
+  beforeEach(() => { quietLogger(); resetLotExpCache(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  afterEach(() => { logSpy.mockRestore(); });
+
+  it.each([0, 1, 6])("lot %i TradeCpi fill: per-token price written with price_lot_exp 0", async (lot) => {
+    rpc(slabBytes(lot));
+    const { rows } = await deliver(enhanced[f.sig]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].price).toBeCloseTo(13.861751 / 10 ** lot, 18);
+    expect(rows[0].price_lot_exp).toBe(0);
+  });
+});

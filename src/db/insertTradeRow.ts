@@ -33,7 +33,17 @@ export interface IndexerTradeRow {
   /** True for forced closes captured from the crank (markers; see baseline note). */
   is_liquidation?: boolean;
   size_provenance?: TradeSizeProvenance | null;
+  /**
+   * The unit `price` is quoted in: per 10^price_lot_exp base tokens (0 = per token). Omitted = derived by the
+   * writer: every price this indexer build writes is per TOKEN (all producers go through lotScale.perTokenPrice),
+   * so a priced row is 0 and a priceless marker is NULL. NULL on old rows = unknown (rows written before the
+   * indexer knew lot_exp hold the per-LOT price); readers (/api/candles) only guess for those.
+   */
+  price_lot_exp?: number | null;
 }
+
+/** price_lot_exp of every price written by this indexer build: per token. */
+export const PRICE_LOT_EXP_PER_TOKEN = 0;
 
 /**
  * Insert one trade fill. Swallows 23505 (duplicate leg already indexed); throws on
@@ -44,7 +54,7 @@ export interface IndexerTradeRow {
  */
 export async function insertTradeRow(row: IndexerTradeRow): Promise<boolean> {
   let { error } = await getSupabase().from("trades").insert(toDbRow(row));
-  if (error && noteMissingProvenanceColumn(error)) {
+  for (let i = 0; i < 2 && error && noteMissingOptionalColumn(error); i++) {
     ({ error } = await getSupabase().from("trades").insert(toDbRow(row)));
   }
   if (error && error.code !== "23505") {
@@ -102,6 +112,23 @@ function provenanceColumnMissing(): boolean {
   return provenanceColumnMissingSince !== null && Date.now() - provenanceColumnMissingSince < PROVENANCE_REPROBE_MS;
 }
 
+/** Same fallback for trades.price_lot_exp (migration 20261120210000): an environment without it keeps indexing. */
+let priceLotExpColumnMissingSince: number | null = null;
+function priceLotExpColumnMissing(): boolean {
+  return priceLotExpColumnMissingSince !== null && Date.now() - priceLotExpColumnMissingSince < PROVENANCE_REPROBE_MS;
+}
+function noteMissingPriceLotExpColumn(error: { code?: string; message?: string }): boolean {
+  if (error.code !== "PGRST204" || !/price_lot_exp/.test(error.message ?? "")) return false;
+  const first = priceLotExpColumnMissingSince === null;
+  priceLotExpColumnMissingSince = Date.now();
+  if (first) logger.error("trades.price_lot_exp is missing (migration 20261120210000 not applied); writing trades without it", { code: error.code, error: error.message });
+  return true;
+}
+/** Either optional column was missing: the write stored nothing and is retried without it. */
+function noteMissingOptionalColumn(error: { code?: string; message?: string }): boolean {
+  return noteMissingProvenanceColumn(error) || noteMissingPriceLotExpColumn(error);
+}
+
 /**
  * True when `error` is the missing-column rejection, i.e. the request wrote nothing and should be retried
  * without the column. Also true when another in-flight write already flagged the column (concurrent writers
@@ -123,11 +150,22 @@ function noteMissingProvenanceColumn(error: { code?: string; message?: string })
 /** Test hook: forget a previously detected missing column. */
 export function resetProvenanceColumnProbe(): void {
   provenanceColumnMissingSince = null;
+  priceLotExpColumnMissingSince = null;
+}
+
+/** The row's price_lot_exp: explicit when given (validated 0..15), else per token for a priced row, NULL for a marker. */
+export function priceLotExpOf(row: Pick<IndexerTradeRow, "price" | "price_lot_exp">): number | null {
+  if (row.price_lot_exp !== undefined) {
+    const k = row.price_lot_exp;
+    return k !== null && Number.isInteger(k) && k >= 0 && k <= 15 ? k : null;
+  }
+  return row.price != null ? PRICE_LOT_EXP_PER_TOKEN : null;
 }
 
 function toDbRow(row: IndexerTradeRow) {
   assertHasSignature(row);
   const provenance = provenanceColumnMissing() ? {} : { size_provenance: row.size_provenance ?? null };
+  const lotScale = priceLotExpColumnMissing() ? {} : { price_lot_exp: priceLotExpOf(row) };
   return {
     slab_address: row.slab_address,
     trader: row.trader,
@@ -140,6 +178,7 @@ function toDbRow(row: IndexerTradeRow) {
     leg_index: row.leg_index,
     is_liquidation: row.is_liquidation ?? false,
     ...provenance,
+    ...lotScale,
     network: getNetwork(),
   };
 }
@@ -174,7 +213,7 @@ export async function insertTradeRows(rows: IndexerTradeRow[]): Promise<Inserted
       })
       .select("tx_signature, asset_index, leg_index");
   let { data, error } = await write();
-  if (error && noteMissingProvenanceColumn(error)) ({ data, error } = await write());
+  for (let i = 0; i < 2 && error && noteMissingOptionalColumn(error); i++) ({ data, error } = await write());
 
   if (error) {
     logger.warn("insertTradeRows failed", {
