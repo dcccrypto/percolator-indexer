@@ -25,7 +25,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
 import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
-import { makeMatcherContextReader } from "../lib/matcherCtx.js";
+import { makeMatcherContextReader, newContextReadMemo, type ContextReadMemo } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
@@ -501,7 +501,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
   // before it. Stable, so transactions without a slot keep their delivery order.
   const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
-  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + parseDeliveryBudgetMs(process.env.TRADECPI_DELIVERY_BUDGET_MS, CTX_DELIVERY_BUDGET_MS) };
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxMemo: newContextReadMemo(), ctxDeadlineAt: Date.now() + parseDeliveryBudgetMs(process.env.TRADECPI_DELIVERY_BUDGET_MS, CTX_DELIVERY_BUDGET_MS) };
   const ordered = [...transactions].sort((x, y) => {
     const sx = slotOf(x), sy = slotOf(y);
     return sx === sy ? 0 : sx < sy ? -1 : 1;
@@ -671,6 +671,8 @@ interface DeliveryState {
   peersOf?: (tx: ValidatedTransaction) => ValidatedTransaction[];
   /** ms-epoch deadline for this delivery's matcher-context reads. */
   ctxDeadlineAt?: number;
+  /** Matcher-context answers shared by this delivery's txs (one read per context, not one per CPI fill). */
+  ctxMemo?: ContextReadMemo;
 }
 
 /** signature -> 1: its matcher-context read already failed once and the delivery was answered 500. Bounded. */
@@ -914,7 +916,7 @@ async function extractTradesFromEnhancedTx(
         )
       : null;
     // 2 s per read, and a per-delivery deadline so a slow RPC cannot eat Helius's ~15 s window.
-    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null, { deadlineAt: delivery.ctxDeadlineAt });
+    const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null, { deadlineAt: delivery.ctxDeadlineAt, memo: delivery.ctxMemo });
 
     for (const leg of legs) {
       if (leg.sizeValue > I128_MAX) continue;
