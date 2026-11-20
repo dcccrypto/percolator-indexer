@@ -14,7 +14,7 @@ The first job hit its time limit and its soak processes did not survive it. At h
 | stats | 10000 | no |
 | lp | 6000 | no |
 
-A one-at-a-time rerun was started (`out-rerun/`). Alone, lp took about 2.5 min per 1k cycles (roughly 50 min for 20k), so rerunning all four to 20k does not fit this job's budget. Rows past the last sampled cycle are `-`. Nothing here is extrapolated. If the rerun finishes, its numbers are in `~/agent-worker/reports/idx-heap-soak/out-rerun/`.
+A one-at-a-time rerun was started (`out-rerun/`). Alone, lp ran about 1 min per 1k cycles for the first 2k and slows as slabs grow (the contended run took 17 min for 6k), so four sequential 20k runs do not fit this job's budget. The rerun was stopped at lp cycle ~2000; its partial output in `out-rerun/` is not used here. Rows past the last sampled cycle are `-`. Nothing here is extrapolated. Finishing trade, stats, lp and webhook needs a dedicated job.
 
 The slab count in the harness grows 10 -> 2000 over the first 15k cycles, then stays flat. Part of every heap rise is therefore legitimate per-market state, not a leak. "heapUsed minus control" subtracts the harness's own heap (fake DB, chain history). Only webhook reached the flat-slab window (15k+), and its slope there is the only direct leak signal.
 
