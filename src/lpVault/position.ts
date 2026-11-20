@@ -82,15 +82,42 @@ export function foldPosition(events: readonly FoldEvent[]): FoldedPosition {
 
   let freshStartSlot = 0;
 
+  // Source rows carry no transaction index, so events of DIFFERENT signatures in one
+  // slot are ordered by signature text, not execution order. Where that order changes
+  // the result (a redemption next to a deposit/redemption of another signature) the
+  // fold cannot be exact: flag it, and never let a same-slot "fresh start" undo it.
+  const ambiguousSlots = new Set<number>();
+  for (let i = 0; i < sorted.length; ) {
+    let j = i;
+    while (j < sorted.length && sorted[j]!.slot === sorted[i]!.slot) j++;
+    const grp = sorted.slice(i, j);
+    const sigs = new Set(grp.map((g) => g.signature));
+    if (sigs.size > 1 && grp.some((g) => g.kind === "execute_redeem")) {
+      ambiguousSlots.add(sorted[i]!.slot);
+    }
+    i = j;
+  }
+  // A deposit may only restart a clean history strictly after a hard taint slot.
+  let hardTaintSlot = -1;
+  const taint = (slot: number, why: string): void => {
+    flag(why);
+    hardTaintSlot = Math.max(hardTaintSlot, slot);
+  };
+
   for (const e of sorted) {
+    if (ambiguousSlots.has(e.slot) && hardTaintSlot < e.slot) {
+      taint(e.slot, `slot ${e.slot} has deposit/redeem events from several transactions; execution order unknown`);
+    }
     switch (e.kind) {
       case "deposit":
         if (lpShares === 0n && pending === 0n && basis === 0n) {
           // Fully exited before this deposit: earlier inconsistencies concern
           // shares that no longer exist in the indexed position.
           freshStartSlot = e.slot;
-          consistent = true;
-          inconsistency = null;
+          if (e.slot > hardTaintSlot) {
+            consistent = true;
+            inconsistency = null;
+          }
         }
         deposited += e.collateralAtoms;
         if (e.lpAmount === null) {
@@ -121,7 +148,7 @@ export function foldPosition(events: readonly FoldEvent[]): FoldedPosition {
         if (burned > lpShares) {
           // More shares redeemed than the index ever saw minted: some arrived by
           // transfer. Their basis is unknowable; close out what we do know.
-          flag(`redemption ${e.signature} burned ${burned} > indexed ${lpShares}`);
+          taint(e.slot, `redemption ${e.signature} burned ${burned} > indexed ${lpShares}`);
           realized += e.collateralAtoms - basis;
           basis = 0n;
           lpShares = 0n;
