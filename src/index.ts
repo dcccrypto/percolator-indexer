@@ -16,6 +16,7 @@ import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
 import { getTradecpiCounters } from "./parsers/matcherFill.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
 import { DroppedTxReconciler } from "./services/DroppedTxReconciler.js";
+import { envInt } from "./lib/envNumbers.js";
 import { RpcLpVaultChain } from "./lpVault/chain.js";
 import { SupabaseLpVaultStore } from "./lpVault/store.js";
 import { CURRENT_NETWORK } from "./network.js";
@@ -326,7 +327,7 @@ async function start() {
       lpNetwork: CURRENT_NETWORK,
       lpStore: new SupabaseLpVaultStore(getSupabase()),
       onTradesRemoved: (slabs) => statsCollector.resyncVolume(slabs),
-      intervalMs: Number(process.env.DROPPED_TX_RECONCILE_INTERVAL_MS ?? 60_000),
+      intervalMs: envInt(process.env.DROPPED_TX_RECONCILE_INTERVAL_MS, { name: "DROPPED_TX_RECONCILE_INTERVAL_MS", fallback: 60_000, min: 10_000, max: 2_147_483_647, warn: (m, c) => logger.warn(m, c) }),
     });
     droppedTxReconciler.start();
   } else {

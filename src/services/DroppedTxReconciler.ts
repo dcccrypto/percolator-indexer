@@ -13,12 +13,15 @@
  *     slot, so by then a live transaction is finalized and a dropped one can no longer land;
  *  2. asks `getSignatureStatuses(…, { searchTransactionHistory: true })` about them, 256 per call;
  *  3. forgets the finalized ones, keeps the not-yet-finalized ones pending, and counts a strike for each `null`;
- *  4. a signature that is `null` on `nullPassesToDrop` separate passes (default 2: a lagging node also answers `null`)
- *     is dropped: its rows are deleted from all three tables, the touched LP positions are recomputed, the removal is
+ *  4. a signature that is `null` on `nullPassesToDrop` separate passes (default 2) is dropped: its rows are deleted from all three tables, the touched LP positions are recomputed, the removal is
  *     recorded in `skipped_signatures` (source `fork-dropped`) and `onTradesRemoved` re-runs the `market_stats` rollup for
  *     the touched markets.
- * A pass in which every status is `null` (at least {@link SUSPECT_ALL_NULL_MIN} of them) is treated as an RPC fault:
- * no strikes are counted, so a node without transaction history cannot wipe the tables.
+ * A `null` can also come from a node that lags or has no transaction history, so a strike only counts when
+ *  - the call also carried a CANARY, a signature known to be finalized (the newest one this pass has seen finalize, or
+ *    else an old `trades` / `lp_vault_events` row), and the canary came back with a status: the node can see history;
+ *  - the answering node's `context.slot` is at least {@link SLOT_MARGIN} slots past the slot at which the signature was
+ *    first checked (finality + blockhash lifetime): the node has moved on far enough that the tx can no longer land.
+ * With no canary available (an empty database) nothing is removed.
  */
 import { createLogger, captureException, getSupabase, getNetwork } from "@percolatorct/shared";
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -31,7 +34,7 @@ export interface SignatureStatusReader {
   getSignatureStatuses(
     signatures: string[],
     config?: { searchTransactionHistory?: boolean },
-  ): Promise<{ value: ReadonlyArray<{ confirmationStatus?: string | null } | null> }>;
+  ): Promise<{ context?: { slot?: number }; value: ReadonlyArray<{ confirmationStatus?: string | null } | null> }>;
 }
 
 export interface DroppedTxReconcilerOptions {
@@ -65,7 +68,8 @@ export interface ReconcileResult {
 }
 
 export const STATUS_PAGE = 256;
-export const SUSPECT_ALL_NULL_MIN = 4;
+/** 32 slots to finality + 151 slots of blockhash lifetime. */
+export const SLOT_MARGIN = 183;
 const DB_PAGE = 1000;
 const DELETE_CHUNK = 50;
 /** Rows read per table per pass; more than this is read on the next passes (the watermark only moves past what was read). */
@@ -94,7 +98,11 @@ export function getForkDroppedCount(): number {
 }
 
 export class DroppedTxReconciler {
-  private readonly pending = new Map<string, { nulls: number; since: number }>();
+  private readonly pending = new Map<string, { nulls: number; since: number; firstSlot: number | null }>();
+  /** A signature known to be finalized, sent with every status call (see the class doc). */
+  private canary: string | null = null;
+  /** Sources whose table is missing (hand-applied migrations): skipped, logged once. */
+  private readonly missing = new Set<string>();
   /** Finalized signatures, kept while they can still be re-read through the overlap. */
   private readonly finalized = new Map<string, number>();
   private readonly lpRepair = new Map<string, { registry: string; user: string }>();
@@ -165,7 +173,7 @@ export class DroppedTxReconciler {
         newUpper = Math.min(newUpper, readThrough);
         for (const s of sigs) {
           if (this.finalized.has(s) || this.pending.has(s)) continue;
-          this.pending.set(s, { nulls: 0, since: now });
+          this.pending.set(s, { nulls: 0, since: now, firstSlot: null });
         }
       }
       this.scannedThrough = newUpper;
@@ -176,43 +184,55 @@ export class DroppedTxReconciler {
     result.candidates = sigs.length;
     if (sigs.length === 0) return result;
 
-    // 2. Statuses, 256 per call. Any RPC failure aborts the pass with no strikes counted.
-    const statuses = new Map<string, { confirmationStatus?: string | null } | null>();
-    for (let i = 0; i < sigs.length; i += STATUS_PAGE) {
-      const chunk = sigs.slice(i, i + STATUS_PAGE);
+    // 2. Statuses, 256 per call (255 + the canary). Any RPC failure aborts the pass with no strikes counted.
+    const canary = this.canary ?? (await this.findCanary());
+    const page = canary ? STATUS_PAGE - 1 : STATUS_PAGE;
+    const statuses = new Map<string, { st: { confirmationStatus?: string | null } | null; slot: number | null; trusted: boolean }>();
+    for (let i = 0; i < sigs.length; i += page) {
+      const chunk = sigs.slice(i, i + page);
+      const ask = canary && !chunk.includes(canary) ? [...chunk, canary] : chunk;
       result.rpcCalls++;
-      const resp = await this.opts.connection.getSignatureStatuses(chunk, { searchTransactionHistory: true });
+      const resp = await this.opts.connection.getSignatureStatuses(ask, { searchTransactionHistory: true });
       const value = resp?.value;
-      if (!Array.isArray(value) || value.length !== chunk.length) {
-        throw new Error(`getSignatureStatuses returned ${Array.isArray(value) ? value.length : "no"} statuses for ${chunk.length} signatures`);
+      if (!Array.isArray(value) || value.length !== ask.length) {
+        throw new Error(`getSignatureStatuses returned ${Array.isArray(value) ? value.length : "no"} statuses for ${ask.length} signatures`);
       }
-      chunk.forEach((s, k) => statuses.set(s, value[k] ?? null));
+      const slot = typeof resp.context?.slot === "number" ? resp.context.slot : null;
+      const trusted = canary !== null && value[ask.indexOf(canary)] != null;
+      if (!trusted) {
+        result.suspect = true;
+        if (canary !== null && this.canary === canary) this.canary = null; // pick a fresh one next pass
+      }
+      chunk.forEach((s, k) => statuses.set(s, { st: value[k] ?? null, slot, trusted }));
     }
     result.checked = statuses.size;
-
-    // 3. Resolve. A pass where EVERY status is null looks like a node without history, not a fork.
-    const nulls = sigs.filter((s) => statuses.get(s) === null);
-    result.suspect = nulls.length === sigs.length && sigs.length >= SUSPECT_ALL_NULL_MIN;
     if (result.suspect) {
-      logger.warn("getSignatureStatuses returned null for every signature in the pass: treated as an RPC fault, no rows removed", { signatures: sigs.length });
+      logger.warn(canary
+        ? "getSignatureStatuses returned null for a finalized canary: treated as an RPC fault, no strikes counted"
+        : "no finalized canary signature available yet: no strikes counted", { canary, signatures: sigs.length });
     }
+
+    // 3. Resolve.
     const toDrop: string[] = [];
     for (const s of sigs) {
-      const st = statuses.get(s);
+      const { st, slot, trusted } = statuses.get(s)!;
       const p = this.pending.get(s)!;
+      if (p.firstSlot === null && slot !== null) p.firstSlot = slot;
       if (st === null) {
-        if (!result.suspect) p.nulls++;
+        // A strike needs a node that can see history (canary) and has moved SLOT_MARGIN slots past the first check.
+        if (trusted && slot !== null && p.firstSlot !== null && slot >= p.firstSlot + SLOT_MARGIN) p.nulls++;
         if (p.nulls >= (this.opts.nullPassesToDrop ?? 2)) toDrop.push(s);
         else if (now - p.since > PENDING_MAX_AGE_MS) this.giveUp(s, "still null");
         continue;
       }
       p.nulls = 0;
-      if (st?.confirmationStatus === "finalized") {
+      if (st.confirmationStatus === "finalized") {
         this.pending.delete(s);
         this.finalized.set(s, now);
+        this.canary = s;
         result.finalized++;
       } else if (now - p.since > PENDING_MAX_AGE_MS) {
-        this.giveUp(s, `still ${st?.confirmationStatus ?? "unknown"}`);
+        this.giveUp(s, `still ${st.confirmationStatus ?? "unknown"}`);
       }
     }
 
@@ -230,6 +250,39 @@ export class DroppedTxReconciler {
     return result;
   }
 
+  /** An old row's signature: long finalized unless it was itself dropped, which this pass would then remove. */
+  private async findCanary(): Promise<string | null> {
+    const before = new Date(this.now - (this.opts.lookbackMs ?? 30 * 60_000)).toISOString();
+    for (const src of SOURCES) {
+      if (src.table === "v22_events" || this.missing.has(src.table)) continue;
+      const { data, error } = await this.db
+        .from(src.table)
+        .select(src.sig)
+        .eq("network", src.lp ? this.lpNetwork : this.network)
+        .lt(src.at, before)
+        .not(src.sig, "is", null)
+        .order(src.at, { ascending: false })
+        .limit(1);
+      if (error) {
+        if (this.noteMissing(src.table, error)) continue;
+        throw new Error(`${src.table} canary read: ${error.message}`);
+      }
+      const sig = ((data ?? []) as unknown as Array<Record<string, string | null>>)[0]?.[src.sig];
+      if (sig) return (this.canary = sig);
+    }
+    return null;
+  }
+
+  /** True (and logged once) when `error` says the table does not exist: its migration is applied by hand. */
+  private noteMissing(table: string, error: { code?: string; message?: string }): boolean {
+    const gone = error.code === "42P01" || error.code === "PGRST205" || /does not exist|Could not find the table/i.test(error.message ?? "");
+    if (gone && !this.missing.has(table)) {
+      this.missing.add(table);
+      logger.error(`dropped-tx reconcile: table ${table} is missing; it is skipped until the indexer restarts`, { error: error.message });
+    }
+    return gone;
+  }
+
   private giveUp(sig: string, why: string): void {
     this.pending.delete(sig);
     logger.warn("dropped-tx reconcile gave up on a signature that never resolved", { signature: sig, why });
@@ -239,6 +292,7 @@ export class DroppedTxReconciler {
   private async readSignatures(src: Source, lower: number, upper: number): Promise<{ sigs: Set<string>; readThrough: number }> {
     const network = src.lp ? this.lpNetwork : this.network;
     const sigs = new Set<string>();
+    if (this.missing.has(src.table)) return { sigs, readThrough: upper };
     let rows = 0;
     let lastAt: string | null = null;
     for (;;) {
@@ -253,7 +307,10 @@ export class DroppedTxReconciler {
         .order(src.at, { ascending: true })
         .order(src.sig, { ascending: true })
         .range(rows, rows + DB_PAGE - 1);
-      if (error) throw new Error(`${src.table} signature read: ${error.message}`);
+      if (error) {
+        if (this.noteMissing(src.table, error)) return { sigs, readThrough: upper };
+        throw new Error(`${src.table} signature read: ${error.message}`);
+      }
       const page = (data ?? []) as unknown as Array<Record<string, string | null>>;
       if (page.length === 0) break;
       for (const r of page) {
@@ -274,18 +331,20 @@ export class DroppedTxReconciler {
 
   private async removeRows(sigs: string[]): Promise<{ trades: number; v22_events: number; lp_vault_events: number }> {
     const db = this.db;
-    const t = await db.from("trades").delete().in("tx_signature", sigs).eq("network", this.network).select("tx_signature,slab_address");
-    if (t.error) throw new Error(`trades delete: ${t.error.message}`);
-    const v = await db.from("v22_events").delete().in("signature", sigs).eq("network", this.network).select("signature,slab_address");
-    if (v.error) throw new Error(`v22_events delete: ${v.error.message}`);
-    const l = await db.from("lp_vault_events").delete().in("signature", sigs).eq("network", this.lpNetwork).select("signature,registry,user_wallet");
-    if (l.error) throw new Error(`lp_vault_events delete: ${l.error.message}`);
-
-    const trades = (t.data ?? []) as Array<{ tx_signature: string; slab_address: string }>;
-    const v22 = (v.data ?? []) as Array<{ signature: string; slab_address: string | null }>;
-    const lp = (l.data ?? []) as Array<{ signature: string; registry: string; user_wallet: string }>;
-
+    // trades go LAST: if an earlier delete fails, the retry still finds the trades and so still resyncs market_stats.
+    const del = async <T>(table: Source["table"], col: string, network: string, cols: string): Promise<T[]> => {
+      if (this.missing.has(table)) return [];
+      const { data, error } = await db.from(table).delete().in(col, sigs).eq("network", network).select(cols);
+      if (error) {
+        if (this.noteMissing(table, error)) return [];
+        throw new Error(`${table} delete: ${error.message}`);
+      }
+      return (data ?? []) as unknown as T[];
+    };
+    const v22 = await del<{ signature: string; slab_address: string | null }>("v22_events", "signature", this.network, "signature,slab_address");
+    const lp = await del<{ signature: string; registry: string; user_wallet: string }>("lp_vault_events", "signature", this.lpNetwork, "signature,registry,user_wallet");
     for (const r of lp) this.lpRepair.set(`${r.registry}|${r.user_wallet}`, { registry: r.registry, user: r.user_wallet });
+    const trades = await del<{ tx_signature: string; slab_address: string }>("trades", "tx_signature", this.network, "tx_signature,slab_address");
     await this.retryLpRepairs();
 
     droppedTotal += sigs.length;
@@ -307,6 +366,8 @@ export class DroppedTxReconciler {
         source: "fork-dropped",
         slab,
         network: this.network,
+        // Not re-indexable (the tx no longer exists): keep it out of the skipped_signatures_pending queue.
+        reindexed_at: new Date(this.now).toISOString(),
         error: `dropped by a fork: getSignatureStatuses null on ${this.opts.nullPassesToDrop ?? 2} passes; removed trades=${nt.length} v22_events=${nv.length} lp_vault_events=${nl.length}`,
       };
     });

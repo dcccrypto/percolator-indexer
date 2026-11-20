@@ -100,13 +100,15 @@ type Case = "drop" | "replace";
 
 const dropped = new Set<string>();
 const statusCalls: number[] = [];
+/** The answering node's slot: 400 ms a slot on the shared test clock. */
+const slotNow = () => Math.floor(H.db.clock.t / 400);
 /** When set, answers instead of the fork model (an RPC fault, a lagging node). */
 let statusOverride: ((sigs: string[]) => Promise<unknown>) | null = null;
 const statusConn = {
   async getSignatureStatuses(sigs: string[], _cfg?: unknown): Promise<any> {
     if (statusOverride) return statusOverride(sigs);
     statusCalls.push(sigs.length);
-    return { context: { slot: 1 }, value: sigs.map((s) => (dropped.has(s) ? null : { slot: 1, confirmations: null, err: null, confirmationStatus: "finalized" })) };
+    return { context: { slot: slotNow() }, value: sigs.map((s) => (dropped.has(s) ? null : { slot: 1, confirmations: null, err: null, confirmationStatus: "finalized" })) };
   },
 };
 
@@ -118,6 +120,8 @@ beforeEach(() => {
   statusOverride = null;
   resetMarketLayoutNotes();
   resetLogEventStats();
+  // The database's history: an old trade, finalized long ago (the reconciler's canary when nothing newer is finalized).
+  H.db.rows("trades").push({ slab_address: "OLDMARKET", trader: TAKER, side: "long", size: "1", price: 1, tx_signature: "OLDSIG", asset_index: 0, leg_index: 0, is_liquidation: false, network: "devnet", created_at: new Date(H.db.clock.t - 2 * 3600_000).toISOString() });
 });
 
 // ── the three trade paths ───────────────────────────────────────────────────
@@ -189,12 +193,22 @@ function reconciler(sc: any, lpStore?: unknown) {
     now: () => H.db.clock.t, onTradesRemoved: (slabs: string[]) => sc.resyncVolume(slabs),
   });
 }
-/** Time passes past finality + blockhash lifetime; the reconcile pass runs on its 60 s timer (twice: a null must repeat). */
+/** One reconcile pass every 60 s (150 slots). */
+async function passes(r: any, n: number): Promise<any[]> {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    H.db.clock.t += 60_000;
+    if (r) out.push(await r.runOnce());
+  }
+  return out;
+}
+/**
+ * Time passes well past finality + blockhash lifetime with the pass on its 60 s timer: the first check at +3 min, then a
+ * null strike counts once the node is 183 slots past that check (+2 min and +3 min): removed on the 4th pass.
+ */
 async function afterFinality(r: any): Promise<void> {
-  H.db.clock.t += 3 * 60_000;
-  if (r) await r.runOnce();
-  H.db.clock.t += 60_000;
-  if (r) await r.runOnce();
+  H.db.clock.t += 2 * 60_000;
+  await passes(r, 4);
 }
 
 // ── the draft assertions, per path ──────────────────────────────────────────
@@ -303,84 +317,97 @@ describeFix("DroppedTxReconciler", () => {
   const seedTrade = (sig: string, slab = MKT, size = "483") =>
     H.db.from("trades").insert({ slab_address: slab, trader: TAKER, side: "long", size, price: 1, tx_signature: sig, network: "devnet" });
 
-  it("RPC cost: 279 signatures cost 2 getSignatureStatuses calls in a pass; once finalized they cost nothing more", async () => {
+  it("RPC cost: 279 signatures cost 2 getSignatureStatuses calls in a pass (255 + the canary each); once finalized they cost nothing more", async () => {
     const sigs = Array.from({ length: 279 }, (_, i) => `S${i}`);
     for (const s of sigs) await seedTrade(s);
     const r = reconciler(collector());
-    H.db.clock.t += 3 * 60_000;
-    const first = await r.runOnce();
-    expect(statusCalls).toEqual([256, 23]);
-    expect(first).toMatchObject({ candidates: 279, checked: 279, rpcCalls: 2, finalized: 279, pending: 0, dropped: [] });
-    H.db.clock.t += 60_000;
-    const second = await r.runOnce();
+    H.db.clock.t += 2 * 60_000;
+    const [first, second] = await passes(r, 2);
+    expect(statusCalls).toEqual([256, 25]);
+    expect(first).toMatchObject({ candidates: 279, checked: 279, rpcCalls: 2, finalized: 279, pending: 0, dropped: [], suspect: false });
     expect(second).toMatchObject({ candidates: 0, rpcCalls: 0 });
-    expect(statusCalls).toEqual([256, 23]);
   });
 
-  it("one null is not enough: the rows go only after a second pass also answers null", async () => {
+  it("a null is not acted on until the node is 183 slots past the first check, and only on the second such pass", async () => {
     await seedTrade(X);
     await seedTrade(PRE);
     dropped.add(X);
     const r = reconciler(collector());
-    H.db.clock.t += 3 * 60_000;
-    expect((await r.runOnce()).dropped).toEqual([]);
-    expect(rowsOf([X]).trades).toBe(1);
-    H.db.clock.t += 60_000;
-    expect((await r.runOnce()).dropped).toEqual([X]);
+    H.db.clock.t += 2 * 60_000;
+    const res = await passes(r, 4); // first check, +150 slots (no strike), +300 (strike 1), +450 (strike 2)
+    expect(res.map((x) => x.dropped)).toEqual([[], [], [], [X]]);
     expect(rowsOf([X, PRE]).trades).toBe(1);
-    // the removal is recorded for audit
-    expect(H.db.rows("skipped_signatures")).toEqual([expect.objectContaining({ signature: X, source: "fork-dropped", slab: MKT, network: "devnet" })]);
+    // the removal is recorded for audit, outside the re-index queue
+    expect(H.db.rows("skipped_signatures")).toEqual([expect.objectContaining({ signature: X, source: "fork-dropped", slab: MKT, network: "devnet", reindexed_at: expect.any(String) })]);
   });
 
   it("a signature that answers again (a lagging node) loses its strike", async () => {
     await seedTrade(X);
+    dropped.add(X);
     const r = reconciler(collector());
-    H.db.clock.t += 3 * 60_000;
-    dropped.add(X);
-    await r.runOnce(); // null #1
-    dropped.delete(X);
-    statusOverride = async (sigs) => ({ value: sigs.map(() => ({ confirmationStatus: "confirmed" })) });
-    H.db.clock.t += 60_000;
-    await r.runOnce(); // answers again (still confirmed): strike reset
+    H.db.clock.t += 2 * 60_000;
+    await passes(r, 3); // strike 1
+    statusOverride = async (sigs) => ({ context: { slot: slotNow() }, value: sigs.map(() => ({ confirmationStatus: "confirmed" })) });
+    await passes(r, 1); // answers again (still confirmed): strike reset
     statusOverride = null;
-    dropped.add(X);
-    H.db.clock.t += 60_000;
-    expect((await r.runOnce()).dropped).toEqual([]); // null #1 again
+    expect((await passes(r, 1))[0].dropped).toEqual([]); // strike 1 again, not 2
     expect(rowsOf([X]).trades).toBe(1);
   });
 
-  it("a pass where every status is null is an RPC fault: nothing is removed", async () => {
-    for (const s of ["A1", "A2", "A3", "A4"]) { await seedTrade(s); dropped.add(s); }
+  it("a null canary (a node without history) counts no strike; the next canary is taken fresh", async () => {
+    for (const s of ["A1", "A2"]) { await seedTrade(s); dropped.add(s); }
+    dropped.add("OLDSIG");
     const r = reconciler(collector());
-    for (let i = 0; i < 3; i++) {
-      H.db.clock.t += 2 * 60_000;
-      const res = await r.runOnce();
-      expect(res).toMatchObject({ suspect: true, dropped: [] });
-    }
-    expect(H.db.rows("trades")).toHaveLength(4);
+    H.db.clock.t += 2 * 60_000;
+    const res = await passes(r, 6);
+    expect(res.every((x) => x.suspect && x.dropped.length === 0)).toBe(true);
+    expect(H.db.rows("trades")).toHaveLength(3);
+  });
+
+  it("no canary at all (empty history): nothing is removed", async () => {
+    H.db.tables.set("trades", []);
+    await seedTrade(X);
+    dropped.add(X);
+    const r = reconciler(collector());
+    H.db.clock.t += 2 * 60_000;
+    const res = await passes(r, 6);
+    expect(res.every((x) => x.suspect && x.dropped.length === 0)).toBe(true);
+    expect(rowsOf([X]).trades).toBe(1);
+  });
+
+  it("a lagging node (context slot not 183 past the first check) counts no strike", async () => {
+    await seedTrade(X);
+    dropped.add(X);
+    const r = reconciler(collector());
+    const frozen = slotNow() + 300;
+    statusOverride = async (sigs) => ({ context: { slot: frozen }, value: sigs.map((s) => (dropped.has(s) ? null : { confirmationStatus: "finalized" })) });
+    H.db.clock.t += 2 * 60_000;
+    const res = await passes(r, 6);
+    expect(res.every((x) => x.dropped.length === 0)).toBe(true);
+    expect(rowsOf([X]).trades).toBe(1);
   });
 
   it("an RPC error or a short status list aborts the pass with no strike", async () => {
     await seedTrade(X);
     dropped.add(X);
     const r = reconciler(collector());
+    H.db.clock.t += 2 * 60_000;
+    await passes(r, 1); // first check
     statusOverride = async () => { throw new Error("429"); };
-    H.db.clock.t += 3 * 60_000;
+    H.db.clock.t += 2 * 60_000;
     await expect(r.runOnce()).rejects.toThrow("429");
-    statusOverride = async () => ({ value: [] });
+    statusOverride = async () => ({ context: { slot: slotNow() }, value: [] });
     H.db.clock.t += 60_000;
-    await expect(r.runOnce()).rejects.toThrow(/0 statuses for 1/);
+    await expect(r.runOnce()).rejects.toThrow(/0 statuses for 2/);
     statusOverride = null;
-    H.db.clock.t += 60_000;
-    expect((await r.runOnce()).dropped).toEqual([]); // the first real null
+    expect((await passes(r, 1))[0].dropped).toEqual([]); // strike 1 only
     expect(rowsOf([X]).trades).toBe(1);
   });
 
   it("rows younger than the finality margin are not checked yet", async () => {
     await seedTrade(X);
     const r = reconciler(collector());
-    H.db.clock.t += 60_000; // < minAgeMs (120 s)
-    expect(await r.runOnce()).toMatchObject({ candidates: 0, rpcCalls: 0 });
+    expect((await passes(r, 1))[0]).toMatchObject({ candidates: 0, rpcCalls: 0 }); // 60 s < minAgeMs (120 s)
   });
 
   it("market_stats: a market whose only trade was dropped goes to 0 (the rollup alone would keep the dropped fill)", async () => {
@@ -394,23 +421,40 @@ describeFix("DroppedTxReconciler", () => {
     expect(stats(MKT)).toEqual({ volume_24h: 0, trade_count_24h: 0 });
   });
 
-  it("a delete failure keeps the signature pending; the next pass removes it", async () => {
+  it("a delete failure keeps the signature pending; trades go last, so the retry still resyncs market_stats", async () => {
     await seedTrade(X);
+    const sc = collector();
+    await sc.syncVolumeForAllDBMarkets();
     dropped.add(X);
-    const r = reconciler(collector());
-    H.db.clock.t += 3 * 60_000;
-    await r.runOnce();
+    const r = reconciler(sc);
+    H.db.clock.t += 2 * 60_000;
+    await passes(r, 3); // strike 1
     const realFrom = H.db.from;
     H.db.from = (t: string) => {
       const q = realFrom(t);
-      if (t !== "v22_events") return q;
+      if (t !== "lp_vault_events") return q;
       return new Proxy(q, { get: (o, k) => (k === "delete" ? () => ({ in: () => ({ eq: () => ({ select: async () => ({ data: null, error: { message: "timeout" } }) }) }) }) : o[k]) });
     };
     H.db.clock.t += 60_000;
-    await expect(r.runOnce()).rejects.toThrow(/v22_events delete: timeout/);
+    await expect(r.runOnce()).rejects.toThrow(/lp_vault_events delete: timeout/);
+    expect(rowsOf([X]).trades).toBe(1); // not deleted before the failing table
     H.db.from = realFrom;
-    H.db.clock.t += 60_000;
-    expect((await r.runOnce()).dropped).toEqual([X]);
+    expect((await passes(r, 1))[0].dropped).toEqual([X]);
+    expect(rowsOf([X]).trades).toBe(0);
+    expect(stats(MKT)).toEqual({ volume_24h: 0, trade_count_24h: 0 });
+  });
+
+  it("a missing hand-applied table (v22_events) is skipped, not fatal", async () => {
+    await seedTrade(X);
+    dropped.add(X);
+    const realFrom = H.db.from;
+    const missing = { data: null, error: { code: "PGRST205", message: "Could not find the table 'public.v22_events'" } };
+    const gone: any = new Proxy({}, { get: (_o, k) => (k === "then" ? (res: any) => res(missing) : () => gone) });
+    H.db.from = (t: string) => (t === "v22_events" ? gone : realFrom(t));
+    const r = reconciler(collector());
+    H.db.clock.t += 2 * 60_000;
+    const res = await passes(r, 4);
+    expect(res.map((x) => x.dropped)).toEqual([[], [], [], [X]]);
     expect(rowsOf([X]).trades).toBe(0);
   });
 });
