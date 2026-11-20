@@ -345,7 +345,9 @@ export const V17_REGISTRATION_SLICE_LEN = registrationSliceLen();
  * @param programId     Program that owns the market accounts
  * @param knownAddresses Optional specific addresses to fetch (MARKETS_FILTER path)
  * @param opts.light     Sliced scan (header bytes only) for the fast discovery pass
- * @returns Parsed v17 DiscoveredMarket array
+ * @returns Parsed v17 DiscoveredMarket array. An empty array means the program really has no v17
+ *          markets; an RPC failure (rejected getProgramAccounts, 429, transport) is THROWN so the caller
+ *          can retry, fall back, or keep the markets it already knows (never mistaken for "none").
  */
 export async function discoverV17Markets(
   connection: Connection,
@@ -377,7 +379,7 @@ export async function discoverV17Markets(
   // This is the v17 equivalent of discoverMarkets() MAGIC_BYTES check.
   // Note: getProgramAccounts is disabled on many public RPC endpoints;
   // Helius supports it on devnet/mainnet for our program.
-  try {
+  {
     // Convert v17 magic bytes to base58 for the RPC memcmp filter
     // [0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]
     // The RPC accepts raw bytes or base58 — use raw bytes array form.
@@ -412,8 +414,6 @@ export async function discoverV17Markets(
       const market = parseV17Account(pubkey, programId, data);
       if (market) markets.push(market);
     }
-  } catch {
-    // getProgramAccounts may be rejected by the RPC — caller falls back to discoverMarkets()
   }
 
   return markets;

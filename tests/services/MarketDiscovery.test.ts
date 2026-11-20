@@ -676,7 +676,7 @@ describe('MarketDiscovery light pass and new-only notification (#223)', () => {
     await expect(d.discoverLight()).resolves.toEqual([]);
     expect(d.getMarkets().size).toBe(2);
 
-    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // swallowed RPC error returns []
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // a genuinely empty scan
     await expect(d.discoverLight()).resolves.toEqual([]);
     expect(d.getMarkets().size).toBe(2);
 
@@ -753,6 +753,67 @@ describe('IDX-SILENT2: a partially failed full pass must not drop the failed pro
     });
     await full(d);
     // Webhook/stats/trade paths gate on this map: dropping B discards its live trades for good.
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('default mode: a failing v17 scan keeps that program\'s known markets (no empty-list drop)', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    expect(d.getMarkets().size).toBe(2);
+    // discoverV17Markets reports failure for program 2 (as the real one now does); v12 would succeed.
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('getProgramAccounts rejected');
+      return [] as any;
+    });
+    vi.mocked(core.discoverMarkets).mockClear();
+    await full(d);
+    expect(vi.mocked(core.discoverMarkets).mock.calls.some((c: any) => c[1].toBase58() === P2)).toBe(true); // v12 still ran
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('cold start: a failing v17 scan does not hide the program\'s v12 markets', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('getProgramAccounts rejected');
+      return [] as any;
+    });
+    const d = new MarketDiscovery();
+    await full(d);
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('MARKETS_FILTER: a failing program keeps its known markets', async () => {
+    const slab = '11111111111111111111111111111111';
+    process.env.MARKETS_FILTER = slab;
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d); // seed via the default path
+    delete process.env.MARKETS_FILTER;
+    await full(d);
+    expect(d.getMarkets().size).toBe(2);
+    process.env.MARKETS_FILTER = slab;
+    vi.mocked(core.getMarketsByAddress).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : []) as any);
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('getMultipleAccounts down');
+      return [] as any;
+    });
+    await full(d);
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('429 exhaustion on every attempt for one program keeps its known markets', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    vi.mocked(v17disc.discoverV17Markets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('429 Too Many Requests');
+      return [] as any;
+    });
+    vi.mocked(v17disc.discoverV17Markets).mockClear();
+    const p = d.discover(); await vi.advanceTimersByTimeAsync(300_000); await p;
+    const p2calls = vi.mocked(v17disc.discoverV17Markets).mock.calls.filter((c: any) => c[1].toBase58() === P2);
+    expect(p2calls.length).toBe(5); // 4 primary backoffs + 1 fallback attempt
     expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
   });
 
