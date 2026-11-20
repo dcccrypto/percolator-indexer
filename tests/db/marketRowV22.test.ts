@@ -1,16 +1,16 @@
 /**
- * DRAFT (report J-20261120-IDX-REPORT-DIFF-MARKETROWVSCHAIN). Place at tests/db/marketRowV22.test.ts with the fixture
- * at tests/fixtures/v22-markets-20261120.fixture.json.
+ * v2.2 `markets` row values vs the decoded account (report J-20261120-IDX-REPORT-DIFF-MARKETROWVSCHAIN).
  *
- * Two real devnet v2.2 (VERSION 19) market accounts, recorded 2026-11-20, go through the REAL discovery parser
- * (discoverV17Markets) and the REAL registration path (StatsCollector.doSyncMarkets); only the DB and RPC are faked.
+ * Two real devnet v2.2 (VERSION 19) market accounts, recorded 2026-11-20 (tests/fixtures/v22-markets-20261120.fixture.json),
+ * go through the REAL discovery parser (discoverV17Markets) and the REAL registration path (StatsCollector.doSyncMarkets);
+ * only the DB and RPC are faked.
  *
- * On feat/v22-indexer b5d6029:
- *   - trading_fee_bps   FAILS: written 0, chain trade_fee_base_bps 30 / 5   (mismatch 1)
- *   - max_leverage      FAILS: written 20, chain floor(10000/im) 10 / 5      (mismatch 2)
- *   - oracle_authority  passes today; it is the guard that a fix adding `configV17` to discovery must not trip
- *     (autoMarketFields.ts:127 nulls oracle_authority whenever configV17 is set).
- *   - decimals / initial_price_e6 pass today (kept as guards).
+ * Before the fix (feat/v22-indexer b5d6029) discovery handed registration stub params:
+ *   - trading_fee_bps   was 0 (chain trade_fee_base_bps 30 / 5)
+ *   - max_leverage      was 20 from the 500 bps stub (chain floor(10000/im) 10 / 5)
+ * Guards that must keep passing:
+ *   - oracle_authority  = the asset-0 oracle profile authority (a fix that nulls it whenever configV17 is set breaks this)
+ *   - decimals / initial_price_e6
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
