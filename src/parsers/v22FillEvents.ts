@@ -158,12 +158,31 @@ function runtimeProgramLine(line: string): { id: string; tail: string } | null {
   if (sp <= 0) return null;
   const id = rest.slice(0, sp);
   if (id.length < 32 || id.length > 44) return null;
-  try {
-    if (new PublicKey(id).toBase58() !== id) return null;
-  } catch {
-    return null;
-  }
+  if (!isCanonicalKey(id)) return null;
   return { id, tail: rest.slice(sp + 1) };
+}
+
+/**
+ * Memo for the two PublicKey round trips (each ~100 us: base58 + curve-free ctor). A transaction repeats the same few
+ * program ids and market/portfolio keys on every line, and across transactions. Bounded: cleared when full, so forged
+ * logs full of distinct ids cannot grow it without limit. Results are pure functions of the input, so output is unchanged.
+ */
+const MEMO_MAX = 4096;
+const canonMemo = new Map<string, boolean>();
+const keyMemo = new Map<string, string>();
+
+function isCanonicalKey(id: string): boolean {
+  const hit = canonMemo.get(id);
+  if (hit !== undefined) return hit;
+  let ok: boolean;
+  try {
+    ok = new PublicKey(id).toBase58() === id;
+  } catch {
+    ok = false;
+  }
+  if (canonMemo.size >= MEMO_MAX) canonMemo.clear();
+  canonMemo.set(id, ok);
+  return ok;
 }
 
 /** `invoke [n]`: decimal digits only, nothing after the bracket. */
@@ -252,7 +271,16 @@ const i128 = (b: Uint8Array, o: number): bigint => {
   const hi = v.getBigInt64(o + 8, true);
   return (hi << 64n) | lo;
 };
-const key = (b: Uint8Array, o: number): string => new PublicKey(b.subarray(o, o + 32)).toBase58();
+const key = (b: Uint8Array, o: number): string => {
+  const sub = b.subarray(o, o + 32);
+  const raw = Buffer.from(sub.buffer, sub.byteOffset, sub.byteLength).toString("latin1");
+  const hit = keyMemo.get(raw);
+  if (hit !== undefined) return hit;
+  const s = new PublicKey(sub).toBase58();
+  if (keyMemo.size >= MEMO_MAX) keyMemo.clear();
+  keyMemo.set(raw, s);
+  return s;
+};
 const ZERO_KEY = new Uint8Array(32);
 const isZeroKey = (b: Uint8Array, o: number): boolean => b.subarray(o, o + 32).every((x, i) => x === ZERO_KEY[i]);
 
