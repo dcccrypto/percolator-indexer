@@ -105,7 +105,7 @@ export class ChainTxReadError extends Error {
  * answer 5xx before writing anything.
  */
 export async function loadChainTxs(
-  connection: TxFetcher<ParsedTransactionWithMeta>,
+  connection: TxFetcher<ParsedTransactionWithMeta> | (() => TxFetcher<ParsedTransactionWithMeta>),
   signatures: string[],
 ): Promise<Map<string, ChainEnhancedTx | null>> {
   const out = new Map<string, ChainEnhancedTx | null>();
@@ -118,9 +118,13 @@ export async function loadChainTxs(
   const chunks: string[][] = [];
   for (let i = 0; i < misses.length; i += CHAIN_TX_BATCH) chunks.push(misses.slice(i, i + CHAIN_TX_BATCH));
   const retry = <R>(fn: () => Promise<R>, label: string) => withRetry(fn, { maxRetries: 1, baseDelayMs: 200, label });
-  const results = await Promise.all(chunks.map((c) => fetchParsedTxsTolerant<ParsedTransactionWithMeta>(connection, c, retry)));
+  // Resolved only when something must be read (a fully memoised redelivery never touches the RPC client).
+  const conn = chunks.length === 0 ? null : typeof connection === "function" ? connection() : connection;
+  const results = conn ? await Promise.all(chunks.map((c) => fetchParsedTxsTolerant<ParsedTransactionWithMeta>(conn, c, retry))) : [];
+  // Memoise every chunk that came back before reporting a failed one, so the redelivery re-reads only that chunk.
+  let failure: { error?: unknown } | null = null;
   results.forEach((r, k) => {
-    if (r.failed) throw new ChainTxReadError(r.error);
+    if (r.failed) { failure ??= r; return; }
     chunks[k].forEach((sig, j) => {
       const tx = r.txs[j];
       const enhanced = tx ? enhancedFromParsedTx(sig, tx) : null;
@@ -128,6 +132,7 @@ export async function loadChainTxs(
       out.set(sig, enhanced);
     });
   });
+  if (failure) throw new ChainTxReadError((failure as { error?: unknown }).error);
   return out;
 }
 
@@ -159,7 +164,7 @@ export interface ChainCheckedDelivery {
  */
 export async function txsFromChain(
   payload: ReadonlyArray<{ signature?: string; instructions?: ReadonlyArray<{ programId?: unknown; data?: unknown; accounts?: unknown }>; logMessages?: unknown }>,
-  connection: TxFetcher<ParsedTransactionWithMeta>,
+  connection: TxFetcher<ParsedTransactionWithMeta> | (() => TxFetcher<ParsedTransactionWithMeta>),
   programIds: ReadonlySet<string>,
 ): Promise<ChainCheckedDelivery> {
   const isSig = (s: unknown): s is string => typeof s === "string" && BASE58_SIGNATURE.test(s);

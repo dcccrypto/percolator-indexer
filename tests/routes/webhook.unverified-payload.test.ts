@@ -199,3 +199,80 @@ describe('DRAFT D1: POST /webhook/trades writes rows from data the chain does no
     expect(insertTradeRow).not.toHaveBeenCalledWith(expect.objectContaining({ trader: ATTACKER }));
   });
 });
+
+// =====================================================================================================================
+// The fix (J-20261120-IDX-FIX-WEBHOOKROWSFROMRPC): rows come from the chain's transaction for the signature.
+// =====================================================================================================================
+import { PublicKey } from '@solana/web3.js';
+import { resetChainTxMemo } from '../../src/lib/webhookChainTx.js';
+
+/** The chain's view of SIG: the same TradeNoCpi, signed by TRADER. */
+function chainTx(trader = TRADER): any {
+  return {
+    slot: 7,
+    blockTime: 1_794_000_000,
+    transaction: { message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(trader), new PublicKey(trader), new PublicKey(SLAB)], data: 'validbase58data' }] } },
+    meta: { err: null, logMessages: [], innerInstructions: [] },
+  };
+}
+
+function chainKnows(map: Record<string, any>) {
+  return {
+    ...unknownToChain(),
+    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => map[s] ?? null)),
+  };
+}
+
+describe('D1 fix: POST /webhook/trades builds rows from the chain transaction', () => {
+  let app: ReturnType<typeof webhookRoutes>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetChainTxMemo();
+    app = webhookRoutes({ getMarkets: () => new Map([[SLAB, {}]]) });
+  });
+
+  it('a REAL signature sent with a made-up trader is stored with the chain\'s trader (report case 09)', async () => {
+    vi.mocked(shared.getConnection).mockReturnValue(chainKnows({ [SIG]: chainTx(TRADER) }) as any);
+    const res = await app.fetch(makeRequest([{
+      signature: SIG,
+      instructions: [{ programId: PROGRAM_ID, data: 'validbase58data', accounts: [ATTACKER, ATTACKER, SLAB] }],
+      innerInstructions: [],
+      accountData: [],
+    }]));
+    expect(res.status).toBe(200);
+    expect(insertTradeRow).toHaveBeenCalledTimes(1);
+    expect(insertTradeRow).toHaveBeenCalledWith(expect.objectContaining({ trader: TRADER, slab_address: SLAB, tx_signature: SIG }));
+    expect(insertTradeRow).not.toHaveBeenCalledWith(expect.objectContaining({ trader: ATTACKER }));
+  });
+
+  it('a transaction the payload calls successful but the chain records as failed writes nothing', async () => {
+    const failed = chainTx(TRADER);
+    failed.meta.err = { InstructionError: [0, 'Custom'] };
+    vi.mocked(shared.getConnection).mockReturnValue(chainKnows({ [SIG]: failed }) as any);
+    await app.fetch(makeRequest([{ signature: SIG, transactionError: null, instructions: makeBaseInstructions(), innerInstructions: [], accountData: [] }]));
+    expect(insertTradeRow).not.toHaveBeenCalled();
+  });
+
+  it('a failed chain read answers 500 and writes nothing, so Helius redelivers', async () => {
+    const c = chainKnows({});
+    c.getParsedTransactions.mockRejectedValue(new Error('429 Too Many Requests'));
+    vi.mocked(shared.getConnection).mockReturnValue(c as any);
+    const res = await app.fetch(makeRequest([{ signature: SIG, instructions: makeBaseInstructions(), innerInstructions: [], accountData: [] }]));
+    expect(res.status).toBe(500);
+    expect(insertTradeRow).not.toHaveBeenCalled();
+  });
+
+  it('RPC cost: a 250-fill delivery reads its transactions in 3 getParsedTransactions calls, its redelivery in 0', async () => {
+    const sigs = Array.from({ length: 250 }, (_, i) => SIG.slice(0, 80) + String(10_000_000 + i).replace(/0/g, 'z').slice(-8));
+    const c = chainKnows(Object.fromEntries(sigs.map((s) => [s, chainTx(TRADER)])));
+    vi.mocked(shared.getConnection).mockReturnValue(c as any);
+    const body = sigs.map((s) => ({ signature: s, instructions: makeBaseInstructions(), innerInstructions: [], accountData: [] }));
+    expect((await app.fetch(makeRequest(body))).status).toBe(200);
+    expect(c.getParsedTransactions).toHaveBeenCalledTimes(3);
+    expect(c.getTransaction).not.toHaveBeenCalled();
+    expect(insertTradeRow).toHaveBeenCalledTimes(250);
+    expect((await app.fetch(makeRequest(body))).status).toBe(200);
+    expect(c.getParsedTransactions).toHaveBeenCalledTimes(3);
+  });
+});

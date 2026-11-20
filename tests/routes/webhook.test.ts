@@ -4,6 +4,8 @@ import * as nodeCrypto from 'node:crypto';
 // These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
 // (that is tests/matcher-fill-*.test.ts, against real transactions). Resolve every CPI leg to its
 // wire size at a fixed price here.
+// Payloads here are hand-built and not modelled as RPC transactions: the chain "confirms" each one as sent (D1 lookup is tested in tests/lib/webhookChainTx.test.ts).
+vi.mock('../../src/lib/webhookChainTx.js', async (orig) => (await import('../helpers/chainTxEcho.js')).chainTxEchoModule(orig as never));
 vi.mock('../../src/parsers/matcherFill.js', async (orig) => ({
   ...(await orig<typeof import('../../src/parsers/matcherFill.js')>()),
   resolveCpiLeg: vi.fn(async (a: { wireSizeAbs: bigint }) => ({ kind: 'fill', sizeValue: a.wireSizeAbs, priceE6: 1_500_000n, exact: true })),

@@ -534,7 +534,7 @@ async function processTransactions(payload: ValidatedTransaction[], discovery: a
   // D1: the payload only names signatures. Every row below is built from the chain's transaction for that
   // signature (one getParsedTransactions per 100 signatures, memoised across redeliveries). A signature the
   // chain does not know writes nothing; a read failure throws before any write, so the delivery is answered 500.
-  const checked = await txsFromChain(payload, getConnection(), PROGRAM_IDS);
+  const checked = await txsFromChain(payload, () => getConnection(), PROGRAM_IDS);
   if (checked.unknown.length > 0) {
     logger.warn("Webhook signatures not found on chain: ignored", { count: checked.unknown.length, first: checked.unknown[0]?.slice(0, 16) });
   }
