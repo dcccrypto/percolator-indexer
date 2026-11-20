@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { parseDeliveryBudgetMs } from "../lib/indexerEnv.js";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
@@ -23,6 +24,7 @@ import { resolveRebalanceReduce } from "../db/traderNetPosition.js";
 
 import { cpiEvidence, resolveCpiLeg } from "../parsers/matcherFill.js";
 import { readAssetEffectivePriceE6 } from "../parsers/markPrice.js";
+import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice, resolveLotExp } from "../parsers/lotScale.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -499,7 +501,7 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
   // Ascending slot order (Helius does not promise it within a delivery): a tag 44 must see the fills
   // before it. Stable, so transactions without a slot keep their delivery order.
   const slotOf = (t: ValidatedTransaction): number => (typeof t.slot === "number" ? t.slot : Number.POSITIVE_INFINITY);
-  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + (Number(process.env.TRADECPI_DELIVERY_BUDGET_MS) || CTX_DELIVERY_BUDGET_MS) };
+  const delivery: DeliveryState = { earlier: new Set<string>(), incomplete: false, ctxDeadlineAt: Date.now() + parseDeliveryBudgetMs(process.env.TRADECPI_DELIVERY_BUDGET_MS, CTX_DELIVERY_BUDGET_MS) };
   const ordered = [...transactions].sort((x, y) => {
     const sx = slotOf(x), sy = slotOf(y);
     return sx === sy ? 0 : sx < sy ? -1 : 1;
@@ -519,13 +521,14 @@ async function processTransactions(transactions: ValidatedTransaction[], discove
         }
         pending.push(trade);
       }
-      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); }
+      if (tx.signature) { delivery.earlier.add(tx.signature); ctxReadAttempts.delete(tx.signature); lotReadAttempts.delete(tx.signature); }
     } catch (err) {
       if (err instanceof MatcherContextRetry) {
         // Not an extraction bug: a transient RPC failure. Everything else in the delivery is still
         // written; this transaction is redelivered (its stored legs are skipped, then it falls back).
         ctxRetries++;
-        ctxReadAttempts.set(err.signature, 1);
+        if (err instanceof LotExpRetry) lotReadAttempts.set(err.signature, (lotReadAttempts.get(err.signature) ?? 0) + 1);
+        else ctxReadAttempts.set(err.signature, 1);
         delivery.incomplete = true;
         logger.warn("matcher context read failed; answering 500 so the delivery is retried", { signature: err.signature.slice(0, 16) });
         continue;
@@ -677,6 +680,11 @@ const ctxReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 
 class MatcherContextRetry extends Error {
   constructor(readonly signature: string) { super("matcher context read failed; delivery will be retried"); }
 }
+
+/** The market account (lot_exp) could not be read: 500 so Helius redelivers, up to MAX_LOT_READ_REDELIVERIES times. */
+class LotExpRetry extends MatcherContextRetry {}
+const lotReadAttempts = new BoundedTtlMap<string, number>(10_000, 6 * 60 * 60 * 1000);
+const MAX_LOT_READ_REDELIVERIES = 5;
 
 async function extractTradesFromEnhancedTx(
   tx: ValidatedTransaction,
@@ -948,9 +956,22 @@ async function extractTradesFromEnhancedTx(
           continue;
         }
         if (r.kind === "fill") {
+          // Never price a lot market at lot 0: slab post-state in this payload, else the cache, else one read.
+          noteLotExpsFromAccountData(tx, slabAddress);
+          // Bounded by the delivery deadline (a slow RPC must not eat Helius's window).
+          const lot = await resolveLotExp(slabAddress, leg.assetIndex, () => readSlabBytesWithin(slabAddress, delivery.ctxDeadlineAt));
+          if (lot === null) {
+            // Written now it would be permanent (ignoreDuplicates). Temporary RPC failure: fail the transaction so the
+            // delivery answers 500 and Helius redelivers (stored legs are skipped on redelivery); only after
+            // MAX_LOT_READ_REDELIVERIES is it recorded for re-index and skipped.
+            if ((lotReadAttempts.get(signature) ?? 0) < MAX_LOT_READ_REDELIVERIES) throw new LotExpRetry(signature);
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: "TradeCpi lot_exp unreadable: market account not read" }]);
+            trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+            continue;
+          }
           legSize = r.sizeValue;
           sizeProvenance = r.exact ? "matcher_exact" : "matcher_request_upper_bound";
-          price = Number(r.priceE6) / 1_000_000;
+          price = perTokenPrice(r.priceE6, lot);
           if (!r.exact) logger.debug("TradeCpi executed size unverified: wrote the matcher-requested size (upper bound)", { signature: signature.slice(0, 12) });
         } // "legacy": wire size + the existing price logic below, exactly as before this parser
       }
@@ -966,7 +987,7 @@ async function extractTradesFromEnhancedTx(
         }
         price = fallback;
       }
-      const fee = computeFeeUsd(legSize, price, leg.feeBps);
+      const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
       trades.push({
         slab_address: slabAddress,
@@ -1112,11 +1133,14 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string, asset
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account = "unknown"): number {
+function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account: string): number {
   // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
-  if (effectiveE6 !== null) return effectiveE6 / 1_000_000;
+  if (effectiveE6 !== null) {
+    noteLotExps(account, raw);
+    return perTokenPrice(effectiveE6, lotExpOfSlabData(raw, assetIndex)); // per-token (lot_exp scale)
+  }
 
   // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
   // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
@@ -1124,7 +1148,9 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
     try {
       const markEwmaE6 = readMarkEwmaE6(raw, "webhook.parseMarkPriceE6FromAccountBytes");
       if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
-        return Number(markEwmaE6) / 1_000_000;
+        // Per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
+        noteLotExps(account, raw);
+        return perTokenPrice(markEwmaE6, lotExpOfSlabData(raw, assetIndex));
       }
     } catch (err) {
       // Unknown VERSION is loud (per market); any other failure returns 0 below.
@@ -1174,6 +1200,45 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
  * Helius enhanced transactions include `accountData[]` with each account's
  * post-state as a base64-encoded `data` field.
  */
+function slabBytesFromAccountData(tx: ValidatedTransaction, slabAddress: string): Uint8Array | null {
+  for (const acc of (tx.accountData ?? []) as any[]) {
+    if (acc.account !== slabAddress) continue;
+    const b64 = typeof acc.data === "string" ? acc.data : Array.isArray(acc.data) && typeof acc.data[0] === "string" ? acc.data[0] : null;
+    if (!b64) continue;
+    try { return Uint8Array.from(Buffer.from(b64, "base64")); } catch { /* skip */ }
+  }
+  return null;
+}
+
+/** Record lot_exp from the slab post-state already in the payload (no RPC). */
+function noteLotExpsFromAccountData(tx: ValidatedTransaction, slabAddress: string): void {
+  const raw = slabBytesFromAccountData(tx, slabAddress);
+  if (raw) noteLotExps(slabAddress, raw);
+}
+
+/** One live read of the market account (retrying); null when unavailable. */
+async function readSlabBytes(slabAddress: string): Promise<Uint8Array | null> {
+  const info = await withRetry(
+    () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+    { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
+  );
+  return info?.data ? new Uint8Array(info.data) : null;
+}
+
+/** readSlabBytes bounded by the delivery deadline: null (unreadable) when the budget is spent or runs out. */
+async function readSlabBytesWithin(slabAddress: string, deadlineAt: number | undefined): Promise<Uint8Array | null> {
+  if (deadlineAt === undefined) return readSlabBytes(slabAddress);
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), remaining); });
+  try {
+    return await Promise.race([readSlabBytes(slabAddress).catch(() => null), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function extractPriceFromAccountData(tx: ValidatedTransaction, slabAddress: string, assetIndex: number): number {
   const accountData: any[] = tx.accountData ?? [];
   for (const acc of accountData) {

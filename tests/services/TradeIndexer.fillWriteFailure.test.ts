@@ -256,3 +256,41 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(idx.lastSignature.get(MARKET)).toBe(sigs[2]);
   });
 });
+
+describe("write-outage alert under a wall-clock step back", () => {
+  it("still alerts when the clock steps back during an outage (negative age is due)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-16T00:00:00Z"));
+      captureSpy.mockClear();
+      const idx: any = new TradeIndexerPolling();
+      const pass = { failedSigs: ["sigA"], writesOk: 0 };
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      vi.setSystemTime(new Date("2026-11-16T00:02:00Z"));
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(1); // normal alert after >= 60s
+      vi.setSystemTime(new Date("2026-11-15T00:00:00Z")); // step back 1 day
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(2); // fails today: silenced until the clock catches up
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("a step back before any alert restarts the outage clock instead of alerting early, then alerts after the threshold; no spam", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-16T00:00:10Z"));
+      captureSpy.mockClear();
+      const idx: any = new TradeIndexerPolling();
+      const pass = { failedSigs: ["sigA"], writesOk: 0 };
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      vi.setSystemTime(new Date("2026-11-16T00:00:00Z")); // 10s back, outage younger than 60s
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(0);
+      vi.setSystemTime(new Date("2026-11-16T00:01:05Z"));
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+      await idx.holdAfterWriteFailure(MARKET, pass);
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+});

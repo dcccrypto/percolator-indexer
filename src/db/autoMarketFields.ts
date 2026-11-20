@@ -95,8 +95,8 @@ function realKey(k: PublicKey | undefined | null): string | null {
 
 function positiveNumber(v: bigint | undefined | null): number | null {
   if (v === undefined || v === null || v <= 0n) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+  // Above 2^53 a u64 no longer fits a double exactly; treat as unset rather than store a rounded price.
+  return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : null;
 }
 
 /**

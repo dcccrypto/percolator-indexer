@@ -717,3 +717,51 @@ describe('MarketDiscovery light pass and new-only notification (#223)', () => {
     }
   });
 });
+
+describe('IDX-SILENT2: a partially failed full pass must not drop the failed program\'s markets', () => {
+  const P1 = '11111111111111111111111111111111';
+  const P2 = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  const mk = (addr: string, pid: string) => ({
+    slabAddress: { toBase58: () => addr, equals: () => false },
+    programId: { toBase58: () => pid },
+    config: {}, params: {}, header: {},
+  });
+  const A = mk('MarketAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', P1);
+  const B = mk('MarketBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', P2);
+  const full = async (d: MarketDiscovery) => { const p = d.discover(); await vi.advanceTimersByTimeAsync(20_000); return p; };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    delete process.env.MARKETS_FILTER;
+    vi.mocked(v17disc.discoverV17Markets).mockReset();
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any);
+    vi.mocked(core.discoverMarkets).mockReset();
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps program 2\'s known markets when only program 2 fails this pass', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    expect(d.getMarkets().size).toBe(2);
+
+    // Program 2's RPC scan fails (non-429); program 1 still answers.
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => {
+      if (pid.toBase58() === P2) throw new Error('boom');
+      return [A] as any;
+    });
+    await full(d);
+    // Webhook/stats/trade paths gate on this map: dropping B discards its live trades for good.
+    expect([...d.getMarkets().keys()].sort()).toEqual([A, B].map((m) => m.slabAddress.toBase58()).sort());
+  });
+
+  it('still removes a market from a program that scanned successfully', async () => {
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : [B]) as any);
+    const d = new MarketDiscovery();
+    await full(d);
+    vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : []) as any);
+    await full(d);
+    expect([...d.getMarkets().keys()]).toEqual([A.slabAddress.toBase58()]);
+  });
+});

@@ -28,12 +28,10 @@ import { RpcLpVaultChain } from "../lpVault/chain.js";
 import { MemoryLpVaultStore, SupabaseLpVaultStore, type LpVaultStore, type PositionRow } from "../lpVault/store.js";
 import { LpVaultIndexer } from "../services/LpVaultIndexer.js";
 import { CURRENT_NETWORK } from "../network.js";
+import { parseBackfillArgs, drainRegistry } from "./backfillLpVaultArgs.js";
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const write = args.includes("--write");
-  const regIdx = args.indexOf("--registry");
-  const only = regIdx >= 0 ? args[regIdx + 1] : undefined;
+  const { write, registry: only } = parseBackfillArgs(process.argv.slice(2));
 
   const origin = process.env.LP_BACKFILL_RPC_ORIGIN;
   const conn = new Connection(config.rpcUrl, {
@@ -52,6 +50,7 @@ async function main(): Promise<void> {
   });
 
   const registries = (await indexer.refreshRegistries()).filter((r) => !only || r.registry === only);
+  if (only && registries.length === 0) throw new Error(`--registry ${only} matches no known LP-vault registry`);
   console.log(`[lp-backfill] ${write ? "WRITE" : "DRY RUN"} network=${CURRENT_NETWORK} programs=${config.allProgramIds.join(",")} vaults=${registries.length}`);
 
   let failures = 0;
@@ -62,18 +61,7 @@ async function main(): Promise<void> {
       // commits its cursor, so a vault with a long history needs several passes. The indexer
       // gets those from its poll loop; a one-shot script has to drain it here, or the tool
       // would stop short of the history it exists to rebuild.
-      const users = new Set<string>();
-      let r = await indexer.syncRegistry(reg);
-      let passes = 1;
-      let events = r.events;
-      for (const u of r.users) users.add(u);
-      while (r.backlog > r.signatures) {
-        r = await indexer.syncRegistry(reg);
-        passes++;
-        events += r.events;
-        for (const u of r.users) users.add(u);
-        if (r.signatures === 0) break; // nothing folded: no progress is possible, stop rather than spin
-      }
+      const { last: r, passes, events, users } = await drainRegistry((x) => indexer.syncRegistry(x), reg);
       console.log(`[lp-backfill] ${reg.registry} market=${reg.market} passes=${passes} events=${events} users=${users.size} reconciled=${r.reconciled} skipped=${r.reconcileSkipped}`);
       for (const u of users) {
         const p = await store.loadPosition(CURRENT_NETWORK, reg.registry, u);

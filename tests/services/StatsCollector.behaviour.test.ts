@@ -18,6 +18,7 @@ const h = vi.hoisted(() => {
     updateThrows: false,
     updates: [] as Array<{ table: string; patch: unknown }>,
     upserts: [] as unknown[],
+    inLists: [] as unknown[][],
   };
   return {
     state,
@@ -55,6 +56,10 @@ vi.mock('@percolatorct/shared', () => {
   const chain = (table: string, op: { kind: string }) => {
     const c: any = {};
     for (const m of ['select', 'eq', 'is', 'not', 'limit', 'neq']) c[m] = () => c;
+    c.in = (_col: string, list: unknown[]) => {
+      h.state.inLists.push(list);
+      return c;
+    };
     c.update = (patch: unknown) => {
       op.kind = 'update';
       h.state.updates.push({ table, patch });
@@ -177,6 +182,7 @@ beforeEach(() => {
     updateThrows: false,
     updates: [],
     upserts: [],
+    inLists: [],
   });
   h.getConnection.mockReturnValue({
     getAccountInfo: h.getAccountInfo,
@@ -416,10 +422,29 @@ describe('start / stop timers', () => {
 });
 
 describe('registration (doSyncMarkets)', () => {
-  it('reads nothing when discovery is empty', async () => {
+  it('registers nothing when discovery is empty, but still refreshes the DB-retired blocklist', async () => {
+    h.getMarketRows.mockResolvedValue([
+      { slab_address: 'RETIRED', keeper_status: 'retired' },
+      { slab_address: 'LIVE', keeper_status: 'active' },
+    ]);
     const { sc } = make();
     expect(await sc.registerNewMarkets()).toBeUndefined();
-    expect(h.getMarketRows).not.toHaveBeenCalled();
+    expect(h.setDbRetiredSlabs).toHaveBeenCalledWith(['RETIRED']);
+    expect(h.insertMarketRow).not.toHaveBeenCalled();
+  });
+
+  it('un-retiring in the DB clears the set even while discovery is empty', async () => {
+    h.getMarketRows.mockResolvedValue([{ slab_address: 'LIVE', keeper_status: 'active' }]);
+    const { sc } = make();
+    await sc.registerNewMarkets();
+    expect(h.setDbRetiredSlabs).toHaveBeenCalledWith([]);
+  });
+
+  it('keeps the previous retired set when the row read throws', async () => {
+    h.getMarketRows.mockRejectedValue(new Error('db down'));
+    const { sc } = make(new Map([[slab(), market()]]));
+    await sc.registerNewMarkets();
+    expect(h.setDbRetiredSlabs).not.toHaveBeenCalled();
   });
 
   it('feeds keeper_status=retired rows to the blocklist and never registers a blocked slab', async () => {
@@ -697,6 +722,17 @@ describe('collect(): sweep', () => {
     expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
   });
 
+  it('sweeps again when the wall clock stepped back (negative age is due)', async () => {
+    const markets = registered();
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
+    const { sc } = make(markets);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() - 86_400_000);
+    await sc.collect();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2);
+  });
+
   it('marks a slab that no longer exists on chain closed + excluded', async () => {
     const markets = registered();
     h.getMultipleAccountsInfo.mockResolvedValue([null]);
@@ -721,6 +757,19 @@ describe('collect(): sweep', () => {
     h.parseEngine.mockReturnValueOnce(engineDust).mockReturnValueOnce(engineLive);
     await sc.collect();
     expect(h.state.updates).toHaveLength(1);
+  });
+
+  it('chunks the close UPDATE at 100 slabs so the PostgREST URL stays bounded, and still closes all of them', async () => {
+    const markets = registered(130);
+    h.getMultipleAccountsInfo.mockImplementation(async (ks: unknown[]) => ks.map(() => ({ data: new Uint8Array(8) })));
+    h.parseEngine.mockReturnValue(engineDust);
+    const { sc } = make(markets);
+    const p = sc.collect();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+    expect(h.state.inLists.map((l) => l.length)).toEqual([100, 30]);
+    expect(sc.closedSlabs.size).toBe(130);
+    expect(new Set(h.state.inLists.flat())).toEqual(new Set(markets.keys()));
   });
 
   it('does not remember a slab when the close write errors, so it retries next sweep', async () => {
@@ -866,20 +915,19 @@ describe('collect(): re-enabling excluded markets', () => {
     h.hasWrapperMagic.mockReturnValue(true);
     h.parseWrapperConfigV17.mockReturnValue({ maxStalenessSecs: 1n, markEwmaE6: 0n, tradeFeeBps: 1, maintenanceFeePerSlot: 0n });
     h.readMarketGroupFields.mockReturnValue({ vault: 5_000_000n, insurance: 0n, cTot: 0n, asset0ProfileOff: null });
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(600) });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(600) }]);
     const { sc } = make(new Map([[s, market()]]));
     sc.closedSlabs.add(s);
     await sc.collect();
     expect(h.state.updates[0]).toEqual({ table: 'markets', patch: { indexer_excluded: false, status: 'active' } });
     expect(sc.closedSlabs.has(s)).toBe(false);
-    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // swept this very cycle
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(2); // one batched exclusion read + the sweep this very cycle
+    expect(h.getAccountInfo).not.toHaveBeenCalled();
   });
 
   it('re-enables on open accounts alone (legacy layout)', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
     h.parseEngine.mockReturnValue({ vault: 0n, numUsedAccounts: 4 });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
     const { sc } = make(new Map([[s, market()]]));
@@ -890,12 +938,12 @@ describe('collect(): re-enabling excluded markets', () => {
   it('keeps a dusty excluded market hidden and does not sweep it', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 1n, numUsedAccounts: 0 });
     const { sc } = make(new Map([[s, market()]]));
     await sc.collect();
     expect(h.state.updates).toHaveLength(0);
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled();
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // the exclusion read only, no sweep
     expect(h.logger.info).toHaveBeenCalledWith('StatsCollector: skipping indexer_excluded slabs', { count: 1, slabs: [s] });
   });
 
@@ -904,10 +952,8 @@ describe('collect(): re-enabling excluded markets', () => {
     const b = slab();
     const c = slab();
     h.getMarketRows.mockResolvedValue([a, b, c].map((s) => ({ slab_address: s, indexer_excluded: true })));
-    h.getAccountInfo
-      .mockResolvedValueOnce(null) // account gone
-      .mockRejectedValueOnce(new Error('rpc'))
-      .mockResolvedValueOnce({ data: Buffer.alloc(10) });
+    // one batched read: first account gone, second and third unparseable
+    h.getMultipleAccountsInfo.mockResolvedValue([null, { data: Buffer.alloc(10) }, { data: Buffer.alloc(10) }]);
     h.parseEngine.mockImplementation(() => {
       throw new Error('unknown version');
     });
@@ -919,31 +965,43 @@ describe('collect(): re-enabling excluded markets', () => {
     expect(h.reportUnknownLayout).toHaveBeenCalledWith(c, expect.any(Error), 'StatsCollector.reenable');
   });
 
+  it('a failed batched exclusion read leaves every candidate excluded and never un-hides one unverified', async () => {
+    const a = slab();
+    const b = slab();
+    h.getMarketRows.mockResolvedValue([a, b].map((s) => ({ slab_address: s, indexer_excluded: true })));
+    h.getMultipleAccountsInfo.mockRejectedValue(new Error('rpc 503'));
+    const { sc } = make(new Map([[a, market()], [b, market()]]));
+    await sc.collect();
+    expect(h.state.updates).toHaveLength(0);
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    expect(h.logger.info).toHaveBeenCalledWith('StatsCollector: skipping indexer_excluded slabs', { count: 2, slabs: [a, b] });
+  });
+
   it('keeps it excluded when the re-enable write throws, so it is retried next cycle', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 9_000_000n, numUsedAccounts: 1 });
     h.state.updateThrows = true;
     const { sc } = make(new Map([[s, market()]]));
     await sc.collect();
-    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded market', expect.objectContaining({ error: 'db down' }));
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled();
+    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded markets', expect.objectContaining({ error: 'db down' }));
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // exclusion read only
   });
 
   it('keeps a market excluded when the re-enable write comes back with an error (not a throw)', async () => {
     const s = slab();
     excluded(s);
-    h.getAccountInfo.mockResolvedValue({ data: Buffer.alloc(100) });
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(100) }]);
     h.parseEngine.mockReturnValue({ vault: 9_000_000n, numUsedAccounts: 1 });
     h.state.updateResult = { error: { message: 'rls denied' } };
     const { sc } = make(new Map([[s, market()]]));
     sc.closedSlabs.add(s);
     await sc.collect();
-    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded market', expect.objectContaining({ error: 'rls denied' }));
+    expect(h.logger.warn).toHaveBeenCalledWith('Failed to re-enable excluded markets', expect.objectContaining({ error: 'rls denied' }));
     expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('Re-enabled'), expect.anything());
     expect(sc.closedSlabs.has(s)).toBe(true);
-    expect(h.getMultipleAccountsInfo).not.toHaveBeenCalled(); // still excluded, so not swept
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1); // exclusion read only: still excluded, so not swept
   });
 
   it('an excluded market that left discovery stays excluded without any RPC read', async () => {
