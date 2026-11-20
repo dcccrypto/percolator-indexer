@@ -25,6 +25,8 @@ export interface ContextReaderOptions {
  * accepts it only when its req_id equals the tx being indexed. If a fresh read at slot T2 shows the tx's
  * answer, nothing overwrote it between the tx's slot and T2, so an earlier read at any slot T1 with
  * tx.slot <= T1 <= T2 shows the same answer. That is why the stored answer needs a slot >= the tx's slot.
+ * The reverse is not guaranteed: if a later trade overwrote the context after T1, the memo still verifies
+ * the tx where a fresh read would have fallen back. So the result is never worse, and in that race it can be better.
  */
 export type ContextReadMemo = Map<string, { slot: number; ret: MatcherReturn | null }>;
 
