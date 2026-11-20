@@ -544,11 +544,15 @@ export class TradeIndexerPolling {
             logger.warn("getParsedTransactions returned null for a confirmed signature; holding the cursor, retried next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8), holds });
             break windowLoop;
           }
-          logger.error("ALERT: confirmed signature still reads as null after MAX_NULL_TX_HOLDS polls; SKIPPING it, needs manual backfill", { signature: sig, slabAddress });
-          await recordSkippedSignatures([{ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `getParsedTransactions returned null ${MAX_NULL_TX_HOLDS}+ polls` }]);
-          captureException(new Error(`confirmed signature ${sig} read as null ${MAX_NULL_TX_HOLDS}+ polls; skipped (slab ${slabAddress})`), { tags: { context: "trade-indexer-null-tx" }, extra: { slabAddress, signature: sig } });
+          if (holds === MAX_NULL_TX_HOLDS + 1) { // recorded once; while another signature holds the cursor it stays passed
+            slabHolds.set(sig, holds);
+            logger.error("ALERT: confirmed signature still reads as null after MAX_NULL_TX_HOLDS polls; SKIPPING it, needs manual backfill", { signature: sig, slabAddress });
+            await recordSkippedSignatures([{ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `getParsedTransactions returned null ${MAX_NULL_TX_HOLDS}+ polls` }]);
+            captureException(new Error(`confirmed signature ${sig} read as null ${MAX_NULL_TX_HOLDS}+ polls; skipped (slab ${slabAddress})`), { tags: { context: "trade-indexer-null-tx" }, extra: { slabAddress, signature: sig } });
+          }
           continue;
         }
+        this.nullTxHolds.get(slabAddress)?.delete(sig); // the count is of consecutive null polls
 
         try {
           await this.processTransaction(tx, sig, slabAddress, programIds, pass); // rows written are counted in pass.newCount
