@@ -1,17 +1,14 @@
 /**
- * DRAFT failing tests (J-20261120-IDX-REPORT-RPCFAULTINJECTREPLAY): permanent trade / v22 losses the RPC fault replay
- * measured in TradeIndexerPolling.indexTradesForSlab on feat/v22-indexer 9e8e192. Each test is what a fix must make
- * pass; on 9e8e192 they FAIL. Drop into tests/services/ to run:
- *   vitest run tests/services/TradeIndexer.rpcFaultLoss.draft.test.ts --maxWorkers=4
+ * RPC faults that lost trades / v22 events for good in TradeIndexerPolling.indexTradesForSlab (RPC fault replay,
+ * J-20261120-IDX-REPORT-RPCFAULTINJECTREPLAY, measured on feat/v22-indexer 9e8e192). These failed there.
  *
  * Loss 1 (fault "nulltx"): getParsedTransactions answers null for a signature that getSignaturesForAddress listed as
- *   confirmed and successful (err null). TradeIndexer.ts (window loop) does `if (!tx) { pass.incomplete = true;
- *   continue; }` and then commits the cursor to the window's newest signature, so the null one is never read again.
- *   (LpVaultIndexer treats the same null as an error and holds its cursor; the trade path should too, bounded like
- *   the other holds.)
- * Loss 2 (fault "shortpage"): with a cursor, fetchSignatureWindow treats any page shorter than `limit` as "the cursor
- *   was reached". A node that cuts a page short (fewer than `limit` while older signatures above the cursor remain)
- *   ends the walk early; the cursor then commits to the newest, and the older remainder is never polled.
+ *   confirmed and successful (err null). The window loop did `if (!tx) { pass.incomplete = true; continue; }` and then
+ *   committed the cursor to the window's newest signature, so the null one was never read again. Now the cursor is
+ *   held (as LpVaultIndexer.syncRegistry does), bounded by MAX_NULL_TX_HOLDS polls, then recorded in skipped_signatures.
+ * Loss 2 (fault "shortpage"): with a cursor, fetchSignatureWindow treated any page shorter than `limit` as "the cursor
+ *   was reached". A node that cuts a page short ended the walk early; the cursor then committed to the newest, and the
+ *   older remainder was never polled. Now a short page costs one extra `before` call.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -48,7 +45,8 @@ vi.mock("../../src/db/storedLegs.js", async (orig) => ({
   fetchStoredLegs: async () => [],
   fetchStoredLegsMany: async () => new Map(),
 }));
-vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: async () => undefined }));
+const recordSkippedSignatures = vi.fn(async (_rows: unknown[]) => undefined);
+vi.mock("../../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: (rows: unknown[]) => recordSkippedSignatures(rows) }));
 
 import { TradeIndexerPolling } from "../../src/services/TradeIndexer.js";
 
@@ -60,6 +58,7 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
   let processed: string[];
   beforeEach(() => {
     calls.length = 0;
+    recordSkippedSignatures.mockClear();
     nullFor = new Set();
     shortFirstPage = false;
     indexer = new TradeIndexerPolling();
@@ -98,5 +97,28 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
     await indexer.indexTradesForSlab(SLAB);
     // 9e8e192: sig1..sig10 are never processed (the walk stopped at the short page, the cursor went to sig20)
     expect([...new Set(processed)].sort()).toEqual(Array.from({ length: 20 }, (_, i) => `sig${i + 1}`).sort());
+  });
+
+  it("loss 1 (bound): a signature that never resolves holds the cursor 5 polls, then is recorded and passed", async () => {
+    chain = makeChain(10);
+    indexer.lastSignature.set(SLAB, "sig0");
+    nullFor = new Set(["sig4"]);
+    for (let poll = 1; poll <= 5; poll++) {
+      await indexer.indexTradesForSlab(SLAB);
+      expect(indexer.lastSignature.get(SLAB)).toBe("sig0");
+    }
+    expect(recordSkippedSignatures).not.toHaveBeenCalled();
+    await indexer.indexTradesForSlab(SLAB); // 6th poll: over MAX_NULL_TX_HOLDS
+    expect(indexer.lastSignature.get(SLAB)).toBe("sig10");
+    expect(recordSkippedSignatures).toHaveBeenCalledWith([expect.objectContaining({ signature: "sig4", slab: SLAB, source: "trade-indexer" })]);
+    expect(processed).toContain("sig10");
+  });
+
+  it("loss 2 (cost): a window that ends on a short page costs exactly one extra before-call, which answers empty", async () => {
+    chain = makeChain(3);
+    indexer.lastSignature.set(SLAB, "sig0");
+    await indexer.indexTradesForSlab(SLAB);
+    expect(calls).toEqual([{ limit: 50, until: "sig0" }, { limit: 50, before: "sig1", until: "sig0" }]);
+    expect(indexer.lastSignature.get(SLAB)).toBe("sig3");
   });
 });

@@ -68,6 +68,7 @@ describe('TradeIndexerPolling: a poll window larger than TRADE_MAX_SIGNATURES (5
       { limit: 50, until: 'sig0' },
       { limit: 50, before: 'sig71', until: 'sig0' },
       { limit: 50, before: 'sig21', until: 'sig0' },
+      { limit: 50, before: 'sig1', until: 'sig0' }, // a short page is confirmed by one extra call (empty here)
     ]);
     expect(processed).toEqual(Array.from({ length: 120 }, (_, i) => `sig${i + 1}`));
     expect(indexer.lastSignature.get(SLAB)).toBe('sig120');

@@ -1,13 +1,12 @@
 /**
- * DRAFT failing test (J-20261120-IDX-REPORT-RPCFAULTINJECTREPLAY): permanent LP-vault event loss the RPC fault replay
- * measured on feat/v22-indexer 9e8e192 (fault "shortpage"). Drop into tests/ to run:
- *   vitest run tests/LpVaultIndexer.shortPage.draft.test.ts --maxWorkers=4
+ * Permanent LP-vault event loss the RPC fault replay measured on feat/v22-indexer 9e8e192 (fault "shortpage",
+ * J-20261120-IDX-REPORT-RPCFAULTINJECTREPLAY). Failed there.
  *
- * LpVaultIndexer.syncRegistry pages getSignatures(registry, { until: cursor }) and stops at the first page shorter than
- * PAGE (1000), taking that as "the cursor was reached". A node that cuts the page short (here: newest half) ends the
- * walk early; the window is folded and the cursor commits to its newest signature, so the older signatures between
- * the old cursor and the short page are never fetched: their deposits / redemptions are missing from
- * lp_vault_events and the folded position (shares, cost basis) is wrong for good.
+ * LpVaultIndexer.syncRegistry paged getSignatures(registry, { until: cursor }) and stopped at the first page shorter
+ * than PAGE (1000), taking that as "the cursor was reached". A node that cuts the page short (here: newest half) ended
+ * the walk early; the window was folded and the cursor committed to its newest signature, so the older signatures
+ * between the old cursor and the short page were never fetched: their deposits were missing from lp_vault_events and
+ * the folded position (shares, cost basis) was wrong for good. Now the walk pages on until a page brings nothing new.
  */
 import { describe, expect, it, vi } from "vitest";
 
