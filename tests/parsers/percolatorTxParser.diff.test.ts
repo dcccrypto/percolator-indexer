@@ -10,6 +10,10 @@ import { makeTxs, encodeBase58, rng } from "./percolatorTxParser.fixtures.js";
 
 describe("parser differential (reference = a6e05f8)", { timeout: 180_000 }, () => {
   const { txs, programIds } = makeTxs(20261116, 2000);
+  // `ixIndex` (the trade instruction's top-level index, for the fill_event lookup) is the one field added since the
+  // reference; every trade fill must carry it, and everything else must be unchanged.
+  const withoutIxIndex = (fills: ReturnType<typeof next.parsePercolatorFills>) =>
+    fills.map(({ ixIndex, ...rest }) => { expect(rest.rebalanceReduce || typeof ixIndex === "number").toBeTruthy(); return rest; });
 
   it("parsePercolatorFills + parsePercolatorLiquidations: 2000 seeded txs, identical output", () => {
     let fills = 0;
@@ -17,7 +21,7 @@ describe("parser differential (reference = a6e05f8)", { timeout: 180_000 }, () =
     for (const { tx, signature } of txs) {
       const a = ref.parsePercolatorFills(tx, signature, programIds);
       const b = next.parsePercolatorFills(tx, signature, programIds);
-      expect(b).toStrictEqual(a);
+      expect(withoutIxIndex(b)).toStrictEqual(a);
       fills += a.length;
       cpi += a.filter((f) => f.cpi).length;
       expect(next.parsePercolatorLiquidations(tx, signature, programIds)).toStrictEqual(
@@ -32,7 +36,7 @@ describe("parser differential (reference = a6e05f8)", { timeout: 180_000 }, () =
   it("a second seed, to catch seed-specific luck", () => {
     const other = makeTxs(7, 500);
     for (const { tx, signature } of other.txs) {
-      expect(next.parsePercolatorFills(tx, signature, other.programIds)).toStrictEqual(
+      expect(withoutIxIndex(next.parsePercolatorFills(tx, signature, other.programIds))).toStrictEqual(
         ref.parsePercolatorFills(tx, signature, other.programIds),
       );
     }
