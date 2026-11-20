@@ -15,6 +15,8 @@ import { createHealthChecker } from "./lib/healthCache.js";
 import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
 import { getTradecpiCounters } from "./parsers/matcherFill.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
+import { DroppedTxReconciler } from "./services/DroppedTxReconciler.js";
+import { envInt } from "./lib/envNumbers.js";
 import { RpcLpVaultChain } from "./lpVault/chain.js";
 import { SupabaseLpVaultStore } from "./lpVault/store.js";
 import { CURRENT_NETWORK } from "./network.js";
@@ -91,6 +93,7 @@ const webhookManager = new HeliusWebhookManager();
 // GH#207: Earn LP-vault cost basis. Polls each vault's registry PDA; see the service doc.
 // Constructed in start() so a missing Supabase/RPC env fails there, not at import.
 let lpVaultIndexer: LpVaultIndexer | null = null;
+let droppedTxReconciler: DroppedTxReconciler | null = null;
 
 let atlasWs: AtlasWs | null = null;
 let eventStream: EventStreamService | null = null;
@@ -317,6 +320,19 @@ async function start() {
   } else {
     logger.info("LP-vault indexer disabled", { reason: "LP_VAULT_INDEXER_ENABLED=false" });
   }
+  // Every ingest path writes at `confirmed`; this pass removes the rows of transactions a fork dropped (see the service doc).
+  if (process.env.DROPPED_TX_RECONCILE_ENABLED !== "false") {
+    droppedTxReconciler = new DroppedTxReconciler({
+      connection: getConnection(),
+      lpNetwork: CURRENT_NETWORK,
+      lpStore: new SupabaseLpVaultStore(getSupabase()),
+      onTradesRemoved: (slabs) => statsCollector.resyncVolume(slabs),
+      intervalMs: envInt(process.env.DROPPED_TX_RECONCILE_INTERVAL_MS, { name: "DROPPED_TX_RECONCILE_INTERVAL_MS", fallback: 60_000, min: 10_000, max: 2_147_483_647, warn: (m, c) => logger.warn(m, c) }),
+    });
+    droppedTxReconciler.start();
+  } else {
+    logger.info("Dropped-tx reconcile disabled", { reason: "DROPPED_TX_RECONCILE_ENABLED=false" });
+  }
   await webhookManager.start();
 
   // Phase 2: Atlas WebSocket event stream (opt-in; real-time complement to webhooks + polling).
@@ -405,6 +421,7 @@ async function shutdown(signal: string): Promise<void> {
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
     lpVaultIndexer?.stop();
+    droppedTxReconciler?.stop();
 
     logger.info("Stopping webhook manager");
     webhookManager.stop();

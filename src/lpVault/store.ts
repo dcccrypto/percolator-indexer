@@ -74,13 +74,16 @@ export interface Reconciliation {
  * With `reconcile`, the on-chain claim is compared with the indexed shares:
  * a mismatch records `transfer_detected_slot` (sticky — see basisKnown), and a
  * match at zero on both sides clears it (full exit).
+ *
+ * With `forkRepair` (after events dropped by a fork were deleted), a flag the phantom event caused is cleared when the
+ * last on-chain reading equals the repaired fold.
  */
 export async function recomputePosition(
   store: LpVaultStore,
   network: string,
   registry: string,
   user: string,
-  opts: { marketSlab?: string | null; reconcile?: Reconciliation } = {},
+  opts: { marketSlab?: string | null; reconcile?: Reconciliation; forkRepair?: boolean } = {},
 ): Promise<PositionRow> {
   const [events, prev] = await Promise.all([
     store.loadEvents(network, registry, user),
@@ -97,6 +100,11 @@ export async function recomputePosition(
     reconciledSlot = contextSlot;
     if (onchainShares !== folded.lpShares) transferDetectedSlot = contextSlot;
     else if (onchainShares === 0n) transferDetectedSlot = null;
+  } else if (opts.forkRepair && onchain !== null && BigInt(onchain) === folded.lpShares) {
+    // An event dropped by a fork was just removed (DroppedTxReconciler). The mismatch it caused was flagged as an LP
+    // transfer; if the last on-chain reading agrees with the repaired fold, that flag was the phantom event, not a
+    // transfer. A real transfer still disagrees here and keeps its flag.
+    transferDetectedSlot = null;
   }
 
   const marketSlab =

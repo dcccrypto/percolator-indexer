@@ -342,6 +342,10 @@ export class StatsCollector {
   private _running = false;
   private _collecting = false;
   private _syncingVolume = false;
+  /** Markets whose trades were removed (fork drop): written as 0 when the rollup has no row for them. */
+  private readonly _volumeZeroIfAbsent = new Set<string>();
+  /** A resync was requested while a rollup was in flight (it may have read the trades before the removal). */
+  private _volumeRerun = false;
   /** #223: one shared in-flight registration pass (the sweep and the discovery hook never overlap). */
   private syncInFlight: Promise<DbMarketRow[] | null> | null = null;
   /**
@@ -555,9 +559,25 @@ export class StatsCollector {
    * SQL function filters them (see the migration header for why the old JS path
    * counted them as zero-volume trades instead of skipping them).
    */
+  /**
+   * Re-run the volume rollup now, after trades of `slabs` were removed (DroppedTxReconciler). A market left with no trade
+   * in the window gets 0 instead of keeping the removed fill. If a rollup is in flight it runs again once that one ends.
+   */
+  async resyncVolume(slabs: readonly string[]): Promise<void> {
+    for (const s of slabs) this._volumeZeroIfAbsent.add(s);
+    if (this._syncingVolume) {
+      this._volumeRerun = true;
+      return;
+    }
+    await this.syncVolumeForAllDBMarkets();
+  }
+
   private async syncVolumeForAllDBMarkets(): Promise<void> {
     if (this._syncingVolume || !this._running) return;
     this._syncingVolume = true;
+    const zeroIfAbsent = [...this._volumeZeroIfAbsent];
+    this._volumeZeroIfAbsent.clear();
+    let wrote = false;
 
     try {
       // Server-side rollup: one row per market with trades in the window.
@@ -576,7 +596,10 @@ export class StatsCollector {
         volume_24h: string | number;
         trade_count_24h: string | number;
       }>;
-      if (agg.length === 0) return;
+      if (agg.length === 0 && zeroIfAbsent.length === 0) {
+        wrote = true;
+        return;
+      }
 
       // volume_24h is NUMERIC in Postgres (arbitrary precision) but MarketStatsRow
       // types it as number. postgres-js/PostgREST hands NUMERIC back as a string to
@@ -600,6 +623,11 @@ export class StatsCollector {
           updated_at: new Date().toISOString(),
         };
       });
+      const inRollup = new Set(agg.map((r) => r.slab_address));
+      for (const slab of zeroIfAbsent) {
+        if (inRollup.has(slab)) continue;
+        payload.push({ slab_address: slab, volume_24h: 0, trade_count_24h: 0, network: getNetwork(), updated_at: new Date().toISOString() });
+      }
 
       // Single bulk upsert. Columns absent from the payload (last_price,
       // volume_24h_usd) are left untouched on conflict.
@@ -618,11 +646,18 @@ export class StatsCollector {
         return;
       }
 
+      wrote = true;
       logger.info("Volume sync complete", { marketsUpdated: payload.length });
     } catch (err) {
       logger.warn("syncVolumeForAllDBMarkets failed", { error: err instanceof Error ? err.message : err });
     } finally {
+      // A failed pass keeps the zero requests for the next one.
+      if (!wrote) for (const s of zeroIfAbsent) this._volumeZeroIfAbsent.add(s);
       this._syncingVolume = false;
+      if (this._volumeRerun) {
+        this._volumeRerun = false;
+        void this.syncVolumeForAllDBMarkets();
+      }
     }
   }
 
