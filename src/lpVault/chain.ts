@@ -72,6 +72,9 @@ export function deriveRedemptionPda(programId: string, registry: string, user: s
   )[0];
 }
 
+/** Max paired reads per getClaim before settling for the earlier slot. */
+const CLAIM_READ_ATTEMPTS = 3;
+
 export class RpcLpVaultChain implements LpVaultChain {
   constructor(private readonly conn: Connection) {}
 
@@ -109,10 +112,21 @@ export class RpcLpVaultChain implements LpVaultChain {
 
   async getClaim(user: string, lpMint: string, registry: string, programId: string): Promise<OnchainClaim> {
     const owner = new PublicKey(user);
-    const [held, redemption] = await Promise.all([
-      this.conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(lpMint) }, "confirmed"),
-      this.conn.getAccountInfoAndContext(deriveRedemptionPda(programId, registry, user), "confirmed"),
-    ]);
+    const mint = new PublicKey(lpMint);
+    const pda = deriveRedemptionPda(programId, registry, user);
+    // The two reads can land on different slots (load-balanced RPC). A redeem request moves shares
+    // held -> escrow, so a skewed pair can double count or drop them. Re-read until both agree on a
+    // slot; if they never do, stamp the EARLIER slot so the stamp never claims fresher state than
+    // the stalest read.
+    let held!: Awaited<ReturnType<Connection["getParsedTokenAccountsByOwner"]>>;
+    let redemption!: Awaited<ReturnType<Connection["getAccountInfoAndContext"]>>;
+    for (let attempt = 0; attempt < CLAIM_READ_ATTEMPTS; attempt++) {
+      [held, redemption] = await Promise.all([
+        this.conn.getParsedTokenAccountsByOwner(owner, { mint }, "confirmed"),
+        this.conn.getAccountInfoAndContext(pda, "confirmed"),
+      ]);
+      if (held.context.slot === redemption.context.slot) break;
+    }
     let heldShares = 0n;
     for (const { account } of held.value) {
       const parsed = account.data as { parsed?: { info?: { tokenAmount?: { amount?: string } } } };
@@ -122,8 +136,7 @@ export class RpcLpVaultChain implements LpVaultChain {
     return {
       heldShares,
       pendingShares: parseRedemptionShares(redemption.value?.data ?? null, registry, user),
-      // The later of the two reads: the guard in the indexer compares against it.
-      contextSlot: Math.max(held.context.slot, redemption.context.slot),
+      contextSlot: Math.min(held.context.slot, redemption.context.slot),
     };
   }
 }

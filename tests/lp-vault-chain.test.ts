@@ -199,7 +199,7 @@ describe("RpcLpVaultChain.getClaim", () => {
     return { getParsedTokenAccountsByOwner, getAccountInfoAndContext };
   }
 
-  it("sums every token account, adds the live redemption, and uses the later slot", async () => {
+  it("sums every token account, adds the live redemption, and stamps the earlier slot", async () => {
     const c = conn(
       [tokenAcct("1000"), tokenAcct((1n << 70n).toString())],
       { data: redemptionData(REGISTRY, USER, 250n) },
@@ -209,14 +209,31 @@ describe("RpcLpVaultChain.getClaim", () => {
 
     const claim = await new RpcLpVaultChain(asConn(c)).getClaim(USER, MINT, REGISTRY, PROGRAM);
 
-    expect(claim).toEqual({ heldShares: 1000n + (1n << 70n), pendingShares: 250n, contextSlot: 105 });
+    expect(claim).toEqual({ heldShares: 1000n + (1n << 70n), pendingShares: 250n, contextSlot: 100 });
     expect(c.getParsedTokenAccountsByOwner).toHaveBeenCalledWith(new PublicKey(USER), { mint: new PublicKey(MINT) }, "confirmed");
     expect(c.getAccountInfoAndContext).toHaveBeenCalledWith(deriveRedemptionPda(PROGRAM, REGISTRY, USER), "confirmed");
   });
 
-  it("takes the held-read slot when it is the later one", async () => {
+  it("takes the redemption-read slot when it is the earlier one", async () => {
     const claim = await new RpcLpVaultChain(asConn(conn([], null, 300, 200))).getClaim(USER, MINT, REGISTRY, PROGRAM);
-    expect(claim).toEqual({ heldShares: 0n, pendingShares: 0n, contextSlot: 300 });
+    expect(claim).toEqual({ heldShares: 0n, pendingShares: 0n, contextSlot: 200 });
+  });
+
+  it("re-reads when the two reads land on different slots, and returns the same-slot pair", async () => {
+    const heldSlots = [100, 110];
+    const redSlots = [105, 110];
+    const getParsedTokenAccountsByOwner = vi.fn(async () => ({ context: { slot: heldSlots.shift()! }, value: [] }));
+    const getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: redSlots.shift()! }, value: null }));
+    const claim = await new RpcLpVaultChain(asConn({ getParsedTokenAccountsByOwner, getAccountInfoAndContext })).getClaim(USER, MINT, REGISTRY, PROGRAM);
+    expect(claim.contextSlot).toBe(110);
+    expect(getParsedTokenAccountsByOwner).toHaveBeenCalledTimes(2);
+  });
+
+  it("never stamps a skewed pair with the later slot: falls back to the minimum after retries", async () => {
+    const c = conn([], null, 100, 109);
+    const claim = await new RpcLpVaultChain(asConn(c)).getClaim(USER, MINT, REGISTRY, PROGRAM);
+    expect(claim.contextSlot).toBe(100);
+    expect(c.getParsedTokenAccountsByOwner).toHaveBeenCalledTimes(3);
   });
 
   it("ignores token accounts without a string amount", async () => {
