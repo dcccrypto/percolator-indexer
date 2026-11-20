@@ -32,50 +32,9 @@ import {
   IX_TAG,
   type AccountSpec,
 } from "@percolatorct/sdk";
-import { decodeBase58 as decodeBase58Shared } from "@percolatorct/shared";
+import { decodeBase58Fast as decodeBase58 } from "./fastBase58.js";
 import { unwrapEvictAndTradeIx } from "./evictTrade.js";
 import { decodeV18SingleFill } from "./percolatorTxParser.js";
-
-const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-const B58_INDEX = new Int8Array(128).fill(-1);
-for (let i = 0; i < B58_ALPHABET.length; i++) B58_INDEX[B58_ALPHABET.charCodeAt(i)] = i;
-
-/**
- * Base58 decode with output identical to `decodeBase58` from @percolatorct/shared ^1.1.0 (pinned by the differential and
- * op-count tests; re-check if shared changes) (null on a character outside the
- * alphabet; leading '1's are leading zero bytes). The shared one grows a plain array with `unshift` and does an
- * `indexOf` per character; this one fills a preallocated Uint8Array from the end. Non-string input is delegated to the
- * shared function so odd inputs behave exactly as before.
- */
-function decodeBase58(str: string): Uint8Array | null {
-  if (typeof str !== "string") return decodeBase58Shared(str);
-  const n = str.length;
-  let zeros = 0;
-  while (zeros < n && str.charCodeAt(zeros) === 49) zeros++;
-  const buf = new Uint8Array(Math.ceil(((n - zeros) * 733) / 1000) + 1); // log(58)/log(256) < 0.7322
-  const last = buf.length - 1;
-  let used = 0;
-  for (let i = zeros; i < n; i++) {
-    const c = str.charCodeAt(i);
-    const d = c < 128 ? B58_INDEX[c] : -1;
-    if (d < 0) return null;
-    let carry = d;
-    let j = last;
-    for (let k = 0; k < used; k++, j--) {
-      carry += buf[j] * 58;
-      buf[j] = carry & 0xff;
-      carry >>= 8;
-    }
-    while (carry > 0) {
-      buf[j--] = carry & 0xff;
-      carry >>= 8;
-      used++;
-    }
-  }
-  const out = new Uint8Array(zeros + used);
-  out.set(buf.subarray(buf.length - used), zeros);
-  return out;
-}
 
 export type V22EventKind =
   | "bond_deposit"
