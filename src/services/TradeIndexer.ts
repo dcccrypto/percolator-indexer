@@ -544,7 +544,7 @@ export class TradeIndexerPolling {
             logger.warn("getParsedTransactions returned null for a confirmed signature; holding the cursor, retried next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8), holds });
             break windowLoop;
           }
-          if (holds === MAX_NULL_TX_HOLDS + 1) { // recorded once; while another signature holds the cursor it stays passed
+          if (holds === MAX_NULL_TX_HOLDS + 1) { // recorded once, then passed (not re-held) until it reads non-null or the slab commits
             slabHolds.set(sig, holds);
             logger.error("ALERT: confirmed signature still reads as null after MAX_NULL_TX_HOLDS polls; SKIPPING it, needs manual backfill", { signature: sig, slabAddress });
             await recordSkippedSignatures([{ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `getParsedTransactions returned null ${MAX_NULL_TX_HOLDS}+ polls` }]);
