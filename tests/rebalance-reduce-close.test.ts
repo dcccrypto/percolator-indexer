@@ -413,11 +413,19 @@ describe('a close-only (tag 44) close reaches the trades table', () => {
       h.rows = [longOpen('20')];
       tableBacked();
       h.txs.set(SIG, parsedTxOf([ixOf(closeData())]));
-      // A is in the window but the RPC returns null for it.
+      // A is in the window but the RPC returns null for it: the cursor is held for MAX_NULL_TX_HOLDS (5) polls with
+      // nothing written (A may still arrive); after that A is recorded and the close, now unresolvable, too.
       h.sigs = [{ signature: SIG, err: null }, { signature: SIG_A, err: null }];
-      await (new TradeIndexerPolling() as any).indexTradesForSlab(SLAB, 100);
+      const indexer = new TradeIndexerPolling() as any;
+      for (let poll = 0; poll < 5; poll++) await indexer.indexTradesForSlab(SLAB, 100);
       expect(written()).toHaveLength(0);
-      expect(h.skipped).toEqual([expect.objectContaining({ signature: SIG, error: expect.stringContaining('earlier transaction') })]);
+      expect(h.skipped).toHaveLength(0);
+      await indexer.indexTradesForSlab(SLAB, 100);
+      expect(written()).toHaveLength(0);
+      expect(h.skipped).toEqual([
+        expect.objectContaining({ signature: SIG_A, error: expect.stringContaining('returned null') }),
+        expect.objectContaining({ signature: SIG, error: expect.stringContaining('earlier transaction') }),
+      ]);
     });
 
     it.each([['delivered oldest-first', false], ['delivered newest-first (sorted by slot)', true]])('F1 webhook: %s, the close sees the earlier transaction of the same delivery', async (_n, reversed) => {

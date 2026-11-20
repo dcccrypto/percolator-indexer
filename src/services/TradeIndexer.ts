@@ -64,6 +64,13 @@ function markFailed(pass: PassState, sig: string | null | undefined, opts: { kee
 const FLUSH_AT = 200;
 /** Polls a signature may hold the cursor for an unreadable market account before it is recorded for re-index. */
 const MAX_LOT_READ_HOLDS = 5;
+/**
+ * Polls a confirmed signature may hold the cursor while getParsedTransactions answers null for it (the node that
+ * answered has not got it yet, e.g. a lagging node behind a load balancer) before it is recorded for re-index.
+ * Same rule as LpVaultIndexer.syncRegistry (`getTransaction returned null` throws, cursor held), but bounded, so a
+ * signature that never resolves cannot stall the slab forever.
+ */
+const MAX_NULL_TX_HOLDS = 5;
 
 /**
  * A failed DB write holds the slab's cursor so the same signatures are retried every poll. It never gives up on
@@ -104,11 +111,14 @@ const TRADE_TAGS = new Set<number>([
 
 /**
  * getSignaturesForAddress for (until, newest], newest-first. Without `until` it is one call of `limit` (the first
- * pass is a bounded look-back, not a window). With `until`, a full page means older signatures may remain, so
- * it pages on with `before` = the page's oldest signature until a short page (the cursor was reached) or
- * MAX_SIGNATURE_PAGES. Each page has its own retries; a page that still fails throws, and the caller then returns
- * with the cursor untouched, so the next poll re-reads the same window. Only the page bound (and a full page of
- * repeats from a misbehaving RPC) cut the window short; both are logged.
+ * pass is a bounded look-back, not a window). With `until`, it pages on with `before` = the page's oldest signature
+ * until a page brings nothing new (empty: the cursor was reached) or MAX_SIGNATURE_PAGES. A SHORT page does not end
+ * the walk: a node behind a load balancer can cut a page short while older signatures above the cursor remain, and
+ * stopping there committed the cursor past them for good (RPC fault replay, "shortpage": 40 of 247 fills lost). So
+ * each short page costs one extra `before` call, which answers empty when the cursor really was reached.
+ * Each page has its own retries; a page that still fails throws, and the caller then returns with the cursor
+ * untouched, so the next poll re-reads the same window. Only the page bound (and a full page of repeats from a
+ * misbehaving RPC) cut the window short; both are logged.
  */
 async function fetchSignatureWindow(
   connection: Connection,
@@ -124,9 +134,9 @@ async function fetchSignatureWindow(
   const out = await page();
   if (!until) return out;
   const seen = new Set(out.map((s) => s.signature));
-  let raw = out; // last page as returned (a full one means there may be more); `fresh` drops any repeat
+  let raw = out; // last page as returned; `fresh` drops any repeat
   let fresh = out;
-  for (let pages = 1; raw.length >= limit && fresh.length > 0; pages++) {
+  for (let pages = 1; fresh.length > 0; pages++) {
     if (pages >= MAX_SIGNATURE_PAGES) {
       // Past the bound the window is processed as far as it was read and the cursor still moves to the newest,
       // which skips the older remainder (the pre-pagination behaviour, at MAX_SIGNATURE_PAGES times the volume).
@@ -222,6 +232,12 @@ export class TradeIndexerPolling {
   private writeHolds = new Map<string, WriteHold>();
   /** Per-slab full signatures whose write failed and are still held; re-added to the next window if it no longer reaches them. */
   private heldSigs = new Map<string, Set<string>>();
+  /**
+   * Per slab: polls each signature has held that slab's cursor because its transaction read as null (MAX_NULL_TX_HOLDS).
+   * Per slab, not per signature: one crank tx is in several slabs' windows, and each slab's hold counts on its own.
+   * A slab's entry goes when its cursor commits (every held signature is then behind it).
+   */
+  private nullTxHolds = new Map<string, Map<string, number>>();
   /**
    * Per-slab `until` boundary for a slab with no cursor yet whose window was held: the oldest signature of the first
    * held window. Later retries page (anchor, newest], so signatures that arrive during a hold are not cut off by the
@@ -509,10 +525,34 @@ export class TradeIndexerPolling {
         }
       }
 
+      const skippedNow = new Set(fetched.skipped.map((sk) => sk.signature));
       for (let j = 0; j < txs.length; j++) {
         const tx = txs[j];
-        if (!tx) { pass.incomplete = true; continue; }
         const sig = batch[j];
+        if (!tx) {
+          pass.incomplete = true;
+          if (skippedNow.has(sig)) continue; // unreadable (poison), already recorded above
+          // Listed as confirmed (err null) but read as null: the answering node does not have it yet. Moving the cursor
+          // past it lost it for good (RPC fault replay, "nulltx": 74 of 247 fills), so hold the cursor and stop here
+          // (oldest-first: nothing after it may be processed ahead of it), up to MAX_NULL_TX_HOLDS polls.
+          const slabHolds = this.nullTxHolds.get(slabAddress) ?? new Map<string, number>();
+          const holds = (slabHolds.get(sig) ?? 0) + 1;
+          if (holds <= MAX_NULL_TX_HOLDS) {
+            slabHolds.set(sig, holds);
+            this.nullTxHolds.set(slabAddress, slabHolds);
+            holdCursor = true;
+            logger.warn("getParsedTransactions returned null for a confirmed signature; holding the cursor, retried next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8), holds });
+            break windowLoop;
+          }
+          if (holds === MAX_NULL_TX_HOLDS + 1) { // recorded once, then passed (not re-held) until it reads non-null or the slab commits
+            slabHolds.set(sig, holds);
+            logger.error("ALERT: confirmed signature still reads as null after MAX_NULL_TX_HOLDS polls; SKIPPING it, needs manual backfill", { signature: sig, slabAddress });
+            await recordSkippedSignatures([{ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `getParsedTransactions returned null ${MAX_NULL_TX_HOLDS}+ polls` }]);
+            captureException(new Error(`confirmed signature ${sig} read as null ${MAX_NULL_TX_HOLDS}+ polls; skipped (slab ${slabAddress})`), { tags: { context: "trade-indexer-null-tx" }, extra: { slabAddress, signature: sig } });
+          }
+          continue;
+        }
+        this.nullTxHolds.get(slabAddress)?.delete(sig); // the count is of consecutive null polls
 
         try {
           await this.processTransaction(tx, sig, slabAddress, programIds, pass); // rows written are counted in pass.newCount
@@ -552,6 +592,7 @@ export class TradeIndexerPolling {
     }
     if (!batchFailed && !holdCursor) {
       await this.commitCursor(slabAddress, signatures[0].signature);
+      this.nullTxHolds.delete(slabAddress);
     } else {
       // Held without a saved cursor: pin the window's oldest signature so the retry pages from it (not just the newest page).
       if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) {
