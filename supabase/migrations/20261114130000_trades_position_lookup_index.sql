@@ -1,13 +1,26 @@
--- NOT APPLIED: review and run by hand against a non-production database first.
--- fetchTraderPositionEvidence (src/db/traderNetPosition.ts) reads every fill of one
--- (trader, slab, asset, network), ordered by id, a page of 1000 at a time.
--- The existing indexes lead with (trader, created_at), so Postgres reads all of the
--- trader's rows across every market and filters them. This index matches the equality
--- filters and ends in id, so the lookup reads only that position's rows (the planner may
--- still sort the small result, or walk the index in id order for a large one).
+-- Transaction-safe stand-in for db/manual/20261114130000_trades_position_lookup_index.sql.
 --
--- CONCURRENTLY cannot run inside a transaction block: apply it by hand as a single statement,
--- not through a transactional runner. If a build fails it leaves an INVALID index; check
--- pg_index.indisvalid and DROP INDEX CONCURRENTLY idx_trades_position_lookup before retrying.
-CREATE INDEX CONCURRENTLY idx_trades_position_lookup
-  ON trades (trader, slab_address, asset_index, network, id);
+-- That file builds idx_trades_position_lookup with CREATE INDEX CONCURRENTLY, which fails inside a
+-- transaction block (25001). The Supabase CLI (db push / db reset) and psql --single-transaction run
+-- each migration file in one transaction, so the CONCURRENTLY build cannot live in this directory.
+-- This file keeps the version in the migration history and does only what is safe in a transaction:
+--   * the index, or the cover index from 20261115120000 that supersedes it, already exists: nothing
+--     (a re-apply does not rebuild an index the next file drops);
+--   * trades is empty (a fresh or reset database): build it plainly; there are no rows to lock out;
+--   * trades has rows (a hosted database): do NOT build it here, since a non-concurrent build blocks
+--     trades writes for the whole build. Raise a WARNING instead. Building it by hand is not needed:
+--     db/manual/20261115120000 builds the cover index that supersedes it (and drops this one).
+--     The indexer works without either (same results, slower reads).
+-- Key: see the db/manual file (fetchTraderPositionEvidence in src/db/traderNetPosition.ts).
+DO $$
+BEGIN
+  IF to_regclass('public.idx_trades_position_lookup') IS NOT NULL
+     OR to_regclass('public.idx_trades_position_lookup_cover') IS NOT NULL THEN
+    RETURN;
+  ELSIF EXISTS (SELECT 1 FROM public.trades LIMIT 1) THEN
+    RAISE WARNING 'idx_trades_position_lookup not built: trades has rows. It is superseded: build idx_trades_position_lookup_cover by hand with db/manual/20261115120000_trades_covering_read_indexes.sql (CONCURRENTLY, outside a transaction) instead.';
+  ELSE
+    CREATE INDEX IF NOT EXISTS idx_trades_position_lookup
+      ON public.trades (trader, slab_address, asset_index, network, id);
+  END IF;
+END $$;

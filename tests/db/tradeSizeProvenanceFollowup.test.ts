@@ -35,7 +35,7 @@ function anonTradeColumns(sql: string): Set<string> {
 describe("#228 follow-up: anon can read size_provenance (Codex P2)", () => {
   it("a migration grants anon SELECT on trades.size_provenance, ordered after the column is added", () => {
     const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith(".sql")).sort();
-    const addIdx = files.findIndex((f) => /ADD COLUMN\s+size_provenance/i.test(readFileSync(join(MIGRATIONS, f), "utf8")));
+    const addIdx = files.findIndex((f) => /ADD COLUMN\s+(?:IF NOT EXISTS\s+)?size_provenance/i.test(readFileSync(join(MIGRATIONS, f), "utf8")));
     const grantIdx = files.findIndex((f) => anonTradeColumns(readFileSync(join(MIGRATIONS, f), "utf8")).has("size_provenance"));
     expect(addIdx).toBeGreaterThanOrEqual(0);
     expect(grantIdx).toBeGreaterThan(addIdx);
