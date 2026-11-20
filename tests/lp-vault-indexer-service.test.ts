@@ -384,4 +384,48 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
     expect(logs.info).toHaveBeenCalledWith("LpVaultIndexer started", expect.objectContaining({ intervalMs: 30_000 }));
     ix.stop();
   });
+
+  describe("wall-clock steps (tick clock)", () => {
+    const T0 = new Date("2026-01-01T00:00:00Z").getTime();
+    afterEach(() => vi.useRealTimers());
+    const setup = async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(T0);
+      const chain = new Chain();
+      chain.add("s1", "alice");
+      const { ix } = mk(chain);
+      const rec = vi.spyOn(ix, "reconcileOpenPositions");
+      await ix.tick();
+      expect(chain.listCalls).toBe(1);
+      expect(rec).toHaveBeenCalledTimes(1);
+      return { chain, ix, rec };
+    };
+
+    it("runs discovery and reconcile after the clock steps back 1h", async () => {
+      const { chain, ix, rec } = await setup();
+      vi.setSystemTime(T0 - 3_600_000);
+      await ix.tick();
+      expect(chain.listCalls).toBe(2);
+      expect(rec).toHaveBeenCalledTimes(2);
+    });
+
+    it("recovers from a NaN or future lastDiscovery/lastFullReconcile", async () => {
+      for (const bad of [Number.NaN, T0 + 10 * 3_600_000]) {
+        const { chain, ix, rec } = await setup();
+        (ix as unknown as Record<string, number>).lastDiscovery = bad;
+        (ix as unknown as Record<string, number>).lastFullReconcile = bad;
+        await ix.tick();
+        expect(chain.listCalls).toBe(2);
+        expect(rec).toHaveBeenCalledTimes(2);
+      }
+    });
+
+    it("does not re-run inside the interval when the clock is normal", async () => {
+      const { chain, ix, rec } = await setup();
+      vi.setSystemTime(T0 + 1_000);
+      await ix.tick();
+      expect(chain.listCalls).toBe(1);
+      expect(rec).toHaveBeenCalledTimes(1);
+    });
+  });
 });
