@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS trades (
     )
   ),
   network        TEXT        NOT NULL DEFAULT 'devnet' CHECK (network IN ('devnet','mainnet')),
-  created_at     TIMESTAMPTZ DEFAULT NOW()
+  created_at     TIMESTAMPTZ DEFAULT NOW(),
+  price_lot_exp  SMALLINT                              -- price is per 10^price_lot_exp tokens (0 = per token); NULL = unknown (legacy)
 );
 -- H2/H3: multi-fill batch legs share a tx_signature; dedupe per (sig, asset, leg).
 -- Deliberately NOT partial: a partial unique index cannot serve as an ON CONFLICT

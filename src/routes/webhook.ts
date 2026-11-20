@@ -654,6 +654,8 @@ interface TradeData {
   leg_index: number;     // H2/H3 — reassigned tx-globally before return
   is_liquidation: boolean;
   size_provenance?: TradeSizeProvenance | null;
+  /** Unit of `price` (per 10^price_lot_exp tokens): 0 for every priced row here (perTokenPrice), NULL for a marker. */
+  price_lot_exp?: number | null;
   /** Holds a tx-wide leg number for a tag 44 that could not be written; dropped after renumbering. */
   placeholder?: boolean;
   /** This entry is a RebalanceReduce (tag 44), written or held; its leg number is not a TradeCpi fill's. */
@@ -1035,6 +1037,9 @@ async function extractTradesFromEnhancedTx(
   let markerSeq = 0;
   for (const t of trades) {
     t.leg_index = t.is_liquidation ? 1000 + markerSeq++ : fillSeq++;
+    // Every price above came out of lotScale.perTokenPrice (TradeCpi priceE6, effective_price, mark EWMA), so the
+    // row says so: /api/candles then trusts it instead of guessing the scale from today's mark.
+    t.price_lot_exp = t.price != null ? 0 : null; // 0 = per token (insertTradeRow PRICE_LOT_EXP_PER_TOKEN)
   }
 
   // Placeholders (tag 44s that could not be written) only held their number.
