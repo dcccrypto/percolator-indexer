@@ -44,7 +44,7 @@ vi.mock("@percolatorct/shared", () => ({
   }),
 }));
 
-import { loadTradeCursors, saveTradeCursor, resetTradeCursorWarnings } from "../../src/db/tradeCursor.js";
+import { loadTradeCursors, saveTradeCursor, resetTradeCursorWarnings, TRADE_CURSOR_WARN_INTERVAL_MS } from "../../src/db/tradeCursor.js";
 
 beforeEach(() => {
   resetTradeCursorWarnings();
@@ -137,5 +137,32 @@ describe("saveTradeCursor", () => {
     await loadTradeCursors();
     await saveTradeCursor("a", "b");
     expect(state.errorLogs).toHaveLength(2);
+  });
+});
+
+describe("saveTradeCursor warning visibility", () => {
+  it("logs a new failure after the table recovered (one transient error must not mute the process)", async () => {
+    state.upsertResult = { error: { message: "boom1" } };
+    await saveTradeCursor("slabA", "s1");
+    state.upsertResult = { error: null };
+    await saveTradeCursor("slabA", "s2");
+    state.upsertResult = { error: { message: "boom2" } };
+    await saveTradeCursor("slabA", "s3");
+    expect(state.errorLogs).toHaveLength(2);
+  });
+
+  it("re-logs a save that keeps failing after the interval, not just once per process", async () => {
+    vi.useFakeTimers();
+    try {
+      state.upsertResult = { error: { message: "down" } };
+      await saveTradeCursor("slabA", "s1");
+      await saveTradeCursor("slabA", "s2");
+      expect(state.errorLogs).toHaveLength(1);
+      vi.advanceTimersByTime(TRADE_CURSOR_WARN_INTERVAL_MS + 1);
+      await saveTradeCursor("slabA", "s3");
+      expect(state.errorLogs).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
