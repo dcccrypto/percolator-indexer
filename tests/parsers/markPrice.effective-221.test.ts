@@ -120,8 +120,8 @@ describe("readMarkPriceE6 with an assetIndex (#221)", () => {
     expect(await readMarkPriceE6(conn, SLAB, 1)).toBe(ASSET1_E6);
   });
 
-  it("falls back to the mark when the asset's slot can't be read", async () => {
-    expect(await readMarkPriceE6(conn, SLAB, SLOTS)).toBe(EWMA_E6);
+  it("an unreadable slot of asset N>0 returns null, not the market-wide mark", async () => {
+    expect(await readMarkPriceE6(conn, SLAB, SLOTS)).toBeNull();
   });
 
   it("keeps the original mark-only behaviour when no assetIndex is given", async () => {
