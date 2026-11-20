@@ -30,7 +30,9 @@ const MAX_LOGO_URL_LEN = 512;
  */
 export function sanitizeText(value: unknown, maxLen: number): string | null {
   if (typeof value !== "string") return null;
-  const cleaned = value.replace(/[\x00-\x1f\x7f<>]/g, "").trim().slice(0, maxLen);
+  const trimmed = value.replace(/[\x00-\x1f\x7f<>]/g, "").trim();
+  // Slice by code point so a cut never leaves half a surrogate pair.
+  const cleaned = Array.from(trimmed).slice(0, maxLen).join("");
   return cleaned.length > 0 ? cleaned : null;
 }
 
@@ -119,7 +121,7 @@ export async function fetchDasTokenMetadata(
     return {
       symbol: sanitizeText(metadata?.symbol ?? tokenInfo?.symbol, MAX_SYMBOL_LEN),
       name: sanitizeText(metadata?.name, MAX_NAME_LEN),
-      decimals: typeof decimalsRaw === "number" && Number.isFinite(decimalsRaw) ? decimalsRaw : null,
+      decimals: Number.isInteger(decimalsRaw) && decimalsRaw >= 0 && decimalsRaw <= 255 ? decimalsRaw : null,
       logoUrl: extractLogoUrl(content),
     };
   } catch (err) {
