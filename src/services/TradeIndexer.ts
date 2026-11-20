@@ -82,7 +82,13 @@ const MAX_NULL_TX_HOLDS = 5;
 export const MAX_WRITE_HOLDS = parseMaxWriteHolds(process.env.INDEXER_MAX_WRITE_HOLDS, (m, c) => logger.warn(m, c));
 const WRITE_OUTAGE_ALERT_MS = parseWriteOutageAlertMs(process.env.INDEXER_WRITE_OUTAGE_ALERT_MS, (m, c) => logger.warn(m, c));
 const WRITE_OUTAGE_REALERT_MS = parseWriteOutageRealertMs(process.env.INDEXER_WRITE_OUTAGE_REALERT_MS, (m, c) => logger.warn(m, c));
-interface WriteHold { since: number; lastAlertAt: number; sigFails: Map<string, number> }
+interface WriteHold {
+  since: number;
+  lastAlertAt: number;
+  sigFails: Map<string, number>;
+  /** Judged poison (skip) but its skipped_signatures record has not landed: held, and retried as poison next pass. */
+  unrecorded?: Set<string>;
+}
 
 /** The matcher-context read failed in transport; this signature is retried once before falling back. */
 
@@ -631,15 +637,31 @@ export class TradeIndexerPolling {
     hold.sigFails = sigFails;
     if (dbUp) hold.since = now; // an outage is measured from its own start, not from earlier poison polls
     this.writeHolds.set(slabAddress, hold);
-    const poison = dbUp ? failed.filter((sig) => (sigFails.get(sig) ?? 0) > MAX_WRITE_HOLDS) : [];
+    // Already judged poison but its record did not land: still poison (the verdict was made with the database up), so the
+    // record write is retried this pass even when no other write succeeded.
+    const poison = failed.filter((sig) => (dbUp && (sigFails.get(sig) ?? 0) > MAX_WRITE_HOLDS) || hold.unrecorded?.has(sig));
     const retry = failed.filter((sig) => !poison.includes(sig));
     const slab = slabAddress.slice(0, 8);
     if (retry.length === 0) {
+      const names = poison.slice(0, 20);
+      // Skip only once the skip is on record. A failed record write (DB fault on skipped_signatures, no file sink) used to
+      // pass the cursor anyway, losing the row with no record (DB fault replay L2, 4 of 4 runs): hold instead, retry next pass.
+      const recorded = await recordSkippedSignatures(poison.map((sig) => ({ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `fill write failed ${MAX_WRITE_HOLDS}+ polls (poison row)` })));
+      if (recorded === false) {
+        hold.unrecorded = new Set(poison);
+        this.heldSigs.set(slabAddress, new Set(failed));
+        // Rate-limited like the outage alert: a record that never lands (table missing, long outage) holds this slab until fixed.
+        const sinceAlert = now - hold.lastAlertAt;
+        if (hold.lastAlertAt === 0 || sinceAlert < 0 || sinceAlert >= WRITE_OUTAGE_REALERT_MS) {
+          hold.lastAlertAt = now;
+          logger.error("ALERT: poison row's skipped_signatures record did not land; cursor HELD (nothing skipped) until it does", { slabAddress: slab, failedSigs: names });
+          captureException(new Error(`indexer poison row record failed to write; cursor held for signature(s) ${names.join(",")} (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-poison-unrecorded" }, extra: { slabAddress, failedSigs: names } });
+        }
+        return true;
+      }
       this.writeHolds.delete(slabAddress);
       this.heldSigs.delete(slabAddress);
-      const names = poison.slice(0, 20);
       logger.error("ALERT: signature kept failing to write while other writes succeed (poison row); SKIPPING it, needs manual backfill", { slabAddress: slab, failedSigs: names });
-      await recordSkippedSignatures(poison.map((sig) => ({ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `fill write failed ${MAX_WRITE_HOLDS}+ polls (poison row)` })));
       captureException(new Error(`indexer write failed ${MAX_WRITE_HOLDS}+ polls for signature(s) ${names.join(",")}; skipped (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-poison" }, extra: { slabAddress, failedSigs: names } });
       return false;
     }

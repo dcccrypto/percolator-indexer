@@ -99,6 +99,33 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(vi.mocked(recordSkippedSignatures).mock.calls.some(([r]) => r.some((x: any) => x.signature === sigs[1]))).toBe(true);
   });
 
+  it("poison row whose skipped_signatures record fails to land: the cursor stays held and the record is retried until it does (DB fault replay L2)", async () => {
+    const { sigs, idx } = setup();
+    vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {
+      if (key(r) === sigs[1]) throw new Error("poison row");
+      return put(r); }) as never);
+    const all = [...sigs];
+    const addFresh = (n: number) => { const x = sigOf(20 + n); txBySig.set(x, mkTx(20 + n)); all.push(x); sigLists.set(MARKET, [...all].reverse().map((signature) => ({ signature, err: null }))); return x; };
+    for (let p = 1; p <= MAX_WRITE_HOLDS; p++) { await idx.indexTradesForSlab(MARKET, 100); addFresh(p); }
+    const poisonRecords = () => vi.mocked(recordSkippedSignatures).mock.calls.filter(([r]) => r.some((x: any) => x.signature === sigs[1])).length;
+    // the record write fails twice (skipped_signatures faulted); the second retry pass writes nothing new (quiet slab)
+    vi.mocked(recordSkippedSignatures).mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(poisonRecords()).toBe(1);
+    expect(idx.lastSignature.get(MARKET)).not.toBe(all[all.length - 1]);
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(poisonRecords()).toBe(2);
+    expect(idx.lastSignature.get(MARKET)).not.toBe(all[all.length - 1]);
+    expect(captureSpy.mock.calls.some(([e]) => /skipped/.test(String(e.message)))).toBe(false); // no "skipped" claim before it is on record
+    expect(captureSpy.mock.calls.filter(([e]) => /record failed to write; cursor held/.test(String(e.message)))).toHaveLength(1); // alerted once, rate-limited
+    vi.mocked(recordSkippedSignatures).mockResolvedValue(true);
+    await idx.indexTradesForSlab(MARKET, 100);
+    expect(poisonRecords()).toBe(3);
+    expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
+    expect(captureSpy.mock.calls.filter(([e]) => /skipped/.test(String(e.message)))).toHaveLength(1);
+    expect(all.filter((x) => x !== sigs[1]).every((x) => store.has(x))).toBe(true);
+  });
+
   it("quiet slab: a lone failing row with no other write in a pass is held, never skipped (no data loss)", async () => {
     const { sigs, idx } = setup();
     vi.mocked(insertTradeRow).mockImplementation((async (r: any) => {

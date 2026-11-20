@@ -45,7 +45,7 @@ describe("skippedSignatures: error and fallback branches", () => {
 
   it("a throwing Sentry capture does not stop the table write", async () => {
     captureException.mockImplementation(() => { throw new Error("sentry down"); });
-    await expect(recordSkippedSignatures([mk(1)])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([mk(1)])).resolves.toBe(true);
     expect(upsert).toHaveBeenCalledTimes(1);
     expect(getSkippedSignatureCount()).toBe(1);
   });
@@ -72,7 +72,7 @@ describe("skippedSignatures: error and fallback branches", () => {
 
   it("a non-Error rejection is stringified in the no-file log", async () => {
     upsert.mockRejectedValue("plain string failure");
-    await expect(recordSkippedSignatures([mk(1)])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([mk(1)])).resolves.toBe(false);
     const ctx = logError.mock.calls.find((c) => String(c[0]).includes("no SKIPPED_SIGNATURES_FILE"))![1];
     expect(ctx.error).toBe("plain string failure");
   });
@@ -101,7 +101,7 @@ describe("skippedSignatures: error and fallback branches", () => {
     // a path inside a directory that does not exist: appendFileSync throws ENOENT
     process.env.SKIPPED_SIGNATURES_FILE = join(dir, "missing", "out.jsonl");
     upsert.mockResolvedValue({ error: { message: "no table" } });
-    await expect(recordSkippedSignatures([mk(1)])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([mk(1)])).resolves.toBe(false);
     const call = logError.mock.calls.find((c) => String(c[0]).includes("could not persist"))!;
     expect(call[1].error).toMatch(/ENOENT/);
     expect(call[1].signatures).toEqual(["sig-1"]);
