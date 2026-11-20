@@ -650,7 +650,13 @@ export class TradeIndexerPolling {
       if (recorded === false) {
         hold.unrecorded = new Set(poison);
         this.heldSigs.set(slabAddress, new Set(failed));
-        logger.error("poison row: its skipped_signatures record did not land; holding the cursor until it does", { slabAddress: slab, failedSigs: names });
+        // Rate-limited like the outage alert: a record that never lands (table missing, long outage) holds this slab until fixed.
+        const sinceAlert = now - hold.lastAlertAt;
+        if (hold.lastAlertAt === 0 || sinceAlert < 0 || sinceAlert >= WRITE_OUTAGE_REALERT_MS) {
+          hold.lastAlertAt = now;
+          logger.error("ALERT: poison row's skipped_signatures record did not land; cursor HELD (nothing skipped) until it does", { slabAddress: slab, failedSigs: names });
+          captureException(new Error(`indexer poison row record failed to write; cursor held for signature(s) ${names.join(",")} (slab ${slabAddress})`), { tags: { context: "indexer-fill-write-poison-unrecorded" }, extra: { slabAddress, failedSigs: names } });
+        }
         return true;
       }
       this.writeHolds.delete(slabAddress);

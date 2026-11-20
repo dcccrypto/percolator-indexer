@@ -117,6 +117,7 @@ describe("poll path: a failed fill write must not lose the fill", () => {
     expect(poisonRecords()).toBe(2);
     expect(idx.lastSignature.get(MARKET)).not.toBe(all[all.length - 1]);
     expect(captureSpy.mock.calls.some(([e]) => /skipped/.test(String(e.message)))).toBe(false); // no "skipped" claim before it is on record
+    expect(captureSpy.mock.calls.filter(([e]) => /record failed to write; cursor held/.test(String(e.message)))).toHaveLength(1); // alerted once, rate-limited
     vi.mocked(recordSkippedSignatures).mockResolvedValue(true);
     await idx.indexTradesForSlab(MARKET, 100);
     expect(poisonRecords()).toBe(3);
