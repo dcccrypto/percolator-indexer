@@ -582,9 +582,25 @@ export class StatsCollector {
       // types it as number. postgres-js/PostgREST hands NUMERIC back as a string to
       // avoid lossy parsing, so keep the string when it exceeds MAX_SAFE_INTEGER and
       // let Postgres store it exactly; only downcast when it's safely representable.
-      const payload = agg.map((r) => {
+      const payload: Array<{
+        slab_address: string;
+        volume_24h: number;
+        trade_count_24h: number;
+        network: string;
+        updated_at: string;
+      }> = [];
+      for (const r of agg) {
         const raw = String(r.volume_24h ?? "0");
         const asNum = Number(raw);
+        // volume_24h is SUM(ABS(size)) over a NUMERIC column, which Postgres allows to
+        // hold NaN/Infinity. Never publish those (or a negative): leave the row untouched.
+        if (Number.isNaN(asNum) || asNum < 0 || raw.toLowerCase().includes("inf")) {
+          logger.warn("syncVolumeForAllDBMarkets: invalid volume, skipping market", {
+            slabAddress: r.slab_address.slice(0, 8),
+            volume: raw,
+          });
+          continue;
+        }
         const safe = Number.isFinite(asNum) && Math.abs(asNum) <= Number.MAX_SAFE_INTEGER;
         if (!safe) {
           logger.warn("syncVolumeForAllDBMarkets: volume exceeds MAX_SAFE_INTEGER, storing as string", {
@@ -592,14 +608,16 @@ export class StatsCollector {
             volume: raw,
           });
         }
-        return {
+        const count = Number(r.trade_count_24h ?? 0);
+        payload.push({
           slab_address: r.slab_address,
           volume_24h: (safe ? asNum : raw) as unknown as number,
-          trade_count_24h: Number(r.trade_count_24h ?? 0),
+          trade_count_24h: Number.isFinite(count) && count >= 0 ? count : 0,
           network: getNetwork(),
           updated_at: new Date().toISOString(),
-        };
-      });
+        });
+      }
+      if (payload.length === 0) return;
 
       // Single bulk upsert. Columns absent from the payload (last_price,
       // volume_24h_usd) are left untouched on conflict.
