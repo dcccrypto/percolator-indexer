@@ -17,9 +17,27 @@ import { IX_TAG } from "@percolatorct/sdk";
 
 const PROGRAM = "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 const getAccountInfo = vi.fn();
-vi.mock("@percolatorct/shared", async (orig) => {
-  const actual = await orig<typeof import("@percolatorct/shared")>();
-  return { ...actual, config: { ...actual.config, allProgramIds: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB"] }, getConnection: vi.fn(() => ({ getAccountInfo })), withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()) };
+// Narrow mock: the barrel pulls sentry, supabase, the Solana send utils and the alerts stack (~10 s of import under
+// load, the cause of the "Failed to start forks worker" flake). This file needs only the real config, logger, event bus
+// and binary decoders, so those come from their own light modules; everything else is a stub (captureException a silent vi.fn, as Sentry was uninitialised here) that throws if
+// it is ever reached, so a new dependency on it fails loudly instead of silently no-op-ing.
+vi.mock("@percolatorct/shared", async () => {
+  const dist = "@percolatorct/shared/dist";
+  const { config } = await import(/* @vite-ignore */ `${dist}/config.js`);
+  const { createLogger } = await import(/* @vite-ignore */ `${dist}/logger.js`);
+  const { eventBus } = await import(/* @vite-ignore */ `${dist}/services/events.js`);
+  const { decodeBase58, parseTradeSize } = await import(/* @vite-ignore */ `${dist}/utils/binary.js`);
+  const unstubbed = (name: string) => () => { throw new Error(`@percolatorct/shared.${name} is not stubbed in evict119-tradecpi-wiring.test.ts`); };
+  return {
+    config: { ...config, allProgramIds: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB"] },
+    createLogger, eventBus, decodeBase58, parseTradeSize,
+    getConnection: vi.fn(() => ({ getAccountInfo })),
+    withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    captureException: vi.fn(),
+    getSupabase: unstubbed("getSupabase"), getFallbackConnection: unstubbed("getFallbackConnection"), getPrimaryConnection: unstubbed("getPrimaryConnection"),
+    getNetwork: unstubbed("getNetwork"), initSentry: unstubbed("initSentry"), sendCriticalAlert: unstubbed("sendCriticalAlert"),
+    sendInfoAlert: unstubbed("sendInfoAlert"), createAtlasWs: unstubbed("createAtlasWs"),
+  };
 });
 vi.mock("../src/lib/skippedSignatures.js", () => ({ recordSkippedSignatures: vi.fn(async () => undefined), assertSkippedSignatureSinkReady: vi.fn() }));
 vi.mock("../src/db/insertTradeRow.js", () => {
