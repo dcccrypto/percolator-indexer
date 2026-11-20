@@ -353,6 +353,8 @@ export interface ParsedFill {
   cpi?: CpiEvidence;
   /** Position of this fill inside its instruction (0 for single fills). */
   legPos?: number;
+  /** Top-level index of the trade instruction in the tx (matches the `ix_index` of its wrapper log events). */
+  ixIndex?: number;
   /** The taker's fee CAP off the wire (not the fee charged). */
   feeBps?: number;
 }
@@ -458,6 +460,7 @@ export function parsePercolatorFills(
         slabAddress,
         priceE6: undefined,
         feeBps: decoded.feeBps,
+        ixIndex: ixIdx,
         ...(cpi ? { cpi, legPos: 0 } : {}),
       });
     } else if (BATCH_TRADE_TAGS.has(tag)) {
@@ -473,6 +476,7 @@ export function parsePercolatorFills(
           slabAddress,
           priceE6: undefined,
           feeBps: leg.feeBps,
+          ixIndex: ixIdx,
           ...(cpi ? { cpi, legPos: leg.legIndex } : {}),
         });
       }

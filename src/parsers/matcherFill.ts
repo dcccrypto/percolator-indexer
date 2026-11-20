@@ -28,6 +28,7 @@
  *    from `meta.returnData` when present.
  */
 
+import type { LogFill } from "./logFill.js";
 import { createLogger } from "@percolatorct/shared";
 
 const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -349,6 +350,11 @@ export async function resolveCpiLeg(args: {
   onReadError?: "fallback" | "report";
   /** for the warn log of a legacy batch */
   signature?: string;
+  /**
+   * This leg's record in the tx's own trusted wrapper `fill_event` log (parsers/logFill.ts), if any. Used when the
+   * matcher context cannot prove the executed size, before the request upper bound: ZERO = no row, else `executed_q`.
+   */
+  logFill?: LogFill | null;
 }): Promise<CpiLegResolution> {
   const { evidence } = args;
   const policy = args.policy ?? unverifiedSizePolicy();
@@ -393,6 +399,18 @@ export async function resolveCpiLeg(args: {
     }
     note("exact");
     return { kind: "fill", sizeValue: abs(ret.execSize), priceE6: leg.oraclePriceE6, exact: true };
+  }
+  // The context no longer holds this call's answer (or could not be read): the wrapper's own fill_event in the same tx
+  // states what executed. Without it a zero fill would be stored as the full request (a phantom trade).
+  const lf = args.logFill;
+  // Only a record consistent with this call is used (ZERO flag <=> executed_q 0, same direction, at most the request).
+  if (lf && lf.zero === (lf.executedQ === 0n) && (lf.zero || (lf.priceE6 > 0n && (lf.executedQ > 0n) === (leg.reqSize > 0n) && abs(lf.executedQ) <= abs(leg.reqSize)))) {
+    if (lf.zero) {
+      note("zeroFill");
+      return { kind: "skip", reason: "zero-fill", detail: "the wrapper's fill_event for this leg has the ZERO flag / executed_q 0: no position change" };
+    }
+    note("exact");
+    return { kind: "fill", sizeValue: abs(lf.executedQ), priceE6: lf.priceE6, exact: true };
   }
   if (readFailed !== null && args.onReadError === "report") {
     return { kind: "read-error", detail: readFailed };

@@ -27,7 +27,8 @@ vi.mock("../../src/parsers/lotScale.js", async (orig) => {
   const actual = await orig<typeof import("../../src/parsers/lotScale.js")>();
   return { ...actual, resolveLotExp: async (s: string, a: number) => actual.knownLotExp(s, a) ?? 0 };
 });
-vi.mock("../../src/parsers/percolatorTxParser.js", () => ({
+vi.mock("../../src/parsers/percolatorTxParser.js", async (orig) => ({
+  computeFeeUsd: (await orig<typeof import("../../src/parsers/percolatorTxParser.js")>()).computeFeeUsd,
   parsePercolatorFills: m.fills,
   parsePercolatorLiquidations: m.liqs,
 }));
