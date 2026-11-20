@@ -121,7 +121,8 @@ export class EventStreamService {
 
     // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
     // a failure here must never cost the tx's fills below.
-    let v22WriteFailed = false;
+    // What failed to reach v22_events, kept so the record names the right kind, error and slab.
+    const v22Failures: Array<{ kind: "instruction" | "log"; slab: string; rows: number }> = [];
     try {
       const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
       const events = decodeV22Events(wrapperIxs, {
@@ -134,7 +135,8 @@ export class EventStreamService {
           await insertV22EventsWithRetry(events);
         } catch (err) {
           if (!(err instanceof V22EventWriteError)) throw err;
-          v22WriteFailed = true; // retries exhausted (counted + alerted); surfaced after the fills are indexed
+          // retries exhausted (counted + alerted); surfaced after the fills are indexed
+          v22Failures.push({ kind: "instruction", slab: events.find((e) => e.slab_address)?.slab_address ?? "", rows: events.length });
         }
       }
       // v2.2 wrapper LOG events (fills / reductions / moves), strict frame attribution; separate write, VERSION-keyed.
@@ -148,7 +150,7 @@ export class EventStreamService {
         blockTimeSec: typeof tx.blockTime === "number" ? tx.blockTime : null,
         isKnownMarket: (slab) => this.slabSet.has(slab),
       });
-      if (logRes.status === "write_failed") v22WriteFailed = true;
+      if (logRes.status === "write_failed") v22Failures.push({ kind: "log", slab: logRes.slab ?? "", rows: logRes.rows });
     } catch (err) {
       log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
     }
@@ -156,7 +158,20 @@ export class EventStreamService {
     // The fills are indexed first and unconditionally; a v22 write that failed after its retries is surfaced AFTER them
     // (the handler logs it as "handler failed"; the failure is counted and alerted in insertV22Events). Only the instruction events are retried here; the log events go through recordV22LogEvents, which reports "write_failed" once.
     await this.indexFills(tx, signature);
-    if (v22WriteFailed) throw new Error(`v22_events write failed after retries for ${signature.slice(0, 16)}`);
+    if (v22Failures.length > 0) {
+      // A websocket stream never redelivers and the poller does not write instruction events: make the loss durable so it can be re-indexed.
+      // Its own source ("v22-events", not "trade-indexer"): the (source, signature) dedupe must not drop it when the trade path above
+      // already recorded this signature, and the row must say that the v22 events (not the trades) are what is missing.
+      const error = v22Failures
+        .map((f) => (f.kind === "instruction" ? `v22 instruction events (${f.rows}) write failed after retries` : `v22 log events (${f.rows}) write failed (not retried)`))
+        .join("; ");
+      try {
+        await recordSkippedSignatures([{ signature, source: "v22-events", slab: v22Failures.find((f) => f.slab)?.slab ?? "", error }]);
+      } catch (recErr) {
+        log.warn("recordSkippedSignatures failed", { sig: signature, err: String(recErr) });
+      }
+      throw new Error(`${error} for ${signature.slice(0, 16)}`);
+    }
   }
 
   private async indexFills(tx: any, signature: string): Promise<void> {
