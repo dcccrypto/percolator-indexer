@@ -1,5 +1,5 @@
 /** #213 / #221 on the poll path (TradeIndexerPolling.processTransaction), real transactions. */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 
@@ -34,6 +34,7 @@ vi.mock("../src/db/storedLegs.js", async (orig) => ({
 }));
 import { insertTradeRow } from "../src/db/insertTradeRow.js";
 import { TradeIndexerPolling } from "../src/services/TradeIndexer.js";
+import { resetTradeCursorWarnings } from "../src/db/tradeCursor.js";
 
 const fx = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
 const pk = (s: string) => new PublicKey(s);
@@ -52,8 +53,15 @@ async function poll(f: any) {
   return idx.processTransaction(asWeb3(f), f.sig, market(f), new Set([PROGRAM]));
 }
 
+// The shared logger writes every line through console.log. Capture it instead of printing: the held-cursor WARN and the
+// in-memory-cursor ERROR (no Supabase in unit tests) are EXPECTED here, and the tests that expect them assert on them.
+let logSpy: ReturnType<typeof vi.spyOn>;
+const logged = () => logSpy.mock.calls.map((c) => String(c[0]));
+const heldWarns = () => logged().filter((l) => l.includes("matcher context read failed; holding the cursor"));
+
 describe("poll path: TradeCpi rows", () => {
-  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); });
+  beforeEach(() => { storedLegs.rows = []; vi.mocked(insertTradeRow).mockClear(); getAccountInfo.mockReset(); recordSkipped.mockClear(); resetTradeCursorWarnings(); logSpy = vi.spyOn(console, "log").mockImplementation(() => {}); });
+  afterEach(() => { logSpy.mockRestore(); });
 
   it("partial fill: executed size, booked price, fee on the executed notional", async () => {
     const f = fx("partial");
@@ -165,6 +173,8 @@ describe("poll path: TradeCpi rows", () => {
       const idx: any = new TradeIndexerPolling();
       expect(await poll1(idx, slabOf(f))).toBeUndefined();
       expect(insertTradeRow).not.toHaveBeenCalled();
+      expect(heldWarns()).toHaveLength(1); // the hold is logged, once
+      expect(logged().some((l) => l.includes("trade_indexer_cursor unavailable"))).toBe(true); // no Supabase: in-memory cursor, said loudly
       expect(await poll1(idx, slabOf(f))).toBe(f.sig); // retry falls back (cannot hold again) and the cursor moves
       expect(sizes()).toEqual(["0:189226154805"]);
       await poll1(idx, slabOf(f));
@@ -181,6 +191,7 @@ describe("poll path: TradeCpi rows", () => {
       expect(await poll1(idx, slabOf(a))).toBeUndefined();
       expect(insertTradeRow).not.toHaveBeenCalled();
       expect(getAccountInfo).toHaveBeenCalledTimes(1); // b was never attempted ahead of the held a
+      expect(heldWarns()).toHaveLength(1);
       getAccountInfo.mockResolvedValue({ data: Buffer.from(fx("full").ctxReturnHex.padEnd(640, "0"), "hex") }); // RPC recovers
       expect(await poll1(idx, slabOf(a))).toBe(b.sig); // a falls back (cannot hold twice), b follows, cursor advances to the newest
       expect(sizes()).toEqual(["0:189226154805", "0:189226154805"]);
@@ -194,6 +205,7 @@ describe("poll path: TradeCpi rows", () => {
       const idx: any = new TradeIndexerPolling();
       await idx.indexTradesForSlab(slabOf(f));
       expect(insertTradeRow).not.toHaveBeenCalled(); // leg 1 was not written alone
+      expect(heldWarns()).toHaveLength(1);
       await idx.indexTradesForSlab(slabOf(f));
       expect(sizes().sort()).toEqual(["0:189226154805", "1:189226154805"]);
     });
