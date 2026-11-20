@@ -25,7 +25,7 @@ const MIGRATIONS = join(ROOT, "supabase", "migrations");
 function anonTradeColumns(sql: string): Set<string> {
   const cols = new Set<string>();
   const re = /GRANT\s+SELECT\s*\(([^)]*)\)\s*ON\s+(?:public\.)?trades\s+TO\s+([^;]+);/gi;
-  for (const m of sql.matchAll(re)) {
+  for (const m of sql.replace(/--[^\n]*/g, "").matchAll(re)) {
     if (!/\banon\b/i.test(m[2])) continue;
     for (const c of m[1].split(",")) cols.add(c.trim().toLowerCase());
   }
@@ -41,8 +41,10 @@ describe("#228 follow-up: anon can read size_provenance (Codex P2)", () => {
     expect(grantIdx).toBeGreaterThan(addIdx);
   });
 
-  it("the fresh baseline grants anon the same trades columns plus size_provenance", () => {
-    const cols = anonTradeColumns(readFileSync(join(ROOT, "db", "v17_baseline.sql"), "utf8"));
+  it("the migration chain grants anon the baseline trades columns plus size_provenance", () => {
+    const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith(".sql")).sort();
+    const cols = new Set<string>();
+    for (const f of files) for (const c of anonTradeColumns(readFileSync(join(MIGRATIONS, f), "utf8"))) cols.add(c);
     expect([...cols].sort()).toEqual(["created_at", "size", "size_provenance", "trader"]);
   });
 });
