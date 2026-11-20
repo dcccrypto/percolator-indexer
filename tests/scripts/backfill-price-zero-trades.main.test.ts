@@ -15,7 +15,7 @@ let trades: any[] = [];
 let selectError: any = null;
 let updateCalls: UpdateCall[] = [];
 let selectRanges: [number, number][] = [];
-const SERVER_MAX_ROWS = 1000;
+let serverMaxRows = 1000;
 let updateOutcome: (call: UpdateCall) => Promise<any> | any = () => ({ error: null });
 let remaining: number | null = 0;
 let countError: any = null;
@@ -37,7 +37,8 @@ function makeSupabase() {
         const page = (from: number, to: number) => {
           selectRanges.push([from, to]);
           return Promise.resolve({
-            data: trades === null ? null : trades.slice(from, to + 1),
+            // PostgREST truncates every response to max_rows, ranged or not.
+            data: trades === null ? null : trades.slice(from, Math.min(to + 1, from + serverMaxRows)),
             error: selectError,
           });
         };
@@ -46,7 +47,7 @@ function makeSupabase() {
           not: () => q,
           order: () => q,
           range: (from: number, to: number) => page(from, to),
-          then: (res: any, rej: any) => page(0, SERVER_MAX_ROWS - 1).then(res, rej),
+          then: (res: any, rej: any) => page(0, serverMaxRows - 1).then(res, rej),
         };
         return q;
       },
@@ -138,6 +139,7 @@ beforeEach(() => {
   selectError = null;
   updateCalls = [];
   selectRanges = [];
+  serverMaxRows = 1000;
   updateOutcome = () => ({ error: null });
   remaining = 0;
   countError = null;
@@ -391,6 +393,23 @@ describe("backfill main()", () => {
     expect(updateCalls).toHaveLength(2500);
     expect(new Set(updateCalls.map((c) => c.filters.find(([k]) => k === "id")![1])).size).toBe(2500);
     expect(out).toContain("2500 updated");
+  }, 60_000);
+
+  it("reads every row when the server caps responses at 500 (max_rows < page size)", async () => {
+    serverMaxRows = 500;
+    trades = Array.from({ length: 1800 }, (_, i) => trade(`t${i}`, `sig${i}`));
+    fetchMock.mockImplementation(async (_u: string, init: any) => {
+      const sigs: string[] = JSON.parse(init.body).transactions;
+      return jsonResponse(sigs.map((s) => enhanced(s, blob(2048, 1040, 1_000_000n))));
+    });
+    const { main } = await loadMain();
+    await main();
+    const out = logs.join("\n");
+    expect(out).toContain("Found 1800 price=0 trade(s)");
+    expect(updateCalls).toHaveLength(1800);
+    expect(new Set(updateCalls.map((c) => c.filters.find(([k]) => k === "id")![1])).size).toBe(1800);
+    // offsets advance by rows actually returned; no write happens before the last read
+    expect(selectRanges.map(([f]) => f)).toEqual([0, 500, 1000, 1500, 1800]);
   }, 60_000);
 
   it("stops paging after a short final page", async () => {
