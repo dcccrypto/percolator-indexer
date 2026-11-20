@@ -38,4 +38,36 @@ describe("BoundedTtlMap (replaces clear() at 2000 entries)", () => {
     m.set("a", 1); m.delete("a");
     expect(m.get("a")).toBeUndefined();
   });
+  it("treats an entry written before a backwards clock step as expired (negative age)", () => {
+    let t = 1_000_000;
+    const m = new BoundedTtlMap<string, number>(10, 100, () => t);
+    m.set("a", 1);
+    t = 500_000; // wall clock stepped back: age is negative
+    expect(m.get("a")).toBeUndefined();
+    expect(m.size).toBe(0);
+  });
+  it("treats a non-finite clock reading as expired", () => {
+    let t = 0;
+    const m = new BoundedTtlMap<string, number>(10, 100, () => t);
+    m.set("a", 1);
+    t = NaN;
+    expect(m.get("a")).toBeUndefined();
+  });
+  it("still serves an entry at age 0 and exactly the TTL", () => {
+    let t = 10;
+    const m = new BoundedTtlMap<string, number>(10, 100, () => t);
+    m.set("a", 1);
+    expect(m.get("a")).toBe(1);
+    t = 110;
+    expect(m.get("a")).toBe(1);
+  });
+  it("an infinite-TTL map ignores a backwards or NaN clock", () => {
+    let t = 1_000_000;
+    const m = new BoundedTtlMap<string, number>(10, Number.POSITIVE_INFINITY, () => t);
+    m.set("a", 1);
+    t = 5;
+    expect(m.get("a")).toBe(1);
+    t = NaN;
+    expect(m.get("a")).toBe(1);
+  });
 });
