@@ -120,7 +120,9 @@ export async function loadChainTxs(
   const retry = <R>(fn: () => Promise<R>, label: string) => withRetry(fn, { maxRetries: 1, baseDelayMs: 200, label });
   // Resolved only when something must be read (a fully memoised redelivery never touches the RPC client).
   const conn = chunks.length === 0 ? null : typeof connection === "function" ? connection() : connection;
-  const results = conn ? await Promise.all(chunks.map((c) => fetchParsedTxsTolerant<ParsedTransactionWithMeta>(conn, c, retry))) : [];
+  // One chunk at a time: a 500-transaction delivery must not land on the RPC as one burst.
+  const results: Awaited<ReturnType<typeof fetchParsedTxsTolerant<ParsedTransactionWithMeta>>>[] = [];
+  for (const c of conn ? chunks : []) results.push(await fetchParsedTxsTolerant<ParsedTransactionWithMeta>(conn!, c, retry));
   // Memoise every chunk that came back before reporting a failed one, so the redelivery re-reads only that chunk.
   let failure: { error?: unknown } | null = null;
   results.forEach((r, k) => {
@@ -162,16 +164,32 @@ export interface ChainCheckedDelivery {
  * the chain; payload `accountData` is dropped. Logs are carried only when the payload carried them, so the
  * delivery's v2.2 log-event path runs exactly when it did before, now on the chain's logs.
  */
+type PayloadIx = { programId?: unknown; data?: unknown; accounts?: unknown; innerInstructions?: ReadonlyArray<{ programId?: unknown }> };
+
+/** Does the payload name one of our programs anywhere (top level, nested CPI, or flat inner groups)? */
+function mentionsProgram(p: { instructions?: ReadonlyArray<PayloadIx>; innerInstructions?: unknown }, programIds: ReadonlySet<string>): boolean {
+  const has = (ix: { programId?: unknown } | null | undefined) => !!ix && typeof ix.programId === "string" && programIds.has(ix.programId);
+  for (const ix of p.instructions ?? []) {
+    if (has(ix) || (ix?.innerInstructions ?? []).some(has)) return true;
+  }
+  for (const g of (Array.isArray(p.innerInstructions) ? p.innerInstructions : []) as Array<{ instructions?: unknown } | null>) {
+    if (Array.isArray(g?.instructions) && g.instructions.some(has)) return true;
+  }
+  return false;
+}
+
 export async function txsFromChain(
-  payload: ReadonlyArray<{ signature?: string; instructions?: ReadonlyArray<{ programId?: unknown; data?: unknown; accounts?: unknown }>; logMessages?: unknown }>,
+  payload: ReadonlyArray<{ signature?: string; instructions?: ReadonlyArray<PayloadIx>; innerInstructions?: unknown; logMessages?: unknown }>,
   connection: TxFetcher<ParsedTransactionWithMeta> | (() => TxFetcher<ParsedTransactionWithMeta>),
   programIds: ReadonlySet<string>,
 ): Promise<ChainCheckedDelivery> {
   const isSig = (s: unknown): s is string => typeof s === "string" && BASE58_SIGNATURE.test(s);
-  const sigs = payload.map((p) => p.signature).filter(isSig);
+  // An entry that names none of our programs yields no rows whatever the chain says, so it costs no read.
+  const relevant = payload.filter((p) => mentionsProgram(p, programIds));
+  const sigs = relevant.map((p) => p.signature).filter(isSig);
   const chain = sigs.length > 0 ? await loadChainTxs(connection, sigs) : new Map<string, ChainEnhancedTx | null>();
   const out: ChainCheckedDelivery = { txs: [], unknown: [], mismatched: [] };
-  for (const p of payload) {
+  for (const p of relevant) {
     const c = isSig(p.signature) ? chain.get(p.signature) : null;
     if (!c) {
       out.unknown.push(typeof p.signature === "string" ? p.signature : "");

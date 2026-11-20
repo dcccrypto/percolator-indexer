@@ -98,8 +98,8 @@ describe("txsFromChain", () => {
     const out = await txsFromChain([
       { signature: real, instructions: [{ programId: WRAPPER, data: "abc", accounts: [ATTACKER, SLAB] }] },
       { signature: forged, instructions: [{ programId: WRAPPER, data: "abc", accounts: [TRADER, SLAB] }] },
-      { signature: "not-a-sig" },
-      {},
+      { signature: "not-a-sig", instructions: [{ programId: WRAPPER }] },
+      { instructions: [{ programId: WRAPPER }] },
     ], c, IDS);
     expect(c.getParsedTransactions).toHaveBeenCalledWith([real, forged], { maxSupportedTransactionVersion: 1 });
     expect(out.txs).toHaveLength(1);
@@ -123,8 +123,31 @@ describe("txsFromChain", () => {
 
   it("makes no RPC call for a delivery without a well-formed signature", async () => {
     const c = conn(() => []);
-    expect(await txsFromChain([{ signature: "x" }], c, IDS)).toEqual({ txs: [], unknown: ["x"], mismatched: [] });
+    expect(await txsFromChain([{ signature: "x", instructions: [{ programId: WRAPPER }] }], c, IDS)).toEqual({ txs: [], unknown: ["x"], mismatched: [] });
     expect(c.getParsedTransactions).not.toHaveBeenCalled();
+  });
+
+  it("reads only entries that name one of our programs (top level, nested CPI or flat inner group); the rest yield nothing and cost nothing", async () => {
+    const [top, nested, flat, none] = [sigN(5), sigN(6), sigN(7), sigN(8)];
+    const c = conn((s) => s.map(() => parsedTx()));
+    const out = await txsFromChain([
+      { signature: top, instructions: [{ programId: WRAPPER }] },
+      { signature: nested, instructions: [{ programId: MATCHER, innerInstructions: [{ programId: WRAPPER }] }] },
+      { signature: flat, instructions: [{ programId: MATCHER }], innerInstructions: [{ instructions: [{ programId: WRAPPER }] }] },
+      { signature: none, instructions: [{ programId: MATCHER, innerInstructions: [{ programId: MATCHER }] }], innerInstructions: [null, { instructions: [{ programId: MATCHER }] }] },
+    ], c, IDS);
+    expect(c.getParsedTransactions).toHaveBeenCalledTimes(1);
+    expect(c.getParsedTransactions.mock.calls[0][0]).toEqual([top, nested, flat]);
+    expect(out.txs.map((t) => t.signature)).toEqual([top, nested, flat]);
+    expect(out.unknown).toEqual([]);
+  });
+
+  it("reads the chunks one after another, not as one burst", async () => {
+    let inFlight = 0, peak = 0;
+    const c = conn(async (s) => { inFlight++; peak = Math.max(peak, inFlight); await new Promise((r) => setTimeout(r, 5)); inFlight--; return s.map(() => parsedTx()); });
+    await loadChainTxs(c, Array.from({ length: 250 }, (_, i) => sigN(i)));
+    expect(c.getParsedTransactions).toHaveBeenCalledTimes(3);
+    expect(peak).toBe(1);
   });
 });
 
