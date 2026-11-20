@@ -158,12 +158,6 @@ export interface ChainCheckedDelivery {
   mismatched: string[];
 }
 
-/**
- * Replace each payload transaction by the chain's transaction for the same signature (see the file comment).
- * Payload fields are never used for rows: instructions, CPIs, slot, block time, error and logs all come from
- * the chain; payload `accountData` is dropped. Logs are carried only when the payload carried them, so the
- * delivery's v2.2 log-event path runs exactly when it did before, now on the chain's logs.
- */
 type PayloadIx = { programId?: unknown; data?: unknown; accounts?: unknown; innerInstructions?: ReadonlyArray<{ programId?: unknown }> };
 
 /** Does the payload name one of our programs anywhere (top level, nested CPI, or flat inner groups)? */
@@ -178,6 +172,12 @@ function mentionsProgram(p: { instructions?: ReadonlyArray<PayloadIx>; innerInst
   return false;
 }
 
+/**
+ * Replace each payload transaction by the chain's transaction for the same signature (see the file comment).
+ * Payload fields are never used for rows: instructions, CPIs, slot, block time, error and logs all come from
+ * the chain; payload `accountData` is dropped. Logs are carried only when the payload carried them, so the
+ * delivery's v2.2 log-event path runs exactly when it did before, now on the chain's logs.
+ */
 export async function txsFromChain(
   payload: ReadonlyArray<{ signature?: string; instructions?: ReadonlyArray<PayloadIx>; innerInstructions?: unknown; logMessages?: unknown }>,
   connection: TxFetcher<ParsedTransactionWithMeta> | (() => TxFetcher<ParsedTransactionWithMeta>),
