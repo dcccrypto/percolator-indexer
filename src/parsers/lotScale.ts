@@ -1,4 +1,4 @@
-import { lotExpOfMarketV22 } from "@percolatorct/sdk";
+import { ACCOUNT_KIND, LOT_EXP_MAX_V22, lotExpOfMarketV22, resolveLayout, type LayoutTable } from "@percolatorct/sdk";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 
 /**
@@ -43,6 +43,7 @@ export function perLotPrice(perToken: number, lotExp: number): number {
 // the size cap evicts the oldest entries, which are simply re-read on demand by resolveLotExp).
 const newCache = () => new BoundedTtlMap<string, number>(200_000, Number.POSITIVE_INFINITY);
 let lotExpCache = newCache();
+const MAX_SLOTS = 64;
 
 /** Test hook: forget every cached lot_exp. */
 export function resetLotExpCache(): void {
@@ -55,16 +56,24 @@ export function resetLotExpCache(): void {
  * Never throws; an unreadable account records nothing.
  */
 export function noteLotExps(slabAddress: string, data: Uint8Array): void {
-  for (let a = 0; a < 64; a++) {
-    let lot: number;
-    try {
-      lot = lotExpOfMarketV22(data, a);
-    } catch (err) {
-      // A lot_exp byte above the cap is one bad slot (skip it); anything else means no more slots / not a market.
-      if (err instanceof RangeError && /lot_exp byte/.test(err.message)) continue;
-      return;
-    }
-    lotExpCache.set(`${slabAddress}:${a}`, lot);
+  // Resolve the market geometry ONCE (the SDK's lotExpOfMarketV22 re-resolves it per call and the old loop ended on a
+  // thrown RangeError), then read each slot's lot_exp byte directly. Same cache contents as the per-slot SDK loop:
+  // not a market / unknown VERSION / too short records nothing; a byte above the cap is one skipped slot.
+  let layout: LayoutTable;
+  try {
+    layout = resolveLayout(data, { parser: "noteLotExps", kind: ACCOUNT_KIND.Market });
+  } catch {
+    return;
+  }
+  const slotsBase = layout.marketGroupOff + layout.marketGroupLen;
+  if (data.length < slotsBase) return;
+  const stride = layout.assetSlotStride;
+  const slotCount = Math.min(MAX_SLOTS, Math.floor((data.length - slotsBase) / stride));
+  const lotOff = layout.wrapperSlot.profileLotExp;
+  for (let a = 0; a < slotCount; a++) {
+    const v = data[slotsBase + a * stride + lotOff];
+    if (v > LOT_EXP_MAX_V22) continue;
+    lotExpCache.set(`${slabAddress}:${a}`, v);
   }
 }
 
