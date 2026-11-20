@@ -25,7 +25,7 @@ describe("skippedSignatures: non-Error file failure", () => {
 
   it("stringifies a non-Error thrown by the file fallback and still logs the signatures", async () => {
     appendFileSync.mockImplementation(() => { throw "disk gone"; });
-    await expect(recordSkippedSignatures([{ signature: "s1", source: "creator-lookup", slab: "sl", error: "x" }])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([{ signature: "s1", source: "creator-lookup", slab: "sl", error: "x" }])).resolves.toBe(false);
     const call = logError.mock.calls.find((c) => String(c[0]).includes("could not persist"))!;
     expect(call[1]).toMatchObject({ error: "disk gone", signatures: ["s1"] });
   });

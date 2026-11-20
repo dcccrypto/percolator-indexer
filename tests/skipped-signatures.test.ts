@@ -35,12 +35,12 @@ describe("(c) durable skip record", () => {
   });
   it("falls back to the JSONL file (full signature + slab) when the table write fails, and never throws", async () => {
     upsert.mockResolvedValue({ error: { message: 'relation "skipped_signatures" does not exist' } });
-    await expect(recordSkippedSignatures([row])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([row])).resolves.toBe(true);
     const line = JSON.parse(readFileSync(FILE, "utf8").trim());
     expect(line).toMatchObject({ signature: FULL, slab: row.slab });
     expect(getSkippedSignatureCount()).toBe(1);
     upsert.mockRejectedValue(new Error("db down"));
-    await expect(recordSkippedSignatures([{ ...row, signature: FULL + "x" }])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([{ ...row, signature: FULL + "x" }])).resolves.toBe(true);
     expect(readFileSync(FILE, "utf8").trim().split("\n")).toHaveLength(2);
   });
   it("the error log line carries the FULL signature, the slab and the metric name (alertable, re-indexable)", async () => {
@@ -53,7 +53,7 @@ describe("(c) durable skip record", () => {
     delete process.env.SKIPPED_SIGNATURES_FILE;
     upsert.mockResolvedValue({ error: { message: "no table" } });
     const unique = `${FULL}-nodefault-${process.pid}-${Date.now()}`;
-    await expect(recordSkippedSignatures([{ ...row, signature: unique }])).resolves.toBeUndefined();
+    await expect(recordSkippedSignatures([{ ...row, signature: unique }])).resolves.toBe(false);
     expect(existsSync("/tmp/indexer-skipped-signatures.jsonl") && readFileSync("/tmp/indexer-skipped-signatures.jsonl", "utf8").includes(unique)).toBe(false);
     const msgs = logError.mock.calls.map((c) => String(c[0]));
     expect(msgs.some((m) => m.includes("no SKIPPED_SIGNATURES_FILE is set"))).toBe(true);
