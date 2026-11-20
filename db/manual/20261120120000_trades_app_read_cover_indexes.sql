@@ -21,8 +21,10 @@
 -- No existing index is dropped here (several reads still pick idx_trades_network /
 -- idx_trades_trader_created; dropping them needs its own re-measure).
 --
--- Write cost: three more indexes maintained on every trades insert; measured in the bench README
--- (insert throughput and WAL bytes for a fixed batch, before vs after).
+-- Write cost (bench README, 250k trades, vs the 20261115 state): +64 MB of index (+256 B per trade);
+-- per inserted trade +53 us backend CPU (+44%), +7 buffer touches, +533 B WAL in steady state (+61%) and
+-- +2.8 KB right after a checkpoint (full-page images, +53%). Small next to the reads it saves at the current
+-- ingest rate; re-measure before applying on a write-heavy, read-light database.
 --
 -- RUN WITH ON_ERROR_STOP, as a script in autocommit:
 --   psql -v ON_ERROR_STOP=1 -f db/manual/20261120120000_trades_app_read_cover_indexes.sql
