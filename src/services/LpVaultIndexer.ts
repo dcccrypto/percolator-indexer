@@ -23,7 +23,7 @@ import { createLogger, captureException } from "@percolatorct/shared";
 import { breakerAlertPolls, createBreakerTracker, isPoisonTxError, skipsAcceptable } from "../lib/tolerantTxFetch.js";
 import { recordSkippedSignatures, type SkippedSignature } from "../lib/skippedSignatures.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
-import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
+import type { LpVaultChain, OnchainClaim, RegistryInfo } from "../lpVault/chain.js";
 import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
 
 const logger = createLogger("indexer:lp-vault");
@@ -313,20 +313,42 @@ export class LpVaultIndexer {
     // #231: mid-drain the chain is knowingly ahead of the fold, so every user would be
     // skipped by the check below anyway. Skip them without spending two RPCs each.
     if (draining) return { reconciled: 0, skipped: users.length };
+    if (users.length === 0) return { reconciled: 0, skipped: 0 };
+    // Read every claim first, then check the registry's newest signature ONCE (it used to be read
+    // once per user). The check comes after the last claim read, so if it still equals what we
+    // synced, no vault transaction landed before any of the claims: each per-user check would have
+    // passed too. If it moved, a claim may include the new transaction and every user is skipped;
+    // the next sync folds it and the next reconcile picks them up.
+    // A claim read that throws still reconciles the users read before it (as the per-user loop did),
+    // then rethrows.
+    const claims: OnchainClaim[] = [];
+    let claimErr: { err: unknown } | null = null;
     for (const user of users) {
-      const claim = await this.opts.chain.getClaim(user, reg.lpMint, reg.registry, reg.programId);
+      try {
+        claims.push(await this.opts.chain.getClaim(user, reg.lpMint, reg.registry, reg.programId));
+      } catch (err) {
+        claimErr = { err };
+        break;
+      }
+    }
+    if (claims.length > 0) {
       const [latest] = await this.opts.chain.getSignatures(reg.registry, { limit: 1 });
       if (latest && latest.signature !== expectedNewest) {
-        // A vault transaction landed after our sync; the balance may include it.
-        skipped++;
-        continue;
+        // A vault transaction landed after our sync; the balances may include it.
+        if (claimErr) throw claimErr.err;
+        return { reconciled: 0, skipped: users.length };
       }
+    }
+    for (let i = 0; i < claims.length; i++) {
+      const user = users[i]!;
+      const claim = claims[i]!;
       await recomputePosition(this.opts.store, this.opts.network, reg.registry, user, {
         marketSlab: reg.market,
         reconcile: { onchainShares: claim.heldShares + claim.pendingShares, contextSlot: claim.contextSlot },
       });
       reconciled++;
     }
+    if (claimErr) throw claimErr.err;
     return { reconciled, skipped };
   }
 }
