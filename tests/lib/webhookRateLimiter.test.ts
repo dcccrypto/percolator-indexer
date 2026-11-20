@@ -144,3 +144,49 @@ describe("window boundary and prune", () => {
     expect(rl.buckets.get(HELIUS_IP)!.resetTime).toBeGreaterThan(Date.now());
   });
 });
+
+describe("backwards wall-clock step (NTP correction, VM resume)", () => {
+  const HOUR = 3_600_000;
+
+  it("a bucket spent before a 1 h backwards step resets within one window of real elapsed time", async () => {
+    let t = 10 * HOUR;
+    const { post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) await post(HELIUS_IP);
+    expect((await post(HELIUS_IP)).status).toBe(429);
+    t -= HOUR; // clock steps back
+    // The stepped bucket is detected at once, so the sender is served immediately...
+    expect((await post(HELIUS_IP)).status).toBe(200);
+    // ...and still after one real window of elapsed time.
+    t += 60_001;
+    expect((await post(HELIUS_IP)).status).toBe(200);
+  });
+
+  it("keeps a live bucket: requests in the same millisecond share one window", async () => {
+    let t = 10 * HOUR;
+    const { post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) expect((await post(HELIUS_IP)).status).toBe(200);
+    expect((await post(HELIUS_IP)).status).toBe(429);
+    t += 59_999;
+    expect((await post(HELIUS_IP)).status).toBe(429);
+  });
+
+  it("Retry-After never exceeds the window after a backwards step", async () => {
+    let t = 10 * HOUR;
+    const { post } = appWith({ now: () => t });
+    for (let i = 0; i < 3; i++) await post(HELIUS_IP);
+    t -= HOUR;
+    for (let i = 0; i < 3; i++) expect((await post(HELIUS_IP)).status).toBe(200);
+    const res = await post(HELIUS_IP);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(60);
+  });
+
+  it("pruneExpired drops a bucket whose resetTime is more than one window ahead of now", async () => {
+    let t = 10 * HOUR;
+    const { rl, post } = appWith({ now: () => t });
+    await post(HELIUS_IP);
+    t -= HOUR;
+    rl.pruneExpired();
+    expect(rl.buckets.size).toBe(0);
+  });
+});
