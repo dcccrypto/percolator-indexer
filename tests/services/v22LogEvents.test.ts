@@ -2,8 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { LAYOUT_V22 } from "@percolatorct/sdk";
 
-const { insertV22Events, logWarn, blocked } = vi.hoisted(() => ({ insertV22Events: vi.fn(async (rows: unknown[]) => rows.length), logWarn: vi.fn(), blocked: new Set<string>() }));
-vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events }));
+const { insertV22Events, logWarn, blocked, V22EventWriteError } = vi.hoisted(() => ({
+  insertV22Events: vi.fn(async (rows: unknown[]) => rows.length),
+  logWarn: vi.fn(),
+  blocked: new Set<string>(),
+  // Same shape as the real class (#361): the only error recordV22LogEvents maps to "write_failed".
+  V22EventWriteError: class V22EventWriteError extends Error {
+    constructor(message: string, readonly count: number, readonly code?: string) { super(message); this.name = "V22EventWriteError"; }
+  },
+}));
+vi.mock("../../src/db/insertV22Events.js", () => ({ insertV22Events, V22EventWriteError }));
 vi.mock("../../src/blocklist.js", () => ({ isBlockedSlab: (s: string) => blocked.has(s) }));
 vi.mock("@percolatorct/shared", () => ({ createLogger: () => ({ info: vi.fn(), warn: logWarn, debug: vi.fn(), error: vi.fn() }) }));
 
@@ -67,21 +75,29 @@ describe("recordV22LogEvents", () => {
     expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ kind: "events_unknown", slab_address: M, detail: { reason: "unlisted_tag" } });
   });
 
-  it("NEVER throws: an insert failure is swallowed", async () => {
-    insertV22Events.mockRejectedValueOnce(new Error("db down"));
-    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toMatchObject({ status: "not_applicable", rows: 0 });
+  it("NEVER throws: a V22EventWriteError is reported as write_failed (not swallowed as not_applicable) so a redeliverable caller can 5xx", async () => {
+    insertV22Events.mockRejectedValueOnce(new V22EventWriteError("db down", 1));
+    await expect(recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] })).resolves.toEqual({ status: "write_failed", rows: 1 });
   });
 
-  it("insert failure: warns once with the Error message, does NOT retry, and carries no counter metric (silent-drop pin)", async () => {
+  it("V22EventWriteError: no retry, and no warn from this layer (insertV22Events already counted + alerted it)", async () => {
+    insertV22Events.mockRejectedValueOnce(new V22EventWriteError("db down", 1, "57P01"));
+    const r = await recordV22LogEvents({ ...base, signature: "SIGFAILED1234567890", logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
+    expect(r).toEqual({ status: "write_failed", rows: 1 });
+    expect(insertV22Events).toHaveBeenCalledTimes(1); // no retry
+    expect(logWarn).not.toHaveBeenCalled();
+  });
+
+  it("a non-V22EventWriteError insert rejection is an unexpected bug: warns once with the Error message, no retry, no counter metric", async () => {
     insertV22Events.mockRejectedValueOnce(new Error("db down"));
     const r = await recordV22LogEvents({ ...base, signature: "SIGFAILED1234567890", logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
     expect(r).toEqual({ status: "not_applicable", rows: 0 });
-    expect(insertV22Events).toHaveBeenCalledTimes(1); // no retry
+    expect(insertV22Events).toHaveBeenCalledTimes(1);
     expect(logWarn).toHaveBeenCalledTimes(1);
     const [msg, ctx] = logWarn.mock.calls[0];
     expect(msg).toContain("trades unaffected");
     expect(ctx).toEqual({ signature: "SIGFAILED1234567", error: "db down" });
-    expect(ctx).not.toHaveProperty("metric"); // visible only as a log line; nothing counts the dropped event
+    expect(ctx).not.toHaveProperty("metric");
   });
 
   it("happy path without slot / blockTime: both default to null on the row", async () => {
@@ -98,7 +114,7 @@ describe("recordV22LogEvents", () => {
   });
 
   it("a failure on one transaction does not affect the next (the caller keeps going)", async () => {
-    insertV22Events.mockRejectedValueOnce(new Error("db down"));
+    insertV22Events.mockRejectedValueOnce(new V22EventWriteError("db down", 1));
     const input = { ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] };
     await recordV22LogEvents(input);
     expect(await recordV22LogEvents({ ...input, signature: "SIG2" })).toEqual({ status: "ok", rows: 1 });
