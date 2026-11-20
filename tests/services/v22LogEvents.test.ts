@@ -33,7 +33,7 @@ beforeEach(() => { insertV22Events.mockClear(); logWarn.mockClear(); blocked.cle
 describe("recordV22LogEvents", () => {
   it("decodes a successful TradeCpi's FILL and writes it in ONE insert call", async () => {
     const r = await recordV22LogEvents({ ...base, logMessages: logs(EX.fill_clipped_tradecpi.b64), wrapperInstructions: [ix(10)] });
-    expect(r).toEqual({ status: "ok", rows: 1 });
+    expect(r).toEqual({ status: "ok", rows: 1, fillEvents: [expect.objectContaining({ kind: "fill_event", slab_address: M })] });
     expect(insertV22Events).toHaveBeenCalledTimes(1);
     expect(insertV22Events.mock.calls[0][0][0]).toMatchObject({ kind: "fill_event", slab_address: M, signature: "SIG1" });
   });

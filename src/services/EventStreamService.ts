@@ -5,10 +5,11 @@ import { createLogger, eventBus, decodeBase58 } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey, type IndexerTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { IX_TAG } from "@percolatorct/sdk";
-import { parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
+import { computeFeeUsd, parsePercolatorFills, parsePercolatorLiquidations } from "../parsers/percolatorTxParser.js";
 import { readMarkPriceE6 } from "../parsers/markPrice.js";
-import { resolveLotExp, perTokenPrice, cachedLotExp } from "../parsers/lotScale.js";
-import { decodeV22Events, rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
+import { resolveLotExp, perTokenPrice, perLotPrice, cachedLotExp } from "../parsers/lotScale.js";
+import { decodeV22Events, rawInstructionsFromParsedTx, type V22EventRow } from "../parsers/v22Events.js";
+import { feeFromAtoms, logFillFor } from "../parsers/logFill.js";
 import { insertV22EventsWithRetry, V22EventWriteError } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
@@ -122,6 +123,7 @@ export class EventStreamService {
     // v2.2 activity events (bond / rescue / units / backstop / rent / eviction / dust). Best effort and isolated:
     // a failure here must never cost the tx's fills below.
     let v22WriteFailed = false;
+    let logFills: V22EventRow[] | undefined;
     try {
       const wrapperIxs = rawInstructionsFromParsedTx(tx, [this.deps.programId]);
       const events = decodeV22Events(wrapperIxs, {
@@ -149,17 +151,18 @@ export class EventStreamService {
         isKnownMarket: (slab) => this.slabSet.has(slab),
       });
       if (logRes.status === "write_failed") v22WriteFailed = true;
+      logFills = logRes.fillEvents;
     } catch (err) {
       log.warn("v22 event decode failed — fills still indexed", { sig: signature, err: String(err) });
     }
 
     // The fills are indexed first and unconditionally; a v22 write that failed after its retries is surfaced AFTER them
     // (the handler logs it as "handler failed"; the failure is counted and alerted in insertV22Events). Only the instruction events are retried here; the log events go through recordV22LogEvents, which reports "write_failed" once.
-    await this.indexFills(tx, signature);
+    await this.indexFills(tx, signature, logFills);
     if (v22WriteFailed) throw new Error(`v22_events write failed after retries for ${signature.slice(0, 16)}`);
   }
 
-  private async indexFills(tx: any, signature: string): Promise<void> {
+  private async indexFills(tx: any, signature: string, logFills?: readonly V22EventRow[]): Promise<void> {
     const fills = parsePercolatorFills(tx, signature, [this.deps.programId]);
 
     // Collect this tx's rows and write them in one round-trip at the end, instead
@@ -197,11 +200,15 @@ export class EventStreamService {
       let sizeAbs = fill.sizeAbs;
       let sizeProvenance: TradeSizeProvenance = "legacy_unverified";
       let matcherPriced = false; // price came from the matcher CPI (no slab read), so lot_exp may not be cached yet
+      // The tx's trusted wrapper fill_event for this leg: executed size when the matcher context cannot prove it, and the
+      // fee. The poll path (TradeIndexer) does the same lookup, so both paths store the same row (parsers/logFill.ts).
+      const logFill = fill.ixIndex === undefined ? null
+        : logFillFor(logFills, { ixIndex: fill.ixIndex, slab, assetIndex: fill.assetIndex, legPos: fill.legPos ?? 0 });
       if (fill.cpi) {
         // #213/#221: TradeCpi/BatchTradeCpi: executed size + booked price from the matcher call.
         const r = await resolveCpiLeg({
           evidence: fill.cpi, assetIndex: fill.assetIndex, side: fill.side, wireSizeAbs: fill.sizeAbs,
-          legPos: fill.legPos ?? 0, readContext: readMatcherContext, signature,
+          legPos: fill.legPos ?? 0, readContext: readMatcherContext, signature, logFill,
         });
         if (r.kind === "skip") {
           if (r.reason !== "zero-fill") {
@@ -272,6 +279,8 @@ export class EventStreamService {
         continue;
       }
       const price = perTokenPrice(priceE6Value, lot);
+      // Same fee as the poll path: the fill_event's fee when the tx has one, else the same wire-cap estimate.
+      const fee = logFill ? feeFromAtoms(logFill.feeAtoms) : computeFeeUsd(sizeAbs, perLotPrice(price, lot), fill.feeBps);
 
       rows.push({
         slab_address: slab,
@@ -280,7 +289,7 @@ export class EventStreamService {
         size: sizeAbs.toString(),
         size_provenance: sizeProvenance,
         price,
-        fee: 0,
+        fee,
         tx_signature: signature,
         asset_index: fill.assetIndex,
         leg_index: legIndex,

@@ -13,7 +13,7 @@ import { createLogger } from "@percolatorct/shared";
 import { isBlockedSlab } from "../blocklist.js";
 import { assetGenerationOf, marketVersionOf } from "../layout/marketVersions.js";
 import { decodeV22LogEvents, getLogEventStats, type EventGate, type UnknownReason } from "../parsers/v22FillEvents.js";
-import type { RawInstruction } from "../parsers/v22Events.js";
+import type { RawInstruction, V22EventRow } from "../parsers/v22Events.js";
 import { insertV22Events, V22EventWriteError } from "../db/insertV22Events.js";
 
 const logger = createLogger("indexer:v22-log-events");
@@ -41,6 +41,11 @@ export interface RecordLogEventsResult {
   status: "not_applicable" | "failed" | "ok" | "unknown" | "write_failed";
   rows: number;
   unknownReason?: UnknownReason;
+  /**
+   * The decoded `fill_event` rows when the tx's events are known ("ok", or "write_failed": the decode was fine, only the
+   * DB write was not). The trade paths read a leg's executed size and fee from them (parsers/logFill.ts).
+   */
+  fillEvents?: V22EventRow[];
 }
 
 /** Decode and write one transaction's log events. Never throws. */
@@ -70,6 +75,7 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
         });
       }
     }
+    const fillEvents = res.status === "ok" ? res.rows.filter((r) => r.kind === "fill_event") : [];
     if (res.rows.length > 0) {
       try {
         await insertV22Events(res.rows);
@@ -77,10 +83,10 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
         if (!(err instanceof V22EventWriteError)) throw err;
         // The DB write failed (already counted + alerted in insertV22Events). Report it instead of pretending it was recorded,
         // so a caller that can be redelivered (the webhook) answers 5xx.
-        return { status: "write_failed", rows: res.rows.length };
+        return { status: "write_failed", rows: res.rows.length, ...(fillEvents.length > 0 ? { fillEvents } : {}) };
       }
     }
-    return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : {}) };
+    return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : fillEvents.length > 0 ? { fillEvents } : {}) };
   } catch (err) {
     logger.warn("v22 log-event recording failed (trades unaffected)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });
     return { status: "not_applicable", rows: 0 };

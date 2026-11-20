@@ -10,6 +10,8 @@ import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { isBlockedSlab } from "../blocklist.js";
 import { insertTradeRow, insertTradeRows, tradeKey, type IndexerTradeRow, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { recordV22LogEvents } from "./v22LogEvents.js";
+import { feeFromAtoms, logFillFor } from "../parsers/logFill.js";
+import type { V22EventRow } from "../parsers/v22Events.js";
 import { rawInstructionsFromParsedTx } from "../parsers/v22Events.js";
 import {
   parsePercolatorLiquidations,
@@ -720,7 +722,9 @@ export class TradeIndexerPolling {
     if (!tx.meta || tx.meta.err) return false;
 
     // v2.2 wrapper LOG events of this slab (fills / reductions / moves; strict frame attribution; VERSION-keyed). Best effort and
-    // isolated: it never throws and never touches the trade path below.
+    // isolated: it never throws. Its decoded fill_event records give each TradeCpi leg its executed size when the matcher
+    // context cannot (a ZERO record = no row) and every leg its fee, the same way the event stream does (parsers/logFill.ts).
+    let logFills: V22EventRow[] | undefined;
     try {
       const v22 = await recordV22LogEvents({
         signature,
@@ -732,6 +736,7 @@ export class TradeIndexerPolling {
         blockTimeSec: tx.blockTime ?? null,
         isKnownMarket: (slab) => slab === slabAddress,
       });
+      logFills = v22.fillEvents;
       // A failed v22_events write must hold the cursor like a failed trade write, else the events are lost for good. It is
       // bounded by the poison-row logic (holdAfterWriteFailure): after MAX_WRITE_HOLDS polls with other writes succeeding the
       // signature is skipped into skipped_signatures with an alert; with no writes succeeding it is held with an outage alert.
@@ -1018,6 +1023,7 @@ export class TradeIndexerPolling {
           touched.add(`${trader}|${slabAddress}|${leg.assetIndex}`);
           // Already stored (same leg, or this fill under the old per-instruction numbering)? Skip it
           // before any price read; the insert's own dedup stays the backstop if this lookup failed.
+          const logFill = logFillFor(logFills, { ixIndex: ixIdx, slab: slabAddress, assetIndex: leg.assetIndex, legPos: leg.legIndex });
           if (batchCpi) {
             if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex, trader, side: leg.side, ordinal: cpiOrdinalOf(slabAddress, leg.assetIndex, trader, leg.side) }, reduceLegs)) continue;
           } else {
@@ -1031,7 +1037,7 @@ export class TradeIndexerPolling {
             // All-or-nothing per transaction: once one leg needs a retry, write none of its later
             // legs in this pass (their stored-leg rank would make the retry drop the unwritten leg).
             if (retryNeeded) continue;
-            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError, signature });
+            const r = await resolveCpiLeg({ evidence: batchCpi, assetIndex: leg.assetIndex, side: leg.side, wireSizeAbs: leg.sizeValue, legPos: leg.legIndex, readContext: readMatcherContext, onReadError, signature, logFill });
             if (r.kind === "read-error") { retryNeeded = true; continue; }
             if (r.kind === "skip") {
               if (r.reason !== "zero-fill") unverified.push(`${r.reason}: ${r.detail}`);
@@ -1047,7 +1053,7 @@ export class TradeIndexerPolling {
             } // "legacy": wire size + the existing price logic, exactly as before this parser
           }
           if (price === undefined) price = await resolvePrice(leg);
-          const fee = computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
+          const fee = logFill ? feeFromAtoms(logFill.feeAtoms) : computeFeeUsd(legSize, perLotPrice(price, cachedLotExp(slabAddress, leg.assetIndex)), leg.feeBps);
 
           const legSizeStr = legSize.toString();
           await writeFill({
@@ -1083,6 +1089,7 @@ export class TradeIndexerPolling {
       if (!traderKey) continue;
       const trader = traderKey.toBase58();
       touched.add(`${trader}|${slabAddress}|${decoded.assetIndex}`);
+      const logFill = logFillFor(logFills, { ixIndex: ixIdx, slab: slabAddress, assetIndex: decoded.assetIndex, legPos: 0 });
       {
         if (tag === IX_TAG.TradeCpi) {
           if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: decoded.assetIndex, legIndex, trader, side, ordinal: cpiOrdinalOf(slabAddress, decoded.assetIndex, trader, side) }, reduceLegs)) continue;
@@ -1101,7 +1108,7 @@ export class TradeIndexerPolling {
         // #213/#221: executed size + booked price from the matcher call, never the request/mark.
         const r = await resolveCpiLeg({
           evidence: cpiEvidenceFromParsed(ix, ixIdx, tx.meta.innerInstructions as any, returnData, false, ixAccounts),
-          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature,
+          assetIndex: decoded.assetIndex, side, wireSizeAbs: sizeValue, legPos: 0, readContext: readMatcherContext, onReadError, signature, logFill,
         });
         if (r.kind === "read-error") { retryNeeded = true; continue; }
         if (r.kind === "skip") {
@@ -1118,7 +1125,7 @@ export class TradeIndexerPolling {
         } // "legacy": wire size + the existing price logic, exactly as before this parser
       }
       if (price === undefined) price = await resolveFallbackPrice(decoded.assetIndex);
-      const fee = computeFeeUsd(sizeValue, perLotPrice(price, cachedLotExp(slabAddress, decoded.assetIndex)), decoded.feeBps);
+      const fee = logFill ? feeFromAtoms(logFill.feeAtoms) : computeFeeUsd(sizeValue, perLotPrice(price, cachedLotExp(slabAddress, decoded.assetIndex)), decoded.feeBps);
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
