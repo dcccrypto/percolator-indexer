@@ -162,9 +162,10 @@ function stackHeightOf(ix: object): number | null {
 
 function readU64(d: Uint8Array, off: number): bigint | null {
   if (d.length < off + 8) return null;
-  let v = 0n;
-  for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(d[off + i]!);
-  return v;
+  // Two 32-bit halves: one BigInt shift/or instead of eight.
+  const lo = (d[off]! | (d[off + 1]! << 8) | (d[off + 2]! << 16) | (d[off + 3]! << 24)) >>> 0;
+  const hi = (d[off + 4]! | (d[off + 5]! << 8) | (d[off + 6]! << 16) | (d[off + 7]! << 24)) >>> 0;
+  return hi === 0 ? BigInt(lo) : (BigInt(hi) << 32n) | BigInt(lo);
 }
 function readU128(d: Uint8Array, off: number): bigint | null {
   const lo = readU64(d, off);
@@ -185,23 +186,23 @@ type SplKind = "transfer" | "mintTo" | "burn";
  * variants (the deployed wrapper uses the plain ones; the checked forms are
  * accepted so a future wrapper switching to them is not silently mis-read).
  */
-function splAmount(
-  children: NormIx[],
-  kind: SplKind,
-  match: { source?: string; dest?: string; mint?: string; account?: string },
-): bigint | null {
-  for (const ix of children) {
+function splAmount(children: NormIx[], kind: SplKind, x?: string, y?: string): bigint | null {
+  // x/y are the two account constraints, in the order they are checked against
+  // the instruction's accounts: transfer (source, dest), mintTo (mint, dest),
+  // burn (account, mint). A falsy constraint is not checked.
+  for (let n = 0; n < children.length; n++) {
+    const ix = children[n]!;
     if (ix.programId !== TOKEN_PROGRAM_ID || ix.data.length < 9) continue;
     const t = ix.data[0]!;
     const a = ix.accounts;
     let ok = false;
     if (kind === "transfer") {
-      if (t === 3) ok = (!match.source || a[0] === match.source) && (!match.dest || a[1] === match.dest);
-      else if (t === 12) ok = (!match.source || a[0] === match.source) && (!match.dest || a[2] === match.dest);
+      if (t === 3) ok = (!x || a[0] === x) && (!y || a[1] === y);
+      else if (t === 12) ok = (!x || a[0] === x) && (!y || a[2] === y);
     } else if (kind === "mintTo") {
-      if (t === 7 || t === 14) ok = (!match.mint || a[0] === match.mint) && (!match.dest || a[1] === match.dest);
+      if (t === 7 || t === 14) ok = (!x || a[0] === x) && (!y || a[1] === y);
     } else if (t === 8 || t === 15) {
-      ok = (!match.account || a[0] === match.account) && (!match.mint || a[1] === match.mint);
+      ok = (!x || a[0] === x) && (!y || a[1] === y);
     }
     if (ok) return readU64(ix.data, 1);
   }
@@ -250,7 +251,7 @@ function decodeOne(
       if (d.length < 19 || a.length < 11) return null;
       const amount = readU128(d, 1)!;
       const [user, market, registry, lpMint, lpAta, source, vaultToken] = a as [string, string, string, string, string, string, string];
-      const moved = splAmount(kids, "transfer", { source, dest: vaultToken });
+      const moved = splAmount(kids, "transfer", source, vaultToken);
       // The handler transfers exactly `amount`. A disagreement means these CPIs
       // are not the ones we think they are, so the shares are not trusted either:
       // the event is kept with lpAmount = null, which marks the basis unknown
@@ -259,7 +260,7 @@ function decodeOne(
       return {
         ...common, kind: "deposit", market, registry, user, lpMint,
         collateralAtoms: amount,
-        lpAmount: consistent ? splAmount(kids, "mintTo", { mint: lpMint, dest: lpAta }) : null,
+        lpAmount: consistent ? splAmount(kids, "mintTo", lpMint, lpAta) : null,
         domain: readU16(d, 17),
       };
     }
@@ -282,13 +283,13 @@ function decodeOne(
       const vaultToken = a[6]!;
       const dest = a[9]!;
       const user = a[12]!;
-      const out = splAmount(kids, "transfer", { source: vaultToken, dest });
+      const out = splAmount(kids, "transfer", vaultToken, dest);
       return {
         ...common, kind: "execute_redeem", market, registry, user, lpMint,
         // The handler skips the Transfer CPI only for a 0-atom payout, which it
         // rejects earlier; a missing Transfer with a present Burn is therefore 0.
         collateralAtoms: out ?? 0n,
-        lpAmount: splAmount(kids, "burn", { account: escrow, mint: lpMint }),
+        lpAmount: splAmount(kids, "burn", escrow, lpMint),
         domain: readU16(d, 1),
       };
     }
@@ -298,7 +299,7 @@ function decodeOne(
       return {
         ...common, kind: "cancel_redeem", market: null, registry, user, lpMint,
         collateralAtoms: 0n,
-        lpAmount: splAmount(kids, "transfer", { source: escrow, dest: lpAta }),
+        lpAmount: splAmount(kids, "transfer", escrow, lpAta),
         domain: null,
       };
     }
