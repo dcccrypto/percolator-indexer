@@ -167,11 +167,17 @@ export class LpVaultIndexer {
     const until = await this.cursorFor(reg.registry);
 
     const sigs: { signature: string; slot: number; failed: boolean }[] = [];
+    const seen = new Set<string>();
     let before: string | undefined;
     for (;;) {
       const page = await chain.getSignatures(reg.registry, { until, before, limit: PAGE });
-      sigs.push(...page);
-      if (page.length < PAGE) break;
+      // A SHORT page does not mean the cursor was reached: a node can cut a page short while older signatures remain,
+      // and stopping there committed the cursor past them for good (RPC fault replay, "shortpage": a deposit lost and
+      // the position folded wrong). Page on until a page brings nothing new: one extra `before` call per short page.
+      const fresh = page.filter((s) => !seen.has(s.signature));
+      if (fresh.length === 0) break;
+      for (const s of fresh) seen.add(s.signature);
+      sigs.push(...fresh);
       if (sigs.length >= hardCap) {
         throw new Error(`LP-vault ${reg.registry}: backlog exceeds ${hardCap} signatures; raise maxBacklogSignatures`);
       }
