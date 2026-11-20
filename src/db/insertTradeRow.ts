@@ -109,7 +109,11 @@ let provenanceColumnMissingSince: number | null = null;
 const PROVENANCE_REPROBE_MS = 5 * 60_000;
 
 function provenanceColumnMissing(): boolean {
-  return provenanceColumnMissingSince !== null && Date.now() - provenanceColumnMissingSince < PROVENANCE_REPROBE_MS;
+  if (provenanceColumnMissingSince === null) return false;
+  const age = Date.now() - provenanceColumnMissingSince;
+  // A wall clock stepped back (NTP) makes the age negative; treat that as expired so the column is
+  // re-probed instead of being omitted until the clock catches up.
+  return age >= 0 && age < PROVENANCE_REPROBE_MS;
 }
 
 /** Same fallback for trades.price_lot_exp (migration 20261120210000): an environment without it keeps indexing. */
