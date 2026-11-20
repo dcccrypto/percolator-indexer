@@ -9,6 +9,8 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import { encodeBase58 } from "../../src/lib/base58.js";
 
 const W = vi.hoisted(() => "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+// Payloads here are hand-built and not modelled as RPC transactions: the chain "confirms" each one as sent (D1 lookup is tested in tests/lib/webhookChainTx.test.ts).
+vi.mock("../../src/lib/webhookChainTx.js", async (orig) => (await import("../helpers/chainTxEcho.js")).chainTxEchoModule(orig as never));
 vi.mock("@percolatorct/shared", async (orig) => {
   const actual = await orig<typeof import("@percolatorct/shared")>();
   return { ...actual, config: { ...actual.config, allProgramIds: ["FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"], webhookSecret: "s3cret" }, eventBus: { publish: vi.fn() }, getConnection: vi.fn(() => ({ getAccountInfo: vi.fn(async () => null) })), withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()), captureException: vi.fn() };

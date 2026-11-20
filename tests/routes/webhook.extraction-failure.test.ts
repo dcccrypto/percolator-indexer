@@ -23,6 +23,8 @@ const TRADER = 'So11111111111111111111111111111111111111112';
 const SLAB = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
 
+// Payloads here are hand-built and not modelled as RPC transactions: the chain "confirms" each one as sent (D1 lookup is tested in tests/lib/webhookChainTx.test.ts).
+vi.mock('../../src/lib/webhookChainTx.js', async (orig) => (await import('../helpers/chainTxEcho.js')).chainTxEchoModule(orig as never));
 vi.mock('@percolatorct/sdk', async (importOriginal) => ({
   // v2.2: the indexer's layout code uses the REAL SDK layout tables; tests override only what they stub.
   ...(await importOriginal<typeof import('@percolatorct/sdk')>()),
