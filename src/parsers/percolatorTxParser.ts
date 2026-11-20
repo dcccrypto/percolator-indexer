@@ -516,7 +516,17 @@ export function cpiEvidenceFromParsed(
       }
     }
   }
-  return cpiEvidence(accounts, inner, returnData, isBatch);
+  // Solana keeps only the LAST return data set in the whole transaction. It can be attributed to
+  // this instruction only when this is the sole matcher-calling CPI in the tx; otherwise it may be
+  // another instruction's answer (identical req_id/lp/asset/price keys would even pass the match).
+  let sharedReturn = false;
+  const matcherProgram = accounts[4];
+  if (returnData && matcherProgram && Array.isArray(innerGroups)) {
+    let calls = 0;
+    for (const g of innerGroups) for (const i of g.instructions ?? []) if (pubkeyToBase58(i?.programId) === matcherProgram) calls++;
+    sharedReturn = calls !== 1;
+  }
+  return cpiEvidence(accounts, inner, sharedReturn ? null : returnData, isBatch);
 }
 
 /**
