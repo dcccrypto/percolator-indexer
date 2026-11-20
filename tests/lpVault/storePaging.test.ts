@@ -12,6 +12,8 @@ function cappingDb(table: string, all: Record<string, unknown>[], maxRows: numbe
       let to = Number.POSITIVE_INFINITY;
       const q: Record<string, unknown> = {};
       for (const op of ["select", "eq", "or"]) q[op] = () => q;
+      let gt: [string, string] | null = null;
+      q.gt = (c: string, v: string) => ((gt = [c, v]), q);
       q.order = (col: string, o?: { ascending?: boolean }) => {
         orders.push([col, o?.ascending !== false]);
         calls.push({ op: "order", args: [col] });
@@ -30,6 +32,7 @@ function cappingDb(table: string, all: Record<string, unknown>[], maxRows: numbe
       };
       q.then = (res: (v: unknown) => unknown) => {
         let rows = t === table ? [...all] : [];
+        if (gt) rows = rows.filter((r) => String(r[gt![0]]) > gt![1]);
         rows.sort((x, y) => {
           for (const [c, asc] of orders) {
             const a = x[c] as number | string, b = y[c] as number | string;

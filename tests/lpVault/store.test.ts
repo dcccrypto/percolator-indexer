@@ -25,7 +25,7 @@ function fakeDb(result: Result) {
         log.push({ table, op, args });
         return q;
       };
-      for (const op of ["select", "eq", "order", "or"]) q[op] = chain(op);
+      for (const op of ["select", "eq", "order", "or", "gt"]) q[op] = chain(op);
       const done = (op: string) => (...args: unknown[]) => {
         log.push({ table, op, args });
         return Promise.resolve({ data: null, error: null, ...result });
