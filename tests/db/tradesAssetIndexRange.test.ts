@@ -16,9 +16,11 @@ function columnType(table: string, col: string): string {
       const m = new RegExp(`^\\s*${col}\\s+(\\w+)`, "im").exec(ct[1]);
       if (m) t = m[1].toLowerCase();
     }
-    const add = new RegExp(`ALTER TABLE (?:IF EXISTS )?(?:public\\.)?${table}[\\s\\S]*?ADD COLUMN(?: IF NOT EXISTS)?\\s+${col}\\s+(\\w+)`, "i").exec(sql);
+    const add = new RegExp(`ALTER TABLE (?:IF EXISTS )?(?:public\\.)?${table}\\s[^;]*?ADD COLUMN(?: IF NOT EXISTS)?\\s+${col}\\s+(\\w+)`, "i").exec(sql);
     if (add) t = add[1].toLowerCase();
-    for (const m of sql.matchAll(new RegExp(`ALTER COLUMN\\s+${col}\\s+(?:SET DATA )?TYPE\\s+(\\w+)`, "gi"))) t = m[1].toLowerCase();
+    for (const stmt of sql.matchAll(new RegExp(`ALTER TABLE (?:IF EXISTS )?(?:ONLY )?(?:public\\.)?${table}\\s[^;]*`, "gi"))) {
+      for (const m of stmt[0].matchAll(new RegExp(`ALTER COLUMN\\s+${col}\\s+(?:SET DATA )?TYPE\\s+(\\w+)`, "gi"))) t = m[1].toLowerCase();
+    }
   }
   if (!t) throw new Error(`${table}.${col} not found`);
   return t;
@@ -30,7 +32,7 @@ const MAX_BY_TYPE: Record<string, number> = { smallint: 32767, int2: 32767, inte
 describe("trades.asset_index holds every u16 the trade writer is typed to send", () => {
   it("column range >= u16 max (same as v22_events.asset_index)", () => {
     const t = columnType("trades", "asset_index");
-    expect({ type: t, max: MAX_BY_TYPE[t] ?? 0 }).toEqual({ type: t, max: expect.any(Number) });
+    expect(MAX_BY_TYPE).toHaveProperty(t);
     expect(MAX_BY_TYPE[t]).toBeGreaterThanOrEqual(U16_MAX);
   });
 });
