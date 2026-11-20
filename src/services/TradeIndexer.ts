@@ -232,8 +232,12 @@ export class TradeIndexerPolling {
   private writeHolds = new Map<string, WriteHold>();
   /** Per-slab full signatures whose write failed and are still held; re-added to the next window if it no longer reaches them. */
   private heldSigs = new Map<string, Set<string>>();
-  /** Polls each signature has held its slab's cursor because its transaction read as null (see MAX_NULL_TX_HOLDS). */
-  private nullTxHolds = new Map<string, number>();
+  /**
+   * Per slab: polls each signature has held that slab's cursor because its transaction read as null (MAX_NULL_TX_HOLDS).
+   * Per slab, not per signature: one crank tx is in several slabs' windows, and each slab's hold counts on its own.
+   * A slab's entry goes when its cursor commits (every held signature is then behind it).
+   */
+  private nullTxHolds = new Map<string, Map<string, number>>();
   /**
    * Per-slab `until` boundary for a slab with no cursor yet whose window was held: the oldest signature of the first
    * held window. Later retries page (anchor, newest], so signatures that arrive during a hold are not cut off by the
@@ -531,20 +535,20 @@ export class TradeIndexerPolling {
           // Listed as confirmed (err null) but read as null: the answering node does not have it yet. Moving the cursor
           // past it lost it for good (RPC fault replay, "nulltx": 74 of 247 fills), so hold the cursor and stop here
           // (oldest-first: nothing after it may be processed ahead of it), up to MAX_NULL_TX_HOLDS polls.
-          const holds = (this.nullTxHolds.get(sig) ?? 0) + 1;
+          const slabHolds = this.nullTxHolds.get(slabAddress) ?? new Map<string, number>();
+          const holds = (slabHolds.get(sig) ?? 0) + 1;
           if (holds <= MAX_NULL_TX_HOLDS) {
-            this.nullTxHolds.set(sig, holds);
+            slabHolds.set(sig, holds);
+            this.nullTxHolds.set(slabAddress, slabHolds);
             holdCursor = true;
             logger.warn("getParsedTransactions returned null for a confirmed signature; holding the cursor, retried next poll", { signature: sig.slice(0, 12), slabAddress: slabAddress.slice(0, 8), holds });
             break windowLoop;
           }
-          this.nullTxHolds.delete(sig);
           logger.error("ALERT: confirmed signature still reads as null after MAX_NULL_TX_HOLDS polls; SKIPPING it, needs manual backfill", { signature: sig, slabAddress });
           await recordSkippedSignatures([{ signature: sig, source: "trade-indexer" as const, slab: slabAddress, error: `getParsedTransactions returned null ${MAX_NULL_TX_HOLDS}+ polls` }]);
           captureException(new Error(`confirmed signature ${sig} read as null ${MAX_NULL_TX_HOLDS}+ polls; skipped (slab ${slabAddress})`), { tags: { context: "trade-indexer-null-tx" }, extra: { slabAddress, signature: sig } });
           continue;
         }
-        this.nullTxHolds.delete(sig);
 
         try {
           await this.processTransaction(tx, sig, slabAddress, programIds, pass); // rows written are counted in pass.newCount
@@ -584,6 +588,7 @@ export class TradeIndexerPolling {
     }
     if (!batchFailed && !holdCursor) {
       await this.commitCursor(slabAddress, signatures[0].signature);
+      this.nullTxHolds.delete(slabAddress);
     } else {
       // Held without a saved cursor: pin the window's oldest signature so the retry pages from it (not just the newest page).
       if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) {

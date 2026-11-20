@@ -114,6 +114,25 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
     expect(processed).toContain("sig10");
   });
 
+  it("loss 1 (bound per slab): one null signature in two slabs' windows holds each slab its own 5 polls", async () => {
+    const SLAB2 = "11111111111111111111111111111111"; // a crank tx is in several slabs' windows
+    chain = makeChain(10);
+    indexer.lastSignature.set(SLAB, "sig0");
+    indexer.lastSignature.set(SLAB2, "sig0");
+    nullFor = new Set(["sig4"]);
+    for (let poll = 1; poll <= 5; poll++) {
+      await indexer.indexTradesForSlab(SLAB);
+      await indexer.indexTradesForSlab(SLAB2);
+    }
+    expect([indexer.lastSignature.get(SLAB), indexer.lastSignature.get(SLAB2)]).toEqual(["sig0", "sig0"]);
+    expect(recordSkippedSignatures).not.toHaveBeenCalled();
+    nullFor = new Set(); // the node catches up: both slabs read it, nothing is skipped
+    await indexer.indexTradesForSlab(SLAB);
+    await indexer.indexTradesForSlab(SLAB2);
+    expect([indexer.lastSignature.get(SLAB), indexer.lastSignature.get(SLAB2)]).toEqual(["sig10", "sig10"]);
+    expect(recordSkippedSignatures).not.toHaveBeenCalled();
+  });
+
   it("loss 2 (cost): a window that ends on a short page costs exactly one extra before-call, which answers empty", async () => {
     chain = makeChain(3);
     indexer.lastSignature.set(SLAB, "sig0");
