@@ -173,7 +173,9 @@ describe("webhook mark-EWMA fallback (legacy leg, effective_price 0)", () => {
 
   function legacyTx(slab: Buffer) {
     const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
-    for (const i of tx.instructions) delete i.innerInstructions; // unrecognised matcher call -> legacy -> mark fallback
+    // Undecodable matcher call (CPI evidence present) -> legacy -> mark fallback. An ABSENT innerInstructions field is not
+    // written at all (tests/webhook-payload-shape-drift.test.ts E1).
+    for (const i of tx.instructions) for (const n of i.innerInstructions ?? []) if (n.programId === i.accounts?.[4]) n.data = "1";
     tx.accountData = [{ account: SLAB, data: slab.toString("base64") }];
     return tx;
   }

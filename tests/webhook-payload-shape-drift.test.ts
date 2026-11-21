@@ -45,6 +45,7 @@ vi.mock("../src/db/insertV22Events.js", async (orig) => ({
 }));
 import { insertTradeRows } from "../src/db/insertTradeRow.js";
 import { webhookRoutes } from "../src/routes/webhook.js";
+import { rawInstructionsFromEnhancedTx } from "../src/parsers/v22Events.js";
 
 const enhanced = JSON.parse(readFileSync(new URL("./fixtures/tradecpi/helius-enhanced.json", import.meta.url), "utf8")).txs as Record<string, any>;
 const classic = (n: string) => JSON.parse(readFileSync(new URL(`./fixtures/tradecpi/${n}.json`, import.meta.url), "utf8"));
@@ -164,5 +165,40 @@ describe("webhook payload-shape drift", () => {
     const nested = clone(drift.fill); nested.meta = { logMessages: drift.fillLogMessages };
     await post([nested]);
     expect(v22Rows.map((r) => r.kind)).toEqual(want);
+  });
+
+  it("per item: a POISON key in one item still rejects the whole request (SEC #127), nothing is written", async () => {
+    const raw = `[${JSON.stringify(clone(drift.fill))},{"__proto__":{"x":1},"signature":"${PARTIAL.sig}","instructions":[]},${JSON.stringify(canonical())}]`;
+    const res = await webhookRoutes().fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body: raw }));
+    expect(res.status).toBe(400);
+    expect(vi.mocked(insertTradeRows)).not.toHaveBeenCalled();
+  });
+
+  it("per item: an unusable item that names a signature is recorded in skipped_signatures; the delivery answers 200 with the counts", async () => {
+    const bad = canonical();
+    wrapperIx(bad).accounts[3] = null;
+    const res = await webhookRoutes().fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body: JSON.stringify([clone(drift.fill), bad]) }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: 1, rejected: 1 });
+    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: PARTIAL.sig, source: "trade-indexer", error: expect.stringContaining("not a resolved address") })]);
+  });
+
+  it("per item: a delivery with NO usable item answers 400 (422 when the items are raw) before any read or write", async () => {
+    expect((await post([null, "notATx"])).status).toBe(400);
+    expect((await post([rawJsonOf(canonical()), rawJsonOf(canonical())])).status).toBe(422);
+    expect(vi.mocked(insertTradeRows)).not.toHaveBeenCalled();
+    expect(getAccountInfo).not.toHaveBeenCalled();
+  });
+
+  it("v22 flat groups: a group without a usable index falls back to 1000 + its position", () => {
+    const tx = clone(drift.v22ix);
+    const groups = tx.instructions.map((i: any, index: number) => ({ index, instructions: i.innerInstructions ?? [] })).filter((g: any) => g.instructions.length);
+    for (const i of tx.instructions) delete i.innerInstructions;
+    const progs = new Set(H.PROGRAMS);
+    const keyed = (gs: unknown) => rawInstructionsFromEnhancedTx({ ...tx, innerInstructions: gs }, progs).filter((r) => r.innerIndex >= 0).map((r) => r.ixIndex);
+    expect(new Set(keyed(groups))).toEqual(new Set(groups.filter((g: any) => g.instructions.some((n: any) => progs.has(n.programId))).map((g: any) => g.index)));
+    const noIndex = groups.map(({ index: _i, ...g }: any) => g);
+    expect(keyed(noIndex).length).toBeGreaterThan(0);
+    expect(keyed(noIndex).every((ix) => ix >= 1000)).toBe(true);
   });
 });
