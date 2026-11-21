@@ -1,3 +1,4 @@
+import { getProgramIds } from "./lib/programIds.js";
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
@@ -305,7 +306,7 @@ async function start() {
       chain: new RpcLpVaultChain(getConnection()),
       store: new SupabaseLpVaultStore(getSupabase()),
       network: CURRENT_NETWORK,
-      programIds: config.allProgramIds,
+      programIds: getProgramIds(),
       pollIntervalMs: Number(process.env.LP_VAULT_POLL_INTERVAL_MS ?? 30_000),
     });
     lpVaultIndexer.start();

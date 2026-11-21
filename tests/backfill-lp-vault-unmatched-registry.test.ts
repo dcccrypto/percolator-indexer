@@ -15,9 +15,9 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("dotenv/config", () => ({}));
-vi.mock("@solana/web3.js", () => ({ Connection: class {} }));
+vi.mock("@solana/web3.js", async (orig) => ({ ...(await orig<typeof import("@solana/web3.js")>()), Connection: class {} }));
 vi.mock("@percolatorct/shared", () => ({
-  config: { rpcUrl: "http://mock.invalid", allProgramIds: ["PROG1"] },
+  config: { rpcUrl: "http://mock.invalid", allProgramIds: ["FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"] },
   getSupabase: h.getSupabase,
 }));
 vi.mock("../src/network.js", () => ({ CURRENT_NETWORK: "devnet" }));

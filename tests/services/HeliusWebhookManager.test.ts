@@ -9,7 +9,7 @@ const { mockFetch, sharedMock } = vi.hoisted(() => ({
       webhookUrl: "https://my-server.example.com",
       webhookSecret: "webhook-secret-123",
       rpcUrl: "https://api-devnet.helius-rpc.com",
-      allProgramIds: ["ProgramId111111111111111111111111111111"],
+      allProgramIds: ["FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"],
     },
     logger: {
       info: vi.fn(),
@@ -50,7 +50,7 @@ describe("HeliusWebhookManager", () => {
     sharedMock.config.webhookUrl = "https://my-server.example.com";
     sharedMock.config.webhookSecret = "webhook-secret-123";
     sharedMock.config.rpcUrl = "https://api-devnet.helius-rpc.com";
-    sharedMock.config.allProgramIds = ["ProgramId111111111111111111111111111111"];
+    sharedMock.config.allProgramIds = ["FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"];
     manager = new HeliusWebhookManager();
   });
 

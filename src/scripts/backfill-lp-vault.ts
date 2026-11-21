@@ -21,6 +21,7 @@
  * Env: RPC_URL, NETWORK, PROGRAM_ID / ALL_PROGRAM_IDS (as the service).
  *      LP_BACKFILL_RPC_ORIGIN — optional Origin header for an Origin-restricted RPC key.
  */
+import { getProgramIds } from "../lib/programIds.js";
 import "dotenv/config";
 import { Connection } from "@solana/web3.js";
 import { config, getSupabase } from "@percolatorct/shared";
@@ -44,14 +45,14 @@ async function main(): Promise<void> {
     chain: new RpcLpVaultChain(conn),
     store,
     network: CURRENT_NETWORK,
-    programIds: config.allProgramIds,
+    programIds: getProgramIds(),
     // Full history, every time: never resume from (or move) the live service's durable cursor.
     ephemeralCursor: true,
   });
 
   const registries = (await indexer.refreshRegistries()).filter((r) => !only || r.registry === only);
   if (only && registries.length === 0) throw new Error(`--registry ${only} matches no known LP-vault registry`);
-  console.log(`[lp-backfill] ${write ? "WRITE" : "DRY RUN"} network=${CURRENT_NETWORK} programs=${config.allProgramIds.join(",")} vaults=${registries.length}`);
+  console.log(`[lp-backfill] ${write ? "WRITE" : "DRY RUN"} network=${CURRENT_NETWORK} programs=${getProgramIds().join(",")} vaults=${registries.length}`);
 
   let failures = 0;
   const touched: PositionRow[] = [];

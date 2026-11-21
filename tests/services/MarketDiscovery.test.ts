@@ -537,6 +537,36 @@ describe('#145 — MarketDiscovery: both v17 and v12 scanners always run per pro
       process.env.MARKETS_FILTER = origFilter;
     }
   });
+
+  it('MARKETS_FILTER (R-1): one bad entry is skipped, the valid one is still discovered', async () => {
+    const slab = 'So11111111111111111111111111111111111111112';
+    vi.mocked(v17disc.discoverV17Markets).mockClear();
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any);
+    vi.mocked(core.getMarketsByAddress).mockResolvedValue([] as any);
+    const orig = process.env.MARKETS_FILTER;
+    process.env.MARKETS_FILTER = `oops, ${slab}`;
+    try {
+      await drive(marketDiscovery.discover());
+      const calls = vi.mocked(v17disc.discoverV17Markets).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const c of calls) expect((c[2] as any[]).map(k => k.toBase58())).toEqual([slab]);
+    } finally {
+      if (orig === undefined) delete process.env.MARKETS_FILTER; else process.env.MARKETS_FILTER = orig;
+    }
+  });
+
+  it('MARKETS_FILTER (R-1): all entries invalid -> no discovery call (an empty list would full-scan)', async () => {
+    vi.mocked(v17disc.discoverV17Markets).mockClear();
+    const orig = process.env.MARKETS_FILTER;
+    process.env.MARKETS_FILTER = 'oops,nope';
+    try {
+      const r = await drive(marketDiscovery.discover());
+      expect(r).toEqual([]);
+      expect(v17disc.discoverV17Markets).not.toHaveBeenCalled();
+    } finally {
+      if (orig === undefined) delete process.env.MARKETS_FILTER; else process.env.MARKETS_FILTER = orig;
+    }
+  });
 });
 
 describe('MarketDiscovery.onDiscovered (#223)', () => {
