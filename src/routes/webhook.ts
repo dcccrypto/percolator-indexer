@@ -1,3 +1,4 @@
+import { getProgramIds } from "../lib/programIds.js";
 import { Hono } from "hono";
 import { parseDeliveryBudgetMs } from "../lib/indexerEnv.js";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -47,7 +48,7 @@ const TRADE_TAGS = new Set<number>([
   IX_TAG.BatchTradeNoCpi, // 66
   IX_TAG.BatchTradeCpi,   // 67
 ]);
-const PROGRAM_IDS = new Set(config.allProgramIds);
+const PROGRAM_IDS = new Set(getProgramIds());
 const BASE58_PUBKEY = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 /** Solana signatures are base58-encoded 64-byte values (87–88 chars). */
 const BASE58_SIGNATURE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
