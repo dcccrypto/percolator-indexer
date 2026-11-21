@@ -17,6 +17,8 @@ export const DEFAULT_WS_SILENCE_MS = 5 * 60_000;
 
 /** Budget for a loop that runs every `intervalMs`: max(3 intervals, 10 min). */
 export function staleBudgetMs(intervalMs: number): number {
+  // A non-numeric interval (e.g. a typo in an env var) must not make the budget NaN, which would read as stale forever.
+  if (!Number.isFinite(intervalMs)) return MIN_STALE_AFTER_MS;
   return Math.max(3 * intervalMs, MIN_STALE_AFTER_MS);
 }
 

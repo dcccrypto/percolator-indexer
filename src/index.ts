@@ -364,8 +364,8 @@ async function start() {
         knownSlabs,
         // Hung-socket liveness: a stream silent for ATLAS_WS_SILENCE_MS (default 5 min; 0 = off) or closed is replaced
         // by a fresh socket and re-subscribed.
-        silenceMs: envInt(process.env.ATLAS_WS_SILENCE_MS, {
-          name: "ATLAS_WS_SILENCE_MS", fallback: DEFAULT_WS_SILENCE_MS, min: 0, max: 2 ** 31 - 1,
+        silenceMs: process.env.ATLAS_WS_SILENCE_MS?.trim() === "0" ? 0 : envInt(process.env.ATLAS_WS_SILENCE_MS, {
+          name: "ATLAS_WS_SILENCE_MS", fallback: DEFAULT_WS_SILENCE_MS, min: 1_000, max: 2 ** 31 - 1,
           warn: (m, c) => logger.warn(m, c),
         }),
         reconnect: () => {

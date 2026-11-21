@@ -139,9 +139,10 @@ export class EventStreamService {
       });
       return;
     }
-    log.warn("event-stream silent or closed; reconnecting and re-subscribing", {
-      silentForMs: silentFor, socketOpen: this.ws.isOpen, reconnects: this.reconnects + 1,
-    });
+    // A closed socket is a fault; an open one that is only quiet may just be a quiet program (devnet), so info.
+    const ctx = { silentForMs: silentFor, socketOpen: this.ws.isOpen, reconnects: this.reconnects + 1 };
+    if (closed) log.warn("event-stream socket closed; reconnecting and re-subscribing", ctx);
+    else log.info("event-stream silent; reconnecting and re-subscribing", ctx);
     let next: AtlasWs;
     try {
       next = this.deps.reconnect();

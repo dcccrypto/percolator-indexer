@@ -34,3 +34,12 @@ describe("LoopLiveness", () => {
     expect(staleBudgetMs(1_000)).toBe(600_000);
   });
 });
+
+describe("staleBudgetMs with a non-numeric interval", () => {
+  it("falls back to the 10 min floor instead of NaN (which would read as stale forever)", () => {
+    expect(staleBudgetMs(Number("abc"))).toBe(MIN_STALE_AFTER_MS);
+    const l = new LoopLiveness(() => 0);
+    l.register("lpVault", staleBudgetMs(NaN));
+    expect(l.probe()).toEqual({ lpVault: true });
+  });
+});
