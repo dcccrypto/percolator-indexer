@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
@@ -17,7 +20,7 @@
     "@hono/node-server": "^1.19.15",
     "@percolatorct/sdk": "file:vendor/percolatorct-sdk-9.0.0-candidate.tgz",
     "@percolatorct/shared": "^1.1.0",
-    "@sentry/node": "10.46.0",
+    "@sentry/node": "~10.78.0",
     "@solana/web3.js": "1.99.0",
     "@supabase/supabase-js": "^2.49.1",
     "dotenv": "^16.4.7",
@@ -27,13 +30,15 @@
     "overrides": {
       "@solana/web3.js": "1.99.0",
       "vite": "8.1.6",
-      "hono": ">=4.13.7",
+      "hono": ">=4.13.16",
       "ws": "8.21.1",
       "brace-expansion": ">=5.0.11",
       "nanoid": ">=3.3.17 <4",
       "source-map-js": ">=1.2.2",
-      "@hono/node-server": ">=1.19.15",
-      "postcss": ">=8.5.23"
+      "@hono/node-server": ">=2.1.6",
+      "postcss": ">=8.5.23",
+      "zod": ">=4.6.6",
+      "@sentry/node": "~10.78.0"
     },
     "auditConfig": {
       "ignoreGhsas": [

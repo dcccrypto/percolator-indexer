@@ -12,6 +12,8 @@ import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
 import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
+import { createDbMonitor } from "./lib/dbMonitor.js";
+import { installUnhandledRejectionPolicy } from "./lib/unhandledRejection.js";
 import { assertSkippedSignatureSinkReady } from "./lib/skippedSignatures.js";
 import { getTradecpiCounters } from "./parsers/matcherFill.js";
 import { LpVaultIndexer } from "./services/LpVaultIndexer.js";
@@ -33,6 +35,9 @@ if (process.env.SENTRY_DSN && !installSentryScrubber()) {
 assertSkippedSignatureSinkReady();
 
 const logger = createLogger("indexer");
+// Explicit policy (lib/unhandledRejection.ts): a stray rejected promise is logged and the
+// process stays up, with or without SENTRY_DSN. Before, Node exited 1 unless Sentry's listener was installed.
+installUnhandledRejectionPolicy(process, logger);
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 /** #163: health probe cache window. Short so a real outage still surfaces fast. */
 const HEALTH_CACHE_TTL_MS = Number(process.env.HEALTH_CACHE_TTL_MS ?? 5000);
@@ -200,33 +205,17 @@ if (port !== rawPort) {
   logger.warn("Invalid INDEXER_PORT, falling back to default", { raw: process.env.INDEXER_PORT, fallback: port });
 }
 
-// DB connection monitoring
-let dbConnectionLost = false;
-const dbMonitorInterval = setInterval(async () => {
-  try {
-    await getSupabase().from("markets").select("id", { count: "exact", head: true });
-    if (dbConnectionLost) {
-      try {
-        await sendInfoAlert("Indexer database connection restored");
-      } catch (alertErr) {
-        logger.error("Failed to send DB restored alert", { error: alertErr });
-      }
-      dbConnectionLost = false;
-    }
-  } catch (err) {
-    if (!dbConnectionLost) {
-      try {
-        await sendCriticalAlert("Indexer database connection lost", [
-          { name: "Error", value: (err instanceof Error ? err.message : String(err)).slice(0, 200), inline: false },
-        ]);
-      } catch (alertErr) {
-        logger.error("Failed to send DB connection lost alert", { error: alertErr });
-      }
-      dbConnectionLost = true;
-    }
-    logger.error("DB connection check failed", { error: err });
-  }
-}, 30_000); // Check every 30s
+// DB connection monitoring (D-1: lib/dbMonitor.ts). supabase-js reports a lost DB as a
+// resolved `{ error }`, not a throw, so the monitor checks `error` and times the probe out.
+const dbMonitor = createDbMonitor({
+  probe: () => getSupabase().from("markets").select("id", { count: "exact", head: true }),
+  timeoutMs: HEALTH_CHECK_TIMEOUT_MS,
+  sendLostAlert: (message) =>
+    sendCriticalAlert("Indexer database connection lost", [{ name: "Error", value: message, inline: false }]),
+  sendRestoredAlert: () => sendInfoAlert("Indexer database connection restored"),
+  logError: (msg, meta) => logger.error(msg, meta),
+});
+const dbMonitorInterval = setInterval(() => void dbMonitor.tick(), 30_000); // Check every 30s
 
 async function start() {
   // Validate NODE_ENV at startup
