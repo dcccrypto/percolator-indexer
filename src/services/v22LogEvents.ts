@@ -50,8 +50,9 @@ export function liquidationMarkers(rows: readonly V22EventRow[]): IndexerTradeRo
       tx_signature: r.signature,
       asset_index: r.asset_index,
       // The trades key is (tx_signature, asset_index, leg_index) with NO slab, so two markets' liquidations of the same asset in
-      // one sweep must not share a leg. The instruction index separates them (one crank names one market) and, unlike a slab-wide
-      // ordinal, is the same on every path whatever its market gate.
+      // one sweep must not share a leg. The top-level instruction index separates them (one top-level crank names one market) and,
+      // unlike a slab-wide ordinal, is the same on every path whatever its market gate. Limit: two markets cranked through CPI inside
+      // ONE top-level instruction still share an ix_index; ord is clamped at 99 so it never spills into the next instruction's range.
       leg_index: 1000 + r.ix_index * 100 + Math.min(ord, 99),
       is_liquidation: true,
     });
