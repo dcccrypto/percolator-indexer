@@ -1,5 +1,5 @@
 /**
- * DRAFT (report idx-liquidations-vs-chain-20261120, finding LIQ-2). Drop into tests/parsers/ with fixtures/ next to it.
+ * Regression for LIQ-2 (report idx-liquidations-vs-chain-20261120).
  *
  * A keeper sweep that liquidates on TWO markets in one tx (376 of 3,148 recorded devnet txs touch more than one market; this
  * fixture is SYNTHETIC: the real liquidations 3cD7owbs… on 6TfAsN… and 679TEtTy… on 7f52gF… concatenated) is stored TWICE
@@ -10,7 +10,7 @@
  * src/routes/webhook.ts:600). So 7f52gF's liquidation is (ix 16, inner 1000000) from poll and (ix 16, inner 1000001) from the
  * stream: two v22_events rows, both reason 3, -45,000,000. Real-path proof: the scratch-PG run "outsynthbase" in the report.
  *
- * Fails on e708fc5.
+ * Failed on e708fc5.
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";

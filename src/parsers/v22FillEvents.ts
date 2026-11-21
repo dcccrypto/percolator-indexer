@@ -508,7 +508,7 @@ export function decodeV22LogEvents(
     if (!accept(e.market)) {
       // The inner_index is part of the upsert key, so it must not depend on which markets THIS
       // path's gate knows (poll: one slab; stream/webhook: the registry). A gated-out event still
-      // consumes the ordinals its rows would have taken, so every path numbers a tx identically.
+      // consumes the ordinals its rows would have taken, so every path numbers a tx's decoded events identically. (events_unknown marker rows are still gate-dependent: follow-up.)
       ordinal += e.kind === "fill" ? e.recs.length : 1;
       continue;
     }
