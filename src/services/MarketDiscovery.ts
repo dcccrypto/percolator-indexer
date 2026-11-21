@@ -155,6 +155,11 @@ export class MarketDiscovery {
     const marketsFilter = (process.env.MARKETS_FILTER ?? "").trim();
     if (marketsFilter) {
       const slabAddresses = parseMarketsFilter(marketsFilter, (entry, error) => logger.warn("Ignoring invalid MARKETS_FILTER entry", { entry, error }));
+      if (slabAddresses.length === 0) {
+        // Every entry invalid: an empty list would make discoverV17Markets fall through to a full getProgramAccounts scan.
+        logger.warn("MARKETS_FILTER has no valid entries — skipping discovery");
+        return [];
+      }
 
       logger.info("Using MARKETS_FILTER — skipping getProgramAccounts discovery", {
         count: slabAddresses.length,
