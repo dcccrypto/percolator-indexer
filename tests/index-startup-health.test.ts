@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
     eventStreamStart: vi.fn(async () => {}),
     addKnownSlab: vi.fn(),
     createAtlasWs: vi.fn(() => ({})),
+    esOpts: null as null | Record<string, any>,
     discoveryDone: Promise.resolve() as Promise<void>,
   };
 });
@@ -65,7 +66,11 @@ vi.mock("../src/services/HeliusWebhookManager.js", () => ({
   HeliusWebhookManager: class { async start() {} async stop() {} },
 }));
 vi.mock("../src/services/EventStreamService.js", () => ({
-  EventStreamService: class { start() { return h.eventStreamStart(); } addKnownSlab(s: string) { h.addKnownSlab(s); } },
+  EventStreamService: class {
+    constructor(opts: Record<string, any>) { h.esOpts = opts; }
+    start() { return h.eventStreamStart(); }
+    addKnownSlab(s: string) { h.addKnownSlab(s); }
+  },
 }));
 vi.mock("../src/services/LpVaultIndexer.js", () => ({ LpVaultIndexer: class { start() {} stop() {} } }));
 vi.mock("../src/lpVault/chain.js", () => ({ RpcLpVaultChain: class {} }));
@@ -105,6 +110,7 @@ beforeEach(() => {
   h.config = { webhookUrl: "", rpcUrl: "", programId: "FAKE", allProgramIds: [] };
   h.fetch = null;
   h.discoveryDone = Promise.resolve();
+  h.esOpts = null;
 });
 
 afterEach(() => {
@@ -154,5 +160,39 @@ describe("HUNG-RPC: /health before the first discovery finishes", { timeout: 60_
     loopLiveness.beat("tradePoll");
     expect((await get("/health")).code).toBe(200);
     loopLiveness.unregister("tradePoll");
+  });
+});
+
+// The Atlas WS wiring in index.ts: ATLAS_WS_SILENCE_MS parsing and the reconnect() closure EventStreamService calls to
+// replace a silent or closed socket (src/index.ts, the HELIUS_ATLAS_WS_URL block).
+describe("HUNG-RPC: Atlas WS silence/reconnect wiring", { timeout: 60_000 }, () => {
+  it("reconnect() builds a fresh socket with createAtlasWs and hands it to the stream", async () => {
+    vi.stubEnv("HELIUS_ATLAS_WS_URL", "wss://atlas.invalid");
+    await loadIndex();
+    expect(h.eventStreamStart).toHaveBeenCalledTimes(1);
+    expect(h.esOpts, "EventStreamService not constructed").toBeTruthy();
+    expect(h.createAtlasWs).toHaveBeenCalledTimes(1);
+    const firstWs = h.esOpts!.ws;
+    expect(firstWs).toBe(h.createAtlasWs.mock.results[0].value);
+
+    const next = h.esOpts!.reconnect();
+    expect(h.createAtlasWs).toHaveBeenCalledTimes(2);
+    expect(next).toBe(h.createAtlasWs.mock.results[1].value);
+    expect(next).not.toBe(firstWs);
+  });
+
+  it.each([
+    ["unset", "", 300_000, false],
+    ["0 turns the check off", "0", 0, false],
+    ["a valid value", "120000", 120_000, false],
+    ["below the 1 s minimum", "500", 300_000, true],
+    ["not an integer", "5m", 300_000, true],
+  ])("ATLAS_WS_SILENCE_MS %s -> silenceMs", async (_label, raw, expected, warns) => {
+    vi.stubEnv("HELIUS_ATLAS_WS_URL", "wss://atlas.invalid");
+    vi.stubEnv("ATLAS_WS_SILENCE_MS", raw);
+    await loadIndex();
+    expect(h.esOpts?.silenceMs).toBe(expected);
+    const warned = h.logger.warn.mock.calls.some((c) => String(c[0]) === "Invalid ATLAS_WS_SILENCE_MS, falling back to default");
+    expect(warned).toBe(warns);
   });
 });

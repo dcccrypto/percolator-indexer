@@ -41,6 +41,7 @@ vi.mock('@percolatorct/shared', () => ({
 }));
 
 import { MarketDiscovery } from '../../src/services/MarketDiscovery.js';
+import { deadlineConnection } from '../../src/lib/rpcDeadline.js';
 import * as core from '@percolatorct/sdk';
 import * as v17disc from '../../src/v17/discovery.js';
 
@@ -199,8 +200,11 @@ describe('MarketDiscovery', () => {
 
     it('should fall back to fallbackConn after exhausting all primary 429 retries', async () => {
       const { getPrimaryConnection, getFallbackConnection } = await import('@percolatorct/shared');
-      const primaryConn = getPrimaryConnection();
-      const fallbackConn = getFallbackConnection();
+      // Discovery calls the SDK with the per-call-deadline proxy of each connection (rpcDeadline.ts), not the raw one.
+      // deadlineConnection() returns one stable proxy per connection, so the same call here yields the instances
+      // discovery passes. Comparing with the raw mocks instead never matched, and this test passed without a single 429.
+      const primaryConn = deadlineConnection(getPrimaryConnection());
+      const fallbackConn = deadlineConnection(getFallbackConnection());
 
       const mockMarket = {
         slabAddress: { toBase58: () => 'MarketFallback11111111111111111111111111' },
@@ -234,6 +238,14 @@ describe('MarketDiscovery', () => {
       expect(getFallbackConnection).toHaveBeenCalled();
       // Market discovered via fallback should be in the results
       expect(result.some(m => m.slabAddress.toBase58() === 'MarketFallback11111111111111111111111111')).toBe(true);
+      // The 429 path really ran: program 1 got four 429s on primary, then exactly one fallback call found the market;
+      // program 2 (the fifth primary call) answered on primary and never touched the fallback.
+      const calls = vi.mocked(core.discoverMarkets).mock.calls.map(([c, id]) => [c === primaryConn ? 'primary' : c === fallbackConn ? 'fallback' : 'other', (id as any).toBase58()]);
+      expect(calls).toEqual([
+        ...Array(4).fill(['primary', '11111111111111111111111111111111']),
+        ['fallback', '11111111111111111111111111111111'],
+        ['primary', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'],
+      ]);
     }, 120_000); // generous timeout — 4 backoff delays sum to ~52 s with max jitter
 
     it('should update existing markets on rediscovery', async () => {
