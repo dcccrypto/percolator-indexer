@@ -9,7 +9,7 @@ import { startDiscovery } from "./services/discoveryWiring.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
-import { EventStreamService, DEFAULT_WS_SILENCE_MS } from "./services/EventStreamService.js";
+import { EventStreamService } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
 import { createDbMonitor } from "./lib/dbMonitor.js";
@@ -23,7 +23,7 @@ import { CURRENT_NETWORK } from "./network.js";
 import { clientIp, trustedProxyDepth } from "./lib/clientIp.js";
 import { createWebhookRateLimiter, webhookRateLimitPerMin, WEBHOOK_RATE_LIMIT_WINDOW_MS } from "./lib/webhookRateLimiter.js";
 import { installSentryScrubber } from "./lib/sentryScrub.js";
-import { loopLiveness } from "./lib/loopLiveness.js";
+import { loopLiveness, DEFAULT_WS_SILENCE_MS } from "./lib/loopLiveness.js";
 import { deadlineConnection } from "./lib/rpcDeadline.js";
 import { envInt } from "./lib/envNumbers.js";
 

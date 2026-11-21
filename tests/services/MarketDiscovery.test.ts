@@ -685,16 +685,31 @@ describe('MarketDiscovery light pass and new-only notification (#223)', () => {
     expect(d.getMarkets().size).toBe(2);
   });
 
-  it('light pass is skipped while a full pass is in flight', async () => {
+  // Hung-RPC liveness (J-20261121-IDX-FIX-HUNGRPCLIVENESS): full and light used to share one in-flight flag, so a full
+  // pass held by a hung RPC also skipped every light pass. They now have their own flags.
+  it('light pass runs while a full pass is in flight (separate in-flight flags)', async () => {
     let release!: (v: any[]) => void;
     const gate = new Promise<any[]>((r) => { release = r; });
     vi.mocked(core.discoverMarkets).mockImplementation(() => gate);
     const d = new MarketDiscovery();
     const inFlight = d.discover();
     await vi.advanceTimersByTimeAsync(100);
-    await expect(d.discoverLight()).resolves.toEqual([]);
-    expect(v17disc.discoverV17Markets).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), undefined, { light: true });
+    await drive(d.discoverLight());
+    expect(v17disc.discoverV17Markets).toHaveBeenCalledWith(expect.anything(), expect.anything(), undefined, { light: true });
     release([]); await settle(); await inFlight;
+  });
+
+  it('a second light pass is skipped while one is in flight', async () => {
+    let release!: (v: any[]) => void;
+    const gate = new Promise<any[]>((r) => { release = r; });
+    vi.mocked(v17disc.discoverV17Markets).mockImplementationOnce(() => gate as any);
+    const d = new MarketDiscovery();
+    const first = d.discoverLight();
+    await vi.advanceTimersByTimeAsync(100);
+    const callsBefore = vi.mocked(v17disc.discoverV17Markets).mock.calls.length;
+    await expect(d.discoverLight()).resolves.toEqual([]);
+    expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.length).toBe(callsBefore);
+    release([]); await settle(); await first;
   });
 
   it('start() runs the light pass on its own, faster timer and stop() clears both', async () => {
@@ -763,5 +778,29 @@ describe('IDX-SILENT2: a partially failed full pass must not drop the failed pro
     vi.mocked(core.discoverMarkets).mockImplementation(async (_c: any, pid: any) => (pid.toBase58() === P1 ? [A] : []) as any);
     await full(d);
     expect([...d.getMarkets().keys()]).toEqual([A.slabAddress.toBase58()]);
+  });
+});
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: discover() and discoverLight() share the _discovering flag. One full scan stuck on a never-settling
+// getProgramAccounts keeps it true until it settles (300 s, or never when trickled), so every later full AND light pass returns [] at the guard and no new
+// market is ever discovered again. /health can still say ok.
+// Measured bound (e708fc5, web3.js 1.99 on Node's undici fetch): a silent / headers-only RPC rejects after undici's
+// 300 s headers/body timeout; a server that trickles bytes is never cut off. The never-settling mock models the trickle
+// case, and the expectation (a service deadline well under 300 s) is also what makes the 300 s case cheap.
+describe("HUNG-RPC: a scan stuck on a never-settling RPC call", () => {
+  it("does not block every later full and light discovery pass", async () => {
+    vi.useFakeTimers();
+    const marketDiscovery = new MarketDiscovery();
+    vi.mocked(v17disc.discoverV17Markets).mockImplementationOnce(() => new Promise(() => {})); // the hung request
+    void marketDiscovery.discover();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const before = vi.mocked(v17disc.discoverV17Markets).mock.calls.length;
+    expect(before).toBeGreaterThanOrEqual(1);
+    await vi.advanceTimersByTimeAsync(15 * 60_000); // RPC answers every NEW request from here on
+    await drive(marketDiscovery.discoverLight());
+    marketDiscovery.stop();
+    // Before the fix (e708fc5 / 3061d3e): discoverLight returns [] at the _discovering guard without a single RPC call.
+    expect(vi.mocked(v17disc.discoverV17Markets).mock.calls.length).toBeGreaterThan(before);
   });
 });

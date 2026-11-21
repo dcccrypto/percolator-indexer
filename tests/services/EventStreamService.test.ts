@@ -1052,3 +1052,103 @@ describe("EventStreamService — #221 fill price per asset", () => {
     vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
 });
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: an Atlas WS that opens and never sends a frame (subscribe swallowed, no pong) leaves the event stream
+// dead for good: shared createAtlasWs pings every 60 s but never checks for a pong and never reconnects, and
+// EventStreamService has no staleness timer, so it neither re-subscribes nor reports itself stale. /health says ok.
+// The expectation below is one acceptable contract (re-subscribe after a silent window, or expose isStale()).
+describe("HUNG-RPC: a WebSocket that opens and never sends", () => {
+  it("re-subscribes, or reports itself stale, after 5 minutes without any notification", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, subCalls } = mockWs();
+      const svc: any = new EventStreamService({ ws, programId: "Prog1111111111111111111111111111111111111111", connection: {} as any });
+      await svc.start();
+      expect(subCalls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(10 * 60_000); // ten silent minutes
+      const resubscribed = subCalls.length > 1;
+      const reportsStale = typeof svc.isStale === "function" && svc.isStale() === true;
+      // Before the fix (e708fc5 / 3061d3e): subCalls stays 1 and there is no staleness signal at all.
+      expect(resubscribed || reportsStale).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("HUNG-RPC: WebSocket silence reconnect", () => {
+  const PROG = "Prog1111111111111111111111111111111111111111";
+  it("replaces a silent socket with reconnect(), re-subscribes, closes the old one and ignores its late frames", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = mockWs();
+      const closed = vi.fn();
+      first.ws.close = closed;
+      const second = mockWs();
+      const reconnect = vi.fn(() => second.ws);
+      const onTx = vi.fn();
+      const svc = new EventStreamService({ ws: first.ws, programId: PROG, connection: {} as any, onTx, reconnect, silenceMs: 60_000 });
+      await svc.start();
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(reconnect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      expect(closed).toHaveBeenCalledTimes(1);
+      expect(second.subCalls).toHaveLength(1);
+      expect(second.subCalls[0].method).toBe("transactionSubscribe");
+      expect(svc.reconnects).toBe(1);
+      first.deliver({ jsonrpc: "2.0", method: "transactionNotification", params: { result: { signature: "OLD" } } } as any);
+      second.deliver({ jsonrpc: "2.0", method: "transactionNotification", params: { result: { signature: "NEW" } } } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onTx.mock.calls.map((c) => c[0].signature)).toEqual(["NEW"]);
+      svc.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stream that keeps receiving notifications is never stale nor reconnected", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, deliver } = mockWs();
+      const reconnect = vi.fn(() => mockWs().ws);
+      const svc = new EventStreamService({ ws, programId: PROG, connection: {} as any, onTx: vi.fn(), reconnect, silenceMs: 60_000 });
+      await svc.start();
+      for (let i = 0; i < 20; i++) {
+        await vi.advanceTimersByTimeAsync(40_000);
+        deliver({ jsonrpc: "2.0", method: "transactionNotification", params: { result: { signature: `S${i}` } } } as any);
+      }
+      expect(reconnect).not.toHaveBeenCalled();
+      expect(svc.isStale()).toBe(false);
+      svc.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("replaces a closed socket after the 60 s grace, and silenceMs 0 turns the check off", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws } = mockWs();
+      Object.defineProperty(ws, "isOpen", { get: () => false });
+      const reconnect = vi.fn(() => mockWs().ws);
+      const svc = new EventStreamService({ ws, programId: PROG, connection: {} as any, onTx: vi.fn(), reconnect });
+      await svc.start();
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      svc.stop();
+
+      const off = mockWs();
+      const reconnectOff = vi.fn(() => mockWs().ws);
+      const svcOff = new EventStreamService({ ws: off.ws, programId: PROG, connection: {} as any, reconnect: reconnectOff, silenceMs: 0 });
+      await svcOff.start();
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(reconnectOff).not.toHaveBeenCalled();
+      expect(svcOff.isStale()).toBe(false);
+      svcOff.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

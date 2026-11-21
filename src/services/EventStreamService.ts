@@ -14,6 +14,7 @@ import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
+import { DEFAULT_WS_SILENCE_MS } from "../lib/loopLiveness.js";
 
 const log = createLogger("indexer:event-stream");
 
@@ -49,7 +50,7 @@ export interface EventStreamDeps {
   silenceMs?: number;
 }
 
-export const DEFAULT_WS_SILENCE_MS = 5 * 60_000;
+export { DEFAULT_WS_SILENCE_MS };
 /** A closed socket gets this long (capped at silenceMs) to come back before it is replaced. */
 const CLOSED_GRACE_MS = 60_000;
 

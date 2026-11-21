@@ -385,3 +385,30 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
     ix.stop();
   });
 });
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: one chain read that never settles keeps LpVaultIndexer.busy=true until it settles (300 s, or never when trickled); every later tick returns
+// at the guard and Earn cost basis stops updating. /health can still say ok.
+// Measured bound (e708fc5, web3.js 1.99 on Node's undici fetch): a silent / headers-only RPC rejects after undici's
+// 300 s headers/body timeout; a server that trickles bytes is never cut off. The never-settling mock models the trickle
+// case, and the expectation (a service deadline well under 300 s) is also what makes the 300 s case cheap.
+describe("HUNG-RPC: a tick stuck on a never-settling chain read", () => {
+  it("does not block every later tick once the RPC answers again", async () => {
+    vi.useFakeTimers();
+    const chain = new Chain();
+    let calls = 0;
+    const orig = chain.getSignatures.bind(chain);
+    chain.getSignatures = (a: string, o: { until?: string; before?: string; limit: number }) => {
+      calls++;
+      return calls === 1 ? new Promise<SigInfo[]>(() => {}) : orig(a, o); // only the first request hangs
+    };
+    const { ix } = mk(chain, undefined, { pollIntervalMs: 10_000 });
+    ix.start();
+    await vi.advanceTimersByTimeAsync(6_000); // first tick: registry list, then the hung getSignatures
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    ix.stop();
+    // Before the fix (e708fc5 / 3061d3e): still 1. Expected: a deadline abandons the hung read and later ticks poll again.
+    expect(calls).toBeGreaterThan(1);
+  });
+});

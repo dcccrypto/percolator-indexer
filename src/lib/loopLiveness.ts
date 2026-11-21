@@ -12,6 +12,9 @@
 
 export const MIN_STALE_AFTER_MS = 10 * 60_000;
 
+/** EventStreamService: a stream with no notification for this long is replaced (ATLAS_WS_SILENCE_MS overrides). */
+export const DEFAULT_WS_SILENCE_MS = 5 * 60_000;
+
 /** Budget for a loop that runs every `intervalMs`: max(3 intervals, 10 min). */
 export function staleBudgetMs(intervalMs: number): number {
   return Math.max(3 * intervalMs, MIN_STALE_AFTER_MS);

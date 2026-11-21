@@ -1054,3 +1054,33 @@ describe('interval env parsing', () => {
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('STATS_AUTOCLOSE_INTERVAL_MS'), { raw: 'abc' });
   });
 });
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: the sweep's getMultipleAccountsInfo never settles on a hung RPC, _collecting stays true, and every
+// later collect() returns at the guard, so market REGISTRATION (syncMarkets, the first step of collect) stops too:
+// a newly discovered market is never registered and its fills are never indexed. /health can still say ok.
+// Measured bound (e708fc5, web3.js 1.99 on Node's undici fetch): a silent / headers-only RPC rejects after undici's
+// 300 s headers/body timeout; a server that trickles bytes is never cut off. The never-settling mock models the trickle
+// case, and the expectation (a service deadline well under 300 s) is also what makes the 300 s case cheap.
+describe("HUNG-RPC: a sweep read that never settles", () => {
+  it("does not stop every later collect cycle (registration included) once the RPC answers again", async () => {
+    const map = new Map<string, any>();
+    map.set(slab(), market());
+    h.getMarketRows.mockResolvedValue([...map.keys()].map((s) => ({ slab_address: s })));
+    h.getMultipleAccountsInfo.mockImplementationOnce(() => new Promise(() => {})); // the hung request
+    h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(8) }]);
+    const { sc } = make(map);
+    void sc.collect();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.getMultipleAccountsInfo).toHaveBeenCalledTimes(1);
+    const reads = h.getMarketRows.mock.calls.length;
+    for (let i = 0; i < 10; i++) { // ten collect intervals later
+      vi.setSystemTime(Date.now() + 60_000);
+      void sc.collect();
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    // Before the fix (e708fc5 / 3061d3e): no further markets read and no further sweep. Expected: the hung read times out and later
+    // cycles register + sweep again.
+    expect(h.getMarketRows.mock.calls.length).toBeGreaterThan(reads);
+  });
+});
