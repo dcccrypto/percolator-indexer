@@ -20,6 +20,7 @@
     "@hono/node-server": "^1.19.15",
     "@percolatorct/sdk": "file:vendor/percolatorct-sdk-9.0.0-candidate.tgz",
     "@percolatorct/shared": "^1.1.0",
+    "@sentry/node": "~10.78.0",
     "@solana/web3.js": "1.99.0",
     "@supabase/supabase-js": "^2.49.1",
     "dotenv": "^16.4.7",
