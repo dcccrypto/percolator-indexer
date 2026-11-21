@@ -15,6 +15,50 @@ import { assetGenerationOf, marketVersionOf } from "../layout/marketVersions.js"
 import { decodeV22LogEvents, getLogEventStats, type EventGate, type UnknownReason } from "../parsers/v22FillEvents.js";
 import type { RawInstruction } from "../parsers/v22Events.js";
 import { insertV22Events, V22EventWriteError } from "../db/insertV22Events.js";
+import { insertTradeRows, type IndexerTradeRow } from "../db/insertTradeRow.js";
+import type { V22EventRow } from "../parsers/v22Events.js";
+
+/** REDUCE reason 3 (`REDUCE_REASONS` in parsers/v22FillEvents.ts): the crank's forced close. */
+const REDUCE_REASON_LIQUIDATION = 3;
+
+/**
+ * `parseLiquidation` is a no-op (no v2.2 instruction declares a liquidation), so the liquidation REDUCE log event is the only
+ * signal. Turn each current-generation one into the size-less `is_liquidation` marker the trades readers expect
+ * (liquidation counts and trader history by portfolio; volume rollups already exclude markers). NOTE: traderNetPosition's guard is keyed by owner wallet, so it does not see these portfolio-keyed markers. leg_index 1000+ keeps clear of fill legs; it is 1000 + 100 * ix_index + the
+ * row's position among this transaction's liquidation events for the same (instruction, slab, asset), so every path and a re-delivery map to the same key (insert ignores duplicates).
+ */
+export function liquidationMarkers(rows: readonly V22EventRow[]): IndexerTradeRow[] {
+  const out: IndexerTradeRow[] = [];
+  // Ordinal per (instruction, slab, asset), counted over EVERY reason-3 event before the generation filter, so it does not depend on which
+  // markets a path's registry accepts or on whether the generation is known yet: poll, stream and webhook agree on the key.
+  const ordinals = new Map<string, number>();
+  for (const r of rows) {
+    if (r.kind !== "reduce_event" || r.detail?.reason !== REDUCE_REASON_LIQUIDATION) continue;
+    if (!r.slab_address || !r.actor || r.asset_index == null) continue;
+    const k = `${r.ix_index}|${r.slab_address}|${r.asset_index}`;
+    const ord = ordinals.get(k) ?? 0;
+    ordinals.set(k, ord + 1);
+    if (r.detail?.gen_current === false) continue;
+    out.push({
+      slab_address: r.slab_address,
+      // The event names the liquidated PORTFOLIO, not its owner wallet (not derivable from the logs): the marker is keyed by it.
+      trader: r.actor,
+      side: null,
+      size: null,
+      price: null,
+      fee: 0,
+      tx_signature: r.signature,
+      asset_index: r.asset_index,
+      // The trades key is (tx_signature, asset_index, leg_index) with NO slab, so two markets' liquidations of the same asset in
+      // one sweep must not share a leg. The top-level instruction index separates them (one top-level crank names one market) and,
+      // unlike a slab-wide ordinal, is the same on every path whatever its market gate. Limit: two markets cranked through CPI inside
+      // ONE top-level instruction still share an ix_index; ord is clamped at 99 so it never spills into the next instruction's range.
+      leg_index: 1000 + r.ix_index * 100 + Math.min(ord, 99),
+      is_liquidation: true,
+    });
+  }
+  return out;
+}
 
 const logger = createLogger("indexer:v22-log-events");
 
@@ -78,6 +122,14 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
         // The DB write failed (already counted + alerted in insertV22Events). Report it instead of pretending it was recorded,
         // so a caller that can be redelivered (the webhook) answers 5xx.
         return { status: "write_failed", rows: res.rows.length };
+      }
+    }
+    const markers = liquidationMarkers(res.rows);
+    if (markers.length > 0) {
+      try {
+        await insertTradeRows(markers);
+      } catch (err) {
+        logger.warn("v2.2 liquidation marker write failed (event row kept)", { signature: input.signature.slice(0, 16), error: err instanceof Error ? err.message : String(err) });
       }
     }
     return { status: res.status, rows: res.rows.length, ...(res.status === "unknown" ? { unknownReason: res.reason } : {}) };
