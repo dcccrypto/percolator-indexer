@@ -8,8 +8,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 
-const H = vi.hoisted(() => ({ PROGRAMS: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB", "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM"] }));
+const H = vi.hoisted(() => ({ PROGRAMS: ["ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB", "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM"], realChain: false }));
 const getAccountInfo = vi.fn();
+const getParsedTransactions = vi.fn();
+
+// #397 (D1): rows come from the chain tx of each signature. These tests are about how the route reads drifted
+// PAYLOAD shapes, so by default the chain "confirms" each validated item as sent (tests/helpers/chainTxEcho.ts).
+// The last test sets H.realChain and runs the real lookup against a chain copy of the fixture.
+vi.mock("../src/lib/webhookChainTx.js", async (orig) => {
+  const real = await orig<typeof import("../src/lib/webhookChainTx.js")>();
+  const echo = await (await import("./helpers/chainTxEcho.js")).chainTxEchoModule(async () => real);
+  return { ...real, txsFromChain: (...a: Parameters<typeof real.txsFromChain>) => (H.realChain ? real.txsFromChain(...a) : echo.txsFromChain(a[0])) };
+});
 
 vi.mock("../src/parsers/lotScale.js", async (orig) => {
   const actual = await orig<typeof import("../src/parsers/lotScale.js")>();
@@ -21,7 +31,7 @@ vi.mock("@percolatorct/shared", async (orig) => {
     ...actual,
     config: { ...actual.config, allProgramIds: H.PROGRAMS, webhookSecret: "s3cret" },
     eventBus: { publish: vi.fn(), emit: vi.fn(), on: vi.fn() },
-    getConnection: vi.fn(() => ({ getAccountInfo })),
+    getConnection: vi.fn(() => ({ getAccountInfo, getParsedTransactions })),
     withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
     captureException: vi.fn(),
   };
@@ -76,6 +86,7 @@ describe("webhook payload-shape drift", () => {
   beforeEach(() => {
     vi.mocked(insertTradeRows).mockClear(); recordSkipped.mockClear(); v22Rows.length = 0;
     getAccountInfo.mockReset(); getAccountInfo.mockResolvedValue({ data: ctxReturnBytes(PARTIAL.ctxReturnHex) });
+    getParsedTransactions.mockReset(); H.realChain = false;
   });
 
   it("control (E0, documented enhanced shape): one row, executed size 483, matcher_exact", async () => {
@@ -211,5 +222,31 @@ describe("webhook payload-shape drift", () => {
     const noIndex = groups.map(({ index: _i, ...g }: any) => g);
     expect(keyed(noIndex).length).toBeGreaterThan(0);
     expect(keyed(noIndex).every((ix) => ix >= 1000)).toBe(true);
+  });
+
+  it("with the real chain lookup (#397): every drifted shape of the partial fill stores the chain's row, 483 matcher_exact, in one read", async () => {
+    H.realChain = true;
+    const { resetChainTxMemo } = await import("../src/lib/webhookChainTx.js");
+    resetChainTxMemo();
+    // The chain's copy of the fixture, as getParsedTransactions returns it (CPIs in meta.innerInstructions groups).
+    const e = canonical();
+    const chainTx = {
+      slot: e.slot, blockTime: e.timestamp,
+      meta: { err: null, logMessages: [], innerInstructions: e.instructions.map((i: any, index: number) => ({ index, instructions: (i.innerInstructions ?? []).map(({ innerInstructions: _n, ...n }: any) => n) })).filter((g: any) => g.instructions.length) },
+      transaction: { signatures: [e.signature], message: { instructions: e.instructions.map(({ innerInstructions: _n, ...i }: any) => i) } },
+    };
+    getParsedTransactions.mockImplementation(async (sigs: string[]) => sigs.map((s) => (s === PARTIAL.sig ? chainTx : null)));
+    const noCpis = canonical(); for (const i of noCpis.instructions) delete i.innerInstructions; // E1
+    const obj = (a: string) => ({ pubkey: a, signer: false, writable: false, source: "transaction" });
+    const pubkeyObjs = canonical(); pubkeyObjs.instructions = pubkeyObjs.instructions.map((i: any) => ({ ...i, accounts: i.accounts.map(obj) })); // E3
+    const blockTime = canonical(); blockTime.blockTime = blockTime.timestamp; delete blockTime.timestamp; // E7
+    for (const shape of [canonical(), noCpis, pubkeyObjs, blockTime]) {
+      vi.mocked(insertTradeRows).mockClear();
+      const r = await post([shape]);
+      expect(r.status).toBe(200);
+      expect(r.rows).toEqual([expect.objectContaining({ tx_signature: PARTIAL.sig, size: "483", size_provenance: "matcher_exact" })]);
+    }
+    // One chain read for the four deliveries of the same signature (memo), never the 29041225 wire size.
+    expect(getParsedTransactions).toHaveBeenCalledTimes(1);
   });
 });
