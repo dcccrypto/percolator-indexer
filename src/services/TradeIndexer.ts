@@ -29,6 +29,8 @@ import { cachedLotExp, perLotPrice, lotExpOfSlabData, noteLotExps, perTokenPrice
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { RpcLimiter, paceConnection } from "../lib/rpcLimiter.js";
+import { deadlineConnection } from "../lib/rpcDeadline.js";
+import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
 import { loadTradeCursors, saveTradeCursor } from "../db/tradeCursor.js";
 
 const logger = createLogger("indexer:trade-indexer");
@@ -174,6 +176,9 @@ const MAX_SIGNATURES = readPositiveIntEnv("TRADE_MAX_SIGNATURES", 50, 100);
  */
 const MAX_SIGNATURE_PAGES = readPositiveIntEnv("TRADE_MAX_SIGNATURE_PAGES", 20, 1_000);
 
+/** Liveness name of the poll loop (lib/loopLiveness.ts). */
+export const TRADE_POLL_LOOP = "tradePoll";
+
 /** Poll interval for trade indexing (5 minutes — backup/backfill only, primary is webhook) */
 const POLL_INTERVAL_MS = parsePollIntervalMs(process.env.TRADE_POLL_INTERVAL_MS, (m, c) => logger.warn(m, c));
 
@@ -275,6 +280,8 @@ export class TradeIndexerPolling {
 
     // Start periodic polling
     this.pollTimer = setInterval(() => this.pollAllMarkets(), POLL_INTERVAL_MS);
+    // Hung-RPC liveness: /health goes degraded if neither a market nor a pass finishes within the budget.
+    loopLiveness.register(TRADE_POLL_LOOP, staleBudgetMs(POLL_INTERVAL_MS));
 
     logger.info("TradeIndexerPolling started (backup mode)", {
       intervalMs: POLL_INTERVAL_MS,
@@ -290,6 +297,7 @@ export class TradeIndexerPolling {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    loopLiveness.unregister(TRADE_POLL_LOOP);
     logger.info("TradeIndexer stopped");
   }
 
@@ -336,6 +344,7 @@ export class TradeIndexerPolling {
         if (!this._running) break;
         try {
           await this.indexTradesForSlab(market.slab_address, BACKFILL_SIGNATURES);
+          loopLiveness.beat(TRADE_POLL_LOOP);
         } catch (err) {
           logger.error("Backfill error", {
             slabAddress: market.slab_address.slice(0, 8),
@@ -381,6 +390,7 @@ export class TradeIndexerPolling {
       await this.pollAllMarketsOnce();
     } finally {
       this.pollInFlight = false;
+      loopLiveness.beat(TRADE_POLL_LOOP);
     }
   }
 
@@ -398,6 +408,7 @@ export class TradeIndexerPolling {
         if (!this._running) break;
         try {
           await this.indexTradesForSlab(market.slab_address, MAX_SIGNATURES);
+          loopLiveness.beat(TRADE_POLL_LOOP);
         } catch (err) {
           logger.error("Poll error", { 
             slabAddress: market.slab_address.slice(0, 8),
@@ -418,7 +429,8 @@ export class TradeIndexerPolling {
    * to collect all slabs before processing
    */
   private async indexTradesForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
-    const rawConnection = getConnection();
+    // Per-call deadline (rpcDeadline.ts): a held call rejects instead of parking the pass behind pollInFlight.
+    const rawConnection = deadlineConnection(getConnection());
     const connection = paceConnection(rawConnection, this.rpcLimiter);
     // The cache prefetch is best effort and makes ONE attempt (see prefetchMisses): paced, but no 429 retry.
     const prefetchConnection = paceConnection(rawConnection, this.rpcLimiter, 0);
@@ -904,7 +916,7 @@ export class TradeIndexerPolling {
       if (price === undefined) {
         price = this.extractPriceFromLogs(tx);
         if (price === 0) {
-          price = await this.readMarkPriceFromSlab(getConnection(), slabAddress, assetIndex);
+          price = await this.readMarkPriceFromSlab(deadlineConnection(getConnection()), slabAddress, assetIndex);
         }
         fallbackPriceByAsset.set(assetIndex, price);
       }
@@ -1245,7 +1257,7 @@ export class TradeIndexerPolling {
   private lotExpForCpi(slabAddress: string, assetIndex: number): Promise<number | null> {
     return resolveLotExp(slabAddress, assetIndex, async () => {
       const info = await withRetry(
-        () => getConnection().getAccountInfo(new PublicKey(slabAddress)),
+        () => deadlineConnection(getConnection()).getAccountInfo(new PublicKey(slabAddress)),
         { maxRetries: 3, baseDelayMs: 1000, label: `getAccountInfo(${slabAddress.slice(0, 8)})` },
       );
       return info?.data ? new Uint8Array(info.data) : null;

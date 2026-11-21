@@ -9,7 +9,7 @@ import { startDiscovery } from "./services/discoveryWiring.js";
 import { StatsCollector } from "./services/StatsCollector.js";
 import { TradeIndexerPolling } from "./services/TradeIndexer.js";
 import { HeliusWebhookManager } from "./services/HeliusWebhookManager.js";
-import { EventStreamService } from "./services/EventStreamService.js";
+import { EventStreamService, DEFAULT_WS_SILENCE_MS } from "./services/EventStreamService.js";
 import { webhookRoutes } from "./routes/webhook.js";
 import { createHealthChecker } from "./lib/healthCache.js";
 import { createDbMonitor } from "./lib/dbMonitor.js";
@@ -23,6 +23,9 @@ import { CURRENT_NETWORK } from "./network.js";
 import { clientIp, trustedProxyDepth } from "./lib/clientIp.js";
 import { createWebhookRateLimiter, webhookRateLimitPerMin, WEBHOOK_RATE_LIMIT_WINDOW_MS } from "./lib/webhookRateLimiter.js";
 import { installSentryScrubber } from "./lib/sentryScrub.js";
+import { loopLiveness } from "./lib/loopLiveness.js";
+import { deadlineConnection } from "./lib/rpcDeadline.js";
+import { envInt } from "./lib/envNumbers.js";
 
 // Initialize Sentry first
 initSentry("indexer");
@@ -144,6 +147,21 @@ app.all("/webhook/trades", async (c, next) => {
   return next();
 });
 
+/**
+ * Hung-RPC liveness: the HTTP server now listens BEFORE the first discovery (which used to hold the port closed for
+ * as long as a hung RPC held discovery). Until start() has done everything it did before `serve()`, /health answers
+ * 503 "starting" (503 "down" if start() threw) and webhook deliveries get 503 + Retry-After, which Helius retries,
+ * exactly as it retried the refused connection before.
+ */
+let startupState: "starting" | "ready" | "failed" = "starting";
+app.use("/webhook/trades", async (c, next) => {
+  if (startupState !== "ready") {
+    c.header("Retry-After", "30");
+    return c.json({ error: "Indexer starting" }, 503);
+  }
+  return next();
+});
+
 // Mount the rate limiter on /webhook/trades
 app.use("/webhook/trades", rateLimiter);
 
@@ -179,10 +197,24 @@ const healthCheck = createHealthChecker({
       return false;
     }
   },
+  // Hung-RPC liveness: each polling loop reports progress (lib/loopLiveness.ts); one past its budget -> degraded.
+  probeLoops: () => {
+    const snap = loopLiveness.snapshot();
+    const stale = Object.entries(snap).filter(([, s]) => !s.ok);
+    if (stale.length > 0) {
+      logger.warn("Loop liveness: loop(s) made no progress within their budget", {
+        loops: Object.fromEntries(stale.map(([name, s]) => [name, { ageMs: s.ageMs, staleAfterMs: s.staleAfterMs }])),
+      });
+    }
+    return Object.fromEntries(Object.entries(snap).map(([name, s]) => [name, s.ok]));
+  },
   ttlMs: HEALTH_CACHE_TTL_MS,
 });
 
 app.get("/health", async (c) => {
+  if (startupState !== "ready") {
+    return c.json({ status: startupState === "failed" ? "down" : "starting", tradecpi: getTradecpiCounters() }, 503);
+  }
   const { status } = await healthCheck();
 
   // Return 503 for both "down" and "degraded" so Docker healthcheck and
@@ -268,6 +300,11 @@ async function start() {
     }
   }
 
+  // Listen now, not after discovery: /health answers ("starting") even when a hung RPC holds the first discovery.
+  httpServer = serve({ fetch: app.fetch, port }, (info) => {
+    logger.info("Indexer HTTP server listening (health reports starting until startup completes)", { port: info.port });
+  });
+
   // PERC-8235: Verify Supabase connectivity at startup â surface DB issues early
   // instead of letting every sync operation fail silently with "Market sync failed".
   try {
@@ -302,7 +339,7 @@ async function start() {
   }
   if (process.env.LP_VAULT_INDEXER_ENABLED !== "false") {
     lpVaultIndexer = new LpVaultIndexer({
-      chain: new RpcLpVaultChain(getConnection()),
+      chain: new RpcLpVaultChain(deadlineConnection(getConnection())),
       store: new SupabaseLpVaultStore(getSupabase()),
       network: CURRENT_NETWORK,
       programIds: config.allProgramIds,
@@ -322,9 +359,19 @@ async function start() {
       eventStream = new EventStreamService({
         ws: atlasWs,
         programId: config.programId,
-        connection: getConnection(),
+        connection: deadlineConnection(getConnection()),
         autoIndex: true,
         knownSlabs,
+        // Hung-socket liveness: a stream silent for ATLAS_WS_SILENCE_MS (default 5 min; 0 = off) or closed is replaced
+        // by a fresh socket and re-subscribed.
+        silenceMs: envInt(process.env.ATLAS_WS_SILENCE_MS, {
+          name: "ATLAS_WS_SILENCE_MS", fallback: DEFAULT_WS_SILENCE_MS, min: 0, max: 2 ** 31 - 1,
+          warn: (m, c) => logger.warn(m, c),
+        }),
+        reconnect: () => {
+          atlasWs = createAtlasWs();
+          return atlasWs;
+        },
       });
       await eventStream.start();
       logger.info("Atlas WS event-stream started", { slabCount: knownSlabs.length });
@@ -346,10 +393,9 @@ async function start() {
     logger.info("Atlas WS event-stream disabled (HELIUS_ATLAS_WS_URL not set)");
   }
   
-  httpServer = serve({ fetch: app.fetch, port }, (info) => {
-    logger.info("Indexer service started", { port: info.port });
-  });
-  
+  startupState = "ready";
+  logger.info("Indexer service started", { port });
+
   // Send startup alert
   await sendInfoAlert("Indexer service started", [
     { name: "Port", value: port.toString(), inline: true },
@@ -357,6 +403,8 @@ async function start() {
 }
 
 start().catch((err) => {
+  // Only a start() that never got ready is "down"; a failure after it (e.g. the startup alert) changes nothing.
+  if (startupState !== "ready") startupState = "failed";
   logger.error("Failed to start indexer â staying alive for healthcheck + retry", {
     error: err instanceof Error ? err.message : String(err),
   });
@@ -400,6 +448,7 @@ async function shutdown(signal: string): Promise<void> {
     logger.info("Stopping trade indexer");
     tradeIndexer.stop();
     lpVaultIndexer?.stop();
+    eventStream?.stop();
 
     logger.info("Stopping webhook manager");
     webhookManager.stop();

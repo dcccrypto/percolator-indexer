@@ -224,6 +224,11 @@ import {
   addBreadcrumb,
 } from "@percolatorct/shared";
 import { getMarketRows, type MarketRowLite } from "../db/marketRows.js";
+import { deadlineConnection } from "../lib/rpcDeadline.js";
+import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
+
+/** Liveness name of the collect loop (lib/loopLiveness.ts). */
+export const STATS_LOOP = "stats";
 
 /**
  * How often to sync volume/trade_count for ALL DB markets, including those not
@@ -409,6 +414,8 @@ export class StatsCollector {
 
     // Periodic collection
     this.timer = setInterval(() => this.collect(), COLLECT_INTERVAL_MS);
+    // Hung-RPC liveness: /health goes degraded if no collect cycle finishes within the budget.
+    loopLiveness.register(STATS_LOOP, staleBudgetMs(COLLECT_INTERVAL_MS));
 
     // Volume sync for ALL DB markets (including uncranked ones) — runs independently.
     // First sync after 30s to let the indexer warm up, then every 5 minutes.
@@ -426,6 +433,7 @@ export class StatsCollector {
 
   stop(): void {
     this._running = false;
+    loopLiveness.unregister(STATS_LOOP);
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -714,7 +722,8 @@ export class StatsCollector {
       logger.info("New markets found", { count: missingMarkets.length });
 
       // Insert missing markets
-      const connection = getConnection();
+      // Per-call deadline (rpcDeadline.ts): a held read rejects instead of parking every later cycle behind _collecting.
+      const connection = deadlineConnection(getConnection());
       for (const [slabAddress, state] of missingMarkets) {
         try {
           const market = state.market;
@@ -1034,7 +1043,7 @@ export class StatsCollector {
           const chunk = candidates.slice(i, i + SWEEP_BATCH_SIZE);
           let infos: Array<{ data: Uint8Array | Buffer } | null> = [];
           try {
-            infos = await getConnection().getMultipleAccountsInfo(chunk.map((s) => new PublicKey(s)));
+            infos = await deadlineConnection(getConnection()).getMultipleAccountsInfo(chunk.map((s) => new PublicKey(s)));
           } catch (err) {
             logger.warn("Excluded-market slab read failed; leaving them excluded", { count: chunk.length, error: err instanceof Error ? err.message : err });
           }
@@ -1091,7 +1100,8 @@ export class StatsCollector {
         // Non-fatal — proceed without exclusion list rather than halting all stats collection
       }
 
-      const connection = getConnection();
+      // Per-call deadline (rpcDeadline.ts): a held read rejects instead of parking every later cycle behind _collecting.
+      const connection = deadlineConnection(getConnection());
       let updated = 0;
       let errors = 0;
       // Closes are collected during the sweep and written as one UPDATE each, not one per market.
@@ -1255,6 +1265,7 @@ export class StatsCollector {
       });
     } finally {
       this._collecting = false;
+      loopLiveness.beat(STATS_LOOP);
     }
   }
 }

@@ -23,6 +23,8 @@
 export interface HealthChecks {
   db: boolean;
   rpc: boolean;
+  /** Present when a loop probe is configured: false when any polling loop is past its liveness budget. */
+  loops?: boolean;
 }
 
 export interface HealthResult {
@@ -36,6 +38,11 @@ export interface HealthResult {
 export interface HealthCheckerOptions {
   probeRpc: () => Promise<boolean>;
   probeDb: () => Promise<boolean>;
+  /**
+   * Hung-RPC liveness: loop name -> healthy (see lib/loopLiveness.ts). A wedged loop makes the status degraded even
+   * when getSlot and the DB answer. Optional; without it only RPC and DB count.
+   */
+  probeLoops?: () => Record<string, boolean> | Promise<Record<string, boolean>>;
   /** Cache window. Short by design: a real outage must still surface fast. */
   ttlMs?: number;
   /** Injectable clock for tests. */
@@ -45,10 +52,11 @@ export interface HealthCheckerOptions {
 export const DEFAULT_HEALTH_TTL_MS = 5_000;
 
 function classify(checks: HealthChecks): HealthResult["status"] {
-  const values = Object.values(checks);
+  // "down" stays defined by the backends alone (RPC and DB both failing); a stale loop on its own is "degraded".
+  const values = [checks.rpc, checks.db];
   const failed = values.filter((v) => !v).length;
-  if (failed === 0) return "ok";
   if (failed === values.length) return "down";
+  if (failed === 0 && checks.loops !== false) return "ok";
   return "degraded";
 }
 
@@ -65,6 +73,15 @@ export function createHealthChecker(opts: HealthCheckerOptions): () => Promise<H
     // throwing, so Promise.all cannot reject here.
     const [rpc, db] = await Promise.all([opts.probeRpc(), opts.probeDb()]);
     const checks: HealthChecks = { rpc, db };
+    if (opts.probeLoops) {
+      let loops = false; // a throwing loop probe counts as unhealthy, never as a crashed /health
+      try {
+        loops = Object.values(await opts.probeLoops()).every(Boolean);
+      } catch {
+        loops = false;
+      }
+      checks.loops = loops;
+    }
     return { status: classify(checks), checks, cached: false };
   }
 
