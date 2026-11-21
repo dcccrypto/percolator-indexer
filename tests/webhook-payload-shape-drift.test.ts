@@ -174,6 +174,17 @@ describe("webhook payload-shape drift", () => {
     expect(vi.mocked(insertTradeRows)).not.toHaveBeenCalled();
   });
 
+  it("per item: a poison key hidden in a {pubkey} account entry, or in an item that is unusable for another reason, still rejects the whole request", async () => {
+    const inAccount = canonical();
+    wrapperIx(inAccount).accounts[0] = JSON.parse(`{"pubkey":"${wrapperIx(inAccount).accounts[0]}","constructor":1}`);
+    const behindError = `[${JSON.stringify(clone(drift.fill))},{"signature":"${PARTIAL.sig}","instructions":[{"programId":5}],"accountData":[{"__proto__":{"x":1}}]}]`;
+    for (const body of [JSON.stringify([inAccount]), behindError]) {
+      const res = await webhookRoutes().fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body }));
+      expect(res.status).toBe(400);
+    }
+    expect(vi.mocked(insertTradeRows)).not.toHaveBeenCalled();
+  });
+
   it("per item: an unusable item that names a signature is recorded in skipped_signatures; the delivery answers 200 with the counts", async () => {
     const bad = canonical();
     wrapperIx(bad).accounts[3] = null;

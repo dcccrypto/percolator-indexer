@@ -158,10 +158,18 @@ type ItemCheck =
     };
 
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
-const clean = <T extends Record<string, unknown>>(o: T): T => {
-  if (hasPoisonKey(o)) throw new PoisonedPayload();
-  return o;
-};
+/** Any object at any depth of one item (accounts, groups, accountData, meta, ...) carrying a poison key. Deliberately wider
+ * than the fields the route reads: SEC #127 rejects "any object in the payload" with one. */
+function hasPoisonKeyDeep(root: unknown): boolean {
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (v === null || typeof v !== "object") continue;
+    if (!Array.isArray(v) && hasPoisonKey(v)) return true;
+    for (const child of Array.isArray(v) ? v : Object.values(v)) if (child !== null && typeof child === "object") stack.push(child);
+  }
+  return false;
+}
 
 /** A resolved address. jsonParsed-style `{pubkey}` entries are read as their key; anything else is unusable (null). */
 function accountKey(a: unknown): string | null {
@@ -178,7 +186,6 @@ function accountKey(a: unknown): string | null {
  */
 function checkIx(ix: unknown, strict: boolean): ValidatedInstruction | string {
   if (!isObj(ix)) return "instruction is not an object";
-  clean(ix);
   if (ix.programId !== undefined && typeof ix.programId !== "string") return "instruction programId is not a string";
   if (ix.data !== undefined && typeof ix.data !== "string") return "instruction data is not a string";
   const out: Record<string, unknown> = { ...ix };
@@ -212,11 +219,12 @@ function checkIx(ix: unknown, strict: boolean): ValidatedInstruction | string {
  * `transactionError` is absent (absent used to read as SUCCESS: a phantom fill), `blockTime` when `timestamp` is
  * absent, `meta.logMessages` when top-level `logMessages` is absent. Raw RPC items are NOT converted (the webhook is
  * registered as `enhanced`; see HeliusWebhookManager) but reported as raw so the route answers 4xx instead of 200.
- * Throws {@link PoisonedPayload} on a poison key anywhere it looks.
+ * Throws {@link PoisonedPayload} on a poison key at any depth of the item.
  */
 function checkItem(tx: unknown): ItemCheck {
   if (!isObj(tx)) return { ok: false, reason: tx === null ? "item is null" : `item is a ${typeof tx}, not an object`, raw: false, signature: null };
-  clean(tx);
+  // Before any per-item verdict, so an item that is unusable for another reason cannot hide a poison key.
+  if (hasPoisonKeyDeep(tx)) throw new PoisonedPayload();
   const sig = typeof tx.signature === "string" && BASE58_SIGNATURE.test(tx.signature) ? tx.signature : null;
   const bad = (reason: string): ItemCheck => ({ ok: false, reason, raw: false, signature: sig });
   if (tx.signature === undefined && (isObj(tx.transaction) || isObj(tx.meta)) && tx.instructions === undefined) {
@@ -241,7 +249,6 @@ function checkItem(tx: unknown): ItemCheck {
     const groups: ValidatedInnerGroup[] = [];
     for (const g of tx.innerInstructions) {
       if (!isObj(g)) return bad("innerInstructions group is not an object");
-      clean(g);
       const group: Record<string, unknown> = { ...g };
       if (g.instructions !== undefined) {
         if (!Array.isArray(g.instructions)) return bad("innerInstructions group instructions is not an array");
@@ -261,12 +268,10 @@ function checkItem(tx: unknown): ItemCheck {
     if (!Array.isArray(tx.accountData)) return bad("accountData is not an array");
     for (const ad of tx.accountData) {
       if (!isObj(ad)) return bad("accountData entry is not an object");
-      clean(ad);
       if (ad.account !== undefined && typeof ad.account !== "string") return bad("accountData account is not a string");
     }
   }
   const meta = isObj(tx.meta) ? tx.meta : null;
-  if (meta) clean(meta);
   if (tx.transactionError === undefined && meta && "err" in meta) out.transactionError = meta.err ?? null;
   if (typeof tx.timestamp !== "number" && typeof tx.blockTime === "number") out.timestamp = tx.blockTime;
   if (!Array.isArray(tx.logMessages) && meta && Array.isArray(meta.logMessages)) out.logMessages = meta.logMessages;
