@@ -20,9 +20,12 @@ import { SupabaseLpVaultStore } from "./lpVault/store.js";
 import { CURRENT_NETWORK } from "./network.js";
 import { clientIp, trustedProxyDepth } from "./lib/clientIp.js";
 import { createWebhookRateLimiter, webhookRateLimitPerMin, WEBHOOK_RATE_LIMIT_WINDOW_MS } from "./lib/webhookRateLimiter.js";
+import { installSentryScrubber } from "./lib/sentryScrub.js";
 
 // Initialize Sentry first
 initSentry("indexer");
+// Strip ?api-key= and the Discord webhook token from breadcrumbs/events before anything is sent.
+installSentryScrubber();
 // X-1: if the optional skipped-signature JSONL sink is configured it must be writable; fail loudly at boot, not at the first skip.
 assertSkippedSignatureSinkReady();
 
