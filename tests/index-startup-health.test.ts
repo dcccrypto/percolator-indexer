@@ -182,7 +182,7 @@ describe("HUNG-RPC: Atlas WS silence/reconnect wiring", { timeout: 60_000 }, () 
   });
 
   it.each([
-    ["unset", "", 300_000, false],
+    ["blank", "", 300_000, false],
     ["0 turns the check off", "0", 0, false],
     ["a valid value", "120000", 120_000, false],
     ["below the 1 s minimum", "500", 300_000, true],

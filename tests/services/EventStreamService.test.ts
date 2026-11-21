@@ -1162,27 +1162,31 @@ describe("HUNG-RPC: WebSocket reconnect that throws", () => {
       const closed = vi.fn();
       first.ws.close = closed;
       const second = mockWs();
-      const reconnect = vi.fn()
-        .mockImplementationOnce(() => { throw new Error("createAtlasWs: socket refused"); })
-        .mockImplementation(() => second.ws);
+      const refused = () => { throw new Error("createAtlasWs: socket refused"); };
+      const reconnect = vi.fn().mockImplementationOnce(refused).mockImplementationOnce(refused).mockImplementation(() => second.ws);
       const onTx = vi.fn();
       // silenceMs 60 s -> the check runs every 30 s.
       const svc = new EventStreamService({ ws: first.ws, programId: PROG, connection: {} as any, onTx, reconnect, silenceMs: 60_000 });
       await svc.start();
 
-      await vi.advanceTimersByTimeAsync(60_000); // first stale check: reconnect() throws
+      await vi.advanceTimersByTimeAsync(60_000); // t=60 s, first stale check: reconnect() throws
       expect(reconnect).toHaveBeenCalledTimes(1);
       expect(svc.reconnects).toBe(0);
       expect(closed).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(30_000); // t=90 s: the very next check retries (and fails again)
+      expect(reconnect).toHaveBeenCalledTimes(2);
+      expect(svc.reconnects).toBe(0);
+      expect(closed).not.toHaveBeenCalled();
       expect(second.subCalls).toHaveLength(0);
+
       // The old socket is still the live one.
       first.deliver({ jsonrpc: "2.0", method: "transactionNotification", params: { result: { signature: "STILL_OLD" } } } as any);
       await vi.advanceTimersByTimeAsync(0);
       expect(onTx.mock.calls.map((c) => c[0].signature)).toEqual(["STILL_OLD"]);
 
-      // That frame reset the silence window; 60 s later the next stale check retries and succeeds.
+      // That frame reset the silence window; one window later the check retries and this time succeeds.
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(reconnect).toHaveBeenCalledTimes(2);
+      expect(reconnect).toHaveBeenCalledTimes(3);
       expect(svc.reconnects).toBe(1);
       expect(closed).toHaveBeenCalledTimes(1);
       expect(second.subCalls).toHaveLength(1);
