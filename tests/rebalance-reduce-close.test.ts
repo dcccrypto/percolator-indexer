@@ -163,7 +163,8 @@ const parsedTxOf = (ixs: unknown[], blockTime: number | null = BLOCK_TIME) => ({
 });
 const parsedTx = () => parsedTxOf([ixOf(CRANK_DATA), ixOf(REBALANCE_DATA)]);
 
-const enhIx = (data: string, accts: string[] = accounts) => ({ programId: PROGRAM_ID, data, accounts: accts });
+// innerInstructions present (empty): a TradeCpi without the field is not written (resolveCpiLeg is mocked above).
+const enhIx = (data: string, accts: string[] = accounts) => ({ programId: PROGRAM_ID, data, accounts: accts, innerInstructions: [] });
 const enhancedTxOf = (ixs: unknown[], timestamp: number | null = BLOCK_TIME, signature: string = SIG, slot?: number) => ({
   signature, ...(slot === undefined ? {} : { slot }), ...(timestamp === null ? {} : { timestamp }), instructions: ixs, innerInstructions: [], accountData: [], logs: [],
 });

@@ -142,70 +142,140 @@ export interface ValidatedTransaction {
   [key: string]: unknown;
 }
 
-function isValidTransactionArray(parsed: unknown): parsed is ValidatedTransaction[] {
-  if (!Array.isArray(parsed)) return false;
-  for (const tx of parsed) {
-    if (tx === null || typeof tx !== "object") return false;
-    // SEC (#127): reject prototype-pollution attempts at every nesting level.
-    if (hasPoisonKey(tx as object)) return false;
-    if (tx.signature !== undefined && typeof tx.signature !== "string") return false;
-    if (tx.instructions !== undefined) {
-      if (!Array.isArray(tx.instructions)) return false;
-      for (const ix of tx.instructions) {
-        if (ix === null || typeof ix !== "object") return false;
-        if (hasPoisonKey(ix as object)) return false;
-        if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
-        if (ix.data !== undefined && typeof ix.data !== "string") return false;
-        if (ix.accounts !== undefined) {
-          if (!Array.isArray(ix.accounts)) return false;
-          // Each account entry must be a string (pubkey) in the Helius enhanced format.
-          for (const acc of ix.accounts) {
-            if (typeof acc !== "string") return false;
-          }
-        }
-        if (ix.innerInstructions !== undefined) {
-          if (!Array.isArray(ix.innerInstructions)) return false;
-          for (const sub of ix.innerInstructions) {
-            if (sub === null || typeof sub !== "object") return false;
-            if (hasPoisonKey(sub as object)) return false;
-            if (sub.programId !== undefined && typeof sub.programId !== "string") return false;
-            if (sub.data !== undefined && typeof sub.data !== "string") return false;
-          }
-        }
-      }
-    }
-    if (tx.innerInstructions !== undefined) {
-      if (!Array.isArray(tx.innerInstructions)) return false;
-      for (const inner of tx.innerInstructions) {
-        if (inner === null || typeof inner !== "object") return false;
-        if (hasPoisonKey(inner as object)) return false;
-        if (inner.instructions !== undefined) {
-          if (!Array.isArray(inner.instructions)) return false;
-          for (const ix of inner.instructions) {
-            if (ix === null || typeof ix !== "object") return false;
-            if (hasPoisonKey(ix as object)) return false;
-            if (ix.programId !== undefined && typeof ix.programId !== "string") return false;
-            if (ix.data !== undefined && typeof ix.data !== "string") return false;
-            if (ix.accounts !== undefined) {
-              if (!Array.isArray(ix.accounts)) return false;
-              for (const acc of ix.accounts) {
-                if (typeof acc !== "string") return false;
-              }
-            }
-          }
-        }
-      }
-    }
-    if (tx.accountData !== undefined) {
-      if (!Array.isArray(tx.accountData)) return false;
-      for (const ad of tx.accountData) {
-        if (ad === null || typeof ad !== "object") return false;
-        if (hasPoisonKey(ad as object)) return false;
-        if (ad.account !== undefined && typeof ad.account !== "string") return false;
-      }
+/** A payload object carrying `__proto__` / `constructor` / `prototype`: the WHOLE request is rejected (see above). */
+class PoisonedPayload extends Error {}
+
+/** One delivery item after {@link checkItem}: usable (normalised) or not, and why. */
+type ItemCheck =
+  | { ok: true; tx: ValidatedTransaction }
+  | {
+      ok: false;
+      reason: string;
+      /** An RPC/raw-shaped item (`transaction` + `meta`, no top-level `signature`): the webhook type is not `enhanced`. */
+      raw: boolean;
+      /** The item's own signature when it has a well-formed one (recorded to skipped_signatures). */
+      signature: string | null;
+    };
+
+const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+/** Any object at any depth of one item (accounts, groups, accountData, meta, ...) carrying a poison key. Deliberately wider
+ * than the fields the route reads: SEC #127 rejects "any object in the payload" with one. */
+function hasPoisonKeyDeep(root: unknown): boolean {
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (v === null || typeof v !== "object") continue;
+    if (!Array.isArray(v) && hasPoisonKey(v)) return true;
+    for (const child of Array.isArray(v) ? v : Object.values(v)) if (child !== null && typeof child === "object") stack.push(child);
+  }
+  return false;
+}
+
+/** A resolved address. jsonParsed-style `{pubkey}` entries are read as their key; anything else is unusable (null). */
+function accountKey(a: unknown): string | null {
+  if (typeof a === "string") return a;
+  if (isObj(a) && typeof a.pubkey === "string") return a.pubkey;
+  return null;
+}
+
+/**
+ * One instruction. `strict` (top-level and tx-level group instructions, whose accounts the trade and v2.2 paths
+ * read by position): every account must resolve to an address, or the ITEM is unusable (an unresolved lookup-table
+ * entry would shift every later position). Nested CPIs keep their pre-existing leniency (accounts not type-checked),
+ * apart from `{pubkey}` entries being read as their key.
+ */
+function checkIx(ix: unknown, strict: boolean): ValidatedInstruction | string {
+  if (!isObj(ix)) return "instruction is not an object";
+  if (ix.programId !== undefined && typeof ix.programId !== "string") return "instruction programId is not a string";
+  if (ix.data !== undefined && typeof ix.data !== "string") return "instruction data is not a string";
+  const out: Record<string, unknown> = { ...ix };
+  if (ix.accounts !== undefined) {
+    if (strict) {
+      if (!Array.isArray(ix.accounts)) return "instruction accounts is not an array";
+      const keys = ix.accounts.map(accountKey);
+      if (keys.some((k) => k === null)) return "instruction account entry is not a resolved address";
+      out.accounts = keys;
+    } else if (Array.isArray(ix.accounts)) {
+      out.accounts = ix.accounts.map((a) => accountKey(a) ?? a);
     }
   }
-  return true;
+  if (strict && ix.innerInstructions !== undefined) {
+    if (!Array.isArray(ix.innerInstructions)) return "innerInstructions is not an array";
+    const inner: ValidatedInstruction[] = [];
+    for (const sub of ix.innerInstructions) {
+      const s = checkIx(sub, false);
+      if (typeof s === "string") return `inner ${s}`;
+      inner.push(s);
+    }
+    out.innerInstructions = inner;
+  }
+  return out as ValidatedInstruction;
+}
+
+/**
+ * Checks ONE delivery item and normalises it to the enhanced shape the extractors read. An unusable item costs only
+ * itself, never the rest of the delivery (Helius redelivers a 400 with the same body, so one bad item used to lose
+ * every good one with it). Fallbacks for RPC-style fields on an otherwise enhanced item: `meta.err` when
+ * `transactionError` is absent (absent used to read as SUCCESS: a phantom fill), `blockTime` when `timestamp` is
+ * absent, `meta.logMessages` when top-level `logMessages` is absent. Raw RPC items are NOT converted (the webhook is
+ * registered as `enhanced`; see HeliusWebhookManager) but reported as raw so the route answers 4xx instead of 200.
+ * Throws {@link PoisonedPayload} on a poison key at any depth of the item.
+ */
+function checkItem(tx: unknown): ItemCheck {
+  // Before any per-item verdict (array items included), so an item that is unusable for another reason cannot hide a poison key.
+  if (hasPoisonKeyDeep(tx)) throw new PoisonedPayload();
+  if (!isObj(tx)) return { ok: false, reason: tx === null ? "item is null" : Array.isArray(tx) ? "item is an array, not an object" : `item is a ${typeof tx}, not an object`, raw: false, signature: null };
+  const sig = typeof tx.signature === "string" && BASE58_SIGNATURE.test(tx.signature) ? tx.signature : null;
+  const bad = (reason: string): ItemCheck => ({ ok: false, reason, raw: false, signature: sig });
+  if (tx.signature === undefined && (isObj(tx.transaction) || isObj(tx.meta)) && tx.instructions === undefined) {
+    const sigs = isObj(tx.transaction) && Array.isArray(tx.transaction.signatures) ? tx.transaction.signatures : [];
+    const rawSig = typeof sigs[0] === "string" && BASE58_SIGNATURE.test(sigs[0]) ? sigs[0] : null;
+    return { ok: false, reason: "raw RPC transaction item (no top-level signature/instructions): the webhook must be registered as enhanced", raw: true, signature: rawSig };
+  }
+  if (tx.signature !== undefined && typeof tx.signature !== "string") return bad("signature is not a string");
+  const out: Record<string, unknown> = { ...tx };
+  if (tx.instructions !== undefined) {
+    if (!Array.isArray(tx.instructions)) return bad("instructions is not an array");
+    const ixs: ValidatedInstruction[] = [];
+    for (const ix of tx.instructions) {
+      const r = checkIx(ix, true);
+      if (typeof r === "string") return bad(r);
+      ixs.push(r);
+    }
+    out.instructions = ixs;
+  }
+  if (tx.innerInstructions !== undefined) {
+    if (!Array.isArray(tx.innerInstructions)) return bad("innerInstructions is not an array");
+    const groups: ValidatedInnerGroup[] = [];
+    for (const g of tx.innerInstructions) {
+      if (!isObj(g)) return bad("innerInstructions group is not an object");
+      const group: Record<string, unknown> = { ...g };
+      if (g.instructions !== undefined) {
+        if (!Array.isArray(g.instructions)) return bad("innerInstructions group instructions is not an array");
+        const ixs: ValidatedInstruction[] = [];
+        for (const ix of g.instructions) {
+          const r = checkIx(ix, true);
+          if (typeof r === "string") return bad(`group ${r}`);
+          ixs.push(r);
+        }
+        group.instructions = ixs;
+      }
+      groups.push(group as ValidatedInnerGroup);
+    }
+    out.innerInstructions = groups;
+  }
+  if (tx.accountData !== undefined) {
+    if (!Array.isArray(tx.accountData)) return bad("accountData is not an array");
+    for (const ad of tx.accountData) {
+      if (!isObj(ad)) return bad("accountData entry is not an object");
+      if (ad.account !== undefined && typeof ad.account !== "string") return bad("accountData account is not a string");
+    }
+  }
+  const meta = isObj(tx.meta) ? tx.meta : null;
+  if (tx.transactionError === undefined && meta && "err" in meta) out.transactionError = meta.err ?? null;
+  if (typeof tx.timestamp !== "number" && typeof tx.blockTime === "number") out.timestamp = tx.blockTime;
+  if (!Array.isArray(tx.logMessages) && meta && Array.isArray(meta.logMessages)) out.logMessages = meta.logMessages;
+  return { ok: true, tx: out as ValidatedTransaction };
 }
 
 export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariables }> {
@@ -323,27 +393,55 @@ export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariabl
     }
 
     // Parse body from the already-read buffer (avoids consuming the stream twice).
-    let transactions: ValidatedTransaction[];
+    let arr: unknown[];
     try {
       const parsed = JSON.parse(rawBody.toString("utf-8"));
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      if (!isValidTransactionArray(arr)) {
-        logger.warn("Webhook request failed: invalid transaction format", { bodyLength: rawBody.length });
-        return c.json({ error: "Invalid transaction format" }, 400);
-      }
-      transactions = arr;
+      arr = Array.isArray(parsed) ? parsed : [parsed];
     } catch {
       logger.warn("Webhook request failed: invalid JSON", { bodyLength: rawBody.length });
       return c.json({ error: "Invalid JSON" }, 400);
     }
 
     // SEC: Reject batches that exceed the transaction cap to prevent DB overload.
-    if (transactions.length > MAX_TRANSACTIONS_PER_REQUEST) {
+    if (arr.length > MAX_TRANSACTIONS_PER_REQUEST) {
       logger.warn("Webhook request rejected: too many transactions", {
-        count: transactions.length,
+        count: arr.length,
         maxAllowed: MAX_TRANSACTIONS_PER_REQUEST,
       });
       return c.json({ error: "Too many transactions in request" }, 400);
+    }
+
+    // Per item: an unusable item is dropped (and recorded when it names a signature), the rest is processed.
+    // A poison key anywhere still rejects the whole request (SEC #127).
+    const transactions: ValidatedTransaction[] = [];
+    const rejected: Extract<ItemCheck, { ok: false }>[] = [];
+    try {
+      for (const item of arr) {
+        const r = checkItem(item);
+        if (r.ok) transactions.push(r.tx);
+        else rejected.push(r);
+      }
+    } catch (err) {
+      if (!(err instanceof PoisonedPayload)) throw err;
+      logger.warn("Webhook request failed: invalid transaction format", { bodyLength: rawBody.length });
+      return c.json({ error: "Invalid transaction format" }, 400);
+    }
+    const rawItems = rejected.filter((r) => r.raw).length;
+    if (rejected.length > 0) {
+      logger.warn("Webhook items rejected: the rest of the delivery is processed", {
+        rejected: rejected.length,
+        raw: rawItems,
+        usable: transactions.length,
+        firstReason: rejected[0].reason,
+        firstSignature: rejected.find((r) => r.signature)?.signature?.slice(0, 16),
+      });
+      const withSig = rejected.filter((r): r is typeof r & { signature: string } => r.signature !== null);
+      if (withSig.length > 0) {
+        await recordSkippedSignatures(withSig.map((r) => ({ signature: r.signature, source: "trade-indexer" as const, slab: "", error: `webhook item rejected: ${r.reason}`.slice(0, 480) })));
+      }
+    }
+    if (transactions.length === 0 && rejected.length > 0) {
+      return c.json({ error: rawItems > 0 ? "Raw transaction items are not supported (register the webhook as enhanced)" : "Invalid transaction format" }, rawItems > 0 ? 422 : 400);
     }
 
     // SEC: Log successful webhook receipt for audit trail
@@ -367,7 +465,12 @@ export function webhookRoutes(discovery?: any): Hono<{ Variables: WebhookVariabl
       return c.json({ error: "Processing failed, please retry" }, 500);
     }
 
-    return c.json({ received: transactions.length }, 200);
+    // A raw item means the webhook is registered with the wrong type: everything usable is written above, and the 4xx
+    // keeps it loud (a 200 would acknowledge fills that were never read). The redelivery re-inserts nothing.
+    if (rawItems > 0) {
+      return c.json({ error: "Raw transaction items are not supported (register the webhook as enhanced)", received: transactions.length, rejected: rejected.length }, 422);
+    }
+    return c.json(rejected.length > 0 ? { received: transactions.length, rejected: rejected.length } : { received: transactions.length }, 200);
   });
 
   return app;
@@ -915,6 +1018,13 @@ async function extractTradesFromEnhancedTx(
           tag === IX_TAG.BatchTradeCpi,
         )
       : null;
+    // The payload carries no `innerInstructions` field for this TradeCpi: nothing says what the matcher executed, and
+    // the wire size is the REQUEST (#213: 29,041,225 asked, 483 filled). Written now it would stay for good
+    // (ignoreDuplicates), so nothing is written: recorded, leg number held, and the poll path (which reads the
+    // transaction's own inner instructions) stores the fill. An EMPTY array is evidence (no matcher call) and is
+    // resolved as before.
+    const cpiInnerAbsent = isCpiTag && !Array.isArray(ix.innerInstructions);
+    let cpiInnerAbsentRecorded = false;
     // 2 s per read, and a per-delivery deadline so a slow RPC cannot eat Helius's ~15 s window.
     const readMatcherContext = makeMatcherContextReader(() => getConnection(), typeof tx.slot === "number" ? tx.slot : null, { deadlineAt: delivery.ctxDeadlineAt });
 
@@ -939,6 +1049,15 @@ async function extractTradesFromEnhancedTx(
         cpiSeen.set(cpiKey, cpiOrdinal);
         const reduceNow = new Set(trades.filter((t) => t.reduce).map((t) => t.leg_index));
         if (cpiFillAlreadyStored(await getStored(), { slab: slabAddress, assetIndex: leg.assetIndex, legIndex: provisionalLeg, trader, side: leg.side, ordinal: cpiOrdinal }, reduceNow)) {
+          trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
+          continue;
+        }
+        if (cpiInnerAbsent) {
+          if (!cpiInnerAbsentRecorded) {
+            cpiInnerAbsentRecorded = true;
+            logger.warn("TradeCpi without innerInstructions in the webhook payload: not written at the wire (request) size", { signature: signature.slice(0, 16) });
+            await recordSkippedSignatures([{ signature, source: "trade-indexer", slab: slabAddress, error: "TradeCpi webhook payload has no innerInstructions: executed size unknown, wire request size not written" }]);
+          }
           trades.push({ slab_address: slabAddress, trader, side: null, size: null, price: null, fee: 0, tx_signature: signature, asset_index: leg.assetIndex, leg_index: 0, is_liquidation: false, placeholder: true });
           continue;
         }
