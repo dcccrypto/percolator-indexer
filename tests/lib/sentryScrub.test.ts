@@ -66,8 +66,10 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     await fetch(`${base}/api/webhooks/1/${DISCORD_TOKEN}`, { method: "POST", body: "{}" });
     captureException(new Error("any later failure"), { tags: { context: "regression" } });
 
-    for (let i = 0; i < 100 && envelopes.length === 0; i++) await new Promise((r) => setTimeout(r, 100));
-    expect(envelopes.length).toBeGreaterThan(0);
+    // Wait for the error event itself: sampled http.server transactions from the stubs can arrive first.
+    const errorEvent = () => envelopes.find((e) => e.includes('"type":"event"'));
+    for (let i = 0; i < 100 && !errorEvent(); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(errorEvent()).toBeDefined();
     const all = envelopes.join("\n");
     expect.soft(all).not.toContain(RPC_KEY);
     expect.soft(all).not.toContain(WH_KEY);
