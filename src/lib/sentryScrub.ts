@@ -11,7 +11,10 @@
  *  - `beforeAddBreadcrumb` scrubs each breadcrumb before it enters the buffer;
  *  - a global-scope event processor scrubs the whole event (breadcrumbs, request, spans, extra)
  *    before it is sent, covering anything added another way.
- * Both need the same @sentry/node instance as shared, so the dependency is pinned to shared's version.
+ * Both need the same @sentry/node instance as shared, so the dependency follows the base's
+ * `@sentry/node` override (~10.78.0) and resolves to the single copy shared also uses.
+ * Since 10.78 Sentry masks `?api-key=` in `http.query` itself; the Discord token in the URL path,
+ * configured secret values and anything outside `http.query` are still only caught here.
  */
 import * as Sentry from "@sentry/node";
 
@@ -26,7 +29,7 @@ const DISCORD_WEBHOOK_TOKEN = /(\/api(?:\/v\d+)?\/webhooks\/\d+\/)[^/?#\s"'<>]+/
 /** Values of configured secrets, matched literally wherever they appear (e.g. a key in a URL path). */
 export function configuredSecrets(env: NodeJS.ProcessEnv): string[] {
   const out: string[] = [];
-  for (const name of ["HELIUS_API_KEY", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "HELIUS_WEBHOOK_SECRET"]) {
+  for (const name of ["HELIUS_API_KEY", "HELIUS_MAINNET_API_KEY", "HELIUS_DEVNET_API_KEY", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "HELIUS_WEBHOOK_SECRET"]) {
     const v = env[name];
     if (v) out.push(v);
   }
@@ -59,6 +62,9 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
 export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>()): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
   if (value === null || typeof value !== "object") return value;
+  // Sentry serialises these in `extra`/contexts (href; name/message/stack), so scrub a plain copy.
+  if (value instanceof URL) return scrubString(value.href, secrets) as T;
+  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen) as T;
   // Only plain data: events also reference live SDK objects (scopes, client, spans) that are never
   // serialised and must not be walked or mutated.
   const proto = Object.getPrototypeOf(value);

@@ -134,6 +134,20 @@ describe("scrubString / scrubDeep", () => {
     expect(crumb.self).toBe(crumb);
   });
 
+  it("scrubs URL and Error objects held in event data", async () => {
+    const m = await loadScrub();
+    expect(m).not.toBeNull();
+    const ev = m!.scrubDeep({
+      extra: {
+        u: new URL("https://rpc.example/?api-key=FAKEURLKEY1") as unknown,
+        e: new Error("POST https://discord.com/api/webhooks/1/FAKEERRTOK1 failed") as unknown,
+      },
+    });
+    expect(ev.extra.u).toBe("https://rpc.example/?api-key=[Filtered]");
+    expect(ev.extra.e).toMatchObject({ name: "Error", message: "POST https://discord.com/api/webhooks/1/[Filtered] failed" });
+    expect(JSON.stringify(ev)).not.toMatch(/FAKEURLKEY1|FAKEERRTOK1/);
+  });
+
   it("collects configured secret values from the env (FAKE values)", async () => {
     const m = await loadScrub();
     expect(m).not.toBeNull();
@@ -144,8 +158,10 @@ describe("scrubString / scrubDeep", () => {
       FALLBACK_RPC_URL: "not a url",
       DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/1/FAKEUNITDISC1",
       HELIUS_WEBHOOK_SECRET: "short",
+      HELIUS_MAINNET_API_KEY: "FAKEUNITMAIN1",
+      HELIUS_DEVNET_API_KEY: "FAKEUNITDEV1",
     });
-    expect(got.sort()).toEqual(["FAKEUNITDISC1", "FAKEUNITRPC1", "FAKEUNITSUPA1", "FAKEUNITWHKEY1"]);
+    expect(got.sort()).toEqual(["FAKEUNITDEV1", "FAKEUNITDISC1", "FAKEUNITMAIN1", "FAKEUNITRPC1", "FAKEUNITSUPA1", "FAKEUNITWHKEY1"]);
   });
 
   it("installSentryScrubber is idempotent once a client exists", async () => {
