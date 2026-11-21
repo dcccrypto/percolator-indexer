@@ -1,0 +1,91 @@
+{
+ "signature": "4qLjcpewfzH4HF8CpdGtRVo1df5Gjv4VNjrkcvV5wPRoNpSfJMS7usDKNZbVrVShvy9PYScKSYH6RWuJT4i18VtD",
+ "source": "devnet getTransaction jsonParsed, confirmed (recorded 2026-11-20 by J-20261120-IDX-REPORT-DIFF-NETPOSITIONVSCHAIN)",
+ "tx": {
+  "slot": 518849791,
+  "blockTime": 1793860600,
+  "meta": {
+   "err": null,
+   "logMessages": [
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+    "Program ComputeBudget111111111111111111111111111111 success",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM invoke [1]",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM consumed 10822 of 1399700 compute units",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM success",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM invoke [1]",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM consumed 172447 of 1388854 compute units",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM success",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM invoke [1]",
+    "Program data: AgEFUnGBW5gG1qlEVZ2dSV7RsFU9wLsbes+Vpmz8QI/z3QCHWZ5HtEnOEDlV6/Doo8TOr8iBNAkGRQbxGqBlBjLhKwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAP2qHz/////////////////GEMDAQAAAAA=",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM consumed 317435 of 1216383 compute units",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM success",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM invoke [1]",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM consumed 87336 of 898924 compute units",
+    "Program 6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM success"
+   ],
+   "innerInstructions": []
+  },
+  "transaction": {
+   "message": {
+    "accountKeys": [
+     "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+     "6YppKdUiMmQSie7DrpJgQ9ofmCxvEhanKoRw6e9Yzh4T",
+     "A7MJHg9g14MPHWJuVohdMTTVJUgcf7BcR56egUF4MVXY",
+     "EszzTsUxkXBU5uGs3gf5YzCVpQcsND63UXjrmH4ajMs4",
+     "FUTiYW8dkpr882EJW5oWnPjamjg5xvL29xwVFNR8HXek",
+     "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM",
+     "ComputeBudget111111111111111111111111111111"
+    ],
+    "instructions": [
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "7YXqJ7"
+     },
+     {
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "accounts": [],
+      "data": "K1FDJ7"
+     },
+     {
+      "programId": "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM",
+      "accounts": [
+       "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+       "6YppKdUiMmQSie7DrpJgQ9ofmCxvEhanKoRw6e9Yzh4T"
+      ],
+      "data": "7HbZHa1orppsjXzKdCeNG1oxowWBRgroUgEKZbGeTumtnBgB"
+     },
+     {
+      "programId": "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM",
+      "accounts": [
+       "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+       "6YppKdUiMmQSie7DrpJgQ9ofmCxvEhanKoRw6e9Yzh4T",
+       "EszzTsUxkXBU5uGs3gf5YzCVpQcsND63UXjrmH4ajMs4"
+      ],
+      "data": "R9yRJ5Qy4j8ckGz2T"
+     },
+     {
+      "programId": "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM",
+      "accounts": [
+       "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+       "6YppKdUiMmQSie7DrpJgQ9ofmCxvEhanKoRw6e9Yzh4T",
+       "A7MJHg9g14MPHWJuVohdMTTVJUgcf7BcR56egUF4MVXY"
+      ],
+      "data": "HHyjUBXMSgS4f"
+     },
+     {
+      "programId": "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM",
+      "accounts": [
+       "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+       "6YppKdUiMmQSie7DrpJgQ9ofmCxvEhanKoRw6e9Yzh4T",
+       "FUTiYW8dkpr882EJW5oWnPjamjg5xvL29xwVFNR8HXek"
+      ],
+      "data": "HHyjUBXMSgS4f"
+     }
+    ]
+   }
+  }
+ }
+}
