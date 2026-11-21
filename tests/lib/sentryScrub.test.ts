@@ -4,6 +4,7 @@
 // Sentry ingest and stub HTTP servers on 127.0.0.1).
 import { describe, it, expect, afterAll } from "vitest";
 import http from "node:http";
+import { gunzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
 
 // Variable path: on the old code the module does not exist, so the end-to-end test runs without
@@ -40,7 +41,9 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
-        envelopes.push(Buffer.concat(chunks).toString("utf8"));
+        // The node transport gzips bodies over 32 KB; unzip so the string checks see the payload.
+        const body = Buffer.concat(chunks);
+        envelopes.push((req.headers["content-encoding"] === "gzip" ? gunzipSync(body) : body).toString("utf8"));
         res.end("{}");
       });
     });
@@ -76,8 +79,9 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     expect.soft(all).not.toContain(DISCORD_TOKEN);
     expect.soft(all).not.toContain('"http.query"');
     // The breadcrumbs themselves are kept (host and path survive), only the secrets go.
-    expect.soft(all).toContain(`/api/webhooks/1/[Filtered]`);
-    expect.soft(all).toContain(`127.0.0.1:${port(ok)}/v0/webhooks`);
+    // Checked on the error event itself: the stubs' http.server transactions carry the same paths.
+    expect.soft(errorEvent()!).toContain(`/api/webhooks/1/[Filtered]`);
+    expect.soft(errorEvent()!).toContain(`127.0.0.1:${port(ok)}/v0/webhooks`);
   }, 60_000);
 
   it("a sampled transaction is still sent, and carries no api-key", async () => {
@@ -89,7 +93,7 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     await Sentry.startSpan({ name: "scrub-tx", forceTransaction: true }, async () => {
       await fetch(`${base}/?api-key=${RPC_KEY}`, { method: "POST", body: "{}" });
     });
-    const tx = () => envelopes.find((e) => e.includes('"type":"transaction"'));
+    const tx = () => envelopes.find((e) => e.includes('"type":"transaction"') && e.includes('"transaction":"scrub-tx"'));
     for (let i = 0; i < 100 && !tx(); i++) await new Promise((r) => setTimeout(r, 100));
     expect(tx()).toBeDefined();
     expect(envelopes.join("\n")).not.toContain(RPC_KEY);
