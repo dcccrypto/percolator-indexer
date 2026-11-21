@@ -141,9 +141,8 @@ describe("webhook payload-shape drift", () => {
     const tx = canonical();
     delete tx.transactionError;
     tx.meta = { err: { InstructionError: [2, { Custom: 1 }] } };
-    for (const i of tx.instructions) delete i.innerInstructions;
+    // CPIs kept, so only the meta.err fallback stops the row (without it: one 483 matcher_exact row for a FAILED tx).
     const r = await post([tx]);
-    // e708fc5: one row, size 29041225 legacy_unverified, for a transaction that FAILED on chain.
     expect(r.rows).toEqual([]);
   });
 
@@ -177,8 +176,9 @@ describe("webhook payload-shape drift", () => {
   it("per item: a poison key hidden in a {pubkey} account entry, or in an item that is unusable for another reason, still rejects the whole request", async () => {
     const inAccount = canonical();
     wrapperIx(inAccount).accounts[0] = JSON.parse(`{"pubkey":"${wrapperIx(inAccount).accounts[0]}","constructor":1}`);
+    const asArrayItem = `[${JSON.stringify(clone(drift.fill))},[{"__proto__":{"x":1}}]]`;
     const behindError = `[${JSON.stringify(clone(drift.fill))},{"signature":"${PARTIAL.sig}","instructions":[{"programId":5}],"accountData":[{"__proto__":{"x":1}}]}]`;
-    for (const body of [JSON.stringify([inAccount]), behindError]) {
+    for (const body of [JSON.stringify([inAccount]), behindError, asArrayItem]) {
       const res = await webhookRoutes().fetch(new Request("http://x/webhook/trades", { method: "POST", headers: { "content-type": "application/json", authorization: "s3cret" }, body }));
       expect(res.status).toBe(400);
     }

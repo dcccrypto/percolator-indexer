@@ -222,9 +222,9 @@ function checkIx(ix: unknown, strict: boolean): ValidatedInstruction | string {
  * Throws {@link PoisonedPayload} on a poison key at any depth of the item.
  */
 function checkItem(tx: unknown): ItemCheck {
-  if (!isObj(tx)) return { ok: false, reason: tx === null ? "item is null" : `item is a ${typeof tx}, not an object`, raw: false, signature: null };
-  // Before any per-item verdict, so an item that is unusable for another reason cannot hide a poison key.
+  // Before any per-item verdict (array items included), so an item that is unusable for another reason cannot hide a poison key.
   if (hasPoisonKeyDeep(tx)) throw new PoisonedPayload();
+  if (!isObj(tx)) return { ok: false, reason: tx === null ? "item is null" : Array.isArray(tx) ? "item is an array, not an object" : `item is a ${typeof tx}, not an object`, raw: false, signature: null };
   const sig = typeof tx.signature === "string" && BASE58_SIGNATURE.test(tx.signature) ? tx.signature : null;
   const bad = (reason: string): ItemCheck => ({ ok: false, reason, raw: false, signature: sig });
   if (tx.signature === undefined && (isObj(tx.transaction) || isObj(tx.meta)) && tx.instructions === undefined) {
