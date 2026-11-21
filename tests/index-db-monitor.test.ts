@@ -28,6 +28,7 @@ const h = vi.hoisted(() => {
     serve: vi.fn(),
     fetch: null as null | ((req: Request) => Promise<Response>),
     eventStreamStart: vi.fn(async () => {}),
+    addKnownSlab: vi.fn(),
     createAtlasWs: vi.fn(() => ({})),
   };
 });
@@ -61,7 +62,7 @@ vi.mock("@hono/node-server", () => ({
   },
 }));
 vi.mock("../src/services/MarketDiscovery.js", () => ({
-  MarketDiscovery: class { getMarkets() { return new Map(); } stop() {} },
+  MarketDiscovery: class { getMarkets() { return new Map([["FAKE_SLAB", {}]]); } stop() {} },
 }));
 vi.mock("../src/services/discoveryWiring.js", () => ({ startDiscovery: vi.fn(async () => {}) }));
 vi.mock("../src/services/StatsCollector.js", () => ({ StatsCollector: class { start() {} stop() {} } }));
@@ -70,7 +71,7 @@ vi.mock("../src/services/HeliusWebhookManager.js", () => ({
   HeliusWebhookManager: class { async start() {} async stop() {} },
 }));
 vi.mock("../src/services/EventStreamService.js", () => ({
-  EventStreamService: class { start() { return h.eventStreamStart(); } addKnownSlab() {} },
+  EventStreamService: class { start() { return h.eventStreamStart(); } addKnownSlab(s: string) { h.addKnownSlab(s); } },
 }));
 vi.mock("../src/services/LpVaultIndexer.js", () => ({ LpVaultIndexer: class { start() {} stop() {} } }));
 vi.mock("../src/lpVault/chain.js", () => ({ RpcLpVaultChain: class {} }));
@@ -218,7 +219,9 @@ describe("index.ts boot", () => {
     expect(h.eventStreamStart).toHaveBeenCalledTimes(1);
     expect(h.logger.info.mock.calls.some((c) => c[0] === "RPC fallback pollers disabled")).toBe(true);
     expect(h.sendInfoAlert.mock.calls.some((c) => c[0] === "Indexer service started")).toBe(true);
-    await vi.advanceTimersByTimeAsync(60_000); // known-slab refresh interval runs without throwing
+    expect(h.addKnownSlab).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60_000); // known-slab refresh: discovery's slabs reach the event stream
+    expect(h.addKnownSlab).toHaveBeenCalledWith("FAKE_SLAB");
   });
 
   it("keeps running with webhook + polling when the Atlas WS fails to start", async () => {
@@ -289,7 +292,7 @@ describe("index.ts HTTP surface", () => {
     expect(warnLogs("RPC health check failed")).toHaveLength(1);
 
     h.getSlot.mockReturnValueOnce(new Promise(() => {}));
-    h.probe.mockReturnValueOnce(Promise.reject(new Error("FAKE db down")));
+    h.probe.mockImplementationOnce(() => Promise.reject(new Error("FAKE db down")));
     await vi.advanceTimersByTimeAsync(1);
     const pending = req("/health");
     await vi.advanceTimersByTimeAsync(6_000);
@@ -308,7 +311,9 @@ describe("index.ts HTTP surface", () => {
     const second = await req("/webhook/trades", { method: "POST", body: "{}" });
     expect(second.status).toBe(429);
     expect(warnLogs("Rate limit exceeded")).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(5 * 60_000); // prune interval
+    // After the 60 s window the same client is allowed again. (Coverage-only for the 5-min prune timer:
+    // the window expiry alone would let this through, so this does not prove pruning.)
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect((await req("/webhook/trades", { method: "POST", body: "{}" })).status).not.toBe(429);
   });
 });
