@@ -59,6 +59,10 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
 export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>()): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
   if (value === null || typeof value !== "object") return value;
+  // Only plain data: events also reference live SDK objects (scopes, client, spans) that are never
+  // serialised and must not be walked or mutated.
+  const proto = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) return value;
   if (seen.has(value)) return value;
   seen.add(value);
   if (Array.isArray(value)) {
@@ -67,6 +71,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
   }
   const obj = value as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
+    if (key === "sdkProcessingMetadata") continue; // SDK-internal, stripped before sending
     if (DROP_KEYS.has(key)) {
       delete obj[key];
       continue;

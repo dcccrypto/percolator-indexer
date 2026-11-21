@@ -30,9 +30,12 @@ const DISCORD_TOKEN = fake("DISCORD8");
 const servers: http.Server[] = [];
 afterAll(() => servers.forEach((s) => s.close()));
 
+// Shared by the two end-to-end tests below (one Sentry client per process).
+const envelopes: string[] = [];
+let base = "";
+
 describe("Sentry events carry no api-key or Discord webhook token", () => {
   it("an exception captured after RPC, Helius and Discord calls ships scrubbed breadcrumbs", async () => {
-    const envelopes: string[] = [];
     const sentry = await listen((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
@@ -54,7 +57,7 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     // Empty env: the patterns alone must catch these, without knowing the configured values.
     scrub?.installSentryScrubber({});
 
-    const base = `http://127.0.0.1:${port(ok)}`;
+    base = `http://127.0.0.1:${port(ok)}`;
     // web3.js Connection RPC call: RPC_URL carries the key in its query string.
     await fetch(`${base}/?api-key=${RPC_KEY}`, { method: "POST", body: "{}" });
     // HeliusWebhookManager call (src/services/HeliusWebhookManager.ts builds ?api-key=).
@@ -73,6 +76,21 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     // The breadcrumbs themselves are kept (host and path survive), only the secrets go.
     expect.soft(all).toContain(`/api/webhooks/1/[Filtered]`);
     expect.soft(all).toContain(`127.0.0.1:${port(ok)}/v0/webhooks`);
+  }, 60_000);
+
+  it("a sampled transaction is still sent, and carries no api-key", async () => {
+    const Sentry = await import("@sentry/node");
+    // shared samples 10% of transactions; force this one. The event holds live scopes in
+    // sdkProcessingMetadata, which the scrubber must leave alone (walking them threw and dropped it).
+    Sentry.getClient()!.getOptions().tracesSampleRate = 1;
+    envelopes.length = 0;
+    await Sentry.startSpan({ name: "scrub-tx", forceTransaction: true }, async () => {
+      await fetch(`${base}/?api-key=${RPC_KEY}`, { method: "POST", body: "{}" });
+    });
+    const tx = () => envelopes.find((e) => e.includes('"type":"transaction"'));
+    for (let i = 0; i < 100 && !tx(); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(tx()).toBeDefined();
+    expect(envelopes.join("\n")).not.toContain(RPC_KEY);
   }, 60_000);
 });
 
