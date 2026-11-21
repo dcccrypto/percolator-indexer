@@ -1,3 +1,4 @@
+import { getProgramIds, parseMarketsFilter } from "../lib/programIds.js";
 import { PublicKey } from "@solana/web3.js";
 import { discoverMarkets, getMarketsByAddress, isV17Account, type DiscoveredMarket } from "@percolatorct/sdk";
 import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException, sendCriticalAlert } from "@percolatorct/shared";
@@ -112,8 +113,13 @@ export class MarketDiscovery {
     try {
       const conn = deadlineConnection(getPrimaryConnection());
       const filter = (process.env.MARKETS_FILTER ?? "").trim();
-      const addresses = filter ? filter.split(",").map((a) => a.trim()).filter(Boolean).map((a) => new PublicKey(a)) : undefined;
-      for (const id of config.allProgramIds) {
+      const addresses = filter ? parseMarketsFilter(filter, (entry, error) => logger.warn("Ignoring invalid MARKETS_FILTER entry", { entry, error })) : undefined;
+      if (addresses && addresses.length === 0) {
+        // Every MARKETS_FILTER entry was invalid: an empty list would fall through to a full scan, so do nothing.
+        logger.warn("MARKETS_FILTER has no valid entries — skipping light discovery");
+        return [];
+      }
+      for (const id of getProgramIds()) {
         try {
           const found = await discoverV17Markets(conn, new PublicKey(id), addresses, { light: true });
           for (const m of found) {
@@ -150,7 +156,7 @@ export class MarketDiscovery {
   }
 
   private async _doDiscover(): Promise<DiscoveredMarket[]> {
-    const programIds = config.allProgramIds;
+    const programIds = getProgramIds();
     // Use Helius primary RPC (primaryConn) for all discovery attempts.
     // fallbackConn is tried exactly once — only after all HELIUS_429_BACKOFF_MS retries are
     // exhausted due to 429 rate-limit responses. Non-429 errors (transport, auth) cause an
@@ -164,11 +170,12 @@ export class MarketDiscovery {
 
     const marketsFilter = (process.env.MARKETS_FILTER ?? "").trim();
     if (marketsFilter) {
-      const slabAddresses = marketsFilter
-        .split(",")
-        .map(s => s.trim())
-        .filter(Boolean)
-        .map(s => new PublicKey(s));
+      const slabAddresses = parseMarketsFilter(marketsFilter, (entry, error) => logger.warn("Ignoring invalid MARKETS_FILTER entry", { entry, error }));
+      if (slabAddresses.length === 0) {
+        // Every entry invalid: an empty list would make discoverV17Markets fall through to a full getProgramAccounts scan.
+        logger.warn("MARKETS_FILTER has no valid entries — skipping discovery");
+        return [];
+      }
 
       logger.info("Using MARKETS_FILTER — skipping getProgramAccounts discovery", {
         count: slabAddresses.length,

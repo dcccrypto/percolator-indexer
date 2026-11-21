@@ -1,3 +1,4 @@
+import { getProgramIds } from "../lib/programIds.js";
 import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, type TolerantFetchResult } from "../lib/tolerantTxFetch.js";
 import { parseMaxWriteHolds, parsePollIntervalMs, parseRpcMinIntervalMs, parseWriteOutageAlertMs, parseWriteOutageRealertMs } from "../lib/indexerEnv.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
@@ -435,7 +436,7 @@ export class TradeIndexerPolling {
     // The cache prefetch is best effort and makes ONE attempt (see prefetchMisses): paced, but no 429 retry.
     const prefetchConnection = paceConnection(rawConnection, this.rpcLimiter, 0);
     const slabPk = new PublicKey(slabAddress);
-    const programIds = new Set(config.allProgramIds);
+    const programIds = new Set(getProgramIds());
 
     // Fetch the signatures newer than this slab's cursor (newest-first). Without a cursor (first pass) this
     // is the newest maxSigs; with one, the window is paged until the cursor is reached.

@@ -97,7 +97,7 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
   it("the fallback price fetch (legacy leg) is under the per-delivery deadline: a hung RPC answers 500 on the first delivery, the redelivery runs through", async () => {
     const f = classic("partial");
     const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
-    for (const i of tx.instructions) delete i.innerInstructions; // unrecognised -> legacy -> extractPrice
+    for (const i of tx.instructions) for (const n of i.innerInstructions ?? []) if (n.programId === i.accounts?.[4]) n.data = "1"; // undecodable matcher call -> legacy -> extractPrice
     const slab = JSON.parse(readFileSync(new URL("./fixtures/v18-market-link.json", import.meta.url), "utf8"));
     getAccountInfo.mockImplementationOnce(() => new Promise(() => {})).mockResolvedValue({ data: Buffer.from(slab.dataBase64, "base64") });
     process.env.TRADECPI_DELIVERY_BUDGET_MS = "150";
@@ -123,10 +123,19 @@ describe("webhook: TradeCpi rows carry the executed size and the booked price", 
     } finally { delete process.env.TRADECPI_UNVERIFIED_SIZE; }
   });
 
-  it("a payload without nested innerInstructions (unrecognised layout) writes what main writes today: wire size, existing price logic; not dropped, not recorded as skipped", async () => {
+  it("a payload without nested innerInstructions writes NO row at the wire (request) size: recorded, leg held, the poll path stores the fill", async () => {
     const f = classic("partial");
     const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
     for (const i of tx.instructions) delete i.innerInstructions;
+    const rows = (await deliver(tx)).filter((r) => !r.is_liquidation);
+    expect(rows).toEqual([]);
+    expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ signature: f.sig, error: expect.stringContaining("no innerInstructions") })]);
+  });
+
+  it("an undecodable matcher call (unrecognised layout) writes what main writes today: wire size, existing price logic; not dropped, not recorded as skipped", async () => {
+    const f = classic("partial");
+    const tx = JSON.parse(JSON.stringify(enhanced[f.sig]));
+    for (const i of tx.instructions) for (const n of i.innerInstructions ?? []) if (n.programId === i.accounts?.[4]) n.data = "1";
     const slab = JSON.parse(readFileSync(new URL("./fixtures/v18-market-link.json", import.meta.url), "utf8"));
     getAccountInfo.mockResolvedValue({ data: Buffer.from(slab.dataBase64, "base64") });
     const rows = (await deliver(tx)).filter((r) => !r.is_liquidation);

@@ -318,7 +318,7 @@ export function rawInstructionsFromParsedTx(
 export function rawInstructionsFromEnhancedTx(
   tx: {
     instructions?: Array<{ programId?: string; accounts?: string[]; data?: string; innerInstructions?: any[] }>;
-    innerInstructions?: Array<{ instructions?: any[] }>;
+    innerInstructions?: Array<{ index?: number; instructions?: any[] }>;
   },
   programIds: ReadonlySet<string>,
 ): RawInstruction[] {
@@ -340,8 +340,14 @@ export function rawInstructionsFromEnhancedTx(
   });
   // The flat `innerInstructions` groups are only read when the per-instruction nesting is absent, so one CPI is never
   // counted twice (the (signature, ix_index, inner_index) key would not catch a double count across the two shapes).
+  // A group's `index` is the outer instruction it belongs to (RPC `meta.innerInstructions` shape): keyed by it, the row
+  // gets the (signature, ix_index, inner_index) key the stream and poll paths give it. Only a group WITHOUT a usable
+  // index falls back to 1000 + its position (no real instruction has that index).
   if (!nestedSeen) {
-    (tx.innerInstructions ?? []).forEach((g, gi) => (g.instructions ?? []).forEach((inner: unknown, j: number) => take(inner, 1000 + gi, j)));
+    (tx.innerInstructions ?? []).forEach((g, gi) => {
+      const ixIndex = Number.isSafeInteger(g?.index) && (g.index as number) >= 0 ? (g.index as number) : 1000 + gi;
+      (g?.instructions ?? []).forEach((inner: unknown, j: number) => take(inner, ixIndex, j));
+    });
   }
   return out;
 }

@@ -650,6 +650,7 @@ function makeCpiInstructions() {
     programId: PROGRAM_ID,
     data: 'validbase58data',
     accounts: [TRADER, SLAB, TRADER],
+    innerInstructions: [], // present: a TradeCpi without the field is not written (resolveCpiLeg is mocked)
   }];
 }
 
@@ -894,9 +895,10 @@ describe('POST /webhook/trades — field-type validation and prototype-pollution
   });
 
   it('rejects payload where ix.accounts contains a non-string element', async () => {
+    // (a jsonParsed `{pubkey: "<string>"}` entry is read as its key: tests/webhook-payload-shape-drift.test.ts E3)
     const body = [{
       signature: SIG,
-      instructions: [{ programId: PROGRAM_ID, data: 'abc', accounts: [{ pubkey: 'not-a-string' }] }],
+      instructions: [{ programId: PROGRAM_ID, data: 'abc', accounts: [{ pubkey: 42 }] }],
     }];
     const res = await app.fetch(makeRequest(body));
     expect(res.status).toBe(400);

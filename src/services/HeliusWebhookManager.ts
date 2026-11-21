@@ -1,3 +1,4 @@
+import { getProgramIds } from "../lib/programIds.js";
 import { config, createLogger, captureException, sendCriticalAlert } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:webhook-manager");
@@ -146,7 +147,7 @@ export class HeliusWebhookManager {
     return {
       webhookURL,
       transactionTypes: ["ANY"],
-      accountAddresses: config.allProgramIds,
+      accountAddresses: getProgramIds(),
       webhookType: isDevnet ? "enhancedDevnet" : "enhanced",
       authHeader: config.webhookSecret || undefined,
     };
