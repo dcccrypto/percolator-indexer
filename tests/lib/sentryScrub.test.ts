@@ -117,13 +117,14 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
         return { href: this.href };
       }
     }
+    const conn = new Connection(u("CONN"));
     envelopes.length = 0;
     console.error("rpc client", new Holder(u("CONSOLE")));
     captureException(new Error("non-plain extra"), {
       extra: {
         cls: new Holder(u("CLASS")),
         tojson: new Endpoint(u("TOJSON")),
-        conn: new Connection(u("CONN")),
+        conn,
         bytes: new TextEncoder().encode(u("BYTES")),
         // Sentry already sends these without their contents ({} / name+message+stack): no leak on the old code.
         map: new Map([["rpc", u("MAP")]]),
@@ -140,6 +141,12 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     // The objects are still reported, only the secret goes; the live Connection is not modified.
     expect.soft(ev()!).toContain(`"endpoint":"${base}/?api-key=[Filtered]"`);
     expect.soft(ev()!).toContain(`"href":"${base}/?api-key=[Filtered]"`);
+    expect.soft(conn.rpcEndpoint).toBe(u("CONN"));
+    // The console breadcrumb hook scrubs a copy of the args, not the array the console then prints.
+    const Sentry = await import("@sentry/node");
+    const args: unknown[] = ["rpc client", new Holder(u("CONSOLE"))];
+    Sentry.addBreadcrumb({ category: "console", data: { arguments: args } });
+    expect.soft(args[1]).toBeInstanceOf(Holder);
   }, 60_000);
 });
 
@@ -212,6 +219,7 @@ describe("scrubString / scrubDeep", () => {
     proto.headers = { apikey: KEY };
     const cyclic = new Custom(`Bearer ${KEY}`) as Custom & { self?: unknown };
     cyclic.self = cyclic;
+    const twice = new Custom(KEY);
     const live = new Custom(KEY);
     const ev = m!.scrubDeep(
       {
@@ -222,6 +230,7 @@ describe("scrubString / scrubDeep", () => {
           proto,
           live,
           cyclic,
+          twice: [twice, twice],
           json: { toJSON: () => ({ key: KEY }) } as unknown,
           bytes: Buffer.from(`key=${KEY}`),
           cleanBytes: new Uint8Array([1, 2, 3]),
@@ -246,6 +255,19 @@ describe("scrubString / scrubDeep", () => {
     expect(ev.extra.bytes).toBe(FILTERED_);
     expect(ev.extra.cleanBytes).toEqual(new Uint8Array([1, 2, 3]));
     expect(ev.extra.throwing).toBe(FILTERED_);
+    // Shared references are copied once, not once per path (2^40 paths here).
+    class Node {
+      l?: Node;
+      r?: Node;
+    }
+    let chain = new Node();
+    for (let i = 0; i < 40; i++) {
+      const n = new Node();
+      n.l = n.r = chain;
+      chain = n;
+    }
+    expect(m!.scrubDeep({ chain }).chain).toMatchObject({ l: { l: {} } });
+    expect(ev.extra.twice).toEqual([{ auth: FILTERED_ }, { auth: FILTERED_ }]); // a shared reference is not a cycle
     expect(ev.extra.cyclic).toEqual({ auth: `Bearer ${FILTERED_}`, self: FILTERED_ });
   });
 

@@ -59,12 +59,12 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
 }
 
 /** Scrub every string in `value` in place (objects/arrays); returns the scrubbed value. */
-export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>()): T {
+export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>(), copies = new WeakMap<object, unknown>()): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
   if (value === null || typeof value !== "object") return value;
   // Sentry serialises these in `extra`/contexts (href; name/message/stack), so scrub a plain copy.
   if (value instanceof URL) return scrubString(value.href, secrets) as T;
-  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen) as T;
+  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen, copies) as T;
   // Bytes go out as their numbers, so a secret inside them survives string scrubbing.
   if (ArrayBuffer.isView(value)) {
     const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
@@ -76,6 +76,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
   const proto = Object.getPrototypeOf(value);
   const toJSON = (value as { toJSON?: unknown }).toJSON;
   if (typeof toJSON === "function" || (!Array.isArray(value) && proto !== Object.prototype && proto !== null)) {
+    if (copies.has(value)) return copies.get(value) as T; // shared reference: reuse its scrubbed copy
     if (seen.has(value)) return FILTERED as T; // a copy cannot point back at itself; drop the cycle
     seen.add(value);
     let copy: unknown;
@@ -84,12 +85,15 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
     } catch {
       return FILTERED as T; // a throwing getter/toJSON: Sentry could not serialise it either
     }
-    return scrubDeep(copy, secrets, seen) as T;
+    const out = scrubDeep(copy, secrets, seen, copies);
+    seen.delete(value); // only ancestors count as a cycle
+    copies.set(value, out);
+    return out as T;
   }
   if (seen.has(value)) return value;
   seen.add(value);
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) value[i] = scrubDeep(value[i], secrets, seen);
+    for (let i = 0; i < value.length; i++) value[i] = scrubDeep(value[i], secrets, seen, copies);
     return value;
   }
   const obj = value as Record<string, unknown>;
@@ -99,7 +103,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
       delete obj[key];
       continue;
     }
-    obj[key] = scrubDeep(obj[key], secrets, seen);
+    obj[key] = scrubDeep(obj[key], secrets, seen, copies);
   }
   return value;
 }
@@ -116,6 +120,8 @@ export function installSentryScrubber(env: NodeJS.ProcessEnv = process.env): boo
   installed = true;
   const secrets = configuredSecrets(env);
   client.on("beforeAddBreadcrumb", (breadcrumb) => {
+    // Console breadcrumbs share their args array with the console call that prints next: scrub a copy.
+    if (Array.isArray(breadcrumb.data?.arguments)) breadcrumb.data.arguments = [...breadcrumb.data.arguments];
     scrubDeep(breadcrumb, secrets);
   });
   Sentry.getGlobalScope().addEventProcessor((event) => scrubDeep(event, secrets));
