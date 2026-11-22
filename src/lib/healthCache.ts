@@ -86,8 +86,13 @@ export function createHealthChecker(opts: HealthCheckerOptions): () => Promise<H
   }
 
   return async function check(): Promise<HealthResult> {
-    if (cached && now() - cached.at < ttlMs) {
-      return { ...cached.result, cached: true };
+    if (cached) {
+      // A negative age means the wall clock stepped backwards; the entry is
+      // then of unknown age, so treat it as expired rather than serving it.
+      const age = now() - cached.at;
+      if (age >= 0 && age < ttlMs) {
+        return { ...cached.result, cached: true };
+      }
     }
 
     // Single-flight: a burst arriving before the first probe resolves shares it
