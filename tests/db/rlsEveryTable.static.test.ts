@@ -29,6 +29,7 @@ type Kind = "table" | "view" | "materialized view";
 interface Rel {
   kind: Kind;
   file: string; // file of the CREATE that produced the current object
+  lastFile: string; // last file whose statement changed RLS, grants or security_invoker
   rls: boolean;
   securityInvoker: boolean;
   writes: Record<ClientRole, Set<string>>;
@@ -65,9 +66,12 @@ function splitStatements(sql: string): string[] {
       continue;
     }
     if (c === "'" || c === '"') {
+      // E'...' strings also allow backslash escapes.
+      const escapes = c === "'" && /(^|[^A-Za-z0-9_])[Ee]$/.test(sql.slice(Math.max(0, i - 2), i));
       let j = i + 1;
       while (j < sql.length) {
-        if (sql[j] === c && sql[j + 1] === c) j += 2;
+        if (escapes && sql[j] === "\\") j += 2;
+        else if (sql[j] === c && sql[j + 1] === c) j += 2;
         else if (sql[j] === c) break;
         else j++;
       }
@@ -95,7 +99,7 @@ function splitStatements(sql: string): string[] {
     i++;
   }
   if (cur.trim()) out.push(cur.trim());
-  return out.map((s) => s.replace(/\s+/g, " "));
+  return out; // whitespace is kept: a DO body may still hold -- comments that end at a newline
 }
 
 const IDENT = String.raw`(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)`;
@@ -123,14 +127,16 @@ const SECURITY_DDL =
 function expandDo(stmt: string): { stmts: string[]; unfollowed: string | null } {
   const m = /^DO\s+(?:LANGUAGE\s+\w+\s+)?(\$[A-Za-z0-9_]*\$)([\s\S]*)\1/i.exec(stmt);
   if (!m) return { stmts: [], unfollowed: SECURITY_DDL.test(stmt) ? stmt : null };
-  let body = m[2];
+  // Comments inside the body are not SQL; drop them before matching.
+  let body = splitStatements(m[2]).join(";\n") + ";";
   const stmts: string[] = [];
   const loop = /FOREACH\s+(\w+)\s+IN\s+ARRAY\s+ARRAY\s*\[([^\]]*)\]\s+LOOP([\s\S]*?)END\s+LOOP\s*;/gi;
   body = body.replace(loop, (whole, v: string, list: string, inner: string) => {
     const names = [...list.matchAll(/'((?:[^']|'')*)'/g)].map((x) => x[1].replace(/''/g, "'"));
     const exec = new RegExp(String.raw`EXECUTE\s+format\s*\(\s*'((?:[^']|'')*)'\s*,\s*${v}\s*\)\s*;`, "gi");
     const templates = [...inner.matchAll(exec)].map((x) => x[1].replace(/''/g, "'"));
-    if (inner.replace(exec, "").trim() !== "") return whole; // something else in the loop: leave it, flagged below
+    // Something else in the loop, or a placeholder other than %I: leave it, flagged below.
+    if (inner.replace(exec, "").trim() !== "" || templates.some((t) => /%(?!I)/.test(t))) return whole;
     for (const n of names) for (const t of templates) stmts.push(...splitStatements(t.replace(/%I/g, `"${n}"`)));
     return " ";
   });
@@ -157,8 +163,9 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
   const rels = new Map<string, Rel>();
   const findings: Finding[] = [];
 
-  const apply = (file: string, s: string): void => {
+  const apply = (file: string, raw: string): void => {
     let m: RegExpExecArray | null;
+    const s = /^DO\s/i.test(raw) ? raw : raw.replace(/\s+/g, " ");
 
     if (/^DO\s/i.test(s)) {
       const { stmts, unfollowed } = expandDo(s);
@@ -179,7 +186,7 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
       const name = relName(m[4]);
       if (name === null) return;
       if (m[3] && rels.has(name)) return;
-      rels.set(name, { kind: "table", file, rls: false, securityInvoker: false, writes: allWrites() });
+      rels.set(name, { kind: "table", file, lastFile: file, rls: false, securityInvoker: false, writes: allWrites() });
       return;
     }
 
@@ -189,7 +196,7 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
       const name = relName(m[2]);
       if (name === null) return;
       if (m[1] && rels.has(name)) return;
-      rels.set(name, { kind: "materialized view", file, rls: false, securityInvoker: false, writes: allWrites() });
+      rels.set(name, { kind: "materialized view", file, lastFile: file, rls: false, securityInvoker: false, writes: allWrites() });
       return;
     }
 
@@ -204,9 +211,10 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
       // CREATE OR REPLACE on an existing view keeps its grants, but resets reloptions to the WITH list.
       if (m[1] && prev && prev.kind === "view") {
         prev.securityInvoker = invoker;
+        prev.lastFile = file;
         return;
       }
-      rels.set(name, { kind: "view", file, rls: false, securityInvoker: invoker, writes: allWrites() });
+      rels.set(name, { kind: "view", file, lastFile: file, rls: false, securityInvoker: invoker, writes: allWrites() });
       return;
     }
 
@@ -237,6 +245,7 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
         return;
       }
       if (!rel) return;
+      rel.lastFile = file;
       if (/\bDISABLE\s+ROW\s+LEVEL\s+SECURITY\b/i.test(rest)) rel.rls = false;
       else if (/\bENABLE\s+ROW\s+LEVEL\s+SECURITY\b/i.test(rest)) rel.rls = true;
       const set = /\bSET\s*\(([^)]*)\)/i.exec(rest);
@@ -258,7 +267,7 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
       if (/^ALL\s+(TABLES|VIEWS)\s+IN\s+SCHEMA\s+/i.test(on)) {
         if (!/\bpublic\b/i.test(on)) return;
         targets = [...rels.keys()];
-      } else if (/^(SEQUENCE|FUNCTION|PROCEDURE|ROUTINE|SCHEMA|DATABASE|TYPE|DOMAIN|LANGUAGE|LARGE|FOREIGN|TABLESPACE|PARAMETER|ALL\s)/i.test(on)) {
+      } else if (/^(SEQUENCE|FUNCTION|PROCEDURE|ROUTINE|SCHEMA|DATABASE|TYPE|DOMAIN|LANGUAGE|TABLESPACE|PARAMETER|ALL|LARGE\s+OBJECT|FOREIGN\s+(DATA|SERVER))\s/i.test(on)) {
         return;
       } else {
         targets = on
@@ -272,6 +281,7 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
       for (const t of targets) {
         const rel = rels.get(t);
         if (!rel) continue;
+        rel.lastFile = file;
         for (const role of roles) {
           const hit: ClientRole[] = role === "public" && isGrant ? [...CLIENT_ROLES] : CLIENT_ROLES.filter((r) => r === role);
           for (const r of hit) {
@@ -290,29 +300,30 @@ function replay(files: { name: string; sql: string }[]): { rels: Map<string, Rel
   for (const f of files) for (const s of splitStatements(f.sql)) apply(f.name, s);
 
   for (const [name, rel] of rels) {
+    const where = rel.lastFile === rel.file ? rel.file : `${rel.file} (last changed by ${rel.lastFile})`;
     const leftover = CLIENT_ROLES.filter((r) => rel.writes[r].size > 0)
       .map((r) => `${r}: ${[...rel.writes[r]].join(",")}`)
       .join("; ");
     if (rel.kind === "materialized view") {
       findings.push({
         key: `${name}:matview`,
-        message: `${rel.file}: materialized view ${name} can have neither RLS nor security_invoker`,
+        message: `${where}: materialized view ${name} can have neither RLS nor security_invoker`,
       });
       continue;
     }
     if (rel.kind === "table" && !rel.rls) {
-      findings.push({ key: `${name}:rls`, message: `${rel.file}: table ${name} has no ENABLE ROW LEVEL SECURITY` });
+      findings.push({ key: `${name}:rls`, message: `${where}: table ${name} has no ENABLE ROW LEVEL SECURITY` });
     }
     if (rel.kind === "view" && !rel.securityInvoker) {
       findings.push({
         key: `${name}:security_invoker`,
-        message: `${rel.file}: view ${name} is not security_invoker = true (runs with owner rights, bypasses RLS)`,
+        message: `${where}: view ${name} is not security_invoker = true (runs with owner rights, bypasses RLS)`,
       });
     }
     if (leftover) {
       findings.push({
         key: `${name}:client-write`,
-        message: `${rel.file}: ${rel.kind} ${name} keeps client write grants (${leftover}); add REVOKE ALL ... FROM anon, authenticated`,
+        message: `${where}: ${rel.kind} ${name} keeps client write grants (${leftover}); add REVOKE ALL ... FROM anon, authenticated`,
       });
     }
   }
@@ -392,6 +403,20 @@ describe("replay model (synthetic migrations)", () => {
     expect(run(SAFE, "GRANT ALL ON TABLE t TO service_role;")).toEqual([]);
   });
 
+  it("a later migration that re-opens a table is named in the finding", () => {
+    const r = replay([
+      { name: "a.sql", sql: SAFE },
+      { name: "b.sql", sql: "GRANT INSERT ON t TO anon;" },
+    ]);
+    expect(r.findings.map((f) => f.message)).toEqual([expect.stringContaining("a.sql (last changed by b.sql): table t keeps client write grants")]);
+  });
+
+  it("table names that start with an object-kind word are still tables", () => {
+    for (const n of ["schema_versions", "large_trades", "typed_orders", "foreign_fx", "all_fills"]) {
+      expect(run(SAFE.replace(/\bt\b/g, n), `GRANT INSERT ON ${n} TO anon;`), n).toEqual([`${n}:client-write`]);
+    }
+  });
+
   it("a column-level REVOKE does not remove the table-level privilege", () => {
     expect(run("CREATE TABLE t (id int); ALTER TABLE t ENABLE ROW LEVEL SECURITY; REVOKE UPDATE (id) ON t FROM anon, authenticated;")).toEqual(["t:client-write"]);
   });
@@ -435,6 +460,11 @@ describe("replay model (synthetic migrations)", () => {
     ).toEqual([]);
     expect(run(SAFE, "DO $$ BEGIN IF true THEN EXECUTE 'CREATE TABLE z (i int)'; END IF; END $$;")).toEqual(["m1.sql:unfollowed-do"]);
     expect(run(SAFE, "DO $$ BEGIN IF NOT EXISTS (SELECT 1) THEN ALTER PUBLICATION p ADD TABLE t; END IF; END $$;")).toEqual([]);
+    // Comments in the body are ignored; %s / positional placeholders are not followed (flagged, not dropped).
+    expect(run(SAFE, "DO $$ BEGIN -- anon reads via its SELECT grant\n ALTER PUBLICATION p ADD TABLE t; END $$;")).toEqual([]);
+    expect(run("CREATE TABLE a (i int);", `DO $$ DECLARE x TEXT; BEGIN FOREACH x IN ARRAY ARRAY['a'] LOOP\n -- lock it down\n EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', x); EXECUTE format('REVOKE ALL ON %I FROM anon, authenticated;', x); END LOOP; END $$;`)).toEqual([]);
+    expect(run(SAFE, loop("GRANT INSERT ON public.%s TO anon;").replace("ARRAY['a','b']", "ARRAY['t']"))).toEqual(["m1.sql:unfollowed-do"]);
+    expect(run(SAFE, loop("GRANT INSERT ON %1$I TO anon;").replace("ARRAY['a','b']", "ARRAY['t']"))).toEqual(["m1.sql:unfollowed-do"]);
   });
 
   it("REVOKE ON ALL TABLES IN SCHEMA public covers existing objects; other schemas and comments are ignored", () => {
@@ -442,5 +472,6 @@ describe("replay model (synthetic migrations)", () => {
     expect(run("CREATE TABLE extensions.e (id int); CREATE TABLE IF NOT EXISTS \"auth\".x (id int);")).toEqual([]);
     expect(run(SAFE, "-- CREATE TABLE c (id int);\n/* CREATE VIEW d AS SELECT 1; */ SELECT 'CREATE TABLE q (i int);';")).toEqual([]);
     expect(run("CREATE TEMP TABLE tmp (i int);")).toEqual([]);
+    expect(run("SELECT E'it\\'s; ok'; CREATE TABLE z (i int);")).toEqual(["z:rls", "z:client-write"]);
   });
 });
