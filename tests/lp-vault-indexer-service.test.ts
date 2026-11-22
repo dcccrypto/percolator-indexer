@@ -287,7 +287,7 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
     const chain = new Chain();
     for (let i = 1; i <= 3; i++) chain.add(`s${i}`, `u${i}`);
     const { ix, store } = mk(chain, undefined, { maxSignaturesPerSync: 2 });
-    const rec = vi.spyOn(ix, "reconcileOpenPositions");
+    const rec = vi.spyOn(ix, "reconcileOpenPositionsMany");
     await ix.tick();
     expect(chain.listCalls).toBe(1);
     expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining("draining a backlog"), expect.objectContaining({ backlog: 3 }));
@@ -303,7 +303,7 @@ describe("LpVaultIndexer registries, tick, start/stop", () => {
     const chain = new Chain();
     chain.add("s1", "alice");
     const { ix } = mk(chain, undefined, { discoveryIntervalMs: -1, reconcileIntervalMs: -1 });
-    const rec = vi.spyOn(ix, "reconcileOpenPositions");
+    const rec = vi.spyOn(ix, "reconcileOpenPositionsMany");
     await ix.tick();
     await ix.tick();
     expect(chain.listCalls).toBe(2);
