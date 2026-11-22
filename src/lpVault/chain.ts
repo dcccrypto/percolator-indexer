@@ -50,6 +50,37 @@ export function parseRegistry(registry: string, programId: string, data: Uint8Ar
   return { registry, programId, market, lpMint };
 }
 
+const KEY_CACHE_MAX = 4096;
+
+/** Insertion-ordered cache, oldest evicted when full (never clear()). */
+function boundedSet<K, V>(m: Map<K, V>, k: K, v: V): void {
+  m.set(k, v);
+  if (m.size > KEY_CACHE_MAX) {
+    const oldest = m.keys().next();
+    if (!oldest.done) m.delete(oldest.value);
+  }
+}
+
+/** base58 -> 32 raw bytes, or null when it is not a valid 32-byte key (such a string can never equal a toBase58()). */
+const keyBytesCache = new Map<string, Uint8Array | null>();
+function keyBytes(b58: string): Uint8Array | null {
+  const hit = keyBytesCache.get(b58);
+  if (hit !== undefined) return hit;
+  let out: Uint8Array | null;
+  try {
+    out = new PublicKey(b58).toBytes();
+  } catch {
+    out = null;
+  }
+  boundedSet(keyBytesCache, b58, out);
+  return out;
+}
+
+function bytesEqual(data: Uint8Array, off: number, key: Uint8Array): boolean {
+  for (let i = 0; i < 32; i++) if (data[off + i] !== key[i]) return false;
+  return true;
+}
+
 /**
  * Shares of a live redemption request, or 0. ExecuteRedemption zeroes the magic
  * and drains the lamports; CancelRedemption closes it — either way it is gone.
@@ -57,19 +88,30 @@ export function parseRegistry(registry: string, programId: string, data: Uint8Ar
 export function parseRedemptionShares(data: Uint8Array | null, registry: string, user: string): bigint {
   if (!data || data.length < LP_REDEMPTION_LEN || data[10] !== KIND_LP_REDEMPTION) return 0n;
   if (data.subarray(0, 8).every((b) => b === 0)) return 0n;
-  const reg = new PublicKey(data.subarray(HEADER_LEN, HEADER_LEN + 32)).toBase58();
-  const who = new PublicKey(data.subarray(HEADER_LEN + 32, HEADER_LEN + 64)).toBase58();
-  if (reg !== registry || who !== user) return 0n;
+  // Base58 is a bijection on 32-byte keys, so comparing raw bytes equals comparing toBase58() strings.
+  const reg = keyBytes(registry);
+  const who = keyBytes(user);
+  if (!reg || !who) return 0n;
+  if (!bytesEqual(data, HEADER_LEN, reg) || !bytesEqual(data, HEADER_LEN + 32, who)) return 0n;
   let v = 0n;
   for (let i = 15; i >= 0; i--) v = (v << 8n) | BigInt(data[HEADER_LEN + 64 + i]!);
   return v;
 }
 
+/** Memoised PDAs are shared: callers must treat the returned PublicKey as read-only. */
+const pdaCache =new Map<string, PublicKey>();
+const REDEMPTION_SEED = Buffer.from("lp_redemption");
+
 export function deriveRedemptionPda(programId: string, registry: string, user: string): PublicKey {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("lp_redemption"), new PublicKey(registry).toBuffer(), new PublicKey(user).toBuffer()],
+  const ck = `${programId}|${registry}|${user}`;
+  const hit = pdaCache.get(ck);
+  if (hit) return hit;
+  const pda = PublicKey.findProgramAddressSync(
+    [REDEMPTION_SEED, new PublicKey(registry).toBuffer(), new PublicKey(user).toBuffer()],
     new PublicKey(programId),
   )[0];
+  boundedSet(pdaCache, ck, pda);
+  return pda;
 }
 
 export class RpcLpVaultChain implements LpVaultChain {
