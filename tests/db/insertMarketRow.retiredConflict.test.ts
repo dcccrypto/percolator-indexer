@@ -13,6 +13,9 @@
  *    before migration 20261001020000 and shared's insertMarket got). blocklist.ts drops that
  *    slab's trades and events.
  *
+ * (syncMarkets sees same-network rows of every status, so in practice the retired case is reached only
+ * on a race or a direct call; the other-network case is reached every sweep.)
+ *
  * Before this fix both were swallowed as success with no log. Now the existing row is read
  * back and the case is named in a warn and in the return value. Nothing is ever written to
  * the existing row: a 'retired' row may be an operator's deliberate retirement, and a

@@ -69,7 +69,9 @@ export type InsertMarketRowResult =
  *    gets its row. Warned; it needs a human to fix the row's network.
  *  - same network, 'retired': blocklist.ts drops the slab's trades and events.
  *    Warned, NOT flipped: 'retired' is also the operator's deliberate lever, and
- *    a legacy column-default row cannot be told apart from it here.
+ *    a legacy column-default row cannot be told apart from it here. syncMarkets
+ *    already sees such a row (getMarketRows reads every status), so this fires
+ *    only on a read-then-insert race or a direct call.
  * The existing row is never written to. A failed read-back is warned and treated
  * as "exists", the same as before.
  */
