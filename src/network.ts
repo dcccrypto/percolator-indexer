@@ -6,11 +6,22 @@
  */
 export type NetworkType = "devnet" | "testnet" | "mainnet";
 
+/**
+ * Unset (or empty) NETWORK keeps the devnet default. A set but unknown value
+ * throws at import: CURRENT_NETWORK tags every row written and filters every
+ * read, so silently mapping a typo to devnet would put a non-devnet indexer's
+ * rows under the devnet tag. "mainnet-beta" is accepted as "mainnet" because
+ * the SDK's getCurrentNetwork() reads the same env var and treats it so.
+ */
 function resolveNetwork(): NetworkType {
-  const n = (process.env.NETWORK ?? "devnet").toLowerCase().trim();
-  if (n === "mainnet") return "mainnet";
+  const raw = process.env.NETWORK;
+  const n = (raw ?? "").toLowerCase().trim();
+  if (n === "" || n === "devnet") return "devnet";
   if (n === "testnet") return "testnet";
-  return "devnet";
+  if (n === "mainnet" || n === "mainnet-beta") return "mainnet";
+  throw new Error(
+    `Unknown NETWORK value ${JSON.stringify(raw)}: expected one of "devnet", "testnet", "mainnet" (or unset for devnet)`,
+  );
 }
 
 /**

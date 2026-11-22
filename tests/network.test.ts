@@ -89,17 +89,15 @@ describe("network", () => {
     });
   });
 
-  describe("invalid values fall back to devnet", () => {
-    it('should fall back to "devnet" for unrecognized value', async () => {
+  describe("invalid values throw at import", () => {
+    it("should throw for unrecognized value", async () => {
       process.env.NETWORK = "staging";
-      const { CURRENT_NETWORK } = await loadNetwork();
-      expect(CURRENT_NETWORK).toBe("devnet");
+      await expect(loadNetwork()).rejects.toThrow(/Unknown NETWORK value "staging"/);
     });
 
-    it('should fall back to "devnet" for numeric value', async () => {
+    it("should throw for numeric value", async () => {
       process.env.NETWORK = "12345";
-      const { CURRENT_NETWORK } = await loadNetwork();
-      expect(CURRENT_NETWORK).toBe("devnet");
+      await expect(loadNetwork()).rejects.toThrow(/Unknown NETWORK value "12345"/);
     });
   });
 });
