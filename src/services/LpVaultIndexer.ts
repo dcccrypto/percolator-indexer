@@ -26,7 +26,7 @@ import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
 import { rpcCallTimeoutMs, withCallDeadlines } from "../lib/rpcDeadline.js";
 import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
-import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
+import { computePositionRow, positionKey, recomputePosition, type LpVaultStore, type PositionRow, type StoredEvent } from "../lpVault/store.js";
 
 const logger = createLogger("indexer:lp-vault");
 const lpBreaker = createBreakerTracker(breakerAlertPolls(), (registry, polls) => {
@@ -84,6 +84,8 @@ export interface SyncResult {
 }
 
 const PAGE = 1000;
+/** Position rows per upsert statement in the batched full reconcile. */
+const RECONCILE_WRITE_CHUNK = 500;
 
 export class LpVaultIndexer {
   private readonly registries = new Map<string, RegistryInfo>();
@@ -141,6 +143,7 @@ export class LpVaultIndexer {
         await this.refreshRegistries();
       }
       const fullReconcile = Date.now() - this.lastFullReconcile > (this.opts.reconcileIntervalMs ?? 600_000);
+      const reconcileDue: RegistryInfo[] = [];
       for (const reg of this.registries.values()) {
         try {
           const r = await this.syncRegistry(reg);
@@ -151,16 +154,15 @@ export class LpVaultIndexer {
               registry: reg.registry, folded: r.signatures, backlog: r.backlog,
             });
           }
-          if (fullReconcile) await this.reconcileOpenPositions(reg);
+          // Only a vault whose sync succeeded is reconciled (as before), but all of them together after the loop:
+          // a handful of DB round-trips in total instead of 2 per vault + 4 per open position.
+          if (fullReconcile) reconcileDue.push(reg);
           loopLiveness.beat(LP_VAULT_LOOP);
         } catch (err) {
-          logger.error("LP-vault sync failed", { registry: reg.registry, error: err instanceof Error ? err.message : String(err) });
-          captureException(err instanceof Error ? err : new Error(String(err)), {
-            tags: { context: "lp-vault-sync" },
-            extra: { registry: reg.registry },
-          });
+          this.reportVaultFailure(reg.registry, err);
         }
       }
+      if (reconcileDue.length > 0) await this.reconcileOpenPositionsMany(reconcileDue);
       if (fullReconcile) this.lastFullReconcile = Date.now();
     } catch (err) {
       logger.error("LP-vault tick failed", { error: err instanceof Error ? err.message : String(err) });
@@ -309,6 +311,136 @@ export class LpVaultIndexer {
     this.cursorLoaded.add(registry);
     if (this.opts.ephemeralCursor) return;
     await this.opts.store.saveCursor(this.opts.network, registry, signature, slot);
+  }
+
+  /** Log + capture one vault's failure; the tick carries on with the other vaults. */
+  private reportVaultFailure(registry: string, err: unknown, stage?: "reconcile"): void {
+    logger.error("LP-vault sync failed", {
+      registry, error: err instanceof Error ? err.message : String(err), ...(stage ? { stage } : {}),
+    });
+    captureException(err instanceof Error ? err : new Error(String(err)), {
+      tags: { context: "lp-vault-sync" },
+      extra: { registry, ...(stage ? { stage } : {}) },
+    });
+  }
+
+  /** The per-vault full reconcile, one vault at a time; a failing vault is reported and the others still run. */
+  private async reconcileEach(regs: readonly RegistryInfo[]): Promise<{ reconciled: number; skipped: number }> {
+    let reconciled = 0;
+    let skipped = 0;
+    for (const reg of regs) {
+      try {
+        const r = await this.reconcileOpenPositions(reg);
+        reconciled += r.reconciled;
+        skipped += r.skipped;
+      } catch (err) {
+        this.reportVaultFailure(reg.registry, err, "reconcile");
+      }
+      loopLiveness.beat(LP_VAULT_LOOP);
+    }
+    return { reconciled, skipped };
+  }
+
+  /**
+   * The full reconcile of many vaults with batched DB access: one paged read of their open positions, one paged read
+   * of those positions' events, and the rows written RECONCILE_WRITE_CHUNK per statement. The per-user chain reads
+   * (claim + newest signature) and the "a vault tx landed after our sync" skip are the same as reconcileOpenPositions.
+   *
+   * Never throws. Failure handling is at least as safe as the per-vault path:
+   * - a failed batched read: nothing was written yet, so every vault falls back to reconcileOpenPositions;
+   * - a failed chain read: that vault is reported and its remaining users are skipped (its earlier users still land);
+   * - a failed batched write: one statement is all or nothing, so none of that chunk landed; its rows are written one
+   *   by one, every vault with a row that still fails is reported, and one bad row no longer blocks its siblings.
+   */
+  async reconcileOpenPositionsMany(regs: readonly RegistryInfo[]): Promise<{ reconciled: number; skipped: number }> {
+    const { store, network, chain } = this.opts;
+    if (!store.listOpenPositionsMany || !store.loadEventsMany || !store.writePositions) return this.reconcileEach(regs);
+
+    const due: { reg: RegistryInfo; expected: string }[] = [];
+    for (const reg of regs) {
+      try {
+        const expected = await this.cursorFor(reg.registry);
+        if (expected) due.push({ reg, expected });
+      } catch (err) {
+        this.reportVaultFailure(reg.registry, err, "reconcile");
+      }
+    }
+    if (due.length === 0) return { reconciled: 0, skipped: 0 };
+
+    let open: PositionRow[];
+    let events: Map<string, StoredEvent[]>;
+    try {
+      open = await store.listOpenPositionsMany(network, due.map((d) => d.reg.registry));
+      events = open.length > 0 ? await store.loadEventsMany(network, open) : new Map();
+    } catch (err) {
+      logger.warn("batched LP-vault reconcile read failed; reconciling vault by vault", {
+        vaults: due.length, error: err instanceof Error ? err.message : String(err),
+      });
+      return this.reconcileEach(due.map((d) => d.reg));
+    }
+
+    const openByVault = new Map<string, PositionRow[]>();
+    for (const p of open) {
+      const list = openByVault.get(p.registry);
+      if (list) list.push(p);
+      else openByVault.set(p.registry, [p]);
+    }
+
+    const rows: PositionRow[] = [];
+    let skipped = 0;
+    for (const { reg, expected } of due) {
+      try {
+        for (const prev of openByVault.get(reg.registry) ?? []) {
+          const user = prev.user_wallet;
+          const claim = await chain.getClaim(user, reg.lpMint, reg.registry, reg.programId);
+          const [latest] = await chain.getSignatures(reg.registry, { limit: 1 });
+          if (latest && latest.signature !== expected) {
+            // A vault transaction landed after our sync; the balance may include it.
+            skipped++;
+            continue;
+          }
+          const history = events.get(positionKey(reg.registry, user));
+          // Never fold a history the read did not return: an empty fold would zero the row.
+          if (!history) throw new Error(`lp_vault_events: no history returned for ${reg.registry}/${user}`);
+          rows.push(computePositionRow(network, reg.registry, user, history, prev, {
+            marketSlab: reg.market,
+            reconcile: { onchainShares: claim.heldShares + claim.pendingShares, contextSlot: claim.contextSlot },
+          }));
+        }
+      } catch (err) {
+        this.reportVaultFailure(reg.registry, err, "reconcile");
+      }
+      loopLiveness.beat(LP_VAULT_LOOP);
+    }
+
+    let reconciled = 0;
+    for (let i = 0; i < rows.length; i += RECONCILE_WRITE_CHUNK) {
+      const chunk = rows.slice(i, i + RECONCILE_WRITE_CHUNK);
+      try {
+        await store.writePositions(chunk);
+        reconciled += chunk.length;
+        loopLiveness.beat(LP_VAULT_LOOP);
+        continue;
+      } catch (err) {
+        logger.warn("batched LP-vault position write failed; writing its rows one by one", {
+          rows: chunk.length, error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      // Nothing of the chunk landed (one statement). Row by row costs at most one request per row, never more than
+      // the per-vault path spends on the same rows, and a row that fails costs only itself.
+      const failed = new Map<string, unknown>();
+      for (const row of chunk) {
+        try {
+          await store.writePosition(row);
+          reconciled++;
+        } catch (err) {
+          if (!failed.has(row.registry)) failed.set(row.registry, err);
+        }
+      }
+      for (const [registry, err] of failed) this.reportVaultFailure(registry, err, "reconcile");
+      loopLiveness.beat(LP_VAULT_LOOP);
+    }
+    return { reconciled, skipped };
   }
 
   /** Reconcile every position in the vault that holds shares (indexed or on-chain). */

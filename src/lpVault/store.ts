@@ -46,6 +46,18 @@ export interface LpVaultStore {
   /** Positions in a registry that may hold shares (indexed or on-chain). */
   listOpenPositions(network: string, registry: string): Promise<PositionRow[]>;
   /**
+   * Batched full reconcile (optional; the indexer falls back to the per-vault calls above without it).
+   * Open positions of many registries, in as few paged reads as the URL length allows.
+   */
+  listOpenPositionsMany?(network: string, registries: readonly string[]): Promise<PositionRow[]>;
+  /**
+   * Full event history of many positions, keyed by `positionKey(registry, user)`, each list in loadEvents order.
+   * Throws if any position has MAX_EVENTS or more (loadEvents refuses that fold, so the caller must not fold it either).
+   */
+  loadEventsMany?(network: string, positions: readonly PositionKeyParts[]): Promise<Map<string, StoredEvent[]>>;
+  /** Upsert many position rows as ONE statement: all of them land or none do. */
+  writePositions?(rows: readonly PositionRow[]): Promise<void>;
+  /**
    * GH#231 — the newest signature already folded for a vault.
    *
    * Durable, so a restart does not re-page the vault's whole history: the fold itself is
@@ -60,6 +72,16 @@ export interface LpVaultStore {
    */
   loadCursor(network: string, registry: string): Promise<string | null>;
   saveCursor(network: string, registry: string, signature: string, slot: number): Promise<void>;
+}
+
+export interface PositionKeyParts {
+  registry: string;
+  user_wallet: string;
+}
+
+/** Map key of one position within a network (registry and wallet are base58, so "|" cannot occur in either). */
+export function positionKey(registry: string, user: string): string {
+  return `${registry}|${user}`;
 }
 
 export interface Reconciliation {
@@ -86,6 +108,23 @@ export async function recomputePosition(
     store.loadEvents(network, registry, user),
     store.loadPosition(network, registry, user),
   ]);
+  const row = computePositionRow(network, registry, user, events, prev, opts);
+  await store.writePosition(row);
+  return row;
+}
+
+/**
+ * The fold behind recomputePosition, with the event history and the previous row supplied: no I/O.
+ * The batched full reconcile reads both for many positions at once and writes the rows in one statement.
+ */
+export function computePositionRow(
+  network: string,
+  registry: string,
+  user: string,
+  events: readonly StoredEvent[],
+  prev: PositionRow | null,
+  opts: { marketSlab?: string | null; reconcile?: Reconciliation } = {},
+): PositionRow {
   const folded: FoldedPosition = foldPosition(events);
 
   let transferDetectedSlot = prev?.transfer_detected_slot ?? null;
@@ -127,7 +166,6 @@ export async function recomputePosition(
     event_count: folded.eventCount,
     updated_slot: folded.lastSlot,
   };
-  await store.writePosition(row);
   return row;
 }
 
@@ -174,6 +212,23 @@ export class MemoryLpVaultStore implements LpVaultStore {
     );
   }
 
+  async listOpenPositionsMany(network: string, registries: readonly string[]): Promise<PositionRow[]> {
+    const want = new Set(registries);
+    const out: PositionRow[] = [];
+    for (const r of want) out.push(...(await this.listOpenPositions(network, r)));
+    return out;
+  }
+
+  async loadEventsMany(network: string, positions: readonly PositionKeyParts[]): Promise<Map<string, StoredEvent[]>> {
+    const out = new Map<string, StoredEvent[]>();
+    for (const p of positions) out.set(positionKey(p.registry, p.user_wallet), await this.loadEvents(network, p.registry, p.user_wallet));
+    return out;
+  }
+
+  async writePositions(rows: readonly PositionRow[]): Promise<void> {
+    for (const row of rows) await this.writePosition(row);
+  }
+
   async loadCursor(network: string, registry: string): Promise<string | null> {
     return this.syncCursors.get(`${network}|${registry}`)?.signature ?? null;
   }
@@ -196,8 +251,26 @@ interface EventRow {
   lp_amount: string | null;
 }
 
+function toStoredEvent(r: EventRow): StoredEvent {
+  return {
+    kind: r.kind,
+    slot: Number(r.slot),
+    signature: r.signature,
+    ixIndex: r.ix_index,
+    collateralAtoms: BigInt(r.collateral_atoms),
+    lpAmount: r.lp_amount === null ? null : BigInt(r.lp_amount),
+    marketSlab: r.market_slab,
+    lpMint: r.lp_mint,
+  };
+}
+
 const PAGE_SIZE = 1_000;
 const MAX_EVENTS = 10_000;
+/**
+ * Registries (or positions) per `in.(...)` filter of a batched read. 100 base58 keys keep the URL under ~5 KB
+ * (positions: under ~9 KB with the registry and wallet lists), the same order as fetchStoredLegsMany's 100 signatures.
+ */
+const IN_CHUNK = 100;
 /** numeric columns are selected ::text so u128 values never pass through a JS number. */
 const POSITION_COLUMNS = [
   "network", "registry", "user_wallet", "market_slab", "lp_mint",
@@ -259,16 +332,7 @@ export class SupabaseLpVaultStore implements LpVaultStore {
         throw new Error(`lp_vault_events: ${registry}/${user} has >= ${MAX_EVENTS} events; fold refused`);
       }
     }
-    return rows.map((r) => ({
-      kind: r.kind,
-      slot: Number(r.slot),
-      signature: r.signature,
-      ixIndex: r.ix_index,
-      collateralAtoms: BigInt(r.collateral_atoms),
-      lpAmount: r.lp_amount === null ? null : BigInt(r.lp_amount),
-      marketSlab: r.market_slab,
-      lpMint: r.lp_mint,
-    }));
+    return rows.map(toStoredEvent);
   }
 
   async loadPosition(network: string, registry: string, user: string): Promise<PositionRow | null> {
@@ -308,6 +372,88 @@ export class SupabaseLpVaultStore implements LpVaultStore {
       out.push(...page);
     }
     return out;
+  }
+
+  async listOpenPositionsMany(network: string, registries: readonly string[]): Promise<PositionRow[]> {
+    const out: PositionRow[] = [];
+    const unique = [...new Set(registries)];
+    for (let i = 0; i < unique.length; i += IN_CHUNK) {
+      const chunk = unique.slice(i, i + IN_CHUNK);
+      // Paged like listOpenPositions, under a total order: (registry, user_wallet) is unique per network.
+      for (let got = 0; ; ) {
+        const { data, error } = await this.db
+          .from("lp_vault_positions")
+          .select(POSITION_COLUMNS)
+          .eq("network", network)
+          .in("registry", chunk)
+          .or("lp_shares.gt.0,onchain_lp_shares.gt.0")
+          .order("registry", { ascending: true })
+          .order("user_wallet", { ascending: true })
+          .range(got, got + PAGE_SIZE - 1);
+        if (error) throw new Error(`lp_vault_positions list: ${error.message}`);
+        const page = (data ?? []) as unknown as PositionRow[];
+        if (page.length === 0) break;
+        out.push(...page);
+        got += page.length;
+      }
+    }
+    return out;
+  }
+
+  async loadEventsMany(network: string, positions: readonly PositionKeyParts[]): Promise<Map<string, StoredEvent[]>> {
+    const out = new Map<string, StoredEvent[]>();
+    const wanted: PositionKeyParts[] = [];
+    for (const p of positions) {
+      const k = positionKey(p.registry, p.user_wallet);
+      if (out.has(k)) continue;
+      out.set(k, []);
+      wanted.push(p);
+    }
+    for (let i = 0; i < wanted.length; i += IN_CHUNK) {
+      const chunk = wanted.slice(i, i + IN_CHUNK);
+      const registries = [...new Set(chunk.map((p) => p.registry))];
+      const users = [...new Set(chunk.map((p) => p.user_wallet))];
+      // registry IN (...) AND user IN (...) is a superset of the wanted pairs; rows of other pairs are dropped below.
+      // Ordered so each position's events arrive in loadEvents order (slot, signature, ix_index) and paging is stable.
+      for (let got = 0; ; ) {
+        const { data, error } = await this.db
+          .from("lp_vault_events")
+          .select("registry,user_wallet,signature,ix_index,kind,slot,market_slab,lp_mint,collateral_atoms::text,lp_amount::text")
+          .eq("network", network)
+          .in("registry", registries)
+          .in("user_wallet", users)
+          .order("registry", { ascending: true })
+          .order("user_wallet", { ascending: true })
+          .order("slot", { ascending: true })
+          .order("signature", { ascending: true })
+          .order("ix_index", { ascending: true })
+          .range(got, got + PAGE_SIZE - 1);
+        if (error) throw new Error(`lp_vault_events select: ${error.message}`);
+        const page = (data ?? []) as unknown as (EventRow & PositionKeyParts)[];
+        if (page.length === 0) break;
+        got += page.length;
+        for (const r of page) {
+          const list = out.get(positionKey(r.registry, r.user_wallet));
+          if (!list) continue;
+          list.push(toStoredEvent(r));
+          if (list.length >= MAX_EVENTS) {
+            // Same refusal as loadEvents: a fold over a truncated history would be silently wrong.
+            throw new Error(`lp_vault_events: ${r.registry}/${r.user_wallet} has >= ${MAX_EVENTS} events; fold refused`);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  async writePositions(rows: readonly PositionRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    const updatedAt = new Date().toISOString();
+    // One upsert = one INSERT ... ON CONFLICT statement: PostgreSQL applies all rows or none.
+    const { error } = await this.db
+      .from("lp_vault_positions")
+      .upsert(rows.map((r) => ({ ...r, updated_at: updatedAt })), { onConflict: "network,registry,user_wallet" });
+    if (error) throw new Error(`lp_vault_positions upsert: ${error.message}`);
   }
 
   // GH#231: best-effort on purpose. `lp_vault_sync_cursor` is applied by hand like
