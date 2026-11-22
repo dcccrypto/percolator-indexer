@@ -399,7 +399,10 @@ export class LpVaultIndexer {
             skipped++;
             continue;
           }
-          rows.push(computePositionRow(network, reg.registry, user, events.get(positionKey(reg.registry, user)) ?? [], prev, {
+          const history = events.get(positionKey(reg.registry, user));
+          // Never fold a history the read did not return: an empty fold would zero the row.
+          if (!history) throw new Error(`lp_vault_events: no history returned for ${reg.registry}/${user}`);
+          rows.push(computePositionRow(network, reg.registry, user, history, prev, {
             marketSlab: reg.market,
             reconcile: { onchainShares: claim.heldShares + claim.pendingShares, contextSlot: claim.contextSlot },
           }));
@@ -416,6 +419,7 @@ export class LpVaultIndexer {
       try {
         await store.writePositions(chunk);
         reconciled += chunk.length;
+        loopLiveness.beat(LP_VAULT_LOOP);
         continue;
       } catch (err) {
         logger.warn("batched LP-vault position write failed; writing its rows one by one", {
@@ -434,6 +438,7 @@ export class LpVaultIndexer {
         }
       }
       for (const [registry, err] of failed) this.reportVaultFailure(registry, err, "reconcile");
+      loopLiveness.beat(LP_VAULT_LOOP);
     }
     return { reconciled, skipped };
   }

@@ -125,7 +125,7 @@ export function computePositionRow(
   prev: PositionRow | null,
   opts: { marketSlab?: string | null; reconcile?: Reconciliation } = {},
 ): PositionRow {
-  const folded: FoldedPosition = foldPosition(events as StoredEvent[]);
+  const folded: FoldedPosition = foldPosition(events);
 
   let transferDetectedSlot = prev?.transfer_detected_slot ?? null;
   let onchain = prev?.onchain_lp_shares ?? null;

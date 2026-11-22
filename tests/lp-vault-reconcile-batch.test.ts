@@ -376,6 +376,31 @@ describe("LP-vault full reconcile: read and chain failures", () => {
     expect(captured).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("fold refused") }), expect.objectContaining({ extra: expect.objectContaining({ registry: "REG001" }) }));
   });
 
+  it("a store that returns no history for a position: that vault is reported and nothing of it is folded as empty", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 3, 2);
+    const before = snapshot(pg);
+    const dropKey = (store: LpVaultStore): LpVaultStore => new Proxy(store, {
+      get(t, p, r) {
+        const v = Reflect.get(t, p, r);
+        if (p !== "loadEventsMany" || typeof v !== "function") return typeof v === "function" ? v.bind(t) : v;
+        return async (...a: unknown[]) => {
+          const m = (await v.apply(t, a)) as Map<string, unknown>;
+          m.delete("REG001|user00");
+          return m;
+        };
+      },
+    });
+    const { tick } = await reconcileTick(pg, regs, dropKey);
+    await tick();
+    const isBad = (r: Row) => r.registry === "REG001";
+    if (typeof (SupabaseLpVaultStore.prototype as { loadEventsMany?: unknown }).loadEventsMany === "function") {
+      expect(snapshot(pg).filter(isBad)).toEqual(before.filter(isBad));
+      expect(captured).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("no history") }), expect.objectContaining({ extra: expect.objectContaining({ registry: "REG001" }) }));
+    }
+    expect(snapshot(pg).filter((r) => !isBad(r)).every(reconciled)).toBe(true);
+  });
+
   it("a failed chain read stops that vault only; its earlier users and every other vault are reconciled", async () => {
     const pg = fakePostgrest();
     const regs = seed(pg, 3, 3);
