@@ -130,6 +130,12 @@ function parseV17AccountStats(data: Uint8Array): {
 
   // Vault / insurance / c_tot from the VERSION-keyed group header (desync fix 4).
   const { vault, insurance, cTot } = fields;
+  // A v17 market's accounts are its portfolios (separate accounts); the group header counts them in
+  // materialized_portfolio_count. The auto-close / re-enable rule reads numUsedAccounts, so a hard 0 here made
+  // "accounts alone count as live" dead for every v17 market (7 devnet markets with portfolios were closed).
+  const numUsedAccounts = fields.materializedPortfolioCount > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(fields.materializedPortfolioCount);
 
   const engine: EngineState = {
     vault,
@@ -163,7 +169,7 @@ function parseV17AccountStats(data: Uint8Array): {
     emergencyOiMode: false,
     emergencyStartSlot: 0n,
     lastBreakerSlot: 0n,
-    numUsedAccounts: 0,
+    numUsedAccounts,
     nextAccountId: 0n,
     markPriceE6: lastEffectivePriceE6,
     oraclePriceE6: 0n,
