@@ -17,7 +17,7 @@ const isBadDec = (r: Row) => r.decimals > 18 || r.decimals < 0;
 const isBadStats = (r: Row) => r.total_open_interest > 5e17 || r.insurance_balance > 5e17 || r.c_tot > 5e17;
 
 // O(1) lookup for the mock UPDATE: a linear rows.find() per update made the
-// 2,000-row spec quadratic. Rebuilt only when the rows array is replaced.
+// 2,001-row spec quadratic. Rebuilt only when `rows` is reassigned (not on in-place push).
 let indexedRows: Row[] | null = null;
 let indexed = new Map<string, Row>();
 function rowIndex(): Map<string, Row> {
