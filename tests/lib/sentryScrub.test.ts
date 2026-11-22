@@ -27,6 +27,7 @@ const fake = (name: string) => ["FAKE", name].join("");
 const RPC_KEY = fake("HELIUS1");
 const WH_KEY = fake("HELIUSWH2");
 const DISCORD_TOKEN = fake("DISCORD8");
+const FILTERED_ = "[Filtered]";
 
 const servers: http.Server[] = [];
 afterAll(() => servers.forEach((s) => s.close()));
@@ -98,6 +99,48 @@ describe("Sentry events carry no api-key or Discord webhook token", () => {
     expect(tx()).toBeDefined();
     expect(envelopes.join("\n")).not.toContain(RPC_KEY);
   }, 60_000);
+
+  // J-20261122-IDX-BUG-SENTRYSCRUBNONPLAINLEAK: scrubDeep returned class instances untouched, but
+  // Sentry serialises them (toJSON(), else own enumerable props), so a key inside one was sent as is.
+  it("class instances in extra and console breadcrumbs ship scrubbed (web3 Connection, toJSON, bytes)", async () => {
+    const { captureException } = await import("@percolatorct/shared");
+    const { Connection } = await import("@solana/web3.js");
+    const k = (n: string) => fake(`NP${n}KEY`);
+    const keys = ["CLASS", "TOJSON", "CONN", "CONSOLE", "BYTES", "MAP", "HDRS", "CAUSE", "ERRPROP"].map(k);
+    const u = (n: string) => `${base}/?api-key=${k(n)}`;
+    class Holder {
+      constructor(public endpoint: string) {}
+    }
+    class Endpoint {
+      constructor(private readonly href: string) {}
+      toJSON() {
+        return { href: this.href };
+      }
+    }
+    envelopes.length = 0;
+    console.error("rpc client", new Holder(u("CONSOLE")));
+    captureException(new Error("non-plain extra"), {
+      extra: {
+        cls: new Holder(u("CLASS")),
+        tojson: new Endpoint(u("TOJSON")),
+        conn: new Connection(u("CONN")),
+        bytes: new TextEncoder().encode(u("BYTES")),
+        // Sentry already sends these without their contents ({} / name+message+stack): no leak on the old code.
+        map: new Map([["rpc", u("MAP")]]),
+        hdrs: new Headers({ "x-rpc": u("HDRS") }),
+        cause: new Error("outer", { cause: new Error(u("CAUSE")) }),
+        errProp: Object.assign(new Error("plain"), { config: { url: u("ERRPROP") } }),
+      },
+    });
+    const ev = () => envelopes.find((e) => e.includes('"type":"event"') && e.includes("non-plain extra"));
+    for (let i = 0; i < 100 && !ev(); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(ev()).toBeDefined();
+    const all = envelopes.join("\n");
+    for (const key of keys) expect.soft(all, key).not.toContain(key);
+    // The objects are still reported, only the secret goes; the live Connection is not modified.
+    expect.soft(ev()!).toContain(`"endpoint":"${base}/?api-key=[Filtered]"`);
+    expect.soft(ev()!).toContain(`"href":"${base}/?api-key=[Filtered]"`);
+  }, 60_000);
 });
 
 describe("scrubString / scrubDeep", () => {
@@ -146,6 +189,64 @@ describe("scrubString / scrubDeep", () => {
     expect(ev.extra.u).toBe("https://rpc.example/?api-key=[Filtered]");
     expect(ev.extra.e).toMatchObject({ name: "Error", message: "POST https://discord.com/api/webhooks/1/[Filtered] failed" });
     expect(JSON.stringify(ev)).not.toMatch(/FAKEURLKEY1|FAKEERRTOK1/);
+  });
+
+  it("leaves no configured secret reachable inside non-plain objects", async () => {
+    const m = await loadScrub();
+    expect(m).not.toBeNull();
+    const KEY = fake("SUPASERVICEKEY9");
+    // Every string reachable through own props (enumerable or not), iteration and byte views.
+    const reachable = (v: unknown, seen = new Set<unknown>()): string => {
+      if (typeof v === "string") return v;
+      if (v === null || typeof v !== "object" || seen.has(v)) return "";
+      seen.add(v);
+      if (ArrayBuffer.isView(v)) return Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString("utf8");
+      const out = Object.getOwnPropertyNames(v).map((p) => reachable((v as Record<string, unknown>)[p], seen));
+      if (Symbol.iterator in v) for (const x of v as Iterable<unknown>) out.push(reachable(x, seen));
+      return out.join(" ");
+    };
+    class Custom {
+      constructor(public auth: string) {}
+    }
+    const proto = Object.create({ kind: "custom" }) as Record<string, unknown>;
+    proto.headers = { apikey: KEY };
+    const cyclic = new Custom(`Bearer ${KEY}`) as Custom & { self?: unknown };
+    cyclic.self = cyclic;
+    const live = new Custom(KEY);
+    const ev = m!.scrubDeep(
+      {
+        extra: {
+          map: new Map<string, unknown>([["k", KEY], ["nested", { key: KEY }]]),
+          set: new Set([KEY]),
+          headers: new Headers({ apikey: KEY }),
+          proto,
+          live,
+          cyclic,
+          json: { toJSON: () => ({ key: KEY }) } as unknown,
+          bytes: Buffer.from(`key=${KEY}`),
+          cleanBytes: new Uint8Array([1, 2, 3]),
+          cause: new Error("outer", { cause: new Error(KEY) }),
+          errProp: Object.assign(new Error("plain"), { body: KEY }),
+          throwing: Object.defineProperty(new Custom(KEY), "boom", {
+            enumerable: true,
+            get() {
+              throw new Error("getter");
+            },
+          }),
+        },
+      },
+      [KEY],
+    );
+    expect(reachable(ev)).not.toContain(KEY);
+    // Copies are scrubbed; the live object (e.g. the indexer's own Connection) is left as it was.
+    expect(live.auth).toBe(KEY);
+    expect(ev.extra.live).toEqual({ auth: FILTERED_ });
+    expect(ev.extra.proto).toEqual({ headers: { apikey: FILTERED_ } });
+    expect(ev.extra.json).toEqual({ key: FILTERED_ });
+    expect(ev.extra.bytes).toBe(FILTERED_);
+    expect(ev.extra.cleanBytes).toEqual(new Uint8Array([1, 2, 3]));
+    expect(ev.extra.throwing).toBe(FILTERED_);
+    expect(ev.extra.cyclic).toEqual({ auth: `Bearer ${FILTERED_}`, self: FILTERED_ });
   });
 
   it("collects configured secret values from the env (FAKE values)", async () => {

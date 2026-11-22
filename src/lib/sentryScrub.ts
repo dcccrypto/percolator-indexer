@@ -65,10 +65,27 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
   // Sentry serialises these in `extra`/contexts (href; name/message/stack), so scrub a plain copy.
   if (value instanceof URL) return scrubString(value.href, secrets) as T;
   if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen) as T;
-  // Only plain data: events also reference live SDK objects (scopes, client, spans) that are never
-  // serialised and must not be walked or mutated.
+  // Bytes go out as their numbers, so a secret inside them survives string scrubbing.
+  if (ArrayBuffer.isView(value)) {
+    const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
+    return (scrubString(text, secrets) === text ? value : FILTERED) as T;
+  }
+  // Anything else Sentry sends as toJSON(), or for class instances (a web3 Connection, a client or
+  // response class, Map/Headers) as their own enumerable props. Scrub a plain copy of that: the live
+  // object, which may be the indexer's own Connection or an SDK scope, is never mutated.
   const proto = Object.getPrototypeOf(value);
-  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) return value;
+  const toJSON = (value as { toJSON?: unknown }).toJSON;
+  if (typeof toJSON === "function" || (!Array.isArray(value) && proto !== Object.prototype && proto !== null)) {
+    if (seen.has(value)) return FILTERED as T; // a copy cannot point back at itself; drop the cycle
+    seen.add(value);
+    let copy: unknown;
+    try {
+      copy = typeof toJSON === "function" ? toJSON.call(value) : Object.fromEntries(Object.keys(value).map((k) => [k, (value as Record<string, unknown>)[k]]));
+    } catch {
+      return FILTERED as T; // a throwing getter/toJSON: Sentry could not serialise it either
+    }
+    return scrubDeep(copy, secrets, seen) as T;
+  }
   if (seen.has(value)) return value;
   seen.add(value);
   if (Array.isArray(value)) {
