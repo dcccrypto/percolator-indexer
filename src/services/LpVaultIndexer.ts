@@ -24,6 +24,8 @@ import { breakerAlertPolls, createBreakerTracker, isPoisonTxError, skipsAcceptab
 import { recordSkippedSignatures, type SkippedSignature } from "../lib/skippedSignatures.js";
 import { decodeLpVaultEvents } from "../lpVault/decoder.js";
 import type { LpVaultChain, RegistryInfo } from "../lpVault/chain.js";
+import { rpcCallTimeoutMs, withCallDeadlines } from "../lib/rpcDeadline.js";
+import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
 import { recomputePosition, type LpVaultStore } from "../lpVault/store.js";
 
 const logger = createLogger("indexer:lp-vault");
@@ -59,7 +61,15 @@ export interface LpVaultIndexerOptions {
    * do nothing, and a full re-read must not move the live service's cursor either. The service leaves this unset.
    */
   ephemeralCursor?: boolean;
+  /**
+   * Hung-RPC liveness: deadline for each chain call (default RPC_CALL_TIMEOUT_MS, 60 s; 0 = none). Without it one call
+   * that never settles keeps `busy` set and every later tick returns at the guard.
+   */
+  rpcCallTimeoutMs?: number;
 }
+
+/** Liveness name of the LP-vault poll loop (lib/loopLiveness.ts). */
+export const LP_VAULT_LOOP = "lpVault";
 
 export interface SyncResult {
   registry: string;
@@ -87,7 +97,10 @@ export class LpVaultIndexer {
   private lastDiscovery = 0;
   private lastFullReconcile = 0;
 
-  constructor(private readonly opts: LpVaultIndexerOptions) {
+  private readonly opts: LpVaultIndexerOptions;
+
+  constructor(opts: LpVaultIndexerOptions) {
+    this.opts = { ...opts, chain: withCallDeadlines(opts.chain, opts.rpcCallTimeoutMs ?? rpcCallTimeoutMs(), "lpVaultChain") };
     this.wrapperIds = new Set(opts.programIds);
   }
 
@@ -97,6 +110,7 @@ export class LpVaultIndexer {
     const interval = this.opts.pollIntervalMs ?? 30_000;
     this.timer = setInterval(() => void this.tick(), interval);
     setTimeout(() => void this.tick(), 5_000);
+    loopLiveness.register(LP_VAULT_LOOP, staleBudgetMs(interval));
     logger.info("LpVaultIndexer started", { intervalMs: interval, programIds: this.opts.programIds });
   }
 
@@ -104,6 +118,7 @@ export class LpVaultIndexer {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    loopLiveness.unregister(LP_VAULT_LOOP);
   }
 
   getRegistries(): RegistryInfo[] {
@@ -137,6 +152,7 @@ export class LpVaultIndexer {
             });
           }
           if (fullReconcile) await this.reconcileOpenPositions(reg);
+          loopLiveness.beat(LP_VAULT_LOOP);
         } catch (err) {
           logger.error("LP-vault sync failed", { registry: reg.registry, error: err instanceof Error ? err.message : String(err) });
           captureException(err instanceof Error ? err : new Error(String(err)), {
@@ -150,6 +166,7 @@ export class LpVaultIndexer {
       logger.error("LP-vault tick failed", { error: err instanceof Error ? err.message : String(err) });
     } finally {
       this.busy = false;
+      loopLiveness.beat(LP_VAULT_LOOP);
     }
   }
 

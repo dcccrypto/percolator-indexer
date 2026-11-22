@@ -3,6 +3,8 @@ import { PublicKey } from "@solana/web3.js";
 import { discoverMarkets, getMarketsByAddress, isV17Account, type DiscoveredMarket } from "@percolatorct/sdk";
 import { config, getPrimaryConnection, getFallbackConnection, createLogger, captureException, sendCriticalAlert } from "@percolatorct/shared";
 import { discoverV17Markets } from "../v17/discovery.js";
+import { deadlineConnection } from "../lib/rpcDeadline.js";
+import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
 
 const logger = createLogger("indexer:market-discovery");
 
@@ -43,6 +45,10 @@ export const DEFAULT_FULL_DISCOVERY_INTERVAL_MS = 300_000;
  */
 export const DEFAULT_LIGHT_DISCOVERY_INTERVAL_MS = 60_000;
 
+/** Liveness names of the two discovery loops (lib/loopLiveness.ts). */
+export const DISCOVERY_FULL_LOOP = "discoveryFull";
+export const DISCOVERY_LIGHT_LOOP = "discoveryLight";
+
 type DiscoveredListener = (markets: DiscoveredMarket[]) => void | Promise<void>;
 
 export class MarketDiscovery {
@@ -50,7 +56,13 @@ export class MarketDiscovery {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lightTimer: ReturnType<typeof setInterval> | null = null;
   private consecutiveFailures = 0;
+  /**
+   * In-flight guards, one per pass kind. They used to share one flag, so a full scan held by a hung RPC also skipped
+   * every light pass (the fast path for new markets) until it settled. The light pass only ever adds markets, so it
+   * is safe next to a running full pass.
+   */
   private _discovering = false;
+  private _discoveringLight = false;
   private discoveredListeners: DiscoveredListener[] = [];
 
   /**
@@ -77,6 +89,7 @@ export class MarketDiscovery {
       found = await this._doDiscover();
     } finally {
       this._discovering = false;
+      loopLiveness.beat(DISCOVERY_FULL_LOOP);
     }
     // #223: only a market that was not already known is news; an unchanged set must not
     // trigger the registration pass (it reads the whole `markets` table).
@@ -90,14 +103,15 @@ export class MarketDiscovery {
    * dataSlice (or one getMultipleAccounts under MARKETS_FILTER), instead of the ~45-call full
    * pass. It only ever ADDS markets to the map: a failed, rate-limited or empty scan leaves the
    * map untouched, and removal stays the full pass's job. Listeners fire only for addresses
-   * that were not already known. Skipped while a full pass is running. Returns the new markets.
+   * that were not already known. Skipped while another light pass is running (not while a full pass runs: see
+   * `_discoveringLight`). Returns the new markets.
    */
   async discoverLight(): Promise<DiscoveredMarket[]> {
-    if (this._discovering) return [];
-    this._discovering = true;
+    if (this._discoveringLight) return [];
+    this._discoveringLight = true;
     const fresh: DiscoveredMarket[] = [];
     try {
-      const conn = getPrimaryConnection();
+      const conn = deadlineConnection(getPrimaryConnection());
       const filter = (process.env.MARKETS_FILTER ?? "").trim();
       const addresses = filter ? parseMarketsFilter(filter, (entry, error) => logger.warn("Ignoring invalid MARKETS_FILTER entry", { entry, error })) : undefined;
       if (addresses && addresses.length === 0) {
@@ -123,7 +137,8 @@ export class MarketDiscovery {
         this.markets = next;
       }
     } finally {
-      this._discovering = false;
+      this._discoveringLight = false;
+      loopLiveness.beat(DISCOVERY_LIGHT_LOOP);
     }
     if (fresh.length > 0) {
       logger.info("Light discovery found new markets", { count: fresh.length });
@@ -146,8 +161,9 @@ export class MarketDiscovery {
     // fallbackConn is tried exactly once — only after all HELIUS_429_BACKOFF_MS retries are
     // exhausted due to 429 rate-limit responses. Non-429 errors (transport, auth) cause an
     // immediate per-program failure without falling back.
-    const primaryConn = getPrimaryConnection();
-    const fallbackConn = getFallbackConnection();
+    // Per-call deadline (rpcDeadline.ts): a held scan rejects instead of parking discovery behind _discovering.
+    const primaryConn = deadlineConnection(getPrimaryConnection());
+    const fallbackConn = deadlineConnection(getFallbackConnection());
     const all: DiscoveredMarket[] = [];
     let failedPrograms = 0;
     const failedProgramIds = new Set<string>();
@@ -332,6 +348,9 @@ export class MarketDiscovery {
   }
   
   async start(intervalMs = DEFAULT_FULL_DISCOVERY_INTERVAL_MS, lightIntervalMs = 0) {
+    const lightOn = lightIntervalMs > 0 && lightIntervalMs < intervalMs;
+    // The initial discovery below is a full pass too, so the full loop is watched from here on.
+    loopLiveness.register(DISCOVERY_FULL_LOOP, staleBudgetMs(intervalMs));
     // Initial discovery with retry + backoff
     let initialSuccess = false;
     for (let attempt = 0; attempt <= INITIAL_RETRY_DELAYS.length; attempt++) {
@@ -368,7 +387,8 @@ export class MarketDiscovery {
     }), intervalMs);
 
     // #223: the fast path. Only worth running when it is meaningfully faster than the full pass.
-    if (lightIntervalMs > 0 && lightIntervalMs < intervalMs) {
+    if (lightOn) {
+      loopLiveness.register(DISCOVERY_LIGHT_LOOP, staleBudgetMs(lightIntervalMs));
       this.lightTimer = setInterval(() => this.discoverLight().catch((err) => {
         logger.warn("Light discovery failed", { error: err instanceof Error ? err.message : String(err) });
       }), lightIntervalMs);
@@ -376,6 +396,8 @@ export class MarketDiscovery {
   }
   
   stop() {
+    loopLiveness.unregister(DISCOVERY_FULL_LOOP);
+    loopLiveness.unregister(DISCOVERY_LIGHT_LOOP);
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;

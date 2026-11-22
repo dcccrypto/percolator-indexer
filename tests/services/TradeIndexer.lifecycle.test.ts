@@ -252,3 +252,27 @@ describe("indexTradesForSlab window skips", () => {
     expect(connection.getParsedTransactions).not.toHaveBeenCalled();
   });
 });
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: an RPC that accepts the request and never answers leaves web3.js waiting (no RPC deadline in the indexer),
+// pollAllMarkets keeps pollInFlight=true, and every later setInterval tick returns at the guard. No trade is indexed
+// while the RPC stays hung (5 min per held call, forever for a trickling server), while /health (getSlot, 5 s timeout) can still say ok.
+// Measured bound (e708fc5, web3.js 1.99 on Node's undici fetch): a silent / headers-only RPC rejects after undici's
+// 300 s headers/body timeout; a server that trickles bytes is never cut off. The never-settling mock models the trickle
+// case, and the expectation (a service deadline well under 300 s) is also what makes the 300 s case cheap.
+describe("HUNG-RPC: poll pass blocked on a never-settling RPC read", () => {
+  it("a later poll pass reads the market again once the RPC answers (a hung read must not wedge pollInFlight)", async () => {
+    vi.useFakeTimers();
+    markets.rows = [{ slab_address: slabA }];
+    const idx: any = new TradeIndexerPolling();
+    idx.hasBackfilled = true; // poll path only
+    connection.getSignaturesForAddress.mockImplementationOnce(() => new Promise(() => {})); // the hung request
+    idx.start();
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1_000); // first poll pass starts and hangs
+    expect(connection.getSignaturesForAddress).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(30 * 60_000); // six more intervals; the RPC answers every NEW request
+    idx.stop();
+    // Before the fix (e708fc5 / 3061d3e): still 1. Expected: the hung read is abandoned after a deadline and later passes run.
+    expect(connection.getSignaturesForAddress.mock.calls.length).toBeGreaterThan(1);
+  });
+});

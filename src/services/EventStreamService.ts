@@ -14,6 +14,7 @@ import { recordV22LogEvents } from "./v22LogEvents.js";
 import { resolveCpiLeg } from "../parsers/matcherFill.js";
 import { makeMatcherContextReader } from "../lib/matcherCtx.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
+import { DEFAULT_WS_SILENCE_MS } from "../lib/loopLiveness.js";
 
 const log = createLogger("indexer:event-stream");
 
@@ -38,7 +39,20 @@ export interface EventStreamDeps {
   autoIndex?: boolean;
   /** Known slab addresses for this service — only fills touching these slabs are indexed. */
   knownSlabs?: string[];
+  /**
+   * Hung-socket liveness: opens a fresh socket. When set, a stream that has been silent for `silenceMs` (or whose
+   * socket is closed) is torn down and replaced by `reconnect()`, then re-subscribed. Without it the service only
+   * reports `isStale()`. shared's createAtlasWs pings but never checks for a pong and never reconnects, so a socket
+   * that opens and goes quiet (or is closed by the server) used to stop the stream for good.
+   */
+  reconnect?: () => AtlasWs;
+  /** No notification for this long -> stale (and reconnect). Default 5 min; 0 disables the check. */
+  silenceMs?: number;
 }
+
+export { DEFAULT_WS_SILENCE_MS };
+/** A closed socket gets this long (capped at silenceMs) to come back before it is replaced. */
+const CLOSED_GRACE_MS = 60_000;
 
 /**
  * EventStreamService — low-latency (~100-500ms) stream of Percolator program transactions
@@ -65,20 +79,96 @@ export interface EventStreamDeps {
 export class EventStreamService {
   private started = false;
   private slabSet: Set<string>;
+  private ws: AtlasWs;
+  /** Last notification, or the last (re)subscribe. */
+  private lastActivityAt = 0;
+  private silenceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Sockets replaced after a silence / close (diagnostics). */
+  reconnects = 0;
 
   constructor(private deps: EventStreamDeps) {
     this.slabSet = new Set(deps.knownSlabs ?? []);
+    this.ws = deps.ws;
+  }
+
+  private get silenceMs(): number {
+    return this.deps.silenceMs ?? DEFAULT_WS_SILENCE_MS;
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    this.attach(this.ws);
 
-    this.deps.ws.onNotification((msg) => this.handle(msg).catch((err) => {
-      log.error("handler failed", { err: String(err) });
-    }));
+    const silenceMs = this.silenceMs;
+    if (silenceMs > 0) {
+      const every = Math.max(1_000, Math.min(30_000, Math.floor(silenceMs / 2)));
+      this.silenceTimer = setInterval(() => this.checkSilence(), every);
+      (this.silenceTimer as { unref?: () => void }).unref?.();
+    }
 
-    this.deps.ws.sub(1, "transactionSubscribe", [
+    log.info("event-stream started", {
+      programId: this.deps.programId,
+      autoIndex: !!this.deps.autoIndex,
+      knownSlabs: this.slabSet.size,
+    });
+  }
+
+  /** Stop the silence check and close the current socket. */
+  stop(): void {
+    if (this.silenceTimer) clearInterval(this.silenceTimer);
+    this.silenceTimer = null;
+    this.started = false;
+    try { this.ws.close(); } catch { /* already closed */ }
+  }
+
+  /** True when no notification has arrived for `silenceMs` (always false when the check is off). */
+  isStale(now = Date.now()): boolean {
+    const silenceMs = this.silenceMs;
+    return this.started && silenceMs > 0 && now - this.lastActivityAt >= silenceMs;
+  }
+
+  private checkSilence(): void {
+    const now = Date.now();
+    const silentFor = now - this.lastActivityAt;
+    const closed = !this.ws.isOpen && silentFor >= Math.min(CLOSED_GRACE_MS, this.silenceMs);
+    if (!closed && !this.isStale(now)) return;
+    if (!this.deps.reconnect) {
+      log.warn("event-stream stale: no notification within the silence window, and no reconnect configured", {
+        silentForMs: silentFor, socketOpen: this.ws.isOpen,
+      });
+      return;
+    }
+    // A closed socket is a fault; an open one that is only quiet may just be a quiet program (devnet), so info.
+    const ctx = { silentForMs: silentFor, socketOpen: this.ws.isOpen, reconnects: this.reconnects + 1 };
+    if (closed) log.warn("event-stream socket closed; reconnecting and re-subscribing", ctx);
+    else log.info("event-stream silent; reconnecting and re-subscribing", ctx);
+    let next: AtlasWs;
+    try {
+      next = this.deps.reconnect();
+    } catch (err) {
+      log.error("event-stream reconnect failed; retrying on the next check", { err: String(err) });
+      return;
+    }
+    const old = this.ws;
+    this.ws = next;
+    this.reconnects++;
+    try { old.close(); } catch { /* already closed */ }
+    this.attach(next);
+  }
+
+  /** Listen on `ws` and subscribe. Notifications from a socket that has since been replaced are ignored. */
+  private attach(ws: AtlasWs): void {
+    this.lastActivityAt = Date.now();
+    ws.onNotification((msg) => {
+      if (ws !== this.ws) return;
+      this.lastActivityAt = Date.now();
+      this.handle(msg).catch((err) => {
+        log.error("handler failed", { err: String(err) });
+      });
+    });
+
+    ws.sub(1, "transactionSubscribe", [
       { accountInclude: [this.deps.programId], failed: false },
       {
         commitment: "confirmed",
@@ -88,12 +178,6 @@ export class EventStreamService {
         maxSupportedTransactionVersion: 1,
       },
     ]);
-
-    log.info("event-stream started", {
-      programId: this.deps.programId,
-      autoIndex: !!this.deps.autoIndex,
-      knownSlabs: this.slabSet.size,
-    });
   }
 
   /** Add a slab to the filter set at runtime (as new markets are discovered). */

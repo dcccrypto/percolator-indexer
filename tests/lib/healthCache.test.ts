@@ -167,3 +167,48 @@ describe("createHealthChecker edge paths", () => {
     expect(b.cached).toBe(true);
   });
 });
+
+// ---- Hung-RPC liveness regression (J-20261121-IDX-REPORT-HUNGRPCSTALL draft, fixed by J-20261121-IDX-FIX-HUNGRPCLIVENESS) ----
+// Live finding: /health probes only getSlot (5 s timeout) and one DB count. With every other RPC method hung, the
+// trade poll, stats, discovery and LP-vault loops are all wedged while /health answers 200 {"status":"ok"} for the
+// whole 15-minute window, so a platform health check never restarts the process.
+// Proposed contract (one option): the checker takes a loop-liveness probe (each service records the end of its last
+// completed pass) and reports degraded when any loop is older than its budget.
+describe("HUNG-RPC: a wedged service loop", () => {
+  it("reports degraded when a loop has not completed a pass within its budget, even though RPC and DB probes pass", async () => {
+    const check = createHealthChecker({
+      probeRpc: async () => true,
+      probeDb: async () => true,
+      // e.g. { tradePoll: lastPassEndMs, stats: ..., discovery: ..., lpVault: ..., eventStream: lastNotificationMs }
+      probeLoops: async () => ({ tradePoll: false, stats: true }),
+      ttlMs: 0,
+    } as any);
+    const r = await check();
+    // Before the fix (e708fc5 / 3061d3e): probeLoops is ignored, status "ok" -> HTTP 200.
+    expect(r.status).not.toBe("ok");
+  });
+});
+
+describe("HUNG-RPC: loop liveness classification", () => {
+  it("is ok with every loop alive, and keeps 'down' for RPC + DB both failing even when loops are alive", async () => {
+    const ok = createHealthChecker({ probeRpc: async () => true, probeDb: async () => true, probeLoops: () => ({ tradePoll: true }), ttlMs: 0 });
+    expect((await ok()).status).toBe("ok");
+    expect((await ok()).checks).toEqual({ rpc: true, db: true, loops: true });
+    const down = createHealthChecker({ probeRpc: async () => false, probeDb: async () => false, probeLoops: () => ({ tradePoll: true }), ttlMs: 0 });
+    expect((await down()).status).toBe("down");
+  });
+
+  it("treats a throwing loop probe as degraded, not as a crashed /health", async () => {
+    const check = createHealthChecker({
+      probeRpc: async () => true, probeDb: async () => true, probeLoops: () => { throw new Error("FAKE"); }, ttlMs: 0,
+    });
+    expect((await check()).status).toBe("degraded");
+  });
+
+  it("without probeLoops behaves as before (no loops key)", async () => {
+    const check = createHealthChecker({ probeRpc: async () => true, probeDb: async () => true, ttlMs: 0 });
+    const r = await check();
+    expect(r.status).toBe("ok");
+    expect(r.checks).toEqual({ rpc: true, db: true });
+  });
+});
