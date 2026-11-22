@@ -10,6 +10,8 @@ import { encodeBase58 } from "../src/lib/base58.js";
 const PROGRAM = vi.hoisted(() => "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
 const db = vi.hoisted(() => ({ upsert: vi.fn(), error: { code: "XX000", message: "connection reset" } as { code?: string; message: string } | null }));
 
+// Payloads here are hand-built and not modelled as RPC transactions: the chain "confirms" each one as sent (D1 lookup is tested in tests/lib/webhookChainTx.test.ts).
+vi.mock("../src/lib/webhookChainTx.js", async (orig) => (await import("./helpers/chainTxEcho.js")).chainTxEchoModule(orig as never));
 vi.mock("@percolatorct/shared", async (orig) => {
   const actual = await orig<typeof import("@percolatorct/shared")>();
   return {

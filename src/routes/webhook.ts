@@ -31,6 +31,7 @@ import { BoundedTtlMap } from "../lib/boundedTtlMap.js";
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { fetchStoredLegs, fetchStoredLegsMany, fillAlreadyStored, cpiFillAlreadyStored, reduceAlreadyStored, type StoredLeg } from "../db/storedLegs.js";
 import { CURRENT_NETWORK } from "../network.js";
+import { txsFromChain } from "../lib/webhookChainTx.js";
 
 const logger = createLogger("indexer:webhook");
 
@@ -529,7 +530,18 @@ export function verifyWebhookSignature(
 /** Time one delivery may spend on matcher-context reads (Helius gives ~15 s in total). */
 const CTX_DELIVERY_BUDGET_MS = 8000;
 
-async function processTransactions(transactions: ValidatedTransaction[], discovery: any): Promise<void> {
+async function processTransactions(payload: ValidatedTransaction[], discovery: any): Promise<void> {
+  // D1: the payload only names signatures. Every row below is built from the chain's transaction for that
+  // signature (one getParsedTransactions per 100 signatures, memoised across redeliveries). A signature the
+  // chain does not know writes nothing; a read failure throws before any write, so the delivery is answered 500.
+  const checked = await txsFromChain(payload, () => getConnection(), PROGRAM_IDS);
+  if (checked.unknown.length > 0) {
+    logger.warn("Webhook signatures not found on chain: ignored", { count: checked.unknown.length, first: checked.unknown[0]?.slice(0, 16) });
+  }
+  if (checked.mismatched.length > 0) {
+    logger.warn("Webhook payload instructions differ from the chain transaction: chain used", { count: checked.mismatched.length, first: checked.mismatched[0]?.slice(0, 16) });
+  }
+  const transactions = checked.txs as unknown as ValidatedTransaction[];
   let indexed = 0;
   let insertFailures = 0;
 
