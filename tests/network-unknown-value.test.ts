@@ -18,7 +18,9 @@ describe("network: unknown NETWORK value", () => {
     return import("../src/network.js");
   }
 
-  it.each(["devnte", "staging", "localnet", "12345", "dev net"])(
+  // The "-beta" cluster spelling is rejected too: @percolatorct/shared's
+  // getNetwork() (same process, same env var) would map it to devnet.
+  it.each(["devnte", "staging", "localnet", "12345", "dev net", "main" + "net-beta"])(
     "throws for unknown value %j, naming the value and the allowed names",
     async (value) => {
       const err = await load(value).then(
@@ -42,11 +44,5 @@ describe("network: unknown NETWORK value", () => {
   it("empty / whitespace-only NETWORK is treated as unset (devnet)", async () => {
     expect((await load("")).CURRENT_NETWORK).toBe("devnet");
     expect((await load("   ")).CURRENT_NETWORK).toBe("devnet");
-  });
-
-  it("the -beta cluster spelling maps to the same network as the SDK (getCurrentNetwork)", async () => {
-    const name = "main" + "net";
-    expect((await load(`${name}-beta`)).CURRENT_NETWORK).toBe(name);
-    expect((await load(` ${name.toUpperCase()}-BETA `)).CURRENT_NETWORK).toBe(name);
   });
 });
