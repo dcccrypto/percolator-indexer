@@ -140,7 +140,7 @@ describe('TradeIndexerPolling RPC budget', () => {
     await (indexer as any).pollAllMarkets();
     const polled = mockGetSignaturesForAddress.mock.calls.map((c) => (c[0] as PublicKey).toBase58());
     expect(polled.sort()).toEqual([A, C].sort());
-  }, 10000);
+  });
 
   it('overlapping backfill() calls share ONE walk over the markets', async () => {
     vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: A }] as any);
@@ -156,16 +156,20 @@ describe('TradeIndexerPolling RPC budget', () => {
     // once complete, later calls are no-ops
     await (indexer as any).backfill();
     expect(mockGetSignaturesForAddress).toHaveBeenCalledTimes(1);
-  }, 10000);
+  });
 
   it('a poll tick that fires while a pass is still running is skipped, not stacked', async () => {
     vi.mocked(shared.getMarkets).mockResolvedValue([{ slab_address: A }] as any);
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
-    mockGetSignaturesForAddress.mockImplementation(async () => { await gate; return []; });
+    // Deterministic hold: `entered` resolves when the first pass is inside the RPC
+    // call (so it is provably still running); `gate` keeps it there until released.
+    let entered!: () => void;
+    const inFlight = new Promise<void>((r) => { entered = r; });
+    mockGetSignaturesForAddress.mockImplementation(async () => { entered(); await gate; return []; });
     (indexer as any).hasBackfilled = true;
     const first = (indexer as any).pollAllMarkets();
-    await new Promise((r) => setTimeout(r, 20));
+    await inFlight;
     await (indexer as any).pollAllMarkets(); // overlapping tick returns immediately
     expect(mockGetSignaturesForAddress).toHaveBeenCalledTimes(1);
     release();
@@ -174,5 +178,5 @@ describe('TradeIndexerPolling RPC budget', () => {
     mockGetSignaturesForAddress.mockImplementation(async () => []);
     await (indexer as any).pollAllMarkets();
     expect(mockGetSignaturesForAddress).toHaveBeenCalledTimes(2);
-  }, 10000);
+  });
 });
