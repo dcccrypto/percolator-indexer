@@ -46,22 +46,44 @@ export interface IndexerMarketRow {
 export const AUTO_ROW_KEEPER_STATUS = "pending";
 
 /**
+ * What insertMarketRow found. "exists" is the harmless case: a concurrent cycle (or the
+ * app's registration) already wrote this network's row and it is not retired.
+ */
+export type InsertMarketRowResult =
+  | "inserted"
+  | "exists"
+  | "exists_retired"
+  | "exists_other_network";
+
+/**
  * Register a market. Everything the indexer writes is 'auto' by definition —
  * only PATCH /api/markets/[slab] produces 'manual' rows, and this never runs for
  * a slab that already exists (syncMarkets only inserts missing ones), so a
  * human's edits cannot be clobbered here.
  *
- * Swallows 23505 (already registered by a concurrent cycle).
+ * On 23505 the existing row is read back, because markets.slab_address is UNIQUE
+ * across the whole table, whatever the row's network or keeper_status:
+ *  - same network, not retired: a concurrent cycle got there first. Quiet.
+ *  - another network: getMarketRows() only reads this network's rows, so the slab
+ *    looks missing every sweep, every insert hits 23505, and this network never
+ *    gets its row. Warned; it needs a human to fix the row's network.
+ *  - same network, 'retired': blocklist.ts drops the slab's trades and events.
+ *    Warned, NOT flipped: 'retired' is also the operator's deliberate lever, and
+ *    a legacy column-default row cannot be told apart from it here.
+ * The existing row is never written to. A failed read-back is warned and treated
+ * as "exists", the same as before.
  */
-export async function insertMarketRow(row: IndexerMarketRow): Promise<void> {
+export async function insertMarketRow(row: IndexerMarketRow): Promise<InsertMarketRowResult> {
+  const network = getNetwork();
   const { error } = await getSupabase().from("markets").insert({
     ...row,
     metadata_source: "auto",
     keeper_status: AUTO_ROW_KEEPER_STATUS,
-    network: getNetwork(),
+    network,
   });
 
-  if (error && error.code !== "23505") {
+  if (!error) return "inserted";
+  if (error.code !== "23505") {
     logger.warn("insertMarketRow failed", {
       slab: row.slab_address.slice(0, 8),
       code: error.code,
@@ -69,6 +91,54 @@ export async function insertMarketRow(row: IndexerMarketRow): Promise<void> {
     });
     throw new Error(`insertMarketRow failed: ${error.message}`);
   }
+  return classifyExistingRow(row.slab_address, network);
+}
+
+async function classifyExistingRow(
+  slabAddress: string,
+  network: string,
+): Promise<InsertMarketRowResult> {
+  const slab = slabAddress.slice(0, 8);
+  let existing: { network: string; keeper_status: string } | null;
+  try {
+    const { data, error } = await getSupabase()
+      .from("markets")
+      .select("network,keeper_status")
+      .eq("slab_address", slabAddress)
+      .maybeSingle();
+    if (error) {
+      logger.warn("insertMarketRow: 23505, existing row could not be read back", {
+        slab,
+        code: error.code,
+        error: error.message,
+      });
+      return "exists";
+    }
+    existing = data as typeof existing;
+  } catch (err) {
+    logger.warn("insertMarketRow: 23505, existing row could not be read back", {
+      slab,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return "exists";
+  }
+
+  if (!existing) return "exists";
+  if (existing.network !== network) {
+    logger.warn(
+      "insertMarketRow: slab already has a markets row under another network; this network's row cannot be created (slab_address is unique) and the market is re-tried every sweep",
+      { slab, network, existingNetwork: existing.network, keeperStatus: existing.keeper_status },
+    );
+    return "exists_other_network";
+  }
+  if (existing.keeper_status === "retired") {
+    logger.warn(
+      "insertMarketRow: slab already has a 'retired' markets row; its trades and events are dropped until keeper_status is changed",
+      { slab, network, keeperStatus: existing.keeper_status },
+    );
+    return "exists_retired";
+  }
+  return "exists";
 }
 
 /** Identity fields the metadata refresh pass may update. */

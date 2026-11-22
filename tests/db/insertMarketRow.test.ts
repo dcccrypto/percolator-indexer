@@ -5,13 +5,14 @@ const m = vi.hoisted(() => ({
   update: vi.fn(),
   eq: vi.fn(),
   select: vi.fn(),
+  readBack: vi.fn(),
   warn: vi.fn(),
 }));
 
 vi.mock("@percolatorct/shared", () => ({
   createLogger: vi.fn(() => ({ info: vi.fn(), warn: m.warn, error: vi.fn(), debug: vi.fn() })),
   getNetwork: vi.fn(() => "devnet"),
-  getSupabase: vi.fn(() => ({ from: vi.fn(() => ({ insert: m.insert, update: m.update })) })),
+  getSupabase: vi.fn(() => ({ from: vi.fn(() => ({ insert: m.insert, update: m.update, select: m.readBack })) })),
 }));
 
 import { insertMarketRow, updateAutoMarketMetadata } from "../../src/db/insertMarketRow.js";
@@ -44,7 +45,10 @@ beforeEach(() => {
 describe("insertMarketRow errors", () => {
   it("swallows 23505 (concurrent registration)", async () => {
     m.insert.mockResolvedValue({ error: { code: "23505", message: "dup" } });
-    await expect(insertMarketRow(row)).resolves.toBeUndefined();
+    // The concurrent cycle's row: same network, pending. See insertMarketRow.retiredConflict.test.ts.
+    const read: any = { eq: vi.fn(() => read), maybeSingle: vi.fn(async () => ({ data: { network: "devnet", keeper_status: "pending" }, error: null })) };
+    m.readBack.mockReturnValue(read);
+    await expect(insertMarketRow(row)).resolves.toBe("exists");
     expect(m.warn).not.toHaveBeenCalled();
   });
 
