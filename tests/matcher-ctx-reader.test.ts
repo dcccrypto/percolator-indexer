@@ -52,6 +52,19 @@ describe("matcher context reader: transport error vs 'read fine'", () => {
     expect(spy.mock.calls.some((c) => c[1] === 300)).toBe(true);
     spy.mockRestore();
   });
+  it("a retry sleep never outlasts the per-delivery deadline", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("429"));
+    const t0 = Date.now();
+    const r = await makeMatcherContextReader(conn(fn), null, { retries: 2, retryDelayMs: 5000, deadlineAt: t0 + 100 })(ADDR);
+    expect(r.kind).toBe("error");
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+  it("an unparseable address is a definite 'not ours', not a retried transport error", async () => {
+    const fn = vi.fn();
+    const r = await makeMatcherContextReader(conn(fn), null, { retries: 2, retryDelayMs: 1 })("not-a-pubkey");
+    expect(r).toEqual({ kind: "ok", ret: null });
+    expect(fn).not.toHaveBeenCalled();
+  });
   it("an account with no data field is 'not ours' (ok/null)", async () => {
     expect(await makeMatcherContextReader(conn(async () => ({})))(ADDR)).toEqual({ kind: "ok", ret: null });
   });

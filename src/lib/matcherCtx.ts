@@ -35,13 +35,16 @@ export function makeMatcherContextReader(getConn: () => Connection, minContextSl
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retries = opts.retries ?? 0;
   return async (address: string): Promise<ContextRead> => {
+    // An address that is not a public key can never be read: a definite answer, never a retried transport error.
+    let key: PublicKey;
+    try { key = new PublicKey(address); } catch { return { kind: "ok", ret: null }; }
     let last = "unknown";
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) return { kind: "error", detail: "deadline exceeded" };
       try {
         const remaining = opts.deadlineAt !== undefined ? Math.max(1, opts.deadlineAt - Date.now()) : timeoutMs;
         const info = await withTimeout(
-          getConn().getAccountInfo(new PublicKey(address), {
+          getConn().getAccountInfo(key, {
             commitment: "confirmed",
             ...(typeof minContextSlot === "number" ? { minContextSlot } : {}),
           }),
@@ -51,7 +54,12 @@ export function makeMatcherContextReader(getConn: () => Connection, minContextSl
         return { kind: "ok", ret: decodeMatcherReturn(new Uint8Array(info.data)) };
       } catch (err) {
         last = err instanceof Error ? err.message : String(err);
-        if (attempt < retries) await new Promise((r) => setTimeout(r, opts.retryDelayMs ?? 300));
+        if (attempt < retries) {
+          const delay = opts.retryDelayMs ?? 300;
+          // never sleep past the per-delivery deadline
+          const wait = opts.deadlineAt !== undefined ? Math.min(delay, Math.max(0, opts.deadlineAt - Date.now())) : delay;
+          await new Promise((r) => setTimeout(r, wait));
+        }
       }
     }
     return { kind: "error", detail: last.slice(0, 200) };
