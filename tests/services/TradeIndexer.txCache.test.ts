@@ -3,7 +3,7 @@
  * skip / failure / cursor outcome of every batch is the same as without the cache.
  */
 import { RpcLimiter } from "../../src/lib/rpcLimiter.js";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 import { Keypair } from "@solana/web3.js";
 
 const fetchedBatches: string[][] = [];
@@ -61,18 +61,26 @@ vi.mock("../../src/db/storedLegs.js", async (orig) => ({
 
 import { TradeIndexerPolling } from "../../src/services/TradeIndexer.js";
 
-/** The cache flag is read at module load: the enabled case uses the static import, the disabled control re-imports. */
-async function freshIndexer(disabled = false): Promise<any> {
-  let Ctor: typeof TradeIndexerPolling = TradeIndexerPolling;
-  if (disabled) {
-    vi.resetModules();
-    process.env.INDEXER_TX_CACHE_DISABLED = "true";
-    try { Ctor = (await import("../../src/services/TradeIndexer.js")).TradeIndexerPolling; } finally { delete process.env.INDEXER_TX_CACHE_DISABLED; }
-  }
+/**
+ * The cache flag is read at module load: the enabled case uses the static import, the disabled control uses a second
+ * copy imported once (with the flag set only for that import) in beforeAll, so no spec pays the cold module graph.
+ */
+let DisabledCtor: typeof TradeIndexerPolling;
+async function importDisabledCtor(): Promise<typeof TradeIndexerPolling> {
+  vi.resetModules();
+  process.env.INDEXER_TX_CACHE_DISABLED = "true";
+  try { return (await import("../../src/services/TradeIndexer.js")).TradeIndexerPolling; } finally { delete process.env.INDEXER_TX_CACHE_DISABLED; }
+}
+
+function newIndexer(Ctor: typeof TradeIndexerPolling): any {
   const idx: any = new Ctor();
   idx.rpcLimiter = new RpcLimiter({ minIntervalMs: 0, baseBackoffMs: 1, maxBackoffMs: 1, maxRateLimitRetries: 1 });
   idx._running = true;
   return idx;
+}
+
+async function freshIndexer(disabled = false): Promise<any> {
+  return newIndexer(disabled ? DisabledCtor : TradeIndexerPolling);
 }
 
 const slab = () => Keypair.generate().publicKey.toBase58();
@@ -81,6 +89,15 @@ const list = (...s: string[]) => s.map((signature) => ({ signature, err: null })
 const allFetched = () => [...fetchedBatches.flat(), ...fetchedSingles];
 
 describe("TradeIndexer shared tx cache", () => {
+  // Warm-up outside any spec budget: cold module graph for the disabled copy, plus one poll through the enabled copy
+  // so the first spec does not pay first-run costs (keypair/crypto init, first poll path). beforeEach resets state.
+  beforeAll(async () => {
+    DisabledCtor = await importDisabledCtor();
+    const warmSlab = slab();
+    sigLists.set(warmSlab, list(sig("W")));
+    await newIndexer(TradeIndexerPolling).indexTradesForSlab(warmSlab, 100);
+  }, 120_000);
+
   beforeEach(() => {
     fetchedBatches.length = 0; fetchedSingles.length = 0; sigLists.clear(); poison.clear(); transient.clear();
     recordSkipped.mockClear(); withRetrySpy.mockClear(); connection.getParsedTransactions.mockClear(); connection.getParsedTransaction.mockClear();
@@ -109,7 +126,7 @@ describe("TradeIndexer shared tx cache", () => {
     await idx.indexTradesForSlab(A, 100);
     await idx.indexTradesForSlab(B, 100);
     expect(allFetched()).toHaveLength(7);
-  }, 60_000); // cold re-import of the module graph
+  });
 
   it("all cached: no RPC transaction fetch at all", async () => {
     const idx = await freshIndexer();
