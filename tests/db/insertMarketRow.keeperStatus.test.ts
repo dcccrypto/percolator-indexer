@@ -5,14 +5,43 @@
  * market came back retired and its trades and events were dropped until it was
  * registered (9EPm8nB8… on 2026-10-01: inserted at 01:21, registered at 01:55).
  * 'active' would enroll it for keeper pricing without registration.
+ *
+ * The DB mock records every call on from() (insert, upsert, update, delete, select),
+ * so a switch to upsert or an extra write or read fails on the recorded calls, not on
+ * a missing mock method.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { insertSpy } = vi.hoisted(() => ({ insertSpy: vi.fn(async () => ({ error: null })) }));
+const h = vi.hoisted(() => {
+  const calls: { table: string; op: string; arg?: unknown }[] = [];
+  const done = { error: null };
+  // A chain that can be awaited at any point (.eq().eq(), upsert().select(), .maybeSingle()). It never rejects.
+  const chain = (): Record<string, unknown> => {
+    const c: Record<string, unknown> = {};
+    c.eq = vi.fn(() => c);
+    c.select = vi.fn(async () => ({ data: [], error: null }));
+    c.maybeSingle = vi.fn(async () => ({ data: null, error: null }));
+    c.then = (res: (v: unknown) => unknown) => res(done);
+    return c;
+  };
+  const write = (table: string, op: string) =>
+    vi.fn((arg?: unknown) => {
+      calls.push({ table, op, arg });
+      return chain();
+    });
+  const from = vi.fn((table: string) => ({
+    insert: write(table, "insert"),
+    upsert: write(table, "upsert"),
+    update: write(table, "update"),
+    delete: write(table, "delete"),
+    select: write(table, "select"),
+  }));
+  return { calls, from };
+});
 vi.mock("@percolatorct/shared", () => ({
   createLogger: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() })),
   getNetwork: vi.fn(() => "devnet"),
-  getSupabase: vi.fn(() => ({ from: vi.fn(() => ({ insert: insertSpy })) })),
+  getSupabase: vi.fn(() => ({ from: h.from })),
 }));
 
 import { insertMarketRow, AUTO_ROW_KEEPER_STATUS } from "../../src/db/insertMarketRow.js";
@@ -35,13 +64,35 @@ const row = {
   logo_url: null,
 };
 
+beforeEach(() => {
+  h.calls.length = 0;
+});
+
 describe("insertMarketRow keeper_status", () => {
-  it("writes keeper_status='pending' explicitly", async () => {
-    await insertMarketRow(row);
-    expect(insertSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ keeper_status: "pending", metadata_source: "auto", network: "devnet" }),
-    );
+  it("writes keeper_status='pending' explicitly, as one plain insert", async () => {
+    await expect(insertMarketRow(row)).resolves.toBe("inserted");
+    expect(h.calls).toEqual([
+      {
+        table: "markets",
+        op: "insert",
+        arg: expect.objectContaining({ keeper_status: "pending", metadata_source: "auto", network: "devnet" }),
+      },
+    ]);
     expect(AUTO_ROW_KEEPER_STATUS).toBe("pending");
+  });
+
+  // A Resolved market is registered with status 'paused' (StatsCollector, #425). It must
+  // still be 'pending': 'retired' would drop its trades and events (blocklist.ts), 'active' would
+  // count it as keeper-enrolled.
+  it("a Resolved (status='paused') market is inserted keeper_status='pending' too", async () => {
+    await expect(insertMarketRow({ ...row, status: "paused" })).resolves.toBe("inserted");
+    expect(h.calls).toEqual([
+      {
+        table: "markets",
+        op: "insert",
+        arg: expect.objectContaining({ status: "paused", keeper_status: "pending", network: "devnet" }),
+      },
+    ]);
   });
 
   it("a pending row is neither retired (still ingested) nor active (not keeper-enrolled)", () => {
