@@ -78,6 +78,11 @@ export class HeliusWebhookManager {
     }
 
     try {
+      // HWM-2: an ALL_PROGRAM_IDS that normalises to [] (e.g. " " or ",") would POST a webhook watching
+      // nothing, or PUT [] over the existing one, and still report "active". Refuse and alert instead.
+      if (getProgramIds().length === 0) {
+        throw new Error("ALL_PROGRAM_IDS has no program ids: refusing to register a webhook that watches nothing");
+      }
       // Check for existing webhook first
       const existing = await this.findExistingWebhook();
       if (existing) {
@@ -202,8 +207,14 @@ export class HeliusWebhookManager {
       throw new Error(`Helius webhook creation failed: ${res.status} ${text}`);
     }
 
-    const data = await res.json();
-    return data.webhookID;
+    // HWM-1: a 2xx body without a webhookID (an error envelope or an API shape change) is not a
+    // registration; returning it unchecked reported "active" with webhookId undefined and no alert.
+    const data: unknown = await res.json();
+    const id = (data as { webhookID?: unknown } | null)?.webhookID;
+    if (typeof id !== "string" || !id) {
+      throw new Error(`Helius webhook creation failed: ${res.status} response has no webhookID`);
+    }
+    return id;
   }
 
   private async updateWebhook(webhookId: string): Promise<void> {
