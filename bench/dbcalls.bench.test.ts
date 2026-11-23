@@ -15,6 +15,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { signedAs } from "../tests/helpers/signedTx.js";
 import { PublicKey } from "@solana/web3.js";
 import { encodeBase58 } from "../src/lib/base58.js";
 
@@ -119,8 +120,8 @@ const fakeConnection = {
     const cut = o.until ? all.findIndex((s) => s.signature === o.until) : -1;
     return (cut >= 0 ? all.slice(0, cut) : all).slice(0, o.limit ?? 1000);
   },
-  async getParsedTransactions(list: string[]) { return list.map((s) => txs.get(s) ?? null); },
-  async getParsedTransaction(s: string) { return txs.get(s) ?? null; },
+  async getParsedTransactions(list: string[]) { return list.map((s) => signedAs(s, txs.get(s) ?? null)); },
+  async getParsedTransaction(s: string) { return signedAs(s, txs.get(s) ?? null); },
   async getAccountInfo() { return { data: Buffer.from(full.ctxReturnHex.padEnd(640, "0"), "hex") }; },
   async getMultipleAccountsInfo(keys: PublicKey[]) { return keys.map(() => null); },
 };

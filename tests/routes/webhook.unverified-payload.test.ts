@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { signedAs } from "../helpers/signedTx.js";
 import * as nodeCrypto from 'node:crypto';
 
 // These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
@@ -219,7 +220,7 @@ function chainTx(trader = TRADER): any {
 function chainKnows(map: Record<string, any>) {
   return {
     ...unknownToChain(),
-    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => map[s] ?? null)),
+    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, map[s] ?? null))),
   };
 }
 

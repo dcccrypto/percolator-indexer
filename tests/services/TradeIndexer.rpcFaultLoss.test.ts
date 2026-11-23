@@ -11,6 +11,7 @@
  *   older remainder was never polled. Now a short page costs one extra `before` call.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { signedAs } from "../helpers/signedTx.js";
 
 type Sig = { signature: string; err: unknown; slot: number };
 let chain: Sig[] = []; // newest-first, like the RPC
@@ -28,7 +29,7 @@ const getSignaturesForAddress = vi.fn(async (_pk: unknown, opts: { limit?: numbe
   return page;
 });
 const tx = (slot: number) => ({ slot, blockTime: 0, meta: { err: null, logMessages: [] }, transaction: { message: { instructions: [], accountKeys: [] } } });
-const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => (nullFor.has(s) ? null : tx(Number(s.slice(3))))));
+const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => (nullFor.has(s) ? null : signedAs(s, tx(Number(s.slice(3)))))));
 
 vi.mock("@percolatorct/shared", () => ({
   config: { allProgramIds: ["FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"] },

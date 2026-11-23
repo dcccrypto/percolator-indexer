@@ -1,5 +1,6 @@
 /** #213 / #221 on the poll path (TradeIndexerPolling.processTransaction), real transactions. */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { signedAs } from "./helpers/signedTx.js";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 
@@ -153,7 +154,7 @@ describe("poll path: TradeCpi rows", () => {
     const slabOf = (f: any) => market(f);
     function wire(sigs: Array<{ f: any; w?: any }>) {
       getSignaturesForAddress.mockResolvedValue([...sigs].reverse().map((x) => ({ signature: x.f.sig, err: null })));
-      getParsedTransactions.mockImplementation(async (list: string[]) => list.map((sig) => { const x = sigs.find((y) => y.f.sig === sig)!; return x.w ?? asWeb3(x.f); }));
+      getParsedTransactions.mockImplementation(async (list: string[]) => list.map((sig) => { const x = sigs.find((y) => y.f.sig === sig)!; return signedAs(sig, x.w ?? asWeb3(x.f)); }));
     }
     const poll1 = async (idx: any, slab: string) => { await idx.indexTradesForSlab(slab); return idx.lastSignature.get(slab) as string | undefined; };
     const sizes = () => vi.mocked(insertTradeRow).mock.calls.map((c) => `${(c[0] as any).leg_index}:${(c[0] as any).size}`);

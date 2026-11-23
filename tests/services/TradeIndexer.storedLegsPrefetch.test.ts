@@ -3,6 +3,7 @@
  * ours). Keeper-crank-only batches cost no DB query, and per-leg dedup still uses the batched rows.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { signedAs } from "../helpers/signedTx.js";
 import { readFileSync } from "node:fs";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { IX_TAG, IX_TAG_V22 } from "@percolatorct/sdk";
@@ -13,8 +14,8 @@ const txBySig = new Map<string, unknown>();
 const sigLists = new Map<string, { signature: string; err: null }[]>();
 const connection = {
   getSignaturesForAddress: vi.fn(async (pk: PublicKey) => sigLists.get(pk.toBase58()) ?? []),
-  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => txBySig.get(s) ?? null)),
-  getParsedTransaction: vi.fn(async (s: string) => txBySig.get(s) ?? null),
+  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, txBySig.get(s) ?? null))),
+  getParsedTransaction: vi.fn(async (s: string) => signedAs(s, txBySig.get(s) ?? null)),
   getAccountInfo: vi.fn(async () => null),
 };
 vi.mock("@percolatorct/shared", async (orig) => {

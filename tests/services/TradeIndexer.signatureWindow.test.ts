@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { signedAs } from "../helpers/signedTx.js";
 
 // Page cap for the runaway-walk test; the window tests stay under it (default page size 50).
 vi.hoisted(() => { process.env.TRADE_MAX_SIGNATURE_PAGES = '4'; });
@@ -21,7 +22,7 @@ const getSignaturesForAddress = vi.fn(async (_pk: unknown, opts: { limit?: numbe
   return (cut >= 0 ? all.slice(0, cut) : all).slice(0, opts.limit ?? 1000);
 });
 const tx = (slot: number) => ({ slot, blockTime: 0, meta: { err: null, logMessages: [] }, transaction: { message: { instructions: [], accountKeys: [] } } });
-const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => tx(Number(s.slice(3)))));
+const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, tx(Number(s.slice(3))))));
 
 const captureException = vi.fn();
 vi.mock('@percolatorct/shared', () => ({

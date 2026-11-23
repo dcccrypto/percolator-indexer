@@ -113,11 +113,51 @@ export interface TolerantFetchResult<T> {
   massSkip?: { skipped: number; total: number };
 }
 
+/** An RPC answer that cannot be paired with the requested signatures (BATCH-ORDER-1). Never poison: holds the cursor. */
+export class TxPairingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TxPairingError";
+  }
+}
+
+function txSignature(tx: unknown): string | undefined {
+  const s = (tx as { transaction?: { signatures?: unknown } } | null)?.transaction?.signatures;
+  return Array.isArray(s) && typeof s[0] === "string" ? s[0] : undefined;
+}
+
+/**
+ * Put each returned transaction at the position of its OWN signature (`transaction.signatures[0]`).
+ * A JSON-RPC batch may answer in any order (the public devnet shuffles it), and web3.js maps answer i to request i
+ * by position, so `txs[i]` is not necessarily the transaction of `sigs[i]`. Throws TxPairingError when the answer
+ * cannot be paired: wrong length, a transaction without a signature, or a signature not requested (or returned more
+ * often than requested). A null stays "not found" for the signature that got no transaction.
+ */
+export function pairTxsBySignature<T>(sigs: string[], txs: (T | null)[]): (T | null)[] {
+  if (!Array.isArray(txs) || txs.length !== sigs.length) {
+    throw new TxPairingError(`RPC returned ${Array.isArray(txs) ? txs.length : "no"} results for ${sigs.length} signatures`);
+  }
+  const wanted = new Map<string, number>();
+  for (const s of sigs) wanted.set(s, (wanted.get(s) ?? 0) + 1);
+  const bySig = new Map<string, T>();
+  for (const tx of txs) {
+    if (tx === null || tx === undefined) continue;
+    const sig = txSignature(tx);
+    if (sig === undefined) throw new TxPairingError("RPC returned a transaction without a signature");
+    const left = wanted.get(sig) ?? 0;
+    if (left === 0) throw new TxPairingError(`RPC returned transaction ${sig.slice(0, 12)} that was not requested (or more than once)`);
+    wanted.set(sig, left - 1);
+    bySig.set(sig, tx);
+  }
+  return sigs.map((s) => bySig.get(s) ?? null);
+}
+
 /**
  * @param connection - Fetcher (a web3.js Connection satisfies it).
  * @param sigs - Signatures of one batch.
  * @param retry - Retry wrapper applied to each RPC call (the indexer's `withRetry`).
- * @returns Parsed transactions in input order, the skipped poison signatures, and whether to hold the cursor.
+ * @returns Parsed transactions in input order (each paired by its own signature), the skipped poison signatures, and
+ *   whether to hold the cursor. An answer that cannot be paired is retried, then held (failed), never paired by position.
  */
 export async function fetchParsedTxsTolerant<T>(
   connection: TxFetcher<T>,
@@ -126,7 +166,10 @@ export async function fetchParsedTxsTolerant<T>(
 ): Promise<TolerantFetchResult<T>> {
   const opts = { maxSupportedTransactionVersion: 1 };
   try {
-    const txs = await retry(() => connection.getParsedTransactions(sigs, opts), `getParsedTransactions(${sigs.length})`);
+    const txs = await retry(
+      async () => pairTxsBySignature(sigs, await connection.getParsedTransactions(sigs, opts)),
+      `getParsedTransactions(${sigs.length})`,
+    );
     return { txs, skipped: [], failed: false };
   } catch (batchErr) {
     // Isolate ONLY a version-unsupported batch error. Rate limits, network errors, bad params, parse errors and
@@ -137,7 +180,10 @@ export async function fetchParsedTxsTolerant<T>(
     let readOk = 0;
     for (const sig of sigs) {
       try {
-        const tx = await retry(() => connection.getParsedTransaction(sig, opts), `getParsedTransaction(${sig.slice(0, 8)})`);
+        const tx = await retry(
+          async () => pairTxsBySignature([sig], [await connection.getParsedTransaction(sig, opts)])[0] ?? null,
+          `getParsedTransaction(${sig.slice(0, 8)})`,
+        );
         if (tx) readOk++;
         txs.push(tx);
       } catch (err) {

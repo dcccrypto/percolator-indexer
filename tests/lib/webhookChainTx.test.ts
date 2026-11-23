@@ -7,6 +7,7 @@ vi.mock("@percolatorct/shared", async (orig) => ({
 }));
 
 import { CHAIN_TX_BATCH, enhancedFromParsedTx, loadChainTxs, resetChainTxMemo, txsFromChain, ChainTxReadError } from "../../src/lib/webhookChainTx.js";
+import { signedAs } from "../helpers/signedTx.js";
 
 const WRAPPER = "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD";
 const MATCHER = "Stake11111111111111111111111111111111111111";
@@ -38,7 +39,7 @@ function parsedTx(trader = TRADER, opts: { err?: unknown; logs?: string[]; meta?
 
 function conn(answer: (sigs: string[]) => any[] | Promise<any[]>) {
   return {
-    getParsedTransactions: vi.fn(async (sigs: string[]) => answer(sigs)),
+    getParsedTransactions: vi.fn(async (sigs: string[]) => (await answer(sigs)).map((t, i) => signedAs(sigs[i], t))),
     getParsedTransaction: vi.fn(async () => null),
   };
 }
