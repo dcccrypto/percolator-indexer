@@ -1,4 +1,5 @@
-import { getSupabase, getNetwork, createLogger } from "@percolatorct/shared";
+import { getSupabase, createLogger } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:trades");
 
@@ -183,7 +184,7 @@ function toDbRow(row: IndexerTradeRow) {
     is_liquidation: row.is_liquidation ?? false,
     ...provenance,
     ...lotScale,
-    network: getNetwork(),
+    network: CURRENT_NETWORK,
   };
 }
 

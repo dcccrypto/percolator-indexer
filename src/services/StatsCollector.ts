@@ -223,12 +223,12 @@ import { resolveIdentitiesByCa, chunkForDexScreener, type DexScreenerIdentity } 
 import {
   getConnection,
   getSupabase,
-  getNetwork,
   withRetry,
   createLogger,
   captureException,
   addBreadcrumb,
 } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 import { getMarketRows, type MarketRowLite } from "../db/marketRows.js";
 import { deadlineConnection } from "../lib/rpcDeadline.js";
 import { loopLiveness, staleBudgetMs } from "../lib/loopLiveness.js";
@@ -490,7 +490,7 @@ export class StatsCollector {
       const { data, error } = await getSupabase()
         .from("markets")
         .select("slab_address, mainnet_ca")
-        .eq("network", getNetwork())
+        .eq("network", CURRENT_NETWORK)
         .eq("metadata_source", "auto")
         .is("logo_url", null)
         .not("mainnet_ca", "is", null)
@@ -590,7 +590,7 @@ export class StatsCollector {
       // Server-side rollup: one row per market with trades in the window.
       // Filters is_liquidation markers and NULL sizes (see migration header).
       const { data: rows, error } = await getSupabase().rpc("volume_24h_by_slab", {
-        p_network: getNetwork(),
+        p_network: CURRENT_NETWORK,
       });
 
       if (error) {
@@ -640,7 +640,7 @@ export class StatsCollector {
           slab_address: r.slab_address,
           volume_24h: (safe ? asNum : raw) as unknown as number,
           trade_count_24h: Number.isFinite(count) && count >= 0 ? count : 0,
-          network: getNetwork(),
+          network: CURRENT_NETWORK,
           updated_at: new Date().toISOString(),
         });
       }
@@ -1121,7 +1121,7 @@ export class StatsCollector {
               .from("markets")
               .update({ indexer_excluded: false, status })
               .in("slab_address", group.map((r) => r.slab))
-              .eq("network", getNetwork());
+              .eq("network", CURRENT_NETWORK);
             if (reenableErr) throw new Error(reenableErr.message);
             for (const r of group) {
               this.closedSlabs.delete(r.slab);
@@ -1267,7 +1267,7 @@ export class StatsCollector {
             .from("markets")
             .update({ status: "closed", indexer_excluded: true })
             .in("slab_address", group)
-            .eq("network", getNetwork());
+            .eq("network", CURRENT_NETWORK);
           if (missErr) logger.warn("Auto-close of non-existent markets failed", { count: group.length, error: missErr.message });
           else for (const s of group) logger.info("Auto-closed non-existent market", { slab: s.slice(0, 8) });
         } catch (e) {
@@ -1294,7 +1294,7 @@ export class StatsCollector {
             .from("markets")
             .update({ status: "closed", indexer_excluded: true })
             .in("slab_address", group.map((d) => d.slab))
-            .eq("network", getNetwork())
+            .eq("network", CURRENT_NETWORK)
             .neq("status", "closed"); // only update if not already closed
           if (closeErr) {
             logger.warn("Auto-close market failed", { count: group.length, error: closeErr.message });

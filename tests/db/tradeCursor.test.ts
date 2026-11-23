@@ -45,6 +45,7 @@ vi.mock("@percolatorct/shared", () => ({
 }));
 
 import { loadTradeCursors, saveTradeCursor, resetTradeCursorWarnings } from "../../src/db/tradeCursor.js";
+import { CURRENT_NETWORK } from "../../src/network.js";
 
 beforeEach(() => {
   resetTradeCursorWarnings();
@@ -73,10 +74,14 @@ describe("loadTradeCursors", () => {
     expect((await loadTradeCursors()).size).toBe(0);
   });
 
-  it("returns empty without querying when the network is unset", async () => {
-    state.network = null;
-    expect((await loadTradeCursors()).size).toBe(0);
-    expect(state.eqCalls).toEqual([]);
+  it("filters by the indexer's CURRENT_NETWORK, not shared getNetwork (NET-SPLIT)", async () => {
+    state.network = CURRENT_NETWORK === "devnet" ? "testnet" : "devnet"; // shared disagrees
+    await loadTradeCursors();
+    expect(state.eqCalls).toEqual([["network", CURRENT_NETWORK]]);
+    state.network = null; // shared would throw: the indexer's own value is still used
+    state.eqCalls = [];
+    await loadTradeCursors();
+    expect(state.eqCalls).toEqual([["network", CURRENT_NETWORK]]);
   });
 
   it("returns empty and logs once when supabase reports an error (missing table)", async () => {
@@ -108,10 +113,10 @@ describe("saveTradeCursor", () => {
     expect(opts).toEqual({ onConflict: "network,slab_address" });
   });
 
-  it("does nothing when the network is unset", async () => {
-    state.network = null;
+  it("tags the row with the indexer's CURRENT_NETWORK, not shared getNetwork (NET-SPLIT)", async () => {
+    state.network = null; // shared would throw
     await saveTradeCursor("slabA", "sig9");
-    expect(state.upserts).toEqual([]);
+    expect(state.upserts.map((u) => u.row.network)).toEqual([CURRENT_NETWORK]);
   });
 
   it("never throws on a supabase error and warns only once per op", async () => {

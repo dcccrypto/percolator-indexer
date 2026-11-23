@@ -1,4 +1,5 @@
-import { getSupabase, getNetwork } from "@percolatorct/shared";
+import { getSupabase } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 /**
  * The only `markets` columns the indexer reads back from the DB. The shared
@@ -73,7 +74,7 @@ async function readAll(): Promise<MarketRowLite[]> {
     let q = getSupabase()
       .from("markets")
       .select(COLUMNS)
-      .eq("network", getNetwork());
+      .eq("network", CURRENT_NETWORK);
     if (after !== null) q = q.gt("slab_address", after);
     const { data, error } = await q
       .order("slab_address", { ascending: true })
