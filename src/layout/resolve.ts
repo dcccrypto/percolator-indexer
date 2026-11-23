@@ -21,6 +21,7 @@ import {
   resolveLayout,
   resolveMarketGeometry,
   LAYOUTS_BY_VERSION,
+  MARKET_MODE_V18,
   V17_ASSET_ORACLE_PROFILE_LEN,
   V17_HEADER_LEN,
   V17_WRAPPER_CONFIG_LEN,
@@ -80,6 +81,17 @@ export function readMarketGroupFields(data: Uint8Array, parser: string): MarketG
     materializedPortfolioCount: u128(data, g + L.group.materializedPortfolioCount),
     asset0ProfileOff: asset0ProfileOffset(data, geometry),
   };
+}
+
+/**
+ * True when the market group's engine `mode` byte (group header, VERSION-keyed offset) is Resolved
+ * (`MARKET_MODE_V18.Resolved`). The byte sits inside the group header, so the light registration slice holds it.
+ *
+ * @throws UnknownLayoutError like {@link readMarketGroupFields}.
+ */
+export function isMarketResolved(data: Uint8Array, parser: string): boolean {
+  const geometry = resolveMarketGeometry(data, { parser, strictLength: false });
+  return data[geometry.groupOff + geometry.layout.group.mode] === MARKET_MODE_V18.Resolved;
 }
 
 /**
