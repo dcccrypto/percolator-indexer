@@ -3,6 +3,7 @@
  * skipped, events fire only for rows really written, and a failed batch falls back to per-row inserts.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { signedAs } from "../helpers/signedTx.js";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 
@@ -12,8 +13,8 @@ const sigLists = new Map<string, { signature: string; err: null }[]>();
 const published: unknown[] = [];
 const connection = {
   getSignaturesForAddress: vi.fn(async (pk: PublicKey) => sigLists.get(pk.toBase58()) ?? []),
-  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => txBySig.get(s) ?? null)),
-  getParsedTransaction: vi.fn(async (s: string) => txBySig.get(s) ?? null),
+  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, txBySig.get(s) ?? null))),
+  getParsedTransaction: vi.fn(async (s: string) => signedAs(s, txBySig.get(s) ?? null)),
   getAccountInfo: vi.fn(async () => null),
 };
 vi.mock("@percolatorct/shared", async (orig) => {

@@ -7,13 +7,14 @@ vi.mock("../../src/parsers/lotScale.js", async (orig) => {
 });
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { PublicKey } from '@solana/web3.js';
+import { signedAs } from "../helpers/signedTx.js";
 
 vi.hoisted(() => { process.env.INDEXER_BREAKER_ALERT_POLLS = '1'; }); // alert on the first held poll in tests
 const mockGetSignaturesForAddress = vi.fn();
 const mockGetParsedTransaction = vi.fn();
 const mockGetAccountInfo = vi.fn(async () => null);
 const mockGetParsedTransactions = vi.fn(async (signatures: string[]) =>
-  Promise.all(signatures.map((sig) => mockGetParsedTransaction(sig))),
+  Promise.all(signatures.map(async (sig) => signedAs(sig, await mockGetParsedTransaction(sig)))),
 );
 
 // These tests are about leg numbering / dedup, not about how a TradeCpi's executed size is proven
@@ -286,7 +287,7 @@ describe('TradeIndexerPolling', () => {
         if (badSigs.includes(sig)) throw V2;
         return {
           meta: { err: null, logMessages: [] },
-          transaction: { message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(TRADER)], data: 'x' }] } },
+          transaction: { signatures: [sig], message: { instructions: [{ programId: new PublicKey(PROGRAM_ID), accounts: [new PublicKey(TRADER)], data: 'x' }] } },
         };
       });
     };

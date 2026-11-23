@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { signedAs } from "./helpers/signedTx.js";
 import { PublicKey } from '@solana/web3.js';
 
 /**
@@ -114,7 +115,7 @@ vi.mock('@percolatorct/shared', () => ({
   getConnection: vi.fn(() => ({
     getAccountInfo: vi.fn(async () => null),
     getSignaturesForAddress: vi.fn(async () => h.sigs),
-    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((x) => h.txs.get(x) ?? null)),
+    getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((x) => signedAs(x, h.txs.get(x) ?? null))),
   })),
   getSupabase: vi.fn(() => fakeSupabase()),
   getNetwork: vi.fn(() => 'devnet'),

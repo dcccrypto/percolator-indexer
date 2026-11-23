@@ -70,6 +70,7 @@ import { breakerAlertPolls, createBreakerTracker, fetchParsedTxsTolerant, isPois
 
 // X-1: one unreadable transaction in a batch must never wedge the cursor, and must never be skipped silently.
 describe("poison-pill tolerant fetch (X-1)", () => {
+  const sigTx = (s: string) => ({ transaction: { signatures: [s] } });
   const retry = <R>(fn: () => Promise<R>): Promise<R> => fn();
   const V2_ERR = Object.assign(new Error("failed to get transaction: Transaction version (2) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 2"), { code: -32015 });
   const mk = (bad: Set<string>, transient?: Set<string>, batchError?: Error) => {
@@ -81,13 +82,13 @@ describe("poison-pill tolerant fetch (X-1)", () => {
           calls.batch++;
           if (batchError) throw batchError;
           if (sigs.some((s) => bad.has(s))) throw V2_ERR; // web3.js throws for the WHOLE batch
-          return sigs.map((s) => ({ sig: s }));
+          return sigs.map((s) => sigTx(s));
         },
         async getParsedTransaction(sig: string) {
           calls.single.push(sig);
           if (bad.has(sig)) throw V2_ERR;
           if (transient?.has(sig)) throw new Error("429 Too Many Requests");
-          return { sig };
+          return sigTx(sig);
         },
       },
     };
@@ -114,7 +115,7 @@ describe("poison-pill tolerant fetch (X-1)", () => {
       const r = await fetchParsedTxsTolerant(mk(new Set(["p1", "p2"])).conn, ["p1", "good", "p2"], retry);
       expect(r.failed).toBe(false);
       expect(r.skipped.map((x) => x.signature)).toEqual(["p1", "p2"]);
-      expect(r.txs).toEqual([null, { sig: "good" }, null]);
+      expect(r.txs).toEqual([null, sigTx("good"), null]);
     });
     it("up to 5 skips with a good sibling are allowed; a sixth holds the cursor and skips nothing", async () => {
       const five = ["a", "b", "c", "d", "e"];
@@ -139,7 +140,7 @@ describe("poison-pill tolerant fetch (X-1)", () => {
       expect((await fetchParsedTxsTolerant(conn, ["p", "nullsig"], retry)).failed).toBe(true);
     });
     it("a signature is only skipped when it is unreadable on its OWN retry: a batch-level version error whose single retries succeed skips nothing", async () => {
-      const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => ({ sig }) };
+      const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => sigTx(sig) };
       const r = await fetchParsedTxsTolerant(conn, ["a", "b", "c"], retry);
       expect(r).toMatchObject({ failed: false, skipped: [] });
     });
@@ -232,7 +233,7 @@ describe("poison-pill tolerant fetch (X-1)", () => {
       expect(isPoisonTxError(V2_ERR)).toBe(true);
       for (const e of [bad502, code429]) {
         // batch fails with a version error, then the per-signature retry of EVERY signature fails with the transient lookalike
-        const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => { if (sig === "p") throw e; return { sig }; } };
+        const conn = { getParsedTransactions: async () => { throw V2_ERR; }, getParsedTransaction: async (sig: string) => { if (sig === "p") throw e; return sigTx(sig); } };
         const r = await fetchParsedTxsTolerant(conn, ["good", "p"], retry);
         expect(r).toMatchObject({ failed: true, skipped: [] });
       }

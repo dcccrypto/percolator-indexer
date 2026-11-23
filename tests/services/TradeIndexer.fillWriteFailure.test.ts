@@ -3,6 +3,7 @@
  * committed, so the fill was never stored. The cursor is now held (capped) so the signatures are retried.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { signedAs } from "../helpers/signedTx.js";
 import { readFileSync } from "node:fs";
 import { PublicKey } from "@solana/web3.js";
 const captureSpy = vi.hoisted(() => vi.fn());
@@ -15,8 +16,8 @@ const connection = {
     if (o?.until) { const i = all.findIndex((s) => s.signature === o.until); return i < 0 ? all : all.slice(0, i); }
     return o?.limit ? all.slice(0, o.limit) : all;
   }),
-  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => txBySig.get(s) ?? null)),
-  getParsedTransaction: vi.fn(async (s: string) => txBySig.get(s) ?? null),
+  getParsedTransactions: vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, txBySig.get(s) ?? null))),
+  getParsedTransaction: vi.fn(async (s: string) => signedAs(s, txBySig.get(s) ?? null)),
   getAccountInfo: vi.fn(async () => null),
 };
 vi.mock("@percolatorct/shared", async (orig) => {
