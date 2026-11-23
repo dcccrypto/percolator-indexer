@@ -37,9 +37,15 @@ export function resetV22EventStats(): void {
   failedTotal = 0;
 }
 
-/** Postgres check_violation on the kind constraint: the log-event migration (20261009120000_v22_log_events.sql) is not applied. */
-function isKindConstraint(error: { code?: string; message?: string }): boolean {
-  return error.code === "23514" || /v22_events_kind_check/i.test(error.message ?? "");
+/**
+ * Postgres check_violation on the kind constraint: the log-event migration (20261009120000_v22_log_events.sql) is not applied.
+ * Matched by the constraint NAME, not by code 23514 alone: any other CHECK on v22_events (a future amount/slot CHECK, or a
+ * temporary one during a migration) is a real write failure and must be thrown, so the caller holds its cursor and retries.
+ */
+const KIND_CONSTRAINT = /\bv22_events_kind_check\b/;
+function isKindConstraint(error: { code?: string; message?: string; details?: string | null }): boolean {
+  if (error.code !== undefined && error.code !== "23514") return false;
+  return KIND_CONSTRAINT.test(error.message ?? "") || KIND_CONSTRAINT.test(error.details ?? "");
 }
 
 /** Postgres undefined_table (42P01) or PostgREST "table not in schema cache" (PGRST205 / 404). */
