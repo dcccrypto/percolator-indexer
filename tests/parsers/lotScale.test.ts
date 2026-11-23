@@ -6,9 +6,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { knownLotExp, resolveLotExp, cachedLotExp, lotExpOfSlabData, noteLotExps, perLotPrice, perTokenPrice, resetLotExpCache } from "../../src/parsers/lotScale.js";
 import { readAssetEffectivePriceE6 } from "../../src/parsers/markPrice.js";
-import { buildMarket, LAYOUT_V21, LAYOUT_V22 } from "../helpers/v22Fixtures.js";
+import { buildMarket, LAYOUT_V21, LAYOUT_V22, REAL_MARKET_V21 } from "../helpers/v22Fixtures.js";
 
 type Layout = typeof LAYOUT_V22;
+const slotOff = (l: Layout, i: number) => l.marketGroupOff + l.marketGroupLen + i * l.assetSlotStride;
 
 /** A market whose asset i has effective_price prices[i] and lot_exp lots[i]. */
 function market(layout: Layout, prices: bigint[], lots: number[], version?: number): Uint8Array {
@@ -43,10 +44,30 @@ describe("perTokenPrice", () => {
     expect(perTokenPrice(1_000_000n, 15)).toBe(1e-15);
   });
 
-  it("an out-of-range lot is treated as 0 rather than producing NaN or a scaled-up price", () => {
+  it("a negative, fractional or NaN lot is treated as 0 rather than producing NaN or a scaled-up price", () => {
     expect(perTokenPrice(1_500_000, -1)).toBe(1.5);
     expect(perTokenPrice(1_500_000, 1.5)).toBe(1.5);
     expect(perTokenPrice(1_500_000, Number.NaN)).toBe(1.5);
+  });
+
+  it("lot 1 is the first scaled lot (not treated as 0)", () => {
+    expect(perTokenPrice(1_500_000n, 1)).toBe(0.15);
+    expect(perTokenPrice(1_500_000, 1)).toBe(0.15);
+    expect(perLotPrice(0.15, 1)).toBe(1.5);
+  });
+
+  it("non-default lots are ONE division by 10^(6+lot): bit-exact, not just close", () => {
+    // A two-step price / 1e6 / 10^lot gives 9.999999999999999e-10, 3.3000000000000004e-8, 6.999999999999999e-21 here.
+    expect(perTokenPrice(1n, 3)).toBe(1e-9);
+    expect(perTokenPrice(33n, 3)).toBe(3.3e-8);
+    expect(perTokenPrice(33, 9)).toBe(3.3e-14);
+    expect(perTokenPrice(7n, 15)).toBe(7e-21);
+  });
+
+  it("a lot above the program cap (16) is NOT clamped or zeroed here: it divides by 10^22", () => {
+    // Today's arithmetic, not a policy: every reader caps first (the SDK throws, lotExpOfSlabData says 0), so
+    // perTokenPrice never sees lot > 15 in practice. Pinned so a silent clamp to 15 is noticed.
+    expect(perTokenPrice(1_500_000n, 16)).toBe(1_500_000 / 1e22);
   });
 });
 
@@ -76,6 +97,63 @@ describe("lot_exp read from the market account", () => {
   it("a lot_exp byte above the program's cap is not trusted (reads 0)", () => {
     expect(lotExpOfSlabData(market(LAYOUT_V22, [1_000_000n], [16]), 0)).toBe(0);
   });
+
+  it("a lot_exp byte >= 128 is read unsigned: reads 0, caches nothing, and resolveLotExp defers", async () => {
+    for (const b of [128, 200, 255]) {
+      resetLotExpCache();
+      const d = market(LAYOUT_V22, [1_000_000n, 1n], [b, 2]);
+      expect(lotExpOfSlabData(d, 0)).toBe(0);
+      noteLotExps("HI", d);
+      expect(knownLotExp("HI", 0)).toBeUndefined();
+      expect(knownLotExp("HI", 1)).toBe(2);
+      resetLotExpCache();
+      expect(await resolveLotExp("HI", 0, async () => d)).toBeNull();
+    }
+  });
+
+  it("the first asset past the last slot reads 0 (not undefined)", () => {
+    const d = buildMarket(LAYOUT_V22, { slots: 2 });
+    d[slotOff(LAYOUT_V22, 1) + LAYOUT_V22.wrapperSlot.profileLotExp] = 4;
+    expect(lotExpOfSlabData(d, 1)).toBe(4);
+    expect(lotExpOfSlabData(d, 2)).toBe(0);
+  });
+
+  it("a negative asset index reads 0 even when the bytes before slot 0 look like a lot_exp", () => {
+    const d = buildMarket(LAYOUT_V22, { slots: 1 });
+    // The byte slotOff(-1) + profileLotExp would land on (inside the market group / config).
+    d[slotOff(LAYOUT_V22, 0) - LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlot.profileLotExp] = 9;
+    expect(lotExpOfSlabData(d, -1)).toBe(0);
+  });
+
+  it("8 trailing bytes after a market account do not hide lot 6", () => {
+    const base = buildMarket(LAYOUT_V22, { slots: 1 });
+    const d = new Uint8Array(base.length + 8);
+    d.set(base);
+    d[slotOff(LAYOUT_V22, 0) + LAYOUT_V22.wrapperSlot.profileLotExp] = 6;
+    expect(lotExpOfSlabData(d, 0)).toBe(6);
+  });
+});
+
+describe("VERSION 18 accounts use the v2.1 slot geometry", () => {
+  it("synthetic: a sentinel at the v2.2 offset of a v2.1 market is ignored", () => {
+    const d = buildMarket(LAYOUT_V21, { slots: 2 });
+    for (const i of [0, 1]) {
+      const v22At = slotOff(LAYOUT_V22, i) + LAYOUT_V22.wrapperSlot.profileLotExp;
+      if (v22At < d.length) d[v22At] = 7;
+    }
+    expect(lotExpOfSlabData(d, 0)).toBe(0);
+    expect(lotExpOfSlabData(d, 1)).toBe(0);
+  });
+
+  it("real devnet VERSION 18 market: every asset is lot 0, cached, and resolveLotExp never defers", async () => {
+    const n = Math.floor((REAL_MARKET_V21.length - LAYOUT_V21.marketGroupOff - LAYOUT_V21.marketGroupLen) / LAYOUT_V21.assetSlotStride);
+    expect(n).toBe(14);
+    for (let a = 0; a < n; a++) expect(lotExpOfSlabData(REAL_MARKET_V21, a)).toBe(0);
+    noteLotExps("V18", REAL_MARKET_V21);
+    for (let a = 0; a < n; a++) expect(knownLotExp("V18", a)).toBe(0);
+    resetLotExpCache();
+    expect(await resolveLotExp("V18b", 0, async () => REAL_MARKET_V21)).toBe(0);
+  });
 });
 
 describe("lot_exp cache for matcher-CPI fills (which never read the slab)", () => {
@@ -99,6 +177,12 @@ describe("fees stay in per-lot units", () => {
   it("perLotPrice undoes perTokenPrice, so size(lots) x price keeps its meaning; lot 0 is the identity", () => {
     expect(perLotPrice(1.5, 0)).toBe(1.5);
     expect(perLotPrice(perTokenPrice(300_000n, 6), 6)).toBeCloseTo(0.3, 12);
+  });
+
+  it("perLotPrice treats a negative, fractional or NaN lot as 0 (the identity), like perTokenPrice", () => {
+    expect(perLotPrice(1.5, -1)).toBe(1.5);
+    expect(perLotPrice(1.5, 1.5)).toBe(1.5);
+    expect(perLotPrice(1.5, Number.NaN)).toBe(1.5);
   });
 
   it("a bad lot_exp byte on one slot does not hide the later slots", () => {
