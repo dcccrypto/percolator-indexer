@@ -58,13 +58,17 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
   return r;
 }
 
-/** Scrub every string in `value` in place (objects/arrays); returns the scrubbed value. */
-export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>(), copies = new WeakMap<object, unknown>()): T {
+/**
+ * Scrub every string in `value` in place (objects/arrays); returns the scrubbed value.
+ * Inside a copied subtree (`inCopy`) nothing is assigned in place: plain objects and arrays are
+ * rebuilt too, so a live object's nested state is never touched and frozen objects cannot throw.
+ */
+export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>(), copies = new WeakMap<object, unknown>(), inCopy = false): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
   if (value === null || typeof value !== "object") return value;
   // Sentry serialises these in `extra`/contexts (href; name/message/stack), so scrub a plain copy.
   if (value instanceof URL) return scrubString(value.href, secrets) as T;
-  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen, copies) as T;
+  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen, copies, inCopy) as T;
   // Bytes go out as their numbers, so a secret inside them survives string scrubbing.
   if (ArrayBuffer.isView(value)) {
     const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
@@ -74,7 +78,12 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
   // response class, Map/Headers) as their own enumerable props. Scrub a plain copy of that: the live
   // object, which may be the indexer's own Connection or an SDK scope, is never mutated.
   const proto = Object.getPrototypeOf(value);
-  const toJSON = (value as { toJSON?: unknown }).toJSON;
+  let toJSON: unknown;
+  try {
+    toJSON = (value as { toJSON?: unknown }).toJSON;
+  } catch {
+    return FILTERED as T; // a throwing toJSON getter
+  }
   if (typeof toJSON === "function" || (!Array.isArray(value) && proto !== Object.prototype && proto !== null)) {
     if (copies.has(value)) return copies.get(value) as T; // shared reference: reuse its scrubbed copy
     if (seen.has(value)) return FILTERED as T; // a copy cannot point back at itself; drop the cycle
@@ -85,8 +94,29 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
     } catch {
       return FILTERED as T; // a throwing getter/toJSON: Sentry could not serialise it either
     }
-    const out = scrubDeep(copy, secrets, seen, copies);
+    const out = scrubDeep(copy, secrets, seen, copies, true);
     seen.delete(value); // only ancestors count as a cycle
+    copies.set(value, out);
+    return out as T;
+  }
+  if (inCopy) {
+    // Plain children of a live object: build a scrubbed copy, same sharing/cycle rules as above.
+    if (copies.has(value)) return copies.get(value) as T;
+    if (seen.has(value)) return FILTERED as T;
+    seen.add(value);
+    let out: unknown;
+    try {
+      out = Array.isArray(value)
+        ? value.map((v) => scrubDeep(v, secrets, seen, copies, true))
+        : Object.fromEntries(
+            Object.keys(value)
+              .filter((k) => !DROP_KEYS.has(k))
+              .map((k) => [k, scrubDeep((value as Record<string, unknown>)[k], secrets, seen, copies, true)]),
+          );
+    } catch {
+      out = FILTERED; // a throwing getter
+    }
+    seen.delete(value);
     copies.set(value, out);
     return out as T;
   }

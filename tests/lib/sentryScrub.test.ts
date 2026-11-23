@@ -249,6 +249,7 @@ describe("scrubString / scrubDeep", () => {
     expect(reachable(ev)).not.toContain(KEY);
     // Copies are scrubbed; the live object (e.g. the indexer's own Connection) is left as it was.
     expect(live.auth).toBe(KEY);
+    expect(proto.headers).toEqual({ apikey: KEY });
     expect(ev.extra.live).toEqual({ auth: FILTERED_ });
     expect(ev.extra.proto).toEqual({ headers: { apikey: FILTERED_ } });
     expect(ev.extra.json).toEqual({ key: FILTERED_ });
@@ -269,6 +270,47 @@ describe("scrubString / scrubDeep", () => {
     expect(m!.scrubDeep({ chain }).chain).toMatchObject({ l: { l: {} } });
     expect(ev.extra.twice).toEqual([{ auth: FILTERED_ }, { auth: FILTERED_ }]); // a shared reference is not a cycle
     expect(ev.extra.cyclic).toEqual({ auth: `Bearer ${FILTERED_}`, self: FILTERED_ });
+  });
+
+  it("never mutates nested state of a live object and does not throw on frozen nested objects", async () => {
+    const m = await loadScrub();
+    expect(m).not.toBeNull();
+    const KEY = fake("NESTEDLIVEKEY7");
+    const cb = () => {};
+    // Shaped like a web3 Connection: a callbacks Set under a plain map, plus a client's headers.
+    class Conn {
+      _subscriptionsByHash: Record<string, { callbacks: Set<() => void>; args: unknown[] }> = {
+        h1: { callbacks: new Set([cb]), args: [`https://rpc.example/?api-key=${KEY}`] },
+      };
+      client = { headers: { apikey: KEY, Authorization: `Bearer ${KEY}` } };
+      opts = Object.freeze({ token: KEY, nested: Object.freeze({ url: `https://rpc.example/?api-key=${KEY}` }) });
+    }
+    const conn = new Conn();
+    const sub = conn._subscriptionsByHash.h1;
+    const json = { toJSON: () => conn.client };
+    let ev: { extra: Record<string, unknown> } | undefined;
+    expect(() => {
+      ev = m!.scrubDeep({ extra: { conn, json } as Record<string, unknown> }, [KEY]);
+    }).not.toThrow();
+    expect(conn._subscriptionsByHash.h1).toBe(sub);
+    expect(sub.callbacks).toBeInstanceOf(Set);
+    expect([...sub.callbacks]).toEqual([cb]);
+    expect(sub.args).toEqual([`https://rpc.example/?api-key=${KEY}`]);
+    expect(conn.client.headers).toEqual({ apikey: KEY, Authorization: `Bearer ${KEY}` });
+    expect(conn.opts.token).toBe(KEY);
+    expect(JSON.stringify(ev)).not.toContain(KEY);
+    expect(ev!.extra.conn).toMatchObject({
+      client: { headers: { apikey: FILTERED_, Authorization: `Bearer ${FILTERED_}` } },
+      opts: { token: FILTERED_, nested: { url: `https://rpc.example/?api-key=${FILTERED_}` } },
+    });
+    expect(ev!.extra.json).toEqual({ headers: { apikey: FILTERED_, Authorization: `Bearer ${FILTERED_}` } });
+    // A throwing toJSON getter drops just that value.
+    const bad = Object.defineProperty({}, "toJSON", {
+      get() {
+        throw new Error("getter");
+      },
+    });
+    expect(m!.scrubDeep({ extra: { bad } }).extra.bad).toBe(FILTERED_);
   });
 
   it("collects configured secret values from the env (FAKE values)", async () => {
