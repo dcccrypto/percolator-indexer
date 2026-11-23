@@ -13,6 +13,7 @@ vi.mock("@percolatorct/shared", () => ({
 }));
 
 import { assertSkippedSignatureSinkReady, getSkippedSignatureCount, recordSkippedSignatures, resetSkippedSignatureCount, resetSkippedSignatureDedupe } from "../src/lib/skippedSignatures.js";
+import { CURRENT_NETWORK } from "../src/network.js";
 
 const FULL = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
 const FILE = join(tmpdir(), `skipped-unit-${process.pid}.jsonl`);
@@ -29,7 +30,8 @@ describe("(c) durable skip record", () => {
     expect(upsert).toHaveBeenCalledTimes(1);
     const [table, rows, opts] = upsert.mock.calls[0]!;
     expect(table).toBe("skipped_signatures");
-    expect(rows[0]).toMatchObject({ signature: FULL, slab: row.slab, source: "trade-indexer", network: "mainnet" });
+    expect(rows[0]).toMatchObject({ signature: FULL, slab: row.slab, source: "trade-indexer", network: CURRENT_NETWORK });
+    expect(CURRENT_NETWORK).not.toBe("mainnet"); // the shared mock above says mainnet: it must not be the source
     expect(opts).toMatchObject({ onConflict: "signature,source" });
     expect(existsSync(FILE)).toBe(false);
   });

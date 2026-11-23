@@ -1,4 +1,5 @@
-import { getSupabase, getNetwork, createLogger } from "@percolatorct/shared";
+import { getSupabase, createLogger } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:stored-legs");
 
@@ -25,7 +26,7 @@ export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | 
       .from("trades")
       .select("slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
       .eq("tx_signature", signature)
-      .eq("network", getNetwork());
+      .eq("network", CURRENT_NETWORK);
     if (error) throw new Error(error.message);
     return (data ?? []) as StoredLeg[];
   } catch (err) {
@@ -65,7 +66,7 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
           .from("trades")
           .select("id, tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
           .in("tx_signature", chunk)
-          .eq("network", getNetwork());
+          .eq("network", CURRENT_NETWORK);
         if (lastId !== null) q = q.gt("id", lastId);
         const { data, error } = await q.order("id", { ascending: true }).limit(STORED_LEGS_PAGE);
         if (error) throw new Error(error.message);

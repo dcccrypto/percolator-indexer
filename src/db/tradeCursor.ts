@@ -1,4 +1,5 @@
-import { createLogger, getSupabase, getNetwork } from "@percolatorct/shared";
+import { createLogger, getSupabase } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:trade-cursor");
 
@@ -19,14 +20,6 @@ export function resetTradeCursorWarnings(): void {
   warned.clear();
 }
 
-function network(): string | null {
-  try {
-    return getNetwork();
-  } catch {
-    return null; // unset in some test/dev setups: no durable cursor
-  }
-}
-
 /** Rows per read. Must be <= the project's PostgREST max_rows (1000 in supabase/config.toml), which caps a response whatever .limit asks for. */
 export const TRADE_CURSOR_PAGE = 1000;
 
@@ -37,8 +30,7 @@ export const TRADE_CURSOR_PAGE = 1000;
  */
 export async function loadTradeCursors(): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  const net = network();
-  if (!net) return out;
+  const net = CURRENT_NETWORK;
   try {
     for (let from = 0; ; from += TRADE_CURSOR_PAGE) {
       const { data, error } = await getSupabase()
@@ -59,8 +51,7 @@ export async function loadTradeCursors(): Promise<Map<string, string>> {
 }
 
 export async function saveTradeCursor(slab: string, signature: string): Promise<void> {
-  const net = network();
-  if (!net) return;
+  const net = CURRENT_NETWORK;
   try {
     const { error } = await getSupabase()
       .from("trade_indexer_cursor")

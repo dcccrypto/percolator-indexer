@@ -1,4 +1,5 @@
-import { getSupabase, getNetwork } from "@percolatorct/shared";
+import { getSupabase } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 import { rebalanceReduceFill } from "../parsers/percolatorTxParser.js";
 
 /**
@@ -86,7 +87,7 @@ export async function fetchTraderPositionEvidence(
       .eq("trader", trader)
       .eq("slab_address", slabAddress)
       .eq("asset_index", assetIndex)
-      .eq("network", getNetwork())
+      .eq("network", CURRENT_NETWORK)
       .neq("tx_signature", excludeSignature)
       .order("id", { ascending: true })
       .range(from, from + PAGE - 1);

@@ -13,7 +13,8 @@
  * Run: npx tsx packages/indexer/src/scripts/cleanup-corrupted-stats.ts
  */
 import { pathToFileURL } from "node:url";
-import { getSupabase, getNetwork } from "@percolatorct/shared";
+import { getSupabase } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 // GH#1208: Use 5e17 instead of 1e18 — values like 7.997e17 are clearly corrupt
 // but slip through the original 1e18 threshold.
@@ -35,7 +36,7 @@ async function fetchAll(
     let q = supabase
       .from("markets")
       .select(columns)
-      .eq("network", getNetwork())
+      .eq("network", CURRENT_NETWORK)
       .or(orFilter)
       .order("slab_address", { ascending: true })
       .limit(PAGE_SIZE);
@@ -68,7 +69,7 @@ export async function main() {
       .from("markets")
       .update({ decimals: 6 })
       .eq("slab_address", m.slab_address)
-      .eq("network", getNetwork());
+      .eq("network", CURRENT_NETWORK);
     if (error) {
       failures++;
       console.error(`  ERROR: ${error.message}`);
@@ -107,7 +108,7 @@ export async function main() {
         lifetime_force_closes: 0,
       })
       .eq("slab_address", s.slab_address)
-      .eq("network", getNetwork());
+      .eq("network", CURRENT_NETWORK);
     if (error) {
       failures++;
       console.error(`  ERROR: ${error.message}`);
