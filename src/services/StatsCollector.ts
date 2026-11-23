@@ -1281,7 +1281,7 @@ export class StatsCollector {
             .from("markets")
             .update({ status: "paused" })
             .in("slab_address", group)
-            .eq("network", getNetwork())
+            .eq("network", CURRENT_NETWORK)
             .eq("status", "active");
           if (pauseErr) logger.warn("Pausing Resolved markets failed", { count: group.length, error: pauseErr.message });
         } catch (e) {
