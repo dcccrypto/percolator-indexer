@@ -97,7 +97,12 @@ describe("NET-SPLIT: every row family is tagged with the cluster the indexer run
       for (const name of readdirSync(dir)) {
         const p = join(dir, name);
         if (statSync(p).isDirectory()) walk(p);
-        else if (p.endsWith(".ts") && importsShared.test(readFileSync(p, "utf8"))) offenders.push(p.slice(root.length + 1));
+        else if (p.endsWith(".ts")) {
+          const src = readFileSync(p, "utf8");
+          const rel = p.slice(root.length + 1);
+          // a named import, or any getNetwork( call (e.g. via a namespace import) outside the resolver itself
+          if (importsShared.test(src) || (rel !== "network.ts" && /\bgetNetwork\s*\(/.test(src))) offenders.push(rel);
+        }
       }
     };
     walk(root);
