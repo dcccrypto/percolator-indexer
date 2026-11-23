@@ -55,4 +55,7 @@ COMMENT ON FUNCTION public.volume_24h_by_slab(text) IS
 REVOKE ALL ON FUNCTION public.volume_24h_by_slab(text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.volume_24h_by_slab(text) TO service_role;
 
+-- PostgREST must see the new return type (as 20261001020000_markets_keeper_status_pending.sql does).
+NOTIFY pgrst, 'reload schema';
+
 COMMIT;
