@@ -223,8 +223,9 @@ describe("KILLERS: batch leg count (M16)", () => {
 describe("KILLERS: BatchTradeCpi on a real devnet tx envelope pairs each batch with its OWN matcher call (M34)", () => {
   // Real devnet tx BUuTJP8E… (wrapper ETDLAd…): 3 ComputeBudget ixs, then the wrapper ixs at outer 3/4/5, each with
   // its own inner group holding one matcher CPI (matcher EDKKgR… at accounts[4], context ADDwHG… at accounts[5]).
-  // Devnet has no real BatchTradeCpi, so the wrapper bodies and matcher call bytes are swapped for batch encodings;
-  // the outer layout, program ids, account lists and inner-ix envelope are the recorded ones.
+  // Devnet has no real BatchTradeCpi. Recorded: the 3-ix ComputeBudget prefix, the wrapper program id, the wrapper
+  // account list and the inner matcher ix (program id, accounts). Synthetic: 2 wrapper ixs (outer 3/4) instead of 3,
+  // the ix bodies (BatchTradeCpi), the matcher call bytes (batch calls) and the rest of meta.
   const real = JSON.parse(readFileSync(new URL("../fixtures/tradecpi/batchLike_multi.json", import.meta.url), "utf8"));
   const realIxs: any[] = real.tx.transaction.message.instructions;
   const realInner: any[] = real.tx.meta.innerInstructions;
@@ -250,6 +251,9 @@ describe("KILLERS: BatchTradeCpi on a real devnet tx envelope pairs each batch w
     expect(realIxs.slice(0, 3).every((i) => i.programId === COMPUTE_BUDGET)).toBe(true);
     expect(realInner[0].index).toBe(3);
     expect(realInner[0].instructions[0].programId).toBe(REAL_MATCHER);
+    // the recorded wrapper ixs at outer 3/4 share one account list, so reusing realIxs[3]'s for both is faithful
+    expect(realIxs[4].programId).toBe(WRAPPER);
+    expect(realIxs[4].accounts).toEqual(REAL_ACCTS);
   });
 
   it("batch at outer 3 reads group 3, batch at outer 4 reads group 4: every leg gets its own call leg", () => {
