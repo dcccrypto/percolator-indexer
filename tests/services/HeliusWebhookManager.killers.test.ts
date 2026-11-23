@@ -1,5 +1,6 @@
-// DRAFT killers for the HeliusWebhookManager mutation run (IDX-REPORT-HELIUSWEBHOOKMGRLIVENESSMUT).
-// Green on feat/v22-indexer 9db52dd. Copy to tests/services/ to run.
+// Mutation killers for HeliusWebhookManager (IDX-REPORT-HELIUSWEBHOOKMGRLIVENESSMUT): pin the
+// accountAddresses list, the PUT repair body, exact-URL matching, skip states, the failure alert
+// path and the 15 s abort signal. Green on feat/v22-indexer 9db52dd. No real Helius calls.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { mockFetch, sharedMock, captureException, sendCriticalAlert } = vi.hoisted(() => ({
@@ -42,7 +43,7 @@ function res(body: unknown, ok = true, status = 200) {
 }
 const bodyOf = (i: number) => JSON.parse(String(mockFetch.mock.calls[i][1].body));
 
-describe("HeliusWebhookManager liveness killers (draft)", () => {
+describe("HeliusWebhookManager liveness killers", () => {
   let m: HeliusWebhookManager;
   beforeEach(() => {
     vi.clearAllMocks();
