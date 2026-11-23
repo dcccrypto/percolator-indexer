@@ -1016,6 +1016,7 @@ export class StatsCollector {
   private async collect(): Promise<void> {
     if (this._collecting || !this._running) return;
     this._collecting = true;
+    let failed = false;
 
     try {
       // Auto-register missing markets at the start of each cycle. Reuse the rows
@@ -1283,6 +1284,7 @@ export class StatsCollector {
         if (!markets.has(key)) this.closedSlabs.delete(key);
       }
     } catch (err) {
+      failed = true;
       logger.error("StatsCollector.collect failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
       captureException(err, {
         tags: { context: "stats-collector-error" },
@@ -1292,7 +1294,8 @@ export class StatsCollector {
       });
     } finally {
       this._collecting = false;
-      loopLiveness.beat(STATS_LOOP);
+      // A cycle that threw is not progress: beating it too kept /health ok while every tick failed.
+      if (!failed) loopLiveness.beat(STATS_LOOP);
     }
   }
 }
