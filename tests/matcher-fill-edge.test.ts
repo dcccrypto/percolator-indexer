@@ -138,6 +138,12 @@ describe("cpiEvidence", () => {
     // single call never takes batch return data
     expect((cpiEvidence(accounts, [call(singleCall(7n, 9n, baseLeg))], { programId: MATCHER, data }, false) as any).batchReturns).toBeNull();
   });
+
+  it("batch return data LONGER than legs x 64 is not split either", () => {
+    const ix = [call(batchCall(7n, 9n, [baseLeg]))];
+    const data = new Uint8Array(128); data.set(ret({ execSize: 10n, assetIndex: 2n }), 0);
+    expect((cpiEvidence(accounts, ix, { programId: MATCHER, data }, true) as any).batchReturns).toBeNull();
+  });
 });
 
 describe("resolveCpiLeg", () => {
@@ -160,6 +166,30 @@ describe("resolveCpiLeg", () => {
     const short = await run(evOf(singleCall(7n, 9n, { ...baseLeg, size: -1000n })), okRead(ret({ execSize: -400n })), { side: "short" });
     expect(short).toMatchObject({ kind: "fill", sizeValue: 400n, exact: true });
     expect(getTradecpiCounters()).toMatchObject({ zeroFill: 1, exact: 1 });
+  });
+
+  it("exact fill is booked at the oracle price, not the matcher's exec_price", async () => {
+    const r = await run(evOf(singleCall(7n, 9n, baseLeg)), okRead(ret({ execSize: 1n, execPriceE6: 105n })));
+    expect(r).toEqual({ kind: "fill", sizeValue: 1n, priceE6: 100n, exact: true });
+  });
+
+  it("a zero-size request on a SHORT leg is legacy, never a 0-size fill or a zero fill", async () => {
+    const zeroShort = singleCall(7n, 9n, { ...baseLeg, size: 0n });
+    const read = okRead(ret({ execSize: 0n }));
+    expect(await run(evOf(zeroShort, false), okRead(null), { side: "short" })).toMatchObject({ kind: "legacy" });
+    expect(await run(evOf(zeroShort), read, { side: "short" })).toMatchObject({ kind: "legacy" });
+    expect(read).not.toHaveBeenCalled();
+    expect(getTradecpiCounters()).toMatchObject({ legacy: 2, zeroFill: 0, unverified: 0 });
+  });
+
+  it("fallback books the post-clip request size, never the larger wire size", async () => {
+    const r = await run(evOf(singleCall(7n, 9n, baseLeg), false), okRead(null), { wireSizeAbs: 2000n });
+    expect(r).toEqual({ kind: "fill", sizeValue: 1000n, priceE6: 100n, exact: false });
+  });
+
+  it("a SHORT fallback books the absolute request size", async () => {
+    const r = await run(evOf(singleCall(7n, 9n, { ...baseLeg, size: -1000n }), false), okRead(null), { side: "short" });
+    expect(r).toEqual({ kind: "fill", sizeValue: 1000n, priceE6: 100n, exact: false });
   });
 
   it("max i128 request filled exactly stays exact (no overflow)", async () => {
