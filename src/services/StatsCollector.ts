@@ -215,7 +215,7 @@ import {
   v17InitialMarginBps,
   type AutoRowMarketInput,
 } from "../db/autoMarketFields.js";
-import { hasWrapperMagic, readMarketGroupFields, reportUnknownLayout } from "../layout/resolve.js";
+import { hasWrapperMagic, isMarketResolved, readMarketGroupFields, reportUnknownLayout } from "../layout/resolve.js";
 import { noteLotExps } from "../parsers/lotScale.js";
 import { noteMarketLayout } from "../layout/marketVersions.js";
 import { isBlockedSlab, setDbRetiredSlabs } from "../blocklist.js";
@@ -329,6 +329,19 @@ function chunked<T>(items: T[], size = WRITE_IN_CHUNK): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
+}
+
+/**
+ * RS-1 follow-up: true when a v2.2 market account's group mode byte is Resolved. A Resolved market is listed as
+ * `paused` (users still close and withdraw; `closed` would hide it). Non-wrapper or unreadable data: false.
+ */
+function slabIsResolved(data: Uint8Array): boolean {
+  if (!hasWrapperMagic(data)) return false;
+  try {
+    return isMarketResolved(data, "StatsCollector.sweep");
+  } catch {
+    return false;
+  }
 }
 
 /** Pause between sweep batches, to stay clear of RPC rate limits. */
@@ -1066,7 +1079,7 @@ export class StatsCollector {
         // read from chain, v17-aware, the same way the sweep below does
         // (parseV17AccountStats). Unreadable slabs stay excluded and are retried next
         // cycle rather than un-hidden unverified.
-        const revive: Array<{ slab: string; vault: bigint; numUsedAccounts: number }> = [];
+        const revive: Array<{ slab: string; vault: bigint; numUsedAccounts: number; resolved: boolean }> = [];
         for (let i = 0; i < candidates.length; i += SWEEP_BATCH_SIZE) {
           const chunk = candidates.slice(i, i + SWEEP_BATCH_SIZE);
           let infos: Array<{ data: Uint8Array | Buffer } | null> = [];
@@ -1078,6 +1091,7 @@ export class StatsCollector {
           chunk.forEach((slab, j) => {
             let vault = 0n;
             let numUsedAccounts = 0;
+            let resolved = false;
             try {
               const info = infos[j];
               if (info?.data) {
@@ -1085,28 +1099,35 @@ export class StatsCollector {
                 const eng = hasWrapperMagic(data) ? parseV17AccountStats(data).engine : parseEngine(data);
                 vault = eng.vault;
                 numUsedAccounts = eng.numUsedAccounts;
+                resolved = slabIsResolved(data);
               }
             } catch (err) {
               reportUnknownLayout(slab, err, "StatsCollector.reenable");
             }
-            if (vault > 1_000_000n || numUsedAccounts > 0) revive.push({ slab, vault, numUsedAccounts });
+            if (vault > 1_000_000n || numUsedAccounts > 0) revive.push({ slab, vault, numUsedAccounts, resolved });
             else excludedSlabs.add(slab);
           });
         }
 
-        for (const group of chunked(revive)) {
+        // A Resolved market comes back `paused`, not `active` (RS-1); one UPDATE per status per chunk.
+        const reviveGroups = [
+          ...chunked(revive.filter((r) => !r.resolved)).map((g) => ({ status: "active" as const, group: g })),
+          ...chunked(revive.filter((r) => r.resolved)).map((g) => ({ status: "paused" as const, group: g })),
+        ];
+        for (const { status, group } of reviveGroups) {
           try {
             // One UPDATE per chunk; supabase-js reports a failed write as { error }.
             const { error: reenableErr } = await getSupabase()
               .from("markets")
-              .update({ indexer_excluded: false, status: "active" })
+              .update({ indexer_excluded: false, status })
               .in("slab_address", group.map((r) => r.slab))
               .eq("network", getNetwork());
             if (reenableErr) throw new Error(reenableErr.message);
             for (const r of group) {
               this.closedSlabs.delete(r.slab);
-              logger.info("Re-enabled previously excluded market (back in discovery and active)", {
+              logger.info("Re-enabled previously excluded market (back in discovery)", {
                 slabAddress: r.slab.slice(0, 8),
+                status,
                 vault: r.vault.toString(),
                 numUsedAccounts: r.numUsedAccounts,
               });
@@ -1135,6 +1156,9 @@ export class StatsCollector {
       // Closes are collected during the sweep and written as one UPDATE each, not one per market.
       const missingSlabs: string[] = [];
       const dustClosable: Array<{ slab: string; vault: number; accounts: number }> = [];
+      // RS-1 follow-up: markets Resolved on chain. Registration writes `paused` only for a market that is already
+      // Resolved when it is first seen; one that resolves later kept its `active` row forever. Demoted below.
+      const resolvedSlabs: string[] = [];
 
       // Batch the account reads: getMultipleAccountsInfo takes up to 100 keys, so
       // SWEEP_BATCH_SIZE keys per call instead of one call per market.
@@ -1205,6 +1229,8 @@ export class StatsCollector {
             // This hides stale/abandoned slabs from the frontend without manual DB edits.
             if (hasDustVault && hasNoAccounts && !this.closedSlabs.has(slabAddress)) {
               dustClosable.push({ slab: slabAddress, vault: Number(engine.vault), accounts: engine.numUsedAccounts });
+            } else if (slabIsResolved(data)) {
+              resolvedSlabs.push(slabAddress);
             }
 
             // REDUCTION (2026-07-26): market_stats is no longer written from collect().
@@ -1246,6 +1272,20 @@ export class StatsCollector {
           else for (const s of group) logger.info("Auto-closed non-existent market", { slab: s.slice(0, 8) });
         } catch (e) {
           logger.warn("Auto-close of non-existent markets error", { count: group.length, error: e instanceof Error ? e.message : e });
+        }
+      }
+      for (const group of chunked(resolvedSlabs)) {
+        try {
+          // Only an `active` row moves: closed rows stay closed, already-paused rows are untouched (0 rows updated).
+          const { error: pauseErr } = await getSupabase()
+            .from("markets")
+            .update({ status: "paused" })
+            .in("slab_address", group)
+            .eq("network", getNetwork())
+            .eq("status", "active");
+          if (pauseErr) logger.warn("Pausing Resolved markets failed", { count: group.length, error: pauseErr.message });
+        } catch (e) {
+          logger.warn("Pausing Resolved markets error", { count: group.length, error: e instanceof Error ? e.message : e });
         }
       }
       for (const group of chunked(dustClosable)) {
