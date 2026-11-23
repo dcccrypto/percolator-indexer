@@ -9,7 +9,7 @@
  * Fixture is SYNTHETIC (real-derived): real TradeCpi 4HMi5a7n… on 6YppKd… + real TradeCpi 35nYdrnS… on 6fonYS…,
  * concatenated (sig SYNTHCP002, slot 510327470); logs cut after the first wrapper data line ("Log truncated").
  *
- * Failed 2/2 on 831a5d4 (cases 1 and 2).
+ * On 6ba70e5 (before the fix) cases 1, 2 and 4 fail; case 3 passes there too (this fixture has no ETDLAd instruction).
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
