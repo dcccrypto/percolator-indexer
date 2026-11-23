@@ -913,15 +913,15 @@ describe('collect(): sweep', () => {
       });
     // 1: profile parses; 2: profile throws; 3: no profile offset.
     h.readMarketGroupFields
-      .mockReturnValueOnce({ vault: 9_000_000n, insurance: 1n, cTot: 1n, asset0ProfileOff: 100 })
-      .mockReturnValueOnce({ vault: 9_000_000n, insurance: 1n, cTot: 1n, asset0ProfileOff: 100 })
-      .mockReturnValueOnce({ vault: 1n, insurance: 0n, cTot: 0n, asset0ProfileOff: null });
+      .mockReturnValueOnce({ vault: 9_000_000n, insurance: 1n, cTot: 1n, materializedPortfolioCount: 0n, asset0ProfileOff: 100 })
+      .mockReturnValueOnce({ vault: 9_000_000n, insurance: 1n, cTot: 1n, materializedPortfolioCount: 0n, asset0ProfileOff: 100 })
+      .mockReturnValueOnce({ vault: 1n, insurance: 0n, cTot: 0n, materializedPortfolioCount: 0n, asset0ProfileOff: null });
     h.getMultipleAccountsInfo.mockResolvedValue([1, 2, 3].map(() => ({ data: new Uint8Array(600) })));
     const { sc } = make(markets);
     await sc.collect();
     expect(h.parseEngine).not.toHaveBeenCalled();
     expect(h.parseWrapperConfigV17).toHaveBeenCalledTimes(3);
-    // Only the third market (dust vault; the v17 shape reports 0 used accounts) is auto-closed.
+    // Only the third market (dust vault, materialized_portfolio_count 0 = no accounts) is auto-closed.
     expect(h.state.updates).toHaveLength(1);
     expect(h.reportUnknownLayout).not.toHaveBeenCalled();
     expect(h.logger.info).toHaveBeenCalledWith('StatsCollector sweep complete', expect.objectContaining({ updated: 3, errors: 0 }));
@@ -931,7 +931,7 @@ describe('collect(): sweep', () => {
     const markets = registered();
     h.hasWrapperMagic.mockReturnValue(true);
     h.parseWrapperConfigV17.mockReturnValue({ maxStalenessSecs: 1n, markEwmaE6: 0n, tradeFeeBps: 1, maintenanceFeePerSlot: 0n });
-    h.readMarketGroupFields.mockReturnValue({ vault: 9n, insurance: 0n, cTot: 0n, asset0ProfileOff: 100 });
+    h.readMarketGroupFields.mockReturnValue({ vault: 9n, insurance: 0n, cTot: 0n, materializedPortfolioCount: 0n, asset0ProfileOff: 100 });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(120) }]);
     const { sc } = make(markets);
     await sc.collect();
@@ -949,7 +949,7 @@ describe('collect(): re-enabling excluded markets', () => {
     excluded(s);
     h.hasWrapperMagic.mockReturnValue(true);
     h.parseWrapperConfigV17.mockReturnValue({ maxStalenessSecs: 1n, markEwmaE6: 0n, tradeFeeBps: 1, maintenanceFeePerSlot: 0n });
-    h.readMarketGroupFields.mockReturnValue({ vault: 5_000_000n, insurance: 0n, cTot: 0n, asset0ProfileOff: null });
+    h.readMarketGroupFields.mockReturnValue({ vault: 5_000_000n, insurance: 0n, cTot: 0n, materializedPortfolioCount: 0n, asset0ProfileOff: null });
     h.getMultipleAccountsInfo.mockResolvedValue([{ data: new Uint8Array(600) }]);
     const { sc } = make(new Map([[s, market()]]));
     sc.closedSlabs.add(s);
