@@ -6,16 +6,16 @@
  * registered (9EPm8nB8… on 2026-10-01: inserted at 01:21, registered at 01:55).
  * 'active' would enroll it for keeper pricing without registration.
  *
- * The DB mock records every write method on from() (insert, upsert, update, delete),
- * so a switch to upsert or an extra write fails on the recorded calls, not on a
- * missing mock method.
+ * The DB mock records every call on from() (insert, upsert, update, delete, select),
+ * so a switch to upsert or an extra write or read fails on the recorded calls, not on
+ * a missing mock method.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const h = vi.hoisted(() => {
   const calls: { table: string; op: string; arg?: unknown }[] = [];
   const done = { error: null };
-  // A filter chain that can be awaited at any point (update/delete .eq().eq()).
+  // A chain that can be awaited at any point (.eq().eq(), upsert().select(), .maybeSingle()). It never rejects.
   const chain = (): Record<string, unknown> => {
     const c: Record<string, unknown> = {};
     c.eq = vi.fn(() => c);
@@ -34,7 +34,7 @@ const h = vi.hoisted(() => {
     upsert: write(table, "upsert"),
     update: write(table, "update"),
     delete: write(table, "delete"),
-    select: vi.fn(() => chain()),
+    select: write(table, "select"),
   }));
   return { calls, from };
 });
@@ -82,7 +82,7 @@ describe("insertMarketRow keeper_status", () => {
   });
 
   // A Resolved market is registered with status 'paused' (StatsCollector, #425). It must
-  // still be 'pending': 'retired' would blocklist its closing fills, 'active' would
+  // still be 'pending': 'retired' would drop its trades and events (blocklist.ts), 'active' would
   // count it as keeper-enrolled.
   it("a Resolved (status='paused') market is inserted keeper_status='pending' too", async () => {
     await expect(insertMarketRow({ ...row, status: "paused" })).resolves.toBe("inserted");
