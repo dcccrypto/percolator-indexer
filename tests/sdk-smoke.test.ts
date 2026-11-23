@@ -39,6 +39,9 @@ import {
   parseDexPool,
   discoverMarkets,
   SLAB_TIERS_V12_17,
+  LAYOUT_V21,
+  LAYOUT_V22,
+  LAYOUTS_BY_VERSION,
 } from "@percolatorct/sdk";
 
 // Type-only imports — these exercise the .d.ts surface without runtime cost.
@@ -158,5 +161,49 @@ describe("@percolatorct/sdk exports — parse function shapes (indexer)", () => 
 
   it("parseAllAccounts is a function", () => {
     expect(typeof parseAllAccounts).toBe("function");
+  });
+});
+
+// ── 6. v2.2 layout pins (vendored copy must match the deployed devnet program) ─
+//
+// The checks above pass on both the vendored SDK (cb444db) and SDK e1fe6692,
+// so they cannot see layout drift. e1fe6692 ships "variant C": engine
+// discriminator 20, market group 790 B (every group offset 16 B earlier) and
+// 10,607 B portfolios. Devnet still runs variant B (disc 19, 806 B group,
+// 10,603 B portfolios: 211/211 live portfolios on wrapper 6kpg2wi7…, slot
+// 525,544,627). With variant C, light discovery reads vault/cTot/insurance/
+// oracle authority 16 B off on 71/71 devnet markets and every portfolio decode
+// throws UnknownLayoutError. A re-vendor must change these pins on purpose,
+// only once devnet runs the new layout.
+//
+// Source: report idx-sdksmoke-vendor-drift-20261123 (J-20261123-IDX-REPORT-SDKSMOKEVENDORDRIFT).
+
+describe("@percolatorct/sdk layout pins — v2.2 variant B (devnet)", () => {
+  it("LAYOUT_V22 is wrapper VERSION 19 with engine discriminator 19", () => {
+    expect(LAYOUT_V22.version).toBe(19);
+    expect(LAYOUT_V22.engineDiscriminator).toBe(19);
+  });
+
+  it("LAYOUT_V22 market group is 806 B with vault at +333", () => {
+    expect(LAYOUT_V22.marketGroupLen).toBe(806);
+    expect(LAYOUT_V22.group.vault).toBe(333);
+  });
+
+  it("LAYOUT_V22 portfolio account is 10,603 B", () => {
+    expect(LAYOUT_V22.portfolio.accountLen).toBe(10603);
+  });
+
+  it("LAYOUT_V22 and LAYOUT_V21 bond tranche body is 128 B", () => {
+    expect(LAYOUT_V22.accounts.bondTrancheBody).toBe(128);
+    expect(LAYOUT_V21.accounts.bondTrancheBody).toBe(128);
+  });
+
+  it("LAYOUTS_BY_VERSION[19] (the table resolve.ts reads) carries the same pins", () => {
+    const v19 = LAYOUTS_BY_VERSION.get(19);
+    expect(v19).toBeDefined();
+    expect(v19?.engineDiscriminator).toBe(19);
+    expect(v19?.marketGroupLen).toBe(806);
+    expect(v19?.group.vault).toBe(333);
+    expect(v19?.portfolio.accountLen).toBe(10603);
   });
 });
