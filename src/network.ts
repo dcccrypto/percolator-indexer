@@ -6,11 +6,22 @@
  */
 export type NetworkType = "devnet" | "testnet" | "mainnet";
 
+/**
+ * Unset (or empty) NETWORK keeps the devnet default. A set but unknown value
+ * throws at import: CURRENT_NETWORK tags every row written and filters every
+ * read, so silently mapping a typo to devnet would put a non-devnet indexer's
+ * rows under the devnet tag. "mainnet-beta" is NOT aliased: @percolatorct/shared
+ * (getNetwork, validateNetworkConfig) in the same process does not accept it.
+ */
 function resolveNetwork(): NetworkType {
-  const n = (process.env.NETWORK ?? "devnet").toLowerCase().trim();
-  if (n === "mainnet") return "mainnet";
+  const raw = process.env.NETWORK;
+  const n = (raw ?? "").toLowerCase().trim();
+  if (n === "" || n === "devnet") return "devnet";
   if (n === "testnet") return "testnet";
-  return "devnet";
+  if (n === "mainnet") return "mainnet";
+  throw new Error(
+    `Unknown NETWORK value ${JSON.stringify(raw)}: expected one of "devnet", "testnet", "mainnet" (or unset for devnet)`,
+  );
 }
 
 /**
