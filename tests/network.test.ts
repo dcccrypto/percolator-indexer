@@ -99,5 +99,55 @@ describe("network", () => {
       process.env.NETWORK = "12345";
       await expect(loadNetwork()).rejects.toThrow(/Unknown NETWORK value "12345"/);
     });
+
+    // M22: the message must quote the value exactly as set (case and whitespace kept),
+    // not the normalised one, so an operator sees what is really in the env.
+    it("names the raw value, case and whitespace kept, in the error", async () => {
+      process.env.NETWORK = " Staging\n";
+      const err = await loadNetwork().then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain(JSON.stringify(" Staging\n"));
+    });
+  });
+
+  // M05: secret stores and shell files leave \n or \r\n behind. Every kind of whitespace is
+  // trimmed (as shared's boot validator does), not only ASCII spaces.
+  describe("any whitespace is trimmed", () => {
+    it.each([
+      ["\tmainnet\n", "mainnet"],
+      ["testnet\r\n", "testnet"],
+      ["\n", "devnet"],
+      ["\t \r\n", "devnet"],
+    ])("%j -> %s", async (value, want) => {
+      process.env.NETWORK = value;
+      const { CURRENT_NETWORK } = await loadNetwork();
+      expect(CURRENT_NETWORK).toBe(want);
+    });
+  });
+
+  // M18: only NETWORK picks the cluster. With NETWORK unset, every other cluster-like
+  // variable is ignored and the devnet default holds.
+  describe("only NETWORK is read", () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it("ignores other cluster env vars when NETWORK is unset", async () => {
+      for (const k of ["SOLANA_NETWORK", "SOLANA_CLUSTER", "CLUSTER", "NETWORK_NAME", "NEXT_PUBLIC_DEFAULT_NETWORK", "NEXT_PUBLIC_NETWORK", "DEFAULT_NETWORK"]) {
+        vi.stubEnv(k, "mainnet");
+      }
+      const { CURRENT_NETWORK } = await loadNetwork();
+      expect(CURRENT_NETWORK).toBe("devnet");
+    });
+  });
+
+  // M21: CURRENT_NETWORK is read once at import and never changes for the life of the
+  // module, even if NETWORK changes later in the process.
+  describe("fixed at import", () => {
+    it("a later NETWORK change is not picked up", async () => {
+      process.env.NETWORK = "testnet";
+      const mod = await loadNetwork();
+      process.env.NETWORK = "mainnet";
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mod.CURRENT_NETWORK).toBe("testnet");
+    });
   });
 });
