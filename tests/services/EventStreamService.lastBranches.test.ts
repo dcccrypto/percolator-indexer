@@ -17,7 +17,7 @@ vi.mock("../../src/db/insertTradeRow.js", () => ({
   tradeKey: (r: any) => `${r.tx_signature}|${r.asset_index}|${r.leg_index}`,
   insertTradeRows: vi.fn(async (rows: any[]) => { rowsOut.push(...rows); return rows; }),
 }));
-vi.mock("../../src/services/v22LogEvents.js", () => ({ recordV22LogEvents: vi.fn(async () => ({ status: logEvents.status })) }));
+vi.mock("../../src/services/v22LogEvents.js", () => ({ recordV22LogEvents: vi.fn(async () => ({ status: logEvents.status, rows: 2, slab: "LOGSLAB" })) }));
 import { EventStreamService } from "../../src/services/EventStreamService.js";
 import { resetLotExpCache } from "../../src/parsers/lotScale.js";
 import { buildMarket, LAYOUT_V22 } from "../helpers/v22Fixtures.js";
@@ -47,13 +47,19 @@ describe("EventStreamService last branches", () => {
     logEvents.status = "write_failed";
     const err = await (mk(slabBytes(6)) as any).handle(msg()).then(() => null, (e: unknown) => e);
     expect(rowsOut).toHaveLength(1); // fill indexed first, unconditionally
-    expect(String(err)).toMatch(/v22_events write failed after retries/);
+    // The log events are not retried: the error must not claim retries, and the record must carry their slab.
+    expect(String(err)).toMatch(/v22 log events \(2\) write failed \(not retried\)/);
+    expect(String(err)).not.toMatch(/after retries/);
+    expect(recordSkipped).toHaveBeenCalledWith([
+      { signature: f.tx.signature, source: "v22-events", slab: "LOGSLAB", error: "v22 log events (2) write failed (not retried)" },
+    ]);
   });
 
   it("log-event ok: handler succeeds (control)", async () => {
     const err = await (mk(slabBytes(6)) as any).handle(msg()).then(() => null, (e: unknown) => e);
     expect(err).toBeNull();
     expect(rowsOut).toHaveLength(1);
+    expect(recordSkipped).not.toHaveBeenCalled();
   });
 
   it.each([["null account", null], ["account without data", { data: undefined }]])(

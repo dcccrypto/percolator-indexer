@@ -85,6 +85,8 @@ export interface RecordLogEventsResult {
   status: "not_applicable" | "failed" | "ok" | "unknown" | "write_failed";
   rows: number;
   unknownReason?: UnknownReason;
+  /** On "write_failed": the first market among the rows that were not written ("" when none names one). */
+  slab?: string;
 }
 
 /** Decode and write one transaction's log events. Never throws. */
@@ -121,7 +123,7 @@ export async function recordV22LogEvents(input: RecordLogEventsInput): Promise<R
         if (!(err instanceof V22EventWriteError)) throw err;
         // The DB write failed (already counted + alerted in insertV22Events). Report it instead of pretending it was recorded,
         // so a caller that can be redelivered (the webhook) answers 5xx.
-        return { status: "write_failed", rows: res.rows.length };
+        return { status: "write_failed", rows: res.rows.length, slab: res.rows.find((r) => r.slab_address)?.slab_address ?? "" };
       }
     }
     const markers = liquidationMarkers(res.rows);
