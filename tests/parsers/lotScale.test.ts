@@ -57,7 +57,8 @@ describe("perTokenPrice", () => {
   });
 
   it("non-default lots are ONE division by 10^(6+lot): bit-exact, not just close", () => {
-    // A two-step price / 1e6 / 10^lot gives 9.999999999999999e-10, 3.3000000000000004e-8, 6.999999999999999e-21 here.
+    // A two-step price / 1e6 / 10^lot gives 9.999999999999999e-10, 3.3000000000000004e-8, 3.3000000000000005e-14,
+    // 6.999999999999999e-21 here.
     expect(perTokenPrice(1n, 3)).toBe(1e-9);
     expect(perTokenPrice(33n, 3)).toBe(3.3e-8);
     expect(perTokenPrice(33, 9)).toBe(3.3e-14);
@@ -118,10 +119,10 @@ describe("lot_exp read from the market account", () => {
     expect(lotExpOfSlabData(d, 2)).toBe(0);
   });
 
-  it("a negative asset index reads 0 even when the bytes before slot 0 look like a lot_exp", () => {
+  it("a negative asset index reads 0 (not undefined)", () => {
     const d = buildMarket(LAYOUT_V22, { slots: 1 });
-    // The byte slotOff(-1) + profileLotExp would land on (inside the market group / config).
-    d[slotOff(LAYOUT_V22, 0) - LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlot.profileLotExp] = 9;
+    // One v2.2 slot is longer than the header, so slot -1 would read before byte 0 (undefined without the SDK guard).
+    expect(slotOff(LAYOUT_V22, -1) + LAYOUT_V22.wrapperSlot.profileLotExp).toBeLessThan(0);
     expect(lotExpOfSlabData(d, -1)).toBe(0);
   });
 
