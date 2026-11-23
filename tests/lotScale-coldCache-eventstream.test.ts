@@ -22,7 +22,8 @@ function slabBytes(lot: number, markEwmaE6?: bigint): Buffer {
   d[LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + LAYOUT_V22.wrapperSlot.profileLotExp] = lot;
   return Buffer.from(d);
 }
-async function run(slab: Buffer | "throw" | ((key: string) => Buffer), tx: any = f.tx) {
+/** `noExtra`: the spec asserts that no row arrives, so keep a short fixed tail after the pipeline has settled. */
+async function run(slab: Buffer | "throw" | ((key: string) => Buffer), tx: any = f.tx, noExtra = false) {
   const getAccountInfo = vi.fn(async (key: any) => {
     if (key.toBase58() === f.ctx) return { data: Buffer.from(f.ctxReturnHex.padEnd(640, "0"), "hex") };
     if (slab === "throw") throw new Error("rpc down");
@@ -33,7 +34,11 @@ async function run(slab: Buffer | "throw" | ((key: string) => Buffer), tx: any =
   const svc = new EventStreamService({ ws, programId: PROGRAM, connection: { getAccountInfo } as any, autoIndex: true, knownSlabs: [SLAB] });
   await svc.start();
   cb({ method: "transactionNotification", params: { result: tx } });
-  await new Promise((r) => setTimeout(r, 600));
+  // The real settle condition: a row was written OR the signature was recorded as skipped.
+  // Valid for this one-fill fixture only: with several fills a skip on one leg could settle before the others' batch insert.
+  // Timeout stays below vitest's 10 s testTimeout so a hang reports "pipeline not settled".
+  await vi.waitFor(() => { if (rowsOut.length === 0 && recordSkipped.mock.calls.length === 0) throw new Error("pipeline not settled"); }, { timeout: 8_000, interval: 5 });
+  if (noExtra) await new Promise((r) => setTimeout(r, 50));
   return rowsOut.splice(0);
 }
 
@@ -56,7 +61,7 @@ describe("event stream: TradeCpi on a cold lot_exp cache", () => {
     expect(rows[0].price).toBeCloseTo(13.861751e-6, 18);
   });
   it("market stays unreadable: no row (a lot-0 price would be permanent), signature recorded so the poller retries", async () => {
-    expect(await run("throw")).toEqual([]);
+    expect(await run("throw", f.tx, true)).toEqual([]);
     expect(recordSkipped).toHaveBeenCalledWith([expect.objectContaining({ error: expect.stringContaining("lot_exp") })]);
   });
 });
