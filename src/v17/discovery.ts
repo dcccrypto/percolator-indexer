@@ -18,6 +18,7 @@
  */
 
 import { Connection, PublicKey } from "@solana/web3.js";
+import { isMarketResolved } from "../layout/resolve.js";
 import {
   parseWrapperConfigV17,
   parseAssetOracleProfileV17,
@@ -165,7 +166,8 @@ function makeV17SlabHeader(data: Uint8Array, _programId: PublicKey): SlabHeader 
     version,
     bump: 0,
     flags: 0,
-    resolved: false,
+    // Market-group engine mode byte. StatsCollector registers a Resolved market as `paused`, not `active` (RS-1).
+    resolved: isMarketResolved(data, "discoverV17Markets"),
     paused: false,
     admin,
     nonce: 0n,

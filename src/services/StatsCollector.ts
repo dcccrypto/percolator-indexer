@@ -985,7 +985,10 @@ export class StatsCollector {
             trading_fee_bps: autoFields.trading_fee_bps,
             lp_collateral: null,
             matcher_context: null,
-            status: "active",
+            // A Resolved market (engine mode byte, discovery sets header.resolved) is `paused`: trading is over but
+            // users still close and withdraw, so it must stay listed (`closed` hides it; markets.status allows
+            // active|closed|paused only). Every other market starts `active`.
+            status: market.header?.resolved === true ? "paused" : "active",
             logo_url: logoUrl,
           });
 
