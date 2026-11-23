@@ -34,7 +34,7 @@ describe("parseMarketsFilter", () => {
 });
 
 describe("call sites read the normalised list (K-M30/M31/M32)", () => {
-  it("no src file outside lib/programIds.ts reads config.allProgramIds", () => {
+  it("no src file outside lib/programIds.ts reads allProgramIds (raw list) in code", () => {
     const hits: string[] = [];
     const walk = (d: string) => {
       for (const f of readdirSync(d)) {
@@ -42,7 +42,7 @@ describe("call sites read the normalised list (K-M30/M31/M32)", () => {
         if (statSync(p).isDirectory()) walk(p);
         else if (p.endsWith(".ts") && !p.endsWith(join("lib", "programIds.ts"))) {
           readFileSync(p, "utf8").split("\n").forEach((l, i) => {
-            if (/config\.allProgramIds/.test(l) && !/^\s*(\/\/|\*)/.test(l)) hits.push(`${p}:${i + 1}`);
+            if (/\ballProgramIds\b/.test(l) && !/^\s*(\/\/|\*)/.test(l)) hits.push(`${p}:${i + 1}`);
           });
         }
       }
