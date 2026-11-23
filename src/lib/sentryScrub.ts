@@ -23,6 +23,12 @@ export const FILTERED = "[Filtered]";
 /** Keys whose whole value is a query string; dropped, since that is where the api-key lives. */
 const DROP_KEYS = new Set(["http.query", "url.query"]);
 
+/**
+ * Keys whose values the app passes in and may still hold (setExtra/setContext/setUser values,
+ * breadcrumb data incl. console args): scrubbed as copies, never written in place.
+ */
+const APP_KEYS = new Set(["extra", "contexts", "user", "data"]);
+
 const API_KEY_PARAM = /\b(api[-_]?key)=[^&#\s"'<>]*/gi;
 const DISCORD_WEBHOOK_TOKEN = /(\/api(?:\/v\d+)?\/webhooks\/\d+\/)[^/?#\s"'<>]+/gi;
 
@@ -58,21 +64,76 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
   return r;
 }
 
-/** Scrub every string in `value` in place (objects/arrays); returns the scrubbed value. */
-export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>()): T {
+/**
+ * Scrub every string in `value`; returns the scrubbed value. Only the SDK-built skeleton of an
+ * event or breadcrumb is assigned in place. Class/toJSON objects, byte views, and everything under
+ * APP_KEYS (`inCopy`) come back as scrubbed copies, so nothing the app still holds is written to.
+ */
+export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>(), copies = new WeakMap<object, unknown>(), inCopy = false): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
   if (value === null || typeof value !== "object") return value;
   // Sentry serialises these in `extra`/contexts (href; name/message/stack), so scrub a plain copy.
   if (value instanceof URL) return scrubString(value.href, secrets) as T;
-  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen) as T;
-  // Only plain data: events also reference live SDK objects (scopes, client, spans) that are never
-  // serialised and must not be walked or mutated.
+  if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen, copies, inCopy) as T;
+  // Bytes go out as their numbers, so a secret inside them survives string scrubbing.
+  if (ArrayBuffer.isView(value)) {
+    try {
+      const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
+      return (scrubString(text, secrets) === text ? value : FILTERED) as T;
+    } catch {
+      return FILTERED as T; // e.g. a view over a detached buffer
+    }
+  }
+  // Anything else Sentry sends as toJSON(), or for class instances (a web3 Connection, a client or
+  // response class, Map/Headers) as their own enumerable props. Scrub a plain copy of that: the live
+  // object, which may be the indexer's own Connection or an SDK scope, is never mutated.
   const proto = Object.getPrototypeOf(value);
-  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) return value;
+  let toJSON: unknown;
+  try {
+    toJSON = (value as { toJSON?: unknown }).toJSON;
+  } catch {
+    return FILTERED as T; // a throwing toJSON getter
+  }
+  if (typeof toJSON === "function" || (!Array.isArray(value) && proto !== Object.prototype && proto !== null)) {
+    if (copies.has(value)) return copies.get(value) as T; // shared reference: reuse its scrubbed copy
+    if (seen.has(value)) return FILTERED as T; // a copy cannot point back at itself; drop the cycle
+    seen.add(value);
+    let copy: unknown;
+    try {
+      copy = typeof toJSON === "function" ? toJSON.call(value) : Object.fromEntries(Object.keys(value).map((k) => [k, (value as Record<string, unknown>)[k]]));
+    } catch {
+      return FILTERED as T; // a throwing getter/toJSON: Sentry could not serialise it either
+    }
+    const out = scrubDeep(copy, secrets, seen, copies, true);
+    seen.delete(value); // only ancestors count as a cycle
+    copies.set(value, out);
+    return out as T;
+  }
+  if (inCopy) {
+    // Plain children of a live object: build a scrubbed copy, same sharing/cycle rules as above.
+    if (copies.has(value)) return copies.get(value) as T;
+    if (seen.has(value)) return FILTERED as T;
+    seen.add(value);
+    let out: unknown;
+    try {
+      out = Array.isArray(value)
+        ? value.map((v) => scrubDeep(v, secrets, seen, copies, true))
+        : Object.fromEntries(
+            Object.keys(value)
+              .filter((k) => !DROP_KEYS.has(k))
+              .map((k) => [scrubString(k, secrets), scrubDeep((value as Record<string, unknown>)[k], secrets, seen, copies, true)]),
+          );
+    } catch {
+      out = FILTERED; // a throwing getter
+    }
+    seen.delete(value);
+    copies.set(value, out);
+    return out as T;
+  }
   if (seen.has(value)) return value;
   seen.add(value);
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) value[i] = scrubDeep(value[i], secrets, seen);
+    for (let i = 0; i < value.length; i++) value[i] = scrubDeep(value[i], secrets, seen, copies);
     return value;
   }
   const obj = value as Record<string, unknown>;
@@ -82,7 +143,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
       delete obj[key];
       continue;
     }
-    obj[key] = scrubDeep(obj[key], secrets, seen);
+    obj[key] = scrubDeep(obj[key], secrets, seen, copies, APP_KEYS.has(key));
   }
   return value;
 }
