@@ -152,7 +152,8 @@ describe("resolveIdentitiesByCa", () => {
 });
 
 // The tests below each name the mutant(s) of resolveIdentitiesByCa they kill
-// (mutation pass J-20261123-IDX-REPORT-DEXSCREENERIDENTITYMUT, M01..M34).
+// (mutation pass J-20261123-IDX-REPORT-DEXSCREENERIDENTITYMUT, M01..M34; M32,
+// `Array.isArray(pairs)` -> `pairs ?? []`, is equivalent and survives).
 
 describe("resolveIdentitiesByCa: request shape", () => {
   beforeEach(() => vi.unstubAllGlobals());
