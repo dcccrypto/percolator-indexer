@@ -55,7 +55,8 @@ const wrapperData = (tag: number): string => encodeBase58(new Uint8Array([tag, 0
 const logs = (...t: string[]): string[] => [`Program ${W} invoke [1]`, ...t.map((x) => `Program data: ${x}`), `Program ${W} consumed 1 of 2 compute units`, `Program ${W} success`];
 
 beforeEach(() => {
-  insertV22Events.mockClear(); vi.mocked(parsePercolatorLiquidations).mockClear(); vi.mocked(rawInstructionsFromParsedTx).mockClear();
+  // mockReset (not mockClear): an unconsumed *Once throw must not leak into the next test. vi.fn(impl) resets to impl.
+  insertV22Events.mockReset(); vi.mocked(parsePercolatorLiquidations).mockReset(); vi.mocked(rawInstructionsFromParsedTx).mockReset();
   h.blocked.clear(); resetMarketLayoutNotes(); resetLogEventStats();
 });
 
@@ -66,6 +67,15 @@ describe("poll path (TradeIndexer.processTransaction)", () => {
     transaction: { message: { instructions: [{ programId: new PublicKey(W), accounts: [TAKER, M].map((k) => new PublicKey(k)), data: wrapperData(tag) }] } },
   });
   const poll = (tx: unknown, slab: string) => (new TradeIndexerPolling() as any).processTransaction(tx, "SIGPOLL", slab, new Set([W])).catch(() => undefined);
+  type Pass = { earlier: Set<string>; incomplete: boolean; writeFailed?: boolean; failedSigs?: Set<string> };
+  const tx = (logMessages: string[] | null, accounts = [TAKER, M], err: unknown = null) => ({
+    ...web3(logMessages),
+    meta: { err, logMessages, innerInstructions: [] },
+    transaction: { message: { instructions: [{ programId: new PublicKey(W), accounts: accounts.map((k) => new PublicKey(k)), data: wrapperData(10) }] } },
+  });
+  const run = (t: unknown, slab = M, sig = SIG88, pass: Pass = { earlier: new Set(), incomplete: false }) =>
+    (new TradeIndexerPolling() as any).processTransaction(t, sig, slab, new Set([W]), pass).then(() => null, (e: unknown) => e);
+  const rowsOf = (call = 0) => insertV22Events.mock.calls[call][0] as Array<Record<string, any>>;
 
   it("writes the FILL of the polled slab", async () => {
     await poll(web3(logs(EX.fill_clipped_tradecpi.b64)), M);
@@ -104,17 +114,8 @@ describe("poll path (TradeIndexer.processTransaction)", () => {
     expect(err).toBeNull();
     expect(insertV22Events).toHaveBeenCalledTimes(1);
     expect(pass.writeFailed).toBeUndefined(); // an unexpected bug is not a DB write failure
+    expect(parsePercolatorLiquidations).toHaveBeenCalledTimes(1); // trade path reached
   });
-
-  type Pass = { earlier: Set<string>; incomplete: boolean; writeFailed?: boolean; failedSigs?: Set<string> };
-  const tx = (logMessages: string[] | null, accounts = [TAKER, M], err: unknown = null) => ({
-    ...web3(logMessages),
-    meta: { err, logMessages, innerInstructions: [] },
-    transaction: { message: { instructions: [{ programId: new PublicKey(W), accounts: accounts.map((k) => new PublicKey(k)), data: wrapperData(10) }] } },
-  });
-  const run = (t: unknown, slab = M, sig = SIG88, pass: Pass = { earlier: new Set(), incomplete: false }) =>
-    (new TradeIndexerPolling() as any).processTransaction(t, sig, slab, new Set([W]), pass).then(() => null, (e: unknown) => e);
-  const rowsOf = (call = 0) => insertV22Events.mock.calls[call][0] as Array<Record<string, any>>;
 
   it("a trade-path failure after the events does not lose them (events are recorded first)", async () => {
     vi.mocked(parsePercolatorLiquidations).mockImplementationOnce(() => { throw new Error("trade path down"); });
