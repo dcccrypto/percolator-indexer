@@ -1,6 +1,7 @@
 import { accessSync, appendFileSync, constants, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { createLogger, getSupabase, getNetwork, captureException } from "@percolatorct/shared";
+import { createLogger, getSupabase, captureException } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:skipped-signatures");
 
@@ -79,12 +80,7 @@ export async function recordSkippedSignatures(allRows: readonly SkippedSignature
   } catch {
     /* alerting must not break ingestion */
   }
-  let network: string | null = null;
-  try {
-    network = getNetwork();
-  } catch {
-    /* unset in some test/dev setups */
-  }
+  const network = CURRENT_NETWORK;
   try {
     const { error } = await getSupabase()
       .from("skipped_signatures")

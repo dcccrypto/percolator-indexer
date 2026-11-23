@@ -22,6 +22,7 @@ import {
   resetSkippedSignatureCount,
   resetSkippedSignatureDedupe,
 } from "../src/lib/skippedSignatures.js";
+import { CURRENT_NETWORK } from "../src/network.js";
 
 const mk = (n: number, error = "boom") => ({ signature: `sig-${n}`, source: "creator-lookup" as const, slab: `slab-${n}`, error });
 
@@ -57,10 +58,11 @@ describe("skippedSignatures: error and fallback branches", () => {
     expect(extra.slabs).toEqual(["slab-1"]);
   });
 
-  it("an unset network writes network: null and still records", async () => {
+  it("tags rows with the indexer's CURRENT_NETWORK and never asks shared getNetwork (NET-SPLIT)", async () => {
     getNetwork.mockImplementation(() => { throw new Error("no network"); });
     await recordSkippedSignatures([mk(1)]);
-    expect(upsert.mock.calls[0]![1][0].network).toBeNull();
+    expect(upsert.mock.calls[0]![1][0].network).toBe(CURRENT_NETWORK);
+    expect(getNetwork).not.toHaveBeenCalled();
   });
 
   it("truncates the error to 200 chars in the log and 500 in the table", async () => {

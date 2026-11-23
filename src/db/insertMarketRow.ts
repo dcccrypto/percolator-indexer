@@ -1,4 +1,5 @@
-import { getSupabase, getNetwork, createLogger } from "@percolatorct/shared";
+import { getSupabase, createLogger } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 
 const logger = createLogger("indexer:markets");
 
@@ -76,7 +77,7 @@ export type InsertMarketRowResult =
  * as "exists", the same as before.
  */
 export async function insertMarketRow(row: IndexerMarketRow): Promise<InsertMarketRowResult> {
-  const network = getNetwork();
+  const network = CURRENT_NETWORK;
   const { error } = await getSupabase().from("markets").insert({
     ...row,
     metadata_source: "auto",
@@ -168,7 +169,7 @@ export async function updateAutoMarketMetadata(
     .from("markets")
     .update(patch)
     .eq("slab_address", slabAddress)
-    .eq("network", getNetwork())
+    .eq("network", CURRENT_NETWORK)
     .eq("metadata_source", "auto")
     .select("slab_address");
 

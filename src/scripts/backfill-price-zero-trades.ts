@@ -25,7 +25,8 @@
  */
 
 import { pathToFileURL } from "node:url";
-import { getSupabase, getNetwork } from "@percolatorct/shared";
+import { getSupabase } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 import { config } from "@percolatorct/shared";
 import { detectSlabLayout } from "@percolatorct/sdk";
 
@@ -202,7 +203,7 @@ export async function main() {
     const { data: page, error: fetchErr } = await supabase
       .from("trades")
       .select("id, slab_address, tx_signature, price")
-      .eq("network", getNetwork())
+      .eq("network", CURRENT_NETWORK)
       .eq("price", 0)
       .not("tx_signature", "is", null)
       .order("created_at", { ascending: true })
@@ -318,7 +319,7 @@ export async function main() {
           .from("trades")
           .update({ price })
           .eq("id", id)
-          .eq("network", getNetwork())
+          .eq("network", CURRENT_NETWORK)
           .eq("price", 0) // guard: only overwrite if still 0
           .select("id") // return changed rows so we can count real updates
       )
@@ -342,7 +343,7 @@ export async function main() {
   const { count: remaining, error: countErr } = await supabase
     .from("trades")
     .select("id", { count: "exact", head: true })
-    .eq("network", getNetwork())
+    .eq("network", CURRENT_NETWORK)
     .eq("price", 0);
 
   if (countErr) {

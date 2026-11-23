@@ -12,6 +12,11 @@ export type NetworkType = "devnet" | "testnet" | "mainnet";
  * read, so silently mapping a typo to devnet would put a non-devnet indexer's
  * rows under the devnet tag. "mainnet-beta" is NOT aliased: @percolatorct/shared
  * (getNetwork, validateNetworkConfig) in the same process does not accept it.
+ *
+ * This is the ONLY cluster resolver in indexer src. Do not call shared's
+ * getNetwork(): it is exact "mainnet" else "devnet" (no case fold, trim or
+ * testnet), so NETWORK=testnet would tag trades/markets/v22_events as devnet
+ * while LP-vault rows get testnet (tests/network-single-resolver.test.ts).
  */
 function resolveNetwork(): NetworkType {
   const raw = process.env.NETWORK;

@@ -1,4 +1,5 @@
-import { createLogger, getSupabase, getNetwork, captureException } from "@percolatorct/shared";
+import { createLogger, getSupabase, captureException } from "@percolatorct/shared";
+import { CURRENT_NETWORK } from "../network.js";
 import type { V22EventRow } from "../parsers/v22Events.js";
 
 const logger = createLogger("indexer:v22-events");
@@ -67,7 +68,7 @@ function isTableMissing(error: { code?: string; message?: string }): boolean {
 export async function insertV22Events(rows: readonly V22EventRow[]): Promise<number> {
   if (rows.length === 0) return 0;
   try {
-    const network = getNetwork();
+    const network = CURRENT_NETWORK;
     const { error } = await getSupabase()
       .from("v22_events")
       .upsert(

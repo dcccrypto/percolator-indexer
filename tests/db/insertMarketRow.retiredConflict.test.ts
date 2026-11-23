@@ -4,8 +4,8 @@
  * markets.slab_address is UNIQUE across the whole table (v17 baseline), whatever the row's
  * network or keeper_status. Two existing-row shapes make every later auto-insert hit 23505:
  *
- *  - a row under the OTHER network value (an earlier run with NETWORK unset or misspelled:
- *    shared getNetwork() falls back to devnet). getMarketRows() reads only this network's
+ *  - a row under the OTHER network value (an earlier run with NETWORK unset, or one from before
+ *    NET-SPLIT when shared getNetwork() mapped testnet/case variants to devnet). getMarketRows() reads only this network's
  *    rows, so the slab looks missing every sweep, the insert is retried every sweep, and this
  *    network never gets a row. Scratch PG16 + real PostgREST: row unchanged, no log, 0 rows
  *    visible to the next sweep.
@@ -111,11 +111,20 @@ describe("insertMarketRow: 23505 against a row this network cannot see or will n
   });
 
   it("works from the other side too (NETWORK=the other value, row under devnet)", async () => {
-    m.network = OTHER;
-    existing({ network: "devnet", keeper_status: "pending" });
-    await expect(insertMarketRow(row)).resolves.toBe("exists_other_network");
-    expect(m.warn.mock.calls[0][1]).toMatchObject({ network: OTHER, existingNetwork: "devnet" });
-    expectNoWriteBack();
+    // The network comes from src/network.ts (NETWORK env read at import), not shared getNetwork:
+    // the shared mock keeps saying devnet and must be ignored.
+    vi.stubEnv("NETWORK", OTHER);
+    vi.resetModules();
+    try {
+      const { insertMarketRow: insertOther } = await import("../../src/db/insertMarketRow.js");
+      existing({ network: "devnet", keeper_status: "pending" });
+      await expect(insertOther(row)).resolves.toBe("exists_other_network");
+      expect(m.warn.mock.calls[0][1]).toMatchObject({ network: OTHER, existingNetwork: "devnet" });
+      expectNoWriteBack();
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 
   it("names a same-network 'retired' row (its trades and events are dropped) and leaves it retired", async () => {
