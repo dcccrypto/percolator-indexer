@@ -15,7 +15,16 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const H = vi.hoisted(() => ({ conn: null as any, rows: [] as any[] }));
+const H = vi.hoisted(() => ({ conn: null as any, rows: [] as any[], dbRows: [] as any[], writes: [] as any[][][], db: false }));
+
+/** Records every chained call of one `from("markets")...` statement; awaiting it resolves to `{ error: null }`. */
+function recorder(ops: any[][]): any {
+  const p: any = new Proxy(function () {}, {
+    get: (_t, k) =>
+      k === "then" ? (res: any) => res({ data: [], error: null }) : (...args: any[]) => (ops.push([String(k), ...args]), p),
+  });
+  return p;
+}
 
 vi.mock("@percolatorct/shared", async (orig) => {
   const real: any = await orig();
@@ -24,11 +33,12 @@ vi.mock("@percolatorct/shared", async (orig) => {
     getConnection: () => H.conn,
     getNetwork: () => "devnet",
     getSupabase: () => {
-      throw new Error("no DB in this test");
+      if (!H.db) throw new Error("no DB in this test");
+      return { from: (t: string) => { const ops: any[][] = [["from", t]]; H.writes.push(ops); return recorder(ops); }, rpc: () => recorder([]) };
     },
   };
 });
-vi.mock("../../src/db/marketRows.js", () => ({ getMarketRows: async () => [] }));
+vi.mock("../../src/db/marketRows.js", () => ({ getMarketRows: async () => H.dbRows }));
 vi.mock("../../src/db/insertMarketRow.js", async (orig) => {
   const real: any = await orig();
   return { ...real, insertMarketRow: vi.fn(async (row: any) => void H.rows.push(row)) };
@@ -54,6 +64,9 @@ const parsedByMint = new Map(FIXTURE.markets.map((m) => [m.mint, m.mintParsed]))
 
 beforeEach(() => {
   H.rows.length = 0;
+  H.dbRows = [];
+  H.writes = [];
+  H.db = false;
   H.conn = {
     rpcEndpoint: "http://127.0.0.1:0", // not helius -> DAS lookup returns null without a request
     getProgramAccounts: async (_p: unknown, o: any) =>
@@ -70,8 +83,38 @@ beforeEach(() => {
     getTransaction: async () => null,
     getParsedAccountInfo: async (pk: PublicKey) => ({ context: { slot: 1 }, value: parsedByMint.get(pk.toBase58()) ?? null }),
     getAccountInfo: async () => null,
+    getMultipleAccountsInfo: async (keys: PublicKey[]) =>
+      keys.map((k) => {
+        const a = accounts.find((x) => x.pubkey.equals(k));
+        return a ? { data: Buffer.from(a.data), owner: PROGRAM_ID, lamports: 1, executable: false } : null;
+      }),
   };
 });
+
+/**
+ * One real StatsCollector.collect() cycle (registration + sweep) with `dbRows` as the existing markets rows.
+ * Returns, per slab, the status every markets UPDATE would write to it (payload status + the update's filters).
+ */
+async function sweep(dbRows: any[]) {
+  H.db = true;
+  H.dbRows = dbRows;
+  const discovered = await discoverV17Markets(H.conn, PROGRAM_ID);
+  const provider = { getMarkets: () => new Map(discovered.map((m) => [m.slabAddress.toBase58(), { market: m }])) };
+  const sc: any = new StatsCollector(provider as any);
+  sc._running = true;
+  await sc.collect();
+  const writes = new Map<string, Array<{ status: string; filters: string }>>();
+  for (const ops of H.writes) {
+    const upd = ops.find((o) => o[0] === "update");
+    if (ops[0][1] !== "markets" || !upd || !("status" in upd[1])) continue;
+    const slabs: string[] = ops.find((o) => o[0] === "in" && o[1] === "slab_address")?.[2] ?? [];
+    const filters = ops.filter((o) => o[0] === "eq" || o[0] === "neq").map((o) => `${o[0]}(${o[1]},${o[2]})`).join(".");
+    for (const s of slabs) writes.set(s, [...(writes.get(s) ?? []), { status: upd[1].status, filters }]);
+  }
+  return (slab: string) => writes.get(slab) ?? [];
+}
+
+const row = (slab: string, extra: Record<string, unknown>) => ({ slab_address: slab, keeper_status: "pending", ...extra });
 
 async function register(light: boolean) {
   const discovered = await discoverV17Markets(H.conn, PROGRAM_ID, undefined, light ? { light: true } : {});
@@ -110,4 +153,22 @@ describe("RS-1: Resolved devnet market is not registered as active", () => {
       for (const m of FIXTURE.markets) expect(row(m.slab).status).toBe(m.expectStatus);
     });
   }
+});
+
+// A market that resolves AFTER it was registered (the normal lifecycle: all 24 Resolved devnet markets were Live when
+// first seen) already has an `active` row, and registration only inserts missing rows. Real devnet census at slot
+// 525,547,637: 20 of the 24 Resolved markets kept `active` through a full collect() cycle (the other 4 are dust-closed).
+describe("RS-1 follow-up: the collect() sweep moves a Resolved market off `active`", () => {
+  it("an existing active row of a Resolved market is set to paused; the Live market's row is not touched", async () => {
+    const writes = await sweep(FIXTURE.markets.map((m) => row(m.slab, { indexer_excluded: false })));
+    expect(writes(RESOLVED.slab)).toEqual([{ status: "paused", filters: "eq(network,devnet).eq(status,active)" }]);
+    expect(writes(LIVE.slab)).toEqual([]);
+  });
+
+  it("re-enabling an excluded Resolved market writes paused, an excluded Live market active", async () => {
+    const writes = await sweep(FIXTURE.markets.map((m) => row(m.slab, { indexer_excluded: true })));
+    expect(writes(RESOLVED.slab)[0]).toEqual({ status: "paused", filters: "eq(network,devnet)" });
+    expect(writes(RESOLVED.slab).map((w) => w.status)).not.toContain("active");
+    expect(writes(LIVE.slab)).toEqual([{ status: "active", filters: "eq(network,devnet)" }]);
+  });
 });
