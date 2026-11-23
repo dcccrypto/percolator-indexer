@@ -198,7 +198,7 @@ describe("@percolatorct/sdk layout pins — v2.2 variant B (devnet)", () => {
     expect(LAYOUT_V21.accounts.bondTrancheBody).toBe(128);
   });
 
-  it("LAYOUTS_BY_VERSION[19] (the table resolve.ts reads) carries the same pins", () => {
+  it("LAYOUTS_BY_VERSION[19] (the table resolve.ts and the SDK resolvers read) carries the same pins", () => {
     const v19 = LAYOUTS_BY_VERSION.get(19);
     expect(v19).toBeDefined();
     expect(v19?.engineDiscriminator).toBe(19);
