@@ -344,8 +344,7 @@ export class TradeIndexerPolling {
       for (const market of markets) {
         if (!this._running) break;
         try {
-          await this.indexTradesForSlab(market.slab_address, BACKFILL_SIGNATURES);
-          loopLiveness.beat(TRADE_POLL_LOOP);
+          if (await this.indexTradesForSlab(market.slab_address, BACKFILL_SIGNATURES)) loopLiveness.beat(TRADE_POLL_LOOP);
         } catch (err) {
           logger.error("Backfill error", {
             slabAddress: market.slab_address.slice(0, 8),
@@ -390,8 +389,10 @@ export class TradeIndexerPolling {
     try {
       await this.pollAllMarketsOnce();
     } finally {
+      // No beat here: a pass that ended is not progress. A pass in which every market failed (RPC timing out at its
+      // deadline, every read rejected) used to beat on the way out, so /health stayed ok forever while nothing was
+      // indexed. Progress is beaten in pollAllMarketsOnce: per finished market, or a pass with nothing to poll.
       this.pollInFlight = false;
-      loopLiveness.beat(TRADE_POLL_LOOP);
     }
   }
 
@@ -405,11 +406,12 @@ export class TradeIndexerPolling {
 
     try {
       const markets = await this.pollTargets();
+      // Nothing to poll (no markets yet, or all excluded) is a healthy pass, not a stall.
+      if (markets.length === 0) loopLiveness.beat(TRADE_POLL_LOOP);
       for (const market of markets) {
         if (!this._running) break;
         try {
-          await this.indexTradesForSlab(market.slab_address, MAX_SIGNATURES);
-          loopLiveness.beat(TRADE_POLL_LOOP);
+          if (await this.indexTradesForSlab(market.slab_address, MAX_SIGNATURES)) loopLiveness.beat(TRADE_POLL_LOOP);
         } catch (err) {
           logger.error("Poll error", { 
             slabAddress: market.slab_address.slice(0, 8),
@@ -427,9 +429,12 @@ export class TradeIndexerPolling {
 
   /**
    * Debounce processing — cranks happen in batches, wait a bit
-   * to collect all slabs before processing
+   * to collect all slabs before processing.
+   *
+   * Returns false when the RPC reads failed (the signature window, or a transaction batch), true otherwise. Only a
+   * true counts as loop progress for /health: a pass whose reads all fail indexes nothing.
    */
-  private async indexTradesForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<void> {
+  private async indexTradesForSlab(slabAddress: string, maxSigs = MAX_SIGNATURES): Promise<boolean> {
     // Per-call deadline (rpcDeadline.ts): a held call rejects instead of parking the pass behind pollInFlight.
     const rawConnection = deadlineConnection(getConnection());
     const connection = paceConnection(rawConnection, this.rpcLimiter);
@@ -451,10 +456,10 @@ export class TradeIndexerPolling {
         slabAddress: slabAddress.slice(0, 8),
         error: err instanceof Error ? err.message : err,
       });
-      return;
+      return false;
     }
 
-    if (signatures.length === 0) return;
+    if (signatures.length === 0) return true;
 
     // #147: Do NOT advance the cursor here. We commit lastSignature only after
     // the entire batch is fetched and processed successfully. Advancing it before
@@ -479,7 +484,7 @@ export class TradeIndexerPolling {
     if (validSigs.length === 0) {
       // No valid txs in this window but signatures were fetched — safe to advance.
       await this.commitCursor(slabAddress, signatures[0].signature);
-      return;
+      return true;
     }
 
     let indexed = 0;
@@ -623,6 +628,7 @@ export class TradeIndexerPolling {
     if (indexed > 0) {
       logger.info("Trades indexed", { count: indexed, slabAddress: slabAddress.slice(0, 8) });
     }
+    return !batchFailed;
   }
 
   /**
