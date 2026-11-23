@@ -718,7 +718,7 @@ describe('MarketDiscovery light pass and new-only notification (#223)', () => {
     await expect(d.discoverLight()).resolves.toEqual([]);
     expect(d.getMarkets().size).toBe(2);
 
-    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // swallowed RPC error returns []
+    vi.mocked(v17disc.discoverV17Markets).mockResolvedValue([] as any); // a program with no markets (a failed light scan now throws: DISCL-1)
     await expect(d.discoverLight()).resolves.toEqual([]);
     expect(d.getMarkets().size).toBe(2);
 

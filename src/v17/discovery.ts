@@ -355,7 +355,8 @@ export const V17_REGISTRATION_SLICE_LEN = registrationSliceLen();
  * @param programId     Program that owns the market accounts
  * @param knownAddresses Optional specific addresses to fetch (MARKETS_FILTER path)
  * @param opts.light     Sliced scan (header bytes only) for the fast discovery pass
- * @returns Parsed v17 DiscoveredMarket array
+ * @returns Parsed v17 DiscoveredMarket array. With `opts.light`, a failed getProgramAccounts scan is thrown, not
+ *          returned as []; without it the scan error is swallowed and the caller's SDK fallback covers it.
  */
 export async function discoverV17Markets(
   connection: Connection,
@@ -422,8 +423,11 @@ export async function discoverV17Markets(
       const market = parseV17Account(pubkey, programId, data);
       if (market) markets.push(market);
     }
-  } catch {
-    // getProgramAccounts may be rejected by the RPC — caller falls back to discoverMarkets()
+  } catch (e) {
+    // DISCL-1: on the light pass a failed scan (429 past web3's retries, JSON-RPC -32429, a truncated body) is not
+    // "0 markets". Rethrow so MarketDiscovery.discoverLight logs it per program. The full pass keeps the old
+    // behaviour: it falls back to the SDK's discoverMarkets(), whose own scan returns the same markets.
+    if (opts.light) throw e;
   }
 
   return markets;
