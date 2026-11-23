@@ -35,7 +35,9 @@ async function run(slab: Buffer | "throw" | ((key: string) => Buffer), tx: any =
   await svc.start();
   cb({ method: "transactionNotification", params: { result: tx } });
   // The real settle condition: a row was written OR the signature was recorded as skipped.
-  await vi.waitFor(() => { if (rowsOut.length === 0 && recordSkipped.mock.calls.length === 0) throw new Error("pipeline not settled"); }, { timeout: 10_000, interval: 5 });
+  // Valid for this one-fill fixture only: with several fills a skip on one leg could settle before the others' batch insert.
+  // Timeout stays below vitest's 10 s testTimeout so a hang reports "pipeline not settled".
+  await vi.waitFor(() => { if (rowsOut.length === 0 && recordSkipped.mock.calls.length === 0) throw new Error("pipeline not settled"); }, { timeout: 8_000, interval: 5 });
   if (noExtra) await new Promise((r) => setTimeout(r, 50));
   return rowsOut.splice(0);
 }
