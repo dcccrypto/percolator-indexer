@@ -69,9 +69,26 @@ export const MOVE_SUBS: Readonly<Record<number, string>> = { 1: "earn_exit", 2: 
 /**
  * Log-event rows live in the same table as the instruction events and share its unique key
  * (signature, ix_index, inner_index, network). Real inner-instruction indices are tiny, so a log event takes
- * `inner_index = LOG_EVENT_INNER_BASE + ordinal`, where `ordinal` is the row's position among the transaction's log-event rows.
+ * `inner_index = LOG_EVENT_INNER_BASE + ordinal`, where `ordinal` is the row's position among the transaction's decoded
+ * log-event rows. An `events_unknown` marker (ix_index -1, a slot no decoded event uses) takes
+ * `inner_index = LOG_EVENT_INNER_BASE + markerOrdinal(market)` instead: see `markerOrdinal`.
  */
 export const LOG_EVENT_INNER_BASE = 1_000_000;
+
+/**
+ * The ordinal of a market's `events_unknown` marker: a function of the market address alone (32-bit FNV-1a of the
+ * base58 string, top 30 bits). It used to be the market's position among the KNOWN v2.2 markets the tx names, so
+ * the poll path (one slab per pass) and the stream/webhook paths (the whole registry) gave one market different keys,
+ * and two markets the same key, which `insertV22Events`' ignoreDuplicates then dropped (LOGORD-1). A tx has at most
+ * one marker per market and markers alone use ix_index -1, so keying on the address is unique per tx and the same on
+ * every path, whatever its gate or wrapper id set. Two markets of one tx hashing alike (p ~ 2^-30 per pair) collide
+ * the same way on every path. 1,000,000 + (2^30 - 1) stays below the int4 column's 2^31 - 1.
+ */
+export function markerOrdinal(market: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < market.length; i++) h = Math.imul(h ^ market.charCodeAt(i), 0x01000193);
+  return h >>> 2;
+}
 
 /** Wrapper instructions that emit events. A transaction without one of them is not expected to carry any. */
 /**
@@ -443,17 +460,18 @@ export function decodeV22LogEvents(
       if (onlyMarking && !ixMarks(ix)) continue;
       for (const a of ix.accounts) if (a && gate.isKnownMarket(a) && gate.versionOf(a) === LAYOUT_V22.version) markets.add(a);
     }
-    return [...markets].sort().map((m) =>
-      mk(-1, {
-        kind: "events_unknown",
-        slab_address: m,
-        asset_index: null,
-        actor: null,
-        subject: null,
-        amount: null,
-        detail: { source: "log", reason, wrapper_instructions: wrapperInstructions.length, reconcile: "from_account_state" },
-      }),
-    );
+    return [...markets].sort().map((m) => ({
+      ...base,
+      ix_index: -1,
+      inner_index: LOG_EVENT_INNER_BASE + markerOrdinal(m), // not `ordinal++`: that numbered by the gate's known markets
+      kind: "events_unknown" as const,
+      slab_address: m,
+      asset_index: null,
+      actor: null,
+      subject: null,
+      amount: null,
+      detail: { source: "log", reason, wrapper_instructions: wrapperInstructions.length, reconcile: "from_account_state" },
+    }));
   };
 
   if (unlistedTag) {
@@ -508,7 +526,7 @@ export function decodeV22LogEvents(
     if (!accept(e.market)) {
       // The inner_index is part of the upsert key, so it must not depend on which markets THIS
       // path's gate knows (poll: one slab; stream/webhook: the registry). A gated-out event still
-      // consumes the ordinals its rows would have taken, so every path numbers a tx's decoded events identically. (events_unknown marker rows are still gate-dependent: follow-up.)
+      // consumes the ordinals its rows would have taken, so every path numbers a tx's decoded events identically. (events_unknown markers are keyed by market address: markerOrdinal.)
       ordinal += e.kind === "fill" ? e.recs.length : 1;
       continue;
     }
