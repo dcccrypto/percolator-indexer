@@ -313,6 +313,43 @@ describe("scrubString / scrubDeep", () => {
     expect(m!.scrubDeep({ extra: { bad } }).extra.bad).toBe(FILTERED_);
   });
 
+  it("never writes into live plain containers the app still holds (extra, contexts, console args)", async () => {
+    const m = await loadScrub();
+    expect(m).not.toBeNull();
+    const KEY = fake("LIVECONTAINER5");
+    class Conn {
+      url = `https://rpc.example/?api-key=${KEY}`;
+      getSlot() {
+        return 1;
+      }
+    }
+    const conn = new Conn();
+    const sig = new Uint8Array(Buffer.from(KEY));
+    const state = { conn, pool: [conn], sig, note: `key ${KEY}` };
+    const pool = [conn];
+    const ctx = { rpc: { conn, sig } };
+    const args = ["state", state];
+    const ev = m!.scrubDeep({ extra: { state, pool }, contexts: ctx, breadcrumbs: [{ category: "console", data: { arguments: args } }] }, [KEY]);
+    const crumb = { category: "console", data: { arguments: args } };
+    m!.scrubDeep(crumb, [KEY]);
+    // The caller's containers and objects are unchanged.
+    expect(state.conn).toBe(conn);
+    expect(state.conn.getSlot()).toBe(1);
+    expect(state.pool[0]).toBe(conn);
+    expect(state.sig).toBe(sig);
+    expect(state.note).toBe(`key ${KEY}`);
+    expect(pool[0]).toBe(conn);
+    expect(ctx.rpc.conn).toBe(conn);
+    expect(ctx.rpc.sig).toBe(sig);
+    expect(args[1]).toBe(state);
+    expect(conn.url).toContain(KEY);
+    // The event and breadcrumb still carry nothing secret.
+    expect(JSON.stringify(ev)).not.toContain(KEY);
+    expect(JSON.stringify(crumb)).not.toContain(KEY);
+    expect(ev.extra.state).toMatchObject({ conn: { url: `https://rpc.example/?api-key=${FILTERED_}` }, sig: FILTERED_, note: `key ${FILTERED_}` });
+    expect((crumb.data.arguments[1] as Record<string, unknown>).sig).toBe(FILTERED_);
+  });
+
   it("collects configured secret values from the env (FAKE values)", async () => {
     const m = await loadScrub();
     expect(m).not.toBeNull();

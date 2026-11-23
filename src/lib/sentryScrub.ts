@@ -23,6 +23,12 @@ export const FILTERED = "[Filtered]";
 /** Keys whose whole value is a query string; dropped, since that is where the api-key lives. */
 const DROP_KEYS = new Set(["http.query", "url.query"]);
 
+/**
+ * Keys whose values the app passes in and may still hold (setExtra/setContext/setUser values,
+ * breadcrumb data incl. console args): scrubbed as copies, never written in place.
+ */
+const APP_KEYS = new Set(["extra", "contexts", "user", "data"]);
+
 const API_KEY_PARAM = /\b(api[-_]?key)=[^&#\s"'<>]*/gi;
 const DISCORD_WEBHOOK_TOKEN = /(\/api(?:\/v\d+)?\/webhooks\/\d+\/)[^/?#\s"'<>]+/gi;
 
@@ -59,9 +65,9 @@ export function scrubString(s: string, secrets: readonly string[] = []): string 
 }
 
 /**
- * Scrub every string in `value` in place (objects/arrays); returns the scrubbed value.
- * Inside a copied subtree (`inCopy`) nothing is assigned in place: plain objects and arrays are
- * rebuilt too, so a live object's nested state is never touched and frozen objects cannot throw.
+ * Scrub every string in `value`; returns the scrubbed value. Only the SDK-built skeleton of an
+ * event or breadcrumb is assigned in place. Class/toJSON objects, byte views, and everything under
+ * APP_KEYS (`inCopy`) come back as scrubbed copies, so nothing the app still holds is written to.
  */
 export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = new WeakSet<object>(), copies = new WeakMap<object, unknown>(), inCopy = false): T {
   if (typeof value === "string") return scrubString(value, secrets) as T;
@@ -71,8 +77,12 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
   if (value instanceof Error) return scrubDeep({ name: value.name, message: value.message, stack: value.stack }, secrets, seen, copies, inCopy) as T;
   // Bytes go out as their numbers, so a secret inside them survives string scrubbing.
   if (ArrayBuffer.isView(value)) {
-    const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
-    return (scrubString(text, secrets) === text ? value : FILTERED) as T;
+    try {
+      const text = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
+      return (scrubString(text, secrets) === text ? value : FILTERED) as T;
+    } catch {
+      return FILTERED as T; // e.g. a view over a detached buffer
+    }
   }
   // Anything else Sentry sends as toJSON(), or for class instances (a web3 Connection, a client or
   // response class, Map/Headers) as their own enumerable props. Scrub a plain copy of that: the live
@@ -111,7 +121,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
         : Object.fromEntries(
             Object.keys(value)
               .filter((k) => !DROP_KEYS.has(k))
-              .map((k) => [k, scrubDeep((value as Record<string, unknown>)[k], secrets, seen, copies, true)]),
+              .map((k) => [scrubString(k, secrets), scrubDeep((value as Record<string, unknown>)[k], secrets, seen, copies, true)]),
           );
     } catch {
       out = FILTERED; // a throwing getter
@@ -133,7 +143,7 @@ export function scrubDeep<T>(value: T, secrets: readonly string[] = [], seen = n
       delete obj[key];
       continue;
     }
-    obj[key] = scrubDeep(obj[key], secrets, seen, copies);
+    obj[key] = scrubDeep(obj[key], secrets, seen, copies, APP_KEYS.has(key));
   }
   return value;
 }
@@ -150,8 +160,6 @@ export function installSentryScrubber(env: NodeJS.ProcessEnv = process.env): boo
   installed = true;
   const secrets = configuredSecrets(env);
   client.on("beforeAddBreadcrumb", (breadcrumb) => {
-    // Console breadcrumbs share their args array with the console call that prints next: scrub a copy.
-    if (Array.isArray(breadcrumb.data?.arguments)) breadcrumb.data.arguments = [...breadcrumb.data.arguments];
     scrubDeep(breadcrumb, secrets);
   });
   Sentry.getGlobalScope().addEventProcessor((event) => scrubDeep(event, secrets));
