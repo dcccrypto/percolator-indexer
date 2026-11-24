@@ -206,6 +206,8 @@ const STARTUP_BACKFILL_ENABLED = process.env.INDEXER_STARTUP_BACKFILL_ENABLED !=
 const RPC_MIN_INTERVAL_MS = parseRpcMinIntervalMs(process.env.TRADE_RPC_MIN_INTERVAL_MS, (m, c) => logger.warn(m, c));
 const TX_CACHE_MAX = readPositiveIntEnv("INDEXER_TX_CACHE_MAX", 1_000, 10_000);
 const TX_CACHE_TTL_MS = 10 * 60_000;
+/** Backoff before a partial/failed durable-cursor load is retried (a missing table must not cost a query per slab). */
+const CURSOR_LOAD_RETRY_MS = 60_000;
 const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
 
 /**
@@ -219,10 +221,21 @@ const TX_CACHE_ENABLED = process.env.INDEXER_TX_CACHE_DISABLED !== "true";
 export class TradeIndexerPolling {
   /** Track last indexed signature per slab to avoid re-processing */
   private lastSignature = new Map<string, string>();
-  /** The durable cursors are read once per process, before the first window of the first slab. */
+  /** The durable cursors are read before the first window of the first slab, and again (after a backoff) only while a load came back incomplete. */
   private cursorsLoaded: Promise<void> | null = null;
+  /** Earliest time a failed/partial cursor load may be retried: one retry per backoff, not one per slab. */
+  private cursorsRetryAt = 0;
   private loadDurableCursors(): Promise<void> {
-    this.cursorsLoaded ??= loadTradeCursors().then((m) => {
+    if (!this.cursorsLoaded && Date.now() < this.cursorsRetryAt) return Promise.resolve();
+    let incomplete = false;
+    this.cursorsLoaded ??= loadTradeCursors(() => {
+      incomplete = true;
+    }).then((m) => {
+      // A page failed: some slabs have no cursor yet. Drop the cached load so the next window reads them again.
+      if (incomplete) {
+        this.cursorsLoaded = null;
+        this.cursorsRetryAt = Date.now() + CURSOR_LOAD_RETRY_MS;
+      }
       // Never overwrite a cursor this process already moved.
       for (const [slab, sig] of m) if (!this.lastSignature.has(slab)) this.lastSignature.set(slab, sig);
     });
