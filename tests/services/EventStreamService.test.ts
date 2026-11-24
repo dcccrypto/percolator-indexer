@@ -890,50 +890,52 @@ describe("#148 — EventStreamService: per-fill slab derived from instruction ac
 });
 
 /**
- * Regression guard for the Atlas WS / jsonParsed accountKeys format bug.
- *
  * Atlas WS pushes accountKeys as plain objects with a STRING `pubkey` field
- * `{pubkey: "<base58>", signer, writable}`. The original resolveSlab only
- * handled raw strings or `{pubkey: {toBase58()}}` PublicKey objects — Atlas
- * WS's shape caused every streamed tx to resolve as "unknown slab", silently
- * skipping oracle-price + trade inserts.
+ * `{pubkey: "<base58>", signer, writable}` (PR #115). This block was describe.skip'd since #115
+ * because it asserted an oracle_prices insert from an UpdateHyperpMark tx; that write was removed
+ * (REDUCTION 2026-07-26, the frontend reads price from chain), so the test could never pass.
  *
- * This skipped block documents the intended assertion; the live production
- * verification (oracle_prices rows growing with tx_signature set) is the
- * definitive regression signal. Left here so future engineers know the shape.
+ * Rewritten to the current contract: a streamed tx carrying Atlas-shaped accountKeys must still
+ * reach the fill write (a wrong shape here would silently drop real trades), and must not write
+ * an oracle price. The slab-resolution helper itself is pinned in EventStreamService.indexing.test.ts.
  */
-describe.skip("EventStreamService — Atlas jsonParsed accountKey shape", () => {
-  it("resolves slab from string-pubkey jsonParsed entries", async () => {
-    const insertOraclePriceMock = vi.fn().mockResolvedValue(undefined);
-    const readMarkPriceE6Mock = vi.fn().mockResolvedValue(84_400_000);
-
-    vi.doMock("@percolatorct/shared", async (orig) => {
-      const mod = await (orig() as Promise<any>);
-      return {
-        ...mod,
-        insertOraclePrice: insertOraclePriceMock,
-        decodeBase58: (s: string) => new Uint8Array([34]), // UpdateHyperpMark tag
-      };
-    });
-    vi.doMock("../../src/parsers/markPrice.js", () => ({
-      readMarkPriceE6: readMarkPriceE6Mock,
-    }));
-
-    const { EventStreamService: Svc } = await import("../../src/services/EventStreamService.js");
-
-    const listeners: Array<(msg: any) => void> = [];
-    const ws = {
-      sub: () => {},
-      onNotification: (cb: any) => { listeners.push(cb); },
-      close: () => {},
-      isOpen: true,
-    };
-
+describe("EventStreamService — Atlas jsonParsed accountKey shape", () => {
+  it("indexes a streamed fill whose accountKeys are {pubkey: string, signer, writable} objects", async () => {
     const SLAB = "SLABjsonparsed111111111111111111111111111111";
     const PERC = "PERC11111111111111111111111111111111111111";
+    const insertTradeMock = vi.fn().mockResolvedValue(undefined);
+    const insertOraclePriceMock = vi.fn().mockResolvedValue(undefined);
+    const parseFillsMock = vi.fn().mockReturnValue([{
+      signature: "sigJsonParsed",
+      trader: "traderJsonParsed",
+      programId: PERC,
+      assetIndex: 0,
+      sizeAbs: 1_000n,
+      side: "long" as const,
+      slabAddress: SLAB,
+      priceE6: undefined,
+    }]);
 
+    vi.resetModules();
+    vi.doMock("@percolatorct/shared", async (orig) => {
+      const mod = await (orig() as Promise<any>);
+      return { ...mod, insertTrade: insertTradeMock, insertOraclePrice: insertOraclePriceMock };
+    });
+    vi.doMock("../../src/db/insertTradeRow.js", () => ({
+      insertTradeRow: insertTradeMock,
+      tradeKey: (r: any) => `${r.tx_signature ?? ""}|${r.asset_index}|${r.leg_index}`,
+      insertTradeRows: vi.fn(async (rows: any[]) => {
+        for (const r of rows) await insertTradeMock(r);
+        return rows.map((r) => ({ tx_signature: r.tx_signature, asset_index: r.asset_index, leg_index: r.leg_index }));
+      }),
+    }));
+    vi.doMock("../../src/parsers/markPrice.js", () => ({ readMarkPriceE6: vi.fn().mockResolvedValue(84_400_000) }));
+    vi.doMock("../../src/parsers/percolatorTxParser.js", () => ({ parsePercolatorFills: parseFillsMock, parsePercolatorLiquidations: vi.fn(() => []) }));
+
+    const { EventStreamService: Svc } = await import("../../src/services/EventStreamService.js");
+    const listeners: Array<(msg: any) => void> = [];
     const svc = new Svc({
-      ws: ws as any,
+      ws: { sub: () => {}, onNotification: (cb: any) => { listeners.push(cb); }, close: () => {}, isOpen: true } as any,
       programId: PERC,
       connection: { getAccountInfo: vi.fn() } as any,
       autoIndex: true,
@@ -942,36 +944,33 @@ describe.skip("EventStreamService — Atlas jsonParsed accountKey shape", () => 
     await svc.start();
 
     // Exact shape Atlas WS delivers: pubkey is a plain STRING, not a PublicKey.
-    const fakeTx = {
-      transaction: {
-        message: {
-          instructions: [
-            { programId: PERC, accounts: [], data: "b" /* bs58 of [34] */ },
-          ],
-          accountKeys: [
-            { pubkey: SLAB, signer: false, writable: true },
-          ],
-        },
-      },
-      meta: { err: null, logMessages: [] },
-      signature: "sigJsonParsed",
-    };
-
     listeners[0]({
       jsonrpc: "2.0",
       method: "transactionNotification",
-      params: { result: fakeTx, subscription: 1 },
+      params: {
+        result: {
+          transaction: {
+            message: {
+              instructions: [{ programId: PERC, accounts: [], data: "b" }],
+              accountKeys: [{ pubkey: SLAB, signer: false, writable: true }],
+            },
+          },
+          meta: { err: null, logMessages: [] },
+          signature: "sigJsonParsed",
+        },
+        subscription: 1,
+      },
     });
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 30));
 
-    expect(insertOraclePriceMock).toHaveBeenCalledTimes(1);
-    expect(insertOraclePriceMock.mock.calls[0][0]).toMatchObject({
-      slab_address: SLAB,
-      tx_signature: "sigJsonParsed",
-    });
+    expect(insertTradeMock).toHaveBeenCalledTimes(1);
+    expect(insertTradeMock.mock.calls[0][0]).toMatchObject({ tx_signature: "sigJsonParsed" });
+    expect(insertOraclePriceMock).not.toHaveBeenCalled();
 
     vi.doUnmock("@percolatorct/shared");
+    vi.doUnmock("../../src/db/insertTradeRow.js");
     vi.doUnmock("../../src/parsers/markPrice.js");
+    vi.doUnmock("../../src/parsers/percolatorTxParser.js");
   });
 });
 
