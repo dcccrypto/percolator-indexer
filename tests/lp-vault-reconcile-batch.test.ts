@@ -423,7 +423,8 @@ describe("LP-vault full reconcile: read and chain failures", () => {
 });
 
 // ── Mutation killers (J-20261123-IDX-REPORT-LPRECONCILEBATCHSAFETYMUT: 28/44 -> 42/44 mutants of the batched reads,
-// writes and reconcile killed; S01 and S17 are equivalent). Mutant ids are in the comments. `shuffleTies` on the fake
+// writes and reconcile killed; S01 (in-chunk 99) and S17 (extra map keys) write the same rows and differ only in
+// request count or fallback cost). Mutant ids are in the comments. `shuffleTies` on the fake
 // returns rows the query's ORDER BY leaves tied in a per-request order (as PostgreSQL may), so a read whose order is
 // not total pages wrong.
 
@@ -463,7 +464,7 @@ describe("LP-vault full reconcile: write and read boundaries (1 row, 101 positio
     const { tick } = await reconcileTick(pg, regs);
     await tick();
     expect.soft(upserts(pg)).toEqual([500, 1]);
-    const written = pg.log.filter((r) => r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
+    const written = pg.log.filter((r) => r.table === "lp_vault_positions" && r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
     expect.soft(new Set(written).size).toBe(written.length);
     expect(snapshot(pg).filter(reconciled)).toHaveLength(501);
   });
@@ -525,7 +526,7 @@ describe("LP-vault full reconcile: which rows the batched read lists and folds",
     const regs = seed(pg, 6, 4);
     const { tick } = await reconcileTick(pg, regs);
     await tick();
-    const written = pg.log.filter((r) => r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
+    const written = pg.log.filter((r) => r.table === "lp_vault_positions" && r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
     expect.soft(new Set(written).size).toBe(written.length);
     expect(snapshot(pg).filter(reconciled)).toHaveLength(24);
   });
