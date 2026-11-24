@@ -72,6 +72,10 @@ describe('TradeIndexerPolling: a poll window larger than TRADE_MAX_SIGNATURES (5
       { limit: 50, before: 'sig1', until: 'sig0' }, // a short page is confirmed by one extra call (empty here)
     ]);
     expect(processed).toEqual(Array.from({ length: 120 }, (_, i) => `sig${i + 1}`));
+    // The walk ended on an empty before-page after a short page: the cursor moves only once a second read agrees
+    // (EMPTY-PAGE-1). The re-read is the same window, so the next poll commits it.
+    expect(indexer.lastSignature.get(SLAB)).toBe('sig0');
+    await indexer.indexTradesForSlab(SLAB);
     expect(indexer.lastSignature.get(SLAB)).toBe('sig120');
   });
 
@@ -114,6 +118,8 @@ describe('TradeIndexerPolling: a poll window larger than TRADE_MAX_SIGNATURES (5
     failPage = null;
     await indexer.indexTradesForSlab(SLAB);
     expect(processed).toHaveLength(120);
+    expect(indexer.lastSignature.get(SLAB)).toBe('sig0'); // first full read of the window: held until confirmed
+    await indexer.indexTradesForSlab(SLAB);
     expect(indexer.lastSignature.get(SLAB)).toBe('sig120');
   });
 
