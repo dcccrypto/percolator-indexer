@@ -191,6 +191,8 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
       gptFault = { err: () => make("transactions"), left: 1, fromCall: 3 };
       expect(await indexer.indexTradesForSlab(SLAB)).toBe(true);
       expect(gptFault.left).toBe(0); // the throw was hit
+      expect(indexer.lastSignature.get(SLAB)).toBe("sig0"); // first clean read ends short-then-empty: held until confirmed (EMPTY-PAGE-1)
+      await indexer.indexTradesForSlab(SLAB);
       expect(indexer.lastSignature.get(SLAB)).toBe("sig60");
       expect(seen()).toEqual(ALL60);
     });
@@ -233,6 +235,8 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
       expect(await indexer.indexTradesForSlab(SLAB)).toBe(true);
       expect(gsfaFault.left).toBe(0);
       expect(calls.filter((c) => c.before === "sig11")).toHaveLength(2); // the same page retried, not the window re-walked
+      expect(indexer.lastSignature.get(SLAB)).toBe("sig0"); // first clean read ends short-then-empty: held until confirmed (EMPTY-PAGE-1)
+      await indexer.indexTradesForSlab(SLAB);
       expect(indexer.lastSignature.get(SLAB)).toBe("sig60");
       expect(seen()).toEqual(ALL60);
     });
@@ -247,6 +251,8 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
       expect(processed).toEqual([]); // a partial window is never processed
       gsfaFault = null;
       expect(await indexer.indexTradesForSlab(SLAB)).toBe(true);
+      expect(indexer.lastSignature.get(SLAB)).toBe("sig0"); // first clean read ends short-then-empty: held until confirmed (EMPTY-PAGE-1)
+      await indexer.indexTradesForSlab(SLAB);
       expect(indexer.lastSignature.get(SLAB)).toBe("sig60");
       expect(seen()).toEqual(ALL60);
     });
