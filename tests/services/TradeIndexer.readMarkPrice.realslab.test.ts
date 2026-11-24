@@ -2,8 +2,8 @@
  * readMarkPriceFromSlab over real v2.2 slab bytes, with no parser mocks.
  *
  * The sibling TradeIndexer.readMarkPrice.test.ts mocks every parser and feeds 64 zero bytes. So lot_exp is always 0,
- * wrapper magic is a separate switch from the effective-price read (never true on a real slab), and any absolute-offset
- * guess throws RangeError, which the outer catch turns into 0. Four wrong-price mutants hid behind that
+ * the mock lets wrapper magic and the effective price vary independently (a real v2.2 slab always has magic), and any
+ * absolute-offset guess throws RangeError, which the outer catch turns into 0. Four wrong-price mutants hid behind that
  * (report IDX-REPORT-READMARKPRICETESTMUT):
  *   M04 lot_exp ignored on the booked effective price (stored 10^lot_exp too high),
  *   M03 asset 0's lot_exp used for asset N,
