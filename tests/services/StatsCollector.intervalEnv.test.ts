@@ -1,5 +1,5 @@
 /** Env interval parsing (leads: hex/exp/fraction/overflow) + inPlaceholderGrace skew. */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 
 
 // StatsCollector pulls in @percolatorct/shared/@percolatorct/sdk at import time;
@@ -28,6 +28,10 @@ vi.mock('@percolatorct/sdk', async (importOriginal) => ({
   V17_HEADER_LEN: 16, V17_MARKET_GROUP_OFF: 592, V17_ASSET_ORACLE_PROFILE_LEN: 400,
   IX_TAG: {},
 }));
+
+// Warm the transform/module graph once under its own hook budget, so the first
+// it.each row is not charged the cold import (load() re-evaluates after resetModules).
+beforeAll(async () => { await import('../../src/services/StatsCollector.js'); }, 120_000);
 
 async function load(name: string, v: string) {
   vi.resetModules();
