@@ -16,6 +16,7 @@ import {
   ACCOUNT_KIND,
   UnknownLayoutError,
   WRAPPER_ACCOUNT_MAGIC,
+  parseAssetOracleProfileV17,
   parseWrapperConfigV17,
   readWrapperHeader,
   resolveLayout,
@@ -138,6 +139,20 @@ export function readMarkEwmaE6(data: Uint8Array, parser: string): bigint {
     throw new UnknownLayoutError("TOO_SHORT", parser, `market too short for the wrapper config: ${data.length} < ${need}`, { version: layout.version, kind: ACCOUNT_KIND.Market });
   }
   return parseWrapperConfigV17(data, V17_HEADER_LEN).markEwmaE6;
+}
+
+/**
+ * Asset `assetIndex`'s own oracle-profile `mark_ewma_e6` (raw e6), the per-asset fill-price proxy. The wrapper
+ * config `mark_ewma_e6` ({@link readMarkEwmaE6}, account offset 248) is per market and holds asset 0's value, so
+ * reading it for asset N > 0 prices that asset with asset 0's mark. Returns null when the index is not a whole slot
+ * of the buffer.
+ *
+ * @throws UnknownLayoutError for an unknown VERSION / wrong kind / buffer shorter than the group header.
+ */
+export function readAssetMarkEwmaE6(data: Uint8Array, assetIndex: number, parser: string): bigint | null {
+  const g = resolveMarketGeometry(data, { parser, strictLength: false });
+  if (!Number.isInteger(assetIndex) || assetIndex < 0 || assetIndex >= g.slotCount) return null;
+  return parseAssetOracleProfileV17(data, g.slotOff(assetIndex) + g.layout.wrapperSlot.oracleProfile).markEwmaE6;
 }
 
 let unknownLayoutTotal = 0;

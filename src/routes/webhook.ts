@@ -8,7 +8,7 @@ import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
 import { decodeV22Events, rawInstructionsFromEnhancedTx } from "../parsers/v22Events.js";
 import { insertV22Events, V22EventWriteError } from "../db/insertV22Events.js";
 import { recordV22LogEvents } from "../services/v22LogEvents.js";
-import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
+import { hasWrapperMagic, readAssetMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, eventBus, decodeBase58, withRetry, captureException, createLogger, getConnection } from "@percolatorct/shared";
 import { insertTradeRows, tradeKey, type TradeSizeProvenance } from "../db/insertTradeRow.js";
 import { isBlockedSlab } from "../blocklist.js";
@@ -1270,7 +1270,8 @@ async function extractPrice(tx: ValidatedTransaction, slabAddress: string, asset
  * the Helius payload) and the fresh-RPC fallback (bytes from `getAccountInfo`)
  * so the v17/v0/v1 layout logic has one copy, not two that can drift.
  */
-function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account: string): number {
+/** Exported for tests. */
+export function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, account: string): number {
   // #221: on a wrapper market (v2.1 or v2.2, VERSION-keyed in readAssetEffectivePriceE6) the asset's effective_price is the price the engine books a fill at; the
   // mark EWMA below is skewed by the trade itself and stays only for layouts without a readable asset slot / unreadable slots.
   const effectiveE6 = readAssetEffectivePriceE6(raw, assetIndex);
@@ -1279,11 +1280,11 @@ function parseMarkPriceE6FromAccountBytes(raw: Uint8Array, assetIndex: number, a
     return perTokenPrice(effectiveE6, lotExpOfSlabData(raw, assetIndex)); // per-token (lot_exp scale)
   }
 
-  // Desync fix 8: v17 account — read mark_ewma_e6 from WrapperConfigV17 at offset 16+232=248.
-  // detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
+  // Desync fix 8: v17 account — read THIS asset's oracle-profile mark_ewma_e6 (the WrapperConfigV17 one at
+  // offset 248 is asset 0's). detectSlabLayout returns null for v17 account sizes (no v17 tier registered).
   if (hasWrapperMagic(raw)) {
     try {
-      const markEwmaE6 = readMarkEwmaE6(raw, "webhook.parseMarkPriceE6FromAccountBytes");
+      const markEwmaE6 = readAssetMarkEwmaE6(raw, assetIndex, "webhook.parseMarkPriceE6FromAccountBytes") ?? 0n;
       if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
         // Per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
         noteLotExps(account, raw);

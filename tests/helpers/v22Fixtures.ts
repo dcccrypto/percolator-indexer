@@ -57,7 +57,12 @@ export function buildMarket(layout: LayoutTable = LAYOUT_V22, spec: MarketSpec =
   const dv = new DataView(d.buffer);
   if (spec.initialMarginBps !== undefined) dv.setBigUint64(g + layout.group.config + 62, spec.initialMarginBps, true);
   // WrapperConfigV17.mark_ewma_e6 sits at config offset 232 (account offset 16 + 232), identical in both layouts.
-  if (spec.markEwmaE6 !== undefined) dv.setBigUint64(16 + 232, spec.markEwmaE6, true);
+  // On chain it is asset 0's mark: slot 0's oracle-profile mark_ewma_e6 (+168) holds the same value, and the price
+  // fallback reads the per-asset one. Stamp both, as devnet has them (71/71 markets at slot 525623852).
+  if (spec.markEwmaE6 !== undefined) {
+    dv.setBigUint64(16 + 232, spec.markEwmaE6, true);
+    if (slots > 0) dv.setBigUint64(layout.marketGroupOff + layout.marketGroupLen + layout.wrapperSlot.oracleProfile + 168, spec.markEwmaE6, true);
+  }
   if (spec.oracleAuthority) d.set(spec.oracleAuthority.toBytes(), layout.marketGroupOff + layout.marketGroupLen + 120);
   return d;
 }
