@@ -32,7 +32,8 @@ describe("(c) durable skip record", () => {
     expect(table).toBe("skipped_signatures");
     expect(rows[0]).toMatchObject({ signature: FULL, slab: row.slab, source: "trade-indexer", network: CURRENT_NETWORK });
     expect(CURRENT_NETWORK).not.toBe("mainnet"); // the shared mock above says mainnet: it must not be the source
-    expect(opts).toMatchObject({ onConflict: "signature,source" });
+    // ignoreDuplicates pins first-write-wins across restarts (a re-record must not overwrite the stored row).
+    expect(opts).toMatchObject({ onConflict: "signature,source", ignoreDuplicates: true });
     expect(existsSync(FILE)).toBe(false);
   });
   it("falls back to the JSONL file (full signature + slab) when the table write fails, and never throws", async () => {
