@@ -5,7 +5,7 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { Keypair, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { attributeWrapperTokens, decodeFillEventToken, decodeV22LogEvents, type EventGate } from "../../src/parsers/v22FillEvents.js";
 import type { RawInstruction } from "../../src/parsers/v22Events.js";
 
@@ -14,8 +14,8 @@ const M = key(1);
 const DOC = JSON.parse(readFileSync(new URL("../fixtures/v22-fill-events-doc-examples.json", import.meta.url), "utf8")) as { examples: Record<string, { b64: string }> };
 const FILL = DOC.examples.fill_clipped_tradecpi.b64;
 const REDUCE = DOC.examples.reduce_rebalance.b64;
-const W = Keypair.generate().publicKey.toBase58();
-const MATCHER = Keypair.generate().publicKey.toBase58();
+const W = key(2);
+const MATCHER = key(3);
 /** The System program: an all-zero key whose canonical base58 text is exactly 32 characters. */
 const SYSTEM = "11111111111111111111111111111111";
 const wrappers = new Set([W]);
@@ -55,6 +55,7 @@ describe("fill attribution: instruction index and frame visibility", () => {
     expect(attributeWrapperTokens(logs, wrappers)).toEqual({ ok: true, tokens: [{ b64: FILL, ixIndex: 1 }] });
   });
 
+  // Synthetic: the real System program never logs data; this only pins that data belongs to the frame on top of the stack.
   it("a data line inside a 32-character-id frame nested in the wrapper is not the wrapper's", () => {
     const logs = [`Program ${W} invoke [1]`, `Program ${SYSTEM} invoke [2]`, `Program data: ${FILL}`, `Program ${SYSTEM} success`, `Program ${W} success`];
     expect(attributeWrapperTokens(logs, wrappers)).toEqual({ ok: true, tokens: [] });
