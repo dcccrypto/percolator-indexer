@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
 
 const warn = vi.fn();
 const error = vi.fn();
@@ -16,7 +16,16 @@ const tradeEnv = async (env: Record<string, string>) => {
 };
 
 describe("A: INDEXER_MAX_WRITE_HOLDS", () => {
+  // The cold TradeIndexer import (whole service graph) took 20-41 s under load and was billed to the first row. Pay it once,
+  // here, under an explicit hook timeout; later resetModules + import re-evaluate from the warm module cache.
+  beforeAll(async () => { await import("../src/services/TradeIndexer.js"); }, 180_000);
+
+  // Every value is checked against the parser TradeIndexer's MAX_WRITE_HOLDS is built from (no service import).
   it.each(["-3", "2.5", "0", "", "10s", "1e3", "101"])("%j falls back to 5", async (v) => {
+    expect((await tradeEnv({})).parseMaxWriteHolds(v)).toBe(5);
+  });
+  // Wiring: the exported constant really comes from INDEXER_MAX_WRITE_HOLDS through that parser, for every bad value too.
+  it.each(["-3", "2.5", "0", "", "10s", "1e3", "101"])("%j falls back to 5 through the TradeIndexer export", async (v) => {
     vi.resetModules();
     vi.stubEnv("INDEXER_MAX_WRITE_HOLDS", v);
     const m = await import("../src/services/TradeIndexer.js");
