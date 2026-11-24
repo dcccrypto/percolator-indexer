@@ -280,7 +280,8 @@ export class TradeIndexerPolling {
       const idx = sigs.findIndex((s) => s.signature === prev.newest);
       const below = idx >= 0 ? sigs.slice(idx) : [];
       if (idx >= 0 && below.length === prev.seen.size && below.every((s) => prev.seen.has(s.signature))) {
-        this.windowChecks.delete(slabAddress);
+        // Kept (as this read) until commitCursor clears it: a pass that then holds for another reason stays confirmed.
+        this.windowChecks.set(slabAddress, { until, newest: sigs[0].signature, seen: new Set(sigs.map((s) => s.signature)), holds: prev.holds });
         return true;
       }
       holds = prev.holds + 1;

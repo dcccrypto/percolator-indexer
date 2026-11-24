@@ -31,7 +31,8 @@ const getSignaturesForAddress = vi.fn(async (_pk: unknown, opts: { limit?: numbe
   return page;
 });
 const tx = (slot: number) => ({ slot, blockTime: 0, meta: { err: null, logMessages: [] }, transaction: { message: { instructions: [], accountKeys: [] } } });
-const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => signedAs(s, tx(Number(s.slice(3))))));
+let nullTxs = false; // getParsedTransactions answers null for every signature (a lagging node)
+const getParsedTransactions = vi.fn(async (sigs: string[]) => sigs.map((s) => (nullTxs ? null : signedAs(s, tx(Number(s.slice(3)))))));
 const captureException = vi.fn();
 
 vi.mock("@percolatorct/shared", () => ({
@@ -63,6 +64,7 @@ describe("TradeIndexerPolling: a falsely empty `before` page must not pass the r
     calls.length = 0;
     falseEmptyOnce = false;
     falseEmptyAlways = false;
+    nullTxs = false;
     captureException.mockClear();
     indexer = new TradeIndexerPolling();
     indexer._running = true;
@@ -106,6 +108,19 @@ describe("TradeIndexerPolling: a falsely empty `before` page must not pass the r
     await indexer.indexTradesForSlab(SLAB);
     expect(indexer.lastSignature.get(SLAB)).toBe("sig5");
     expect(new Set(processed)).toEqual(new Set(["sig1", "sig2", "sig3", "sig4", "sig5"]));
+  });
+
+  it("a confirmation is not used up by a pass that holds for another reason (null tx): the cursor commits on the next clean pass", async () => {
+    chain = makeChain(3);
+    indexer.lastSignature.set(SLAB, "sig0");
+    await indexer.indexTradesForSlab(SLAB); // first read: held, unconfirmed
+    indexer.txCache = new (indexer.txCache.constructor)(10, 60_000); // empty cache: the next read goes to the node
+    nullTxs = true;
+    await indexer.indexTradesForSlab(SLAB); // agrees, but every tx reads null: null-tx hold
+    nullTxs = false;
+    expect(indexer.lastSignature.get(SLAB)).toBe("sig0");
+    await indexer.indexTradesForSlab(SLAB); // clean pass, still agreeing: commits now, not one poll later
+    expect(indexer.lastSignature.get(SLAB)).toBe("sig3");
   });
 
   it("bounded: a window that reads differently on every poll holds the cursor 5 polls, then commits with an alert", async () => {
