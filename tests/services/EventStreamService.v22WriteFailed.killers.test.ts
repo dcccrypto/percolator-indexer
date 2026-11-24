@@ -29,8 +29,8 @@ vi.mock("@percolatorct/shared", async (orig) => {
     eventBus: { publish: vi.fn(), emit: vi.fn(), on: vi.fn() },
     getNetwork: vi.fn(() => "devnet"),
     getSupabase: vi.fn(() => ({
-      from: () => ({
-        upsert: () => { st.v22Calls++; return Promise.resolve({ error: { code: "XX000", message: "connection reset" } }); },
+      from: (t: string) => ({
+        upsert: () => { if (t === "v22_events") st.v22Calls++; return Promise.resolve({ error: { code: "XX000", message: "connection reset" } }); },
       }),
     })),
     withRetry: vi.fn(async (fn: () => Promise<unknown>) => fn()),
