@@ -80,7 +80,8 @@ export class RpcLimiter {
         this.rateLimited++;
         const backoffMs = Math.min(this.opts.maxBackoffMs, this.opts.baseBackoffMs * 2 ** attempt);
         // Everyone waits, not just this call, including when this call gives up (the caller's own retry then starts late too).
-        this.nextSlot = Math.max(this.nextSlot, this.readNow() + backoffMs);
+        const failedAt = this.readNow(); // read (and apply any clock step) before nextSlot is read
+        this.nextSlot = Math.max(this.nextSlot, failedAt + backoffMs);
         if (attempt >= maxRetries) throw err;
         this.opts.onRateLimited?.({ attempt: attempt + 1, backoffMs });
       }
