@@ -426,7 +426,7 @@ describe("LP-vault full reconcile: read and chain failures", () => {
 // writes and reconcile killed; S17 (extra map keys) writes the same rows and differs only in fallback cost). S01
 // (in-chunk 99) was NOT equivalent: at in-chunk 100, loadEventsMany folded a wallet's events twice when the same wallet
 // held positions in vaults of two chunks (167 x 3: 10/501 rows at 600 shares instead of 300); 99 = 33 x 3 hid that.
-// Fixed in loadEventsMany (each chunk keeps only its own pairs); since then S01 changes only the request count.
+// Fixed in loadEventsMany (each chunk keeps only its own pairs); since then S01 is equivalent at the tested sizes.
 // Mutant ids are in the comments. `shuffleTies` on the fake
 // returns rows the query's ORDER BY leaves tied in a per-request order (as PostgreSQL may), so a read whose order is
 // not total pages wrong.
@@ -473,14 +473,16 @@ describe("LP-vault full reconcile: write and read boundaries (1 row, 101 positio
     expect(snapshot(pg)).toEqual(await referenceSnapshot(167, 3));
   });
 
-  // #451 gate: 167 x 3 = 501 positions, 100 per events chunk. user00..02 hold positions in vaults of every chunk, so
-  // each chunk's registry IN x user IN read also returns pairs another chunk owns; those must be folded once, not twice.
+  // #451 gate: 167 x 3 = 501 positions, 100 per events chunk. When a chunk boundary splits a vault's users, the
+  // registry IN x user IN read of one chunk also returns pairs the neighbouring chunk owns (10 rows here); each
+  // position's history must still be folded once, not twice.
   it("a wallet with positions in vaults of different events chunks: each position's history is folded once", async () => {
     const pg = fakePostgrest();
     const regs = seed(pg, 167, 3);
     const { tick } = await reconcileTick(pg, regs);
     await tick();
-    // REG033/user00 is in chunk 1 (pair 99..101 = REG033), REG000..032 users are in chunk 0.
+    // REG033/user00 is pair 99, the last of chunk 0; REG033/user01..02 (pairs 100..101) are in chunk 1, whose
+    // REG033 x user00 read returned chunk 0's pair too.
     expect.soft(row(pg, "REG033", "user00")).toMatchObject({ lp_shares: "300", cost_basis_atoms: "300", event_count: 2, basis_known: true, transfer_detected_slot: null });
     const bad = snapshot(pg).filter((r) => r.lp_shares !== "300" || r.event_count !== 2);
     expect.soft(bad.map((r) => `${r.registry}|${r.user_wallet}`)).toEqual([]);
