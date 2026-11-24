@@ -1,7 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { parseEngine, detectSlabLayout, resolveMarketGeometry } from "@percolatorct/sdk";
 import { noteLotExps } from "./lotScale.js";
-import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
+import { hasWrapperMagic, readAssetMarkEwmaE6, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { createLogger, withRetry } from "@percolatorct/shared";
 
 const logger = createLogger("indexer:mark-price");
@@ -89,7 +89,10 @@ export async function readMarkPriceE6(
     // (no v17 tier registered). Use parseWrapperConfigV17 to read mark_ewma_e6 directly.
     if (hasWrapperMagic(data)) {
       try {
-        const markEwmaE6 = readMarkEwmaE6(data, "readMarkPriceE6");
+        // With an asset: THAT asset's oracle-profile mark (the wrapper config one is asset 0's). Without: the market-wide one.
+        const markEwmaE6 = assetIndex !== undefined
+          ? readAssetMarkEwmaE6(data, assetIndex, "readMarkPriceE6") ?? 0n
+          : readMarkEwmaE6(data, "readMarkPriceE6");
         if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
           // Per lot, like effective_price: record lot_exp so callers divide it out the same way.
           if (assetIndex !== undefined) noteLotExps(slabAddress, data);

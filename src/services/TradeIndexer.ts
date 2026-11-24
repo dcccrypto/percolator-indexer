@@ -4,7 +4,7 @@ import { parseMaxWriteHolds, parsePollIntervalMs, parseRpcMinIntervalMs, parseWr
 import { recordSkippedSignatures } from "../lib/skippedSignatures.js";
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG, detectSlabLayout } from "@percolatorct/sdk";
-import { hasWrapperMagic, readMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
+import { hasWrapperMagic, readAssetMarkEwmaE6, reportUnknownLayout } from "../layout/resolve.js";
 import { config, getConnection, eventBus, decodeBase58, withRetry, createLogger, captureException } from "@percolatorct/shared";
 import { getMarketRowsCached, type MarketRowLite } from "../db/marketRows.js";
 import { unwrapEvictAndTradeIx } from "../parsers/evictTrade.js";
@@ -1256,8 +1256,8 @@ export class TradeIndexerPolling {
    * Fallback: read mark_price_e6 from the slab account's on-chain state.
    * This gives the current mark price (close to execution price for recent trades).
    *
-   * Desync fix (finding 9 / TradeIndexer path): v17 accounts use parseWrapperConfigV17
-   * to read markEwmaE6 at absolute offset 248 (WrapperConfigV17.mark_ewma_e6).
+   * Desync fix (finding 9 / TradeIndexer path): v17 accounts read the asset's own oracle-profile
+   * mark_ewma_e6 (readAssetMarkEwmaE6), not WrapperConfigV17.mark_ewma_e6 @248, which is asset 0's.
    * detectSlabLayout returns null for v17 account sizes — do not use it for v17.
    */
   /** lot_exp for pricing a CPI fill: cache, else one slab read (primes the cache); null = unreadable, skip + retry. */
@@ -1292,10 +1292,10 @@ export class TradeIndexerPolling {
         return perTokenPrice(effectiveE6, lotExpOfSlabData(rawData, assetIndex)); // per-token: the engine price is per 10^lot_exp units
       }
 
-      // v17 path: read mark_ewma_e6 from WrapperConfigV17
+      // v17 path: THIS asset's oracle-profile mark_ewma_e6 (the wrapper config one is asset 0's)
       if (hasWrapperMagic(rawData)) {
         try {
-          const markEwmaE6 = readMarkEwmaE6(rawData, "TradeIndexer.readMarkPriceFromSlab");
+          const markEwmaE6 = readAssetMarkEwmaE6(rawData, assetIndex, "TradeIndexer.readMarkPriceFromSlab") ?? 0n;
           if (markEwmaE6 > 0n && markEwmaE6 < 1_000_000_000_000n) {
             // The EWMA is per lot like effective_price: scale it the same way (lot 0: / 1e6, unchanged).
             noteLotExps(slabAddress, rawData);

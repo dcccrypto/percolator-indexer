@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mocks = vi.hoisted(() => ({
   effective: vi.fn<(d: Uint8Array, a: number) => number | null>(() => null),
   magic: vi.fn<(d: Uint8Array) => boolean>(() => false),
-  ewma: vi.fn<(d: Uint8Array, p: string) => bigint>(() => 0n),
+  ewma: vi.fn<(d: Uint8Array, a: number, p: string) => bigint | null>(() => 0n),
   report: vi.fn(),
   layout: vi.fn<(n: number) => { engineOff: number; engineMarkPriceOff: number } | null>(() => null),
   warn: vi.fn(),
@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../src/parsers/markPrice.js', () => ({ readAssetEffectivePriceE6: mocks.effective }));
 vi.mock('../../src/layout/resolve.js', () => ({
   hasWrapperMagic: mocks.magic,
-  readMarkEwmaE6: mocks.ewma,
+  readAssetMarkEwmaE6: mocks.ewma,
   reportUnknownLayout: mocks.report,
 }));
 vi.mock('@percolatorct/sdk', async (orig) => ({
@@ -68,6 +68,19 @@ describe('TradeIndexer.readMarkPriceFromSlab', () => {
     mocks.magic.mockReturnValue(true);
     mocks.ewma.mockReturnValue(1_500_000n);
     expect(await read(conn({ data: buf(64) }))).toBe(1.5);
+  });
+
+  it('v17 wrapper: reads THIS asset\'s mark EWMA (passes the asset index), not the market-wide one', async () => {
+    mocks.magic.mockReturnValue(true);
+    mocks.ewma.mockReturnValue(9_000_000n);
+    expect(await read(conn({ data: buf(64) }), 3)).toBe(9);
+    expect(mocks.ewma.mock.calls[0][1]).toBe(3);
+  });
+
+  it('v17 wrapper: an asset not in the market (null EWMA) yields 0', async () => {
+    mocks.magic.mockReturnValue(true);
+    mocks.ewma.mockReturnValue(null);
+    expect(await read(conn({ data: buf(64) }), 7)).toBe(0);
   });
 
   it.each([0n, 1_000_000_000_000n])('v17 wrapper: an out-of-range EWMA (%s) yields 0, never a guess', async (v) => {
