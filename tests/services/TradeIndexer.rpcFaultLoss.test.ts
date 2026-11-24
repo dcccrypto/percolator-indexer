@@ -226,6 +226,7 @@ describe("TradeIndexerPolling: RPC faults must not lose a confirmed signature fo
       gsfaFault = { err: () => make("signatures for address"), left: 1, before: "sig11" };
       expect(await indexer.indexTradesForSlab(SLAB)).toBe(true);
       expect(gsfaFault.left).toBe(0);
+      expect(calls.filter((c) => c.before === "sig11")).toHaveLength(2); // the same page retried, not the window re-walked
       expect(indexer.lastSignature.get(SLAB)).toBe("sig60");
       expect(seen()).toEqual(ALL60);
     });
