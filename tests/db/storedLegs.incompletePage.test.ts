@@ -8,7 +8,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 type Row = { id: string; tx_signature: string; network: string; slab_address: string; asset_index: number; leg_index: number; trader: string; side: string; size: string; is_liquidation: boolean };
-type Fault = "nullNoError" | "emptyPage" | "noId" | "noCount" | "ignoreGt";
+type Fault = "nullNoError" | "emptyPage" | "noId" | "noCount" | "starCount" | "ignoreGt";
 
 const db = {
   rows: [] as Row[],
@@ -29,7 +29,8 @@ function serve(st: { inVals?: string[]; eqs: Array<[string, unknown]>; after?: s
   if (mode === "nullNoError") data = null;
   if (mode === "emptyPage") data = [];
   if (mode === "noId") data = data!.map((r, i) => (i === data!.length - 1 ? { ...(r as Row), id: undefined } : r));
-  const count = st.count && mode !== "noCount" ? total : null;
+  // starCount: Content-Range "0-n/*" (Prefer header stripped) -> postgrest-js parseInt("*") = NaN
+  const count = !st.count || mode === "noCount" ? null : mode === "starCount" ? Number.NaN : total;
   return { data, error: null, count };
 }
 
@@ -123,6 +124,12 @@ describe("fetchStoredLegsMany: an incomplete read returns null, never a partial 
     const sigs = seed([120], 50);
     db.fault = { page: 0, mode: "noCount" };
     expect(await fetchStoredLegsMany(sigs)).toBeNull(); // before: no count asked; the mid-read empty case could not be caught
+  });
+
+  it("a row count of * (NaN) -> null", async () => {
+    const sigs = seed([120], 50);
+    db.fault = { page: 0, mode: "starCount" };
+    expect(await fetchStoredLegsMany(sigs)).toBeNull();
   });
 
   it("a page that ignores gt(id) and repeats the previous page -> null", async () => {

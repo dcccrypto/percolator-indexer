@@ -72,7 +72,7 @@ async function readAllPages(filter: Filter): Promise<PagedRow[]> {
     if (error) throw new Error(error.message);
     if (!Array.isArray(data)) throw new Error("stored-leg page returned no data and no error");
     if (first) {
-      if (typeof count !== "number") throw new Error("stored-leg read returned no row count");
+      if (typeof count !== "number" || !Number.isFinite(count)) throw new Error("stored-leg read returned no row count");
       expected = count;
     }
     const page = data as PagedRow[];
