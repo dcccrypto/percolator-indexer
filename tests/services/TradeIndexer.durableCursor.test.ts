@@ -87,6 +87,10 @@ describe("TradeIndexerPolling durable cursor", () => {
     sigLists.set(slab, mk("s5", "s4", "s3", "s2", "s1")); // two new transactions after the restart
     await restarted.indexTradesForSlab(slab, 50);
     expect(fetched.sort()).toEqual(["s4", "s5"]); // only the new ones, none missed
+    // The window ended on an empty before-page after a short page: held until a second read agrees (EMPTY-PAGE-1).
+    expect(table.get(slab)).toBe("s3");
+    await restarted.indexTradesForSlab(slab, 50);
+    expect(fetched.sort()).toEqual(["s4", "s5"]); // the confirming re-read is served from the tx cache
     expect(table.get(slab)).toBe("s5");
   });
 

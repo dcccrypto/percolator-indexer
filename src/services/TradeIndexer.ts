@@ -74,6 +74,13 @@ const MAX_LOT_READ_HOLDS = 5;
  * signature that never resolves cannot stall the slab forever.
  */
 const MAX_NULL_TX_HOLDS = 5;
+/**
+ * Polls a slab's cursor may be held because its window ended on an empty `before` page after a short page and no two
+ * reads of it agreed yet (EMPTY-PAGE-1). A truthful window is confirmed by the next poll (one poll of delay); only a
+ * node that answers differently on every read reaches this bound, and then the cursor commits with an alert.
+ */
+const MAX_EMPTY_PAGE_HOLDS = 5;
+interface WindowCheck { until: string; newest: string; seen: Set<string>; holds: number }
 
 /**
  * A failed DB write holds the slab's cursor so the same signatures are retried every poll. It never gives up on
@@ -119,6 +126,9 @@ const TRADE_TAGS = new Set<number>([
  * the walk: a node behind a load balancer can cut a page short while older signatures above the cursor remain, and
  * stopping there committed the cursor past them for good (RPC fault replay, "shortpage": 40 of 247 fills lost). So
  * each short page costs one extra `before` call, which answers empty when the cursor really was reached.
+ * That empty answer cannot be told from a node that falsely answers a `before` page empty while older signatures
+ * remain (EMPTY-PAGE-1), so a walk that had a short page and ended on an empty `before` page is returned as
+ * `unconfirmed`: the caller processes it but commits the cursor only once a second read agrees (see confirmWindow).
  * Each page has its own retries; a page that still fails throws, and the caller then returns with the cursor
  * untouched, so the next poll re-reads the same window. Only the page bound (and a full page of repeats from a
  * misbehaving RPC) cut the window short; both are logged.
@@ -129,13 +139,14 @@ async function fetchSignatureWindow(
   limit: number,
   until: string | undefined,
   slabAddress: string,
-): Promise<Awaited<ReturnType<Connection["getSignaturesForAddress"]>>> {
+): Promise<{ sigs: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>; unconfirmed: boolean }> {
   const page = (before?: string) => withRetry(
     () => connection.getSignaturesForAddress(slabPk, { limit, ...(before ? { before } : {}), ...(until ? { until } : {}) }),
     { maxRetries: 3, baseDelayMs: 1000, label: `getSignaturesForAddress(${slabAddress.slice(0, 8)})` },
   );
   const out = await page();
-  if (!until) return out;
+  if (!until) return { sigs: out, unconfirmed: false };
+  let short = out.length < limit;
   const seen = new Set(out.map((s) => s.signature));
   let raw = out; // last page as returned; `fresh` drops any repeat
   let fresh = out;
@@ -148,6 +159,8 @@ async function fetchSignatureWindow(
       break;
     }
     raw = await page(raw[raw.length - 1].signature);
+    if (raw.length === 0) return { sigs: out, unconfirmed: short };
+    if (raw.length < limit) short = true;
     fresh = raw.filter((s) => !seen.has(s.signature));
     for (const s of fresh) seen.add(s.signature);
     out.push(...fresh);
@@ -155,7 +168,7 @@ async function fetchSignatureWindow(
       logger.error("getSignaturesForAddress returned a full page of signatures already seen; window walk stopped", { slab: slabAddress, signatures: out.length });
     }
   }
-  return out;
+  return { sigs: out, unconfirmed: false };
 }
 
 function readPositiveIntEnv(name: string, fallback: number, max?: number): number {
@@ -232,6 +245,7 @@ export class TradeIndexerPolling {
   private async commitCursor(slabAddress: string, signature: string): Promise<void> {
     this.lastSignature.set(slabAddress, signature);
     this.holdAnchor.delete(slabAddress);
+    this.windowChecks.delete(slabAddress);
     await saveTradeCursor(slabAddress, signature);
   }
   /** Per-slab hold state of a failed write (see MAX_WRITE_HOLDS). Per instance. */
@@ -250,6 +264,37 @@ export class TradeIndexerPolling {
    * newest-limit first-poll window. Cleared when the cursor commits.
    */
   private holdAnchor = new Map<string, string>();
+  /** Per slab: the last read of an unconfirmed window (see MAX_EMPTY_PAGE_HOLDS). Cleared when the cursor commits. */
+  private windowChecks = new Map<string, WindowCheck>();
+  /**
+   * EMPTY-PAGE-1: a window that ended on an empty `before` page after a short page may have been cut by a node that
+   * answered that page falsely empty, and committing to its newest would pass the unread rest for good. Returns true
+   * when this read agrees with the previous read of the same window (same cursor, same signatures from the previous
+   * newest down, nothing missing), or after MAX_EMPTY_PAGE_HOLDS disagreeing reads; otherwise records this read and
+   * returns false (hold the cursor; the next poll re-reads the window, and per-leg dedup makes the re-pass idempotent).
+   */
+  private confirmWindow(slabAddress: string, until: string, sigs: { signature: string }[]): boolean {
+    const prev = this.windowChecks.get(slabAddress);
+    let holds = 1;
+    if (prev && prev.until === until) {
+      const idx = sigs.findIndex((s) => s.signature === prev.newest);
+      const below = idx >= 0 ? sigs.slice(idx) : [];
+      if (idx >= 0 && below.length === prev.seen.size && below.every((s) => prev.seen.has(s.signature))) {
+        this.windowChecks.delete(slabAddress);
+        return true;
+      }
+      holds = prev.holds + 1;
+    }
+    if (holds > MAX_EMPTY_PAGE_HOLDS) {
+      logger.error("ALERT: signature window read differently on every poll (short pages ending on an empty before-page); committing the cursor, older signatures may be missed", { slabAddress, holds: prev?.holds, signatures: sigs.length });
+      captureException(new Error(`trade poll window never read the same twice in ${MAX_EMPTY_PAGE_HOLDS} polls; cursor committed (slab ${slabAddress})`), { tags: { context: "trade-indexer-window-unconfirmed" }, extra: { slabAddress } });
+      this.windowChecks.delete(slabAddress);
+      return true;
+    }
+    this.windowChecks.set(slabAddress, { until, newest: sigs[0].signature, seen: new Set(sigs.map((s) => s.signature)), holds });
+    if (holds > 1) logger.warn("signature window read differently from the previous poll; holding the cursor", { slabAddress: slabAddress.slice(0, 8), holds });
+    return false;
+  }
   private _running = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** signature -> 1: its matcher-context read already failed once (see CtxReadRetry). Bounded. */
@@ -449,8 +494,9 @@ export class TradeIndexerPolling {
     const lastSig = this.lastSignature.get(slabAddress) ?? this.holdAnchor.get(slabAddress);
 
     let signatures: Awaited<ReturnType<Connection["getSignaturesForAddress"]>>;
+    let unconfirmed: boolean;
     try {
-      signatures = await fetchSignatureWindow(connection, slabPk, maxSigs, lastSig, slabAddress);
+      ({ sigs: signatures, unconfirmed } = await fetchSignatureWindow(connection, slabPk, maxSigs, lastSig, slabAddress));
     } catch (err) {
       logger.warn("Failed to get signatures after retries", {
         slabAddress: slabAddress.slice(0, 8),
@@ -460,6 +506,8 @@ export class TradeIndexerPolling {
     }
 
     if (signatures.length === 0) return true;
+    // Whether the cursor may move to this window's newest as far as the window read goes (EMPTY-PAGE-1).
+    const windowOk = !unconfirmed || lastSig === undefined || this.confirmWindow(slabAddress, lastSig, signatures);
 
     // #147: Do NOT advance the cursor here. We commit lastSignature only after
     // the entire batch is fetched and processed successfully. Advancing it before
@@ -482,8 +530,8 @@ export class TradeIndexerPolling {
       validSigs.unshift(...[...held].filter((s) => s !== "?" && !have.has(s)));
     }
     if (validSigs.length === 0) {
-      // No valid txs in this window but signatures were fetched — safe to advance.
-      await this.commitCursor(slabAddress, signatures[0].signature);
+      // No valid txs in this window but signatures were fetched — safe to advance (once the window read is confirmed).
+      if (windowOk) await this.commitCursor(slabAddress, signatures[0].signature);
       return true;
     }
 
@@ -608,9 +656,12 @@ export class TradeIndexerPolling {
       this.writeHolds.delete(slabAddress);
       this.heldSigs.delete(slabAddress);
     }
-    if (!batchFailed && !holdCursor) {
+    if (!batchFailed && !holdCursor && windowOk) {
       await this.commitCursor(slabAddress, signatures[0].signature);
       this.nullTxHolds.delete(slabAddress);
+    } else if (!batchFailed && !holdCursor) {
+      // Only the window read is unconfirmed: the pass itself succeeded, so no other hold state is touched.
+      logger.debug("window ended on an empty before-page after a short page; cursor held until a second read agrees", { slabAddress: slabAddress.slice(0, 8) });
     } else {
       // Held without a saved cursor: pin the window's oldest signature so the retry pages from it (not just the newest page).
       if (!this.lastSignature.has(slabAddress) && !this.holdAnchor.has(slabAddress)) {
