@@ -145,8 +145,10 @@ describe("poll path batched writes: threshold, final flush, cursor, fallback", (
     const idx = newIndexer();
     for (let p = 1; p <= MAX_WRITE_HOLDS; p++) {
       await idx.indexTradesForSlab(MARKET, 100);
-      expect(idx.lastSignature.get(MARKET)).not.toBe(all[all.length - 1]);
-      all.push(...load(1, 20 + p)); list(all); // each poll brings a fresh fill whose (batched) write succeeds
+      expect(idx.lastSignature.get(MARKET)).toBeUndefined(); // held, not committed
+      // a fresh fill per poll (the fake RPC ignores `until`, so every held poll re-sends the whole window through the
+      // batch, which reports every row written): the batch is the only DB write that succeeds on this slab
+      all.push(...load(1, 20 + p)); list(all);
     }
     await idx.indexTradesForSlab(MARKET, 100);
     expect(idx.lastSignature.get(MARKET)).toBe(all[all.length - 1]);
