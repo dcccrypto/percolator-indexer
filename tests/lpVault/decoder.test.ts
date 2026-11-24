@@ -306,3 +306,71 @@ describe("normalizeRpcTransaction on a legacy response with sparse fields", () =
     expect([...n.instructions[0]!.data]).toEqual([1]);
   });
 });
+
+// ── mutation killers (IDX-REPORT-LPVAULTDECODERTESTMUT) ─────────────────────
+// Every field of every kind is asserted against a distinct account or byte, so a
+// swapped index or a shifted read cannot reproduce the expected row. Tag bytes are
+// literal (75/76/77/81, from the wrapper source) rather than LP_VAULT_TAG, so a
+// wrong table entry fails here instead of moving the test along with the code.
+
+const one = (data: number[], accounts: string[], inner: NormIx[] = [], failed = false): NormTx =>
+  ({ ...tx([top(wrapperIx(data, accounts, 1), inner)]), failed });
+
+describe("killers: tag bytes are the wrapper's, not the exported table's", () => {
+  it("75 deposit, 76 request_redeem, 77 execute_redeem, 81 cancel_redeem", () => {
+    const a = Array.from({ length: 13 }, pk);
+    expect(decode(one([75, ...le(9n, 16), 1, 0], a))[0]!.kind).toBe("deposit");
+    expect(decode(one([76, ...le(9n, 16)], a))[0]!.kind).toBe("request_redeem");
+    expect(decode(one([77, 1, 0], a))[0]!.kind).toBe("execute_redeem");
+    expect(decode(one([81], a))[0]!.kind).toBe("cancel_redeem");
+  });
+});
+
+describe("killers: every account field of every kind", () => {
+  it("deposit: user=a0, market=a1, registry=a2, lpMint=a3", () => {
+    const a = Array.from({ length: 11 }, pk);
+    const [ev] = decode(one([75, ...le(7n, 16), 3, 0], a));
+    expect(ev).toMatchObject({ user: a[0], market: a[1], registry: a[2], lpMint: a[3] });
+  });
+
+  it("request: user=a0, registry=a1, lpMint=a2 (not the lp ATA a3)", () => {
+    const a = Array.from({ length: 8 }, pk);
+    const [ev] = decode(one([76, ...le(9n, 16)], a));
+    expect(ev).toMatchObject({ user: a[0], registry: a[1], lpMint: a[2], market: null });
+  });
+
+  it("execute: market=a1, registry=a2, lpMint=a4, user=a12", () => {
+    const a = Array.from({ length: 13 }, pk);
+    const [ev] = decode(one([77, 1, 0], a));
+    expect(ev).toMatchObject({ market: a[1], registry: a[2], lpMint: a[4], user: a[12] });
+  });
+});
+
+describe("killers: domain and CPI direction", () => {
+  it("deposit domain is bytes 17..18, distinct from the amount's top byte", () => {
+    const a = Array.from({ length: 11 }, pk);
+    const amount = 0xaan << 120n; // byte 16 = 0xaa, so a read one byte early gives 0x34aa
+    const [ev] = decode(one([75, ...le(amount, 16), 0x34, 0x12], a));
+    expect(ev).toMatchObject({ collateralAtoms: amount, domain: 0x1234 });
+  });
+
+  it("cancel reads escrow(a5) -> lp ATA(a4), not the reverse", () => {
+    const a = Array.from({ length: 7 }, pk);
+    const back = splIx(3, [a[4]!, a[5]!, pk()], 11n, 2); // wrong direction
+    const ret = splIx(3, [a[5]!, a[4]!, pk()], 12n, 2);
+    expect(decode(one([81], a, [back, ret]))[0]!.lpAmount).toBe(12n);
+  });
+
+  it("execute payout must be vault(a6) -> redeemer_dest(a9); an unrelated Transfer first is ignored", () => {
+    const a = Array.from({ length: 13 }, pk);
+    const other = splIx(3, [pk(), pk(), pk()], 5n, 2);
+    const pay = splIx(3, [a[6]!, a[9]!, pk()], 33n, 2);
+    expect(decode(one([77, 1, 0], a, [other, pay]))[0]!.collateralAtoms).toBe(33n);
+  });
+
+  it("a failed transaction yields no LP rows", () => {
+    const a = Array.from({ length: 11 }, pk);
+    expect(decode(one([75, ...le(7n, 16), 3, 0], a))).toHaveLength(1);
+    expect(decode(one([75, ...le(7n, 16), 3, 0], a, [], true))).toEqual([]);
+  });
+});
