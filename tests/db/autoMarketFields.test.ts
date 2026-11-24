@@ -30,6 +30,8 @@ import {
   initialMarginBpsOffset,
   type CreatorLookupRpc,
 } from "../../src/db/autoMarketFields.js";
+import { discoverV17Markets } from "../../src/v17/discovery.js";
+import { buildMarket, pk } from "../helpers/v22Fixtures.js";
 
 const WRAPPER = new PublicKey("ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
 const SLAB = new PublicKey("9EPm8nB8Fs7WcEZgE1WGFPTGc6rAzD6GhFJyMm4dEFHn");
@@ -449,5 +451,109 @@ describe("creatorFromCreationTx malformed / non-touching instructions", () => {
     expect(creatorFromCreationTx(withIxs([{ programIdIndex: w, accountKeyIndexes: [98, 2] }]), SLAB, WRAPPER)).toBeNull();
     // a later well-formed ix is still found after the malformed one
     expect(creatorFromCreationTx(withIxs([{ programIdIndex: 99, accountKeyIndexes: [0, 1] }, { programIdIndex: w, accountKeyIndexes: [0, 1] }]), SLAB, WRAPPER)).toBe(CREATOR.toBase58());
+  });
+});
+
+// Each test below pins one choice that an earlier mutation run showed this file did not
+// check (deployer source, price and fee priority, oracle authority fallback, field width).
+// The discovery tests run real v2.2 account bytes through discoverV17Markets, the code that
+// fills what the resolver reads. Offsets are from percolator-prog 3b256d49
+// (WrapperConfigV16 / AssetOracleProfileV16); the asset-0 profile is at 592 + 806.
+describe("auto market fields: discovery -> resolver pins", () => {
+  const CFG = 16;
+  const P0 = 592 + 806;
+  const conn = (data: Uint8Array) =>
+    ({ getMultipleAccountsInfo: vi.fn(async () => [{ data: Buffer.from(data), owner: SYSTEM }]) }) as never;
+  function v22Bytes(o: {
+    oracleAuthority?: PublicKey;
+    profileTarget?: bigint;
+    profileMark?: bigint;
+    cfgTarget?: bigint;
+    cfgMark?: bigint;
+    fee?: bigint;
+  }) {
+    const data = buildMarket(LAYOUT_V22, { slots: 1, oracleAuthority: o.oracleAuthority ?? pk() });
+    data.set(MARKETAUTH.toBytes(), CFG + 0);
+    data.set(MINT.toBytes(), CFG + 32);
+    const dv = new DataView(data.buffer, data.byteOffset);
+    if (o.fee !== undefined) dv.setBigUint64(CFG + 128, o.fee, true);
+    if (o.cfgMark !== undefined) dv.setBigUint64(CFG + 232, o.cfgMark, true);
+    if (o.cfgTarget !== undefined) dv.setBigUint64(CFG + 264, o.cfgTarget, true);
+    if (o.profileMark !== undefined) dv.setBigUint64(P0 + 168, o.profileMark, true);
+    if (o.profileTarget !== undefined) dv.setBigUint64(P0 + 200, o.profileTarget, true);
+    return data;
+  }
+  const discoverOne = async (data: Uint8Array) => {
+    const [m] = await discoverV17Markets(conn(data), SYSTEM, [pk()]);
+    expect(m).toBeDefined();
+    return resolveAutoMarketFields(m as never, null);
+  };
+
+  it("v2.2 deployer fallback is marketauth (config +0), never the collateral mint (config +32)", async () => {
+    const f = await discoverOne(v22Bytes({}));
+    expect(f.deployer).toBe(MARKETAUTH.toBase58());
+    expect(f.deployer).not.toBe(MINT.toBase58());
+  });
+
+  it("v2.2 initial_price_e6 is the asset-0 profile oracle_target_price_e6, not the config copy or the profile mark", async () => {
+    const f = await discoverOne(v22Bytes({ profileTarget: 3630n, profileMark: 4000n, cfgTarget: 1111n, cfgMark: 2222n }));
+    expect(f.initial_price_e6).toBe(3630);
+  });
+
+  it("v2.2 oracle_authority is the asset-0 profile oracle_authority, read at the v2.2 slot-0 offset", async () => {
+    const oracle = pk();
+    const f = await discoverOne(v22Bytes({ oracleAuthority: oracle, profileTarget: 3630n }));
+    expect(f.oracle_authority).toBe(oracle.toBase58());
+    expect(f.initial_price_e6).toBe(3630);
+  });
+
+  it("v2.2 trading_fee_bps is the wrapper config trade_fee_base_bps (config +128), not 0 or another fee field", async () => {
+    const f = await discoverOne(v22Bytes({ fee: 5n }));
+    expect(f.trading_fee_bps).toBe(5);
+  });
+
+  it("a zero profile oracle authority stays NULL even though header.admin (marketauth) is set", () => {
+    expect(
+      resolveAutoMarketFields({ header: { admin: MARKETAUTH }, config: { oracleAuthority: PublicKey.default } }, null).oracle_authority,
+    ).toBeNull();
+  });
+
+  it("v17 target price outranks a non-zero mark EWMA", () => {
+    expect(resolveAutoMarketFields({ configV17: { oracleTargetPriceE6: 3630n, markEwmaE6: 4000n } }, null).initial_price_e6).toBe(3630);
+  });
+
+  it("configV17.tradeFeeBps outranks a stub params.tradingFeeBps", () => {
+    expect(resolveAutoMarketFields({ configV17: { tradeFeeBps: 5n }, params: { tradingFeeBps: 0n } }, null).trading_fee_bps).toBe(5);
+  });
+
+  it("creator is the signing FIRST ix account even when the fee payer is someone else and the mint is third", () => {
+    const payer = Keypair.generate().publicKey;
+    const message = new TransactionMessage({
+      payerKey: payer,
+      recentBlockhash: SYSTEM.toBase58(),
+      instructions: [
+        new TransactionInstruction({
+          programId: WRAPPER,
+          keys: [
+            { pubkey: CREATOR, isSigner: true, isWritable: true },
+            { pubkey: SLAB, isSigner: true, isWritable: true },
+            { pubkey: MINT, isSigner: false, isWritable: false },
+          ],
+          data: Buffer.from([0]),
+        }),
+      ],
+    }).compileToV0Message();
+    const tx = { slot: 1, blockTime: null, transaction: { message, signatures: [] }, meta: null, version: 0 } as unknown as VersionedTransactionResponse;
+    expect(creatorFromCreationTx(tx, SLAB, WRAPPER)).toBe(CREATOR.toBase58());
+  });
+
+  it("initial_margin_bps is read as a full u64 (a value above u32 survives; width pin, not a real margin)", () => {
+    const data = new Uint8Array(4096);
+    const dv = new DataView(data.buffer);
+    dv.setBigUint64(0, 0x5045_5243_5631_3600n, true);
+    dv.setUint16(8, 18, true);
+    data[10] = 1;
+    dv.setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 0x1_0000_0001n, true);
+    expect(v17InitialMarginBps(data)).toBe(0x1_0000_0001n);
   });
 });
