@@ -413,7 +413,9 @@ export class SupabaseLpVaultStore implements LpVaultStore {
       const chunk = wanted.slice(i, i + IN_CHUNK);
       const registries = [...new Set(chunk.map((p) => p.registry))];
       const users = [...new Set(chunk.map((p) => p.user_wallet))];
-      // registry IN (...) AND user IN (...) is a superset of the wanted pairs; rows of other pairs are dropped below.
+      const own = new Set(chunk.map((p) => positionKey(p.registry, p.user_wallet)));
+      // registry IN (...) AND user IN (...) is a superset of this chunk's pairs; rows of other pairs are dropped below,
+      // including pairs another chunk owns (a wallet with positions in vaults of two chunks), or they would be folded twice.
       // Ordered so each position's events arrive in loadEvents order (slot, signature, ix_index) and paging is stable.
       for (let got = 0; ; ) {
         const { data, error } = await this.db
@@ -433,8 +435,9 @@ export class SupabaseLpVaultStore implements LpVaultStore {
         if (page.length === 0) break;
         got += page.length;
         for (const r of page) {
-          const list = out.get(positionKey(r.registry, r.user_wallet));
-          if (!list) continue;
+          const k = positionKey(r.registry, r.user_wallet);
+          if (!own.has(k)) continue;
+          const list = out.get(k)!;
           list.push(toStoredEvent(r));
           if (list.length >= MAX_EVENTS) {
             // Same refusal as loadEvents: a fold over a truncated history would be silently wrong.

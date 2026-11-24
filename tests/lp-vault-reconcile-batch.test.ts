@@ -42,7 +42,14 @@ const PK: Record<string, string[]> = {
 };
 
 /** Enough of PostgREST for SupabaseLpVaultStore: eq / in / or(col.gt.0,...) / order / range / maybeSingle / upsert. */
-function fakePostgrest(opts: { maxRows?: number } = {}) {
+function fakePostgrest(opts: { maxRows?: number; shuffleTies?: boolean } = {}) {
+  let reqNo = 0;
+  // Deterministic per-request tie order (FNV-1a of request number + row), standing in for PostgreSQL's unspecified one.
+  const tieKey = (row: Row, n: number) => {
+    let h = 2166136261;
+    for (const ch of `${n}|${row.registry}|${row.user_wallet}|${row.signature}|${row.ix_index}`) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+    return h >>> 0;
+  };
   const tables: Record<string, Row[]> = { lp_vault_positions: [], lp_vault_events: [], lp_vault_sync_cursor: [] };
   const log: Req[] = [];
   let fail: ((r: Req) => string | null) | null = null;
@@ -90,12 +97,13 @@ function fakePostgrest(opts: { maxRows?: number } = {}) {
           return Promise.resolve({ data: null, error: null });
         }
         let rows = tables[table]!.filter((r) => req.filters.every((f) => matches(r, f)));
+        const n = reqNo++;
         rows = [...rows].sort((a, b) => {
           for (const o of orders) {
             const c = cmp(a[o.col], b[o.col]);
             if (c !== 0) return o.asc ? c : -c;
           }
-          return 0;
+          return opts.shuffleTies ? tieKey(a, n) - tieKey(b, n) : 0;
         });
         if (single) return Promise.resolve({ data: rows[0] ? project(rows[0], select) : null, error: null });
         if (range) rows = rows.slice(range[0], range[1] + 1);
@@ -411,5 +419,165 @@ describe("LP-vault full reconcile: read and chain failures", () => {
     expect(reconciled(row(pg, "REG001", "user01"))).toBe(false);
     for (const r of snapshot(pg).filter((x) => x.registry !== "REG001")) expect(reconciled(r)).toBe(true);
     expect(captured).toHaveBeenCalledWith(expect.objectContaining({ message: "rpc 503" }), expect.objectContaining({ extra: expect.objectContaining({ registry: "REG001" }) }));
+  });
+});
+
+// ── Mutation killers (J-20261123-IDX-REPORT-LPRECONCILEBATCHSAFETYMUT: 28/44 -> 42/44 mutants of the batched reads,
+// writes and reconcile killed; S17 (extra map keys) writes the same rows and differs only in fallback cost). S01
+// (in-chunk 99) was NOT equivalent: at in-chunk 100, loadEventsMany folded a wallet's events twice when the same wallet
+// held positions in vaults of two chunks (167 x 3: 10/501 rows at 600 shares instead of 300); 99 = 33 x 3 hid that.
+// Fixed in loadEventsMany (each chunk keeps only its own pairs); since then S01 is equivalent at the tested sizes.
+// Mutant ids are in the comments. `shuffleTies` on the fake
+// returns rows the query's ORDER BY leaves tied in a per-request order (as PostgreSQL may), so a read whose order is
+// not total pages wrong.
+
+const upserts = (pg: ReturnType<typeof fakePostgrest>) =>
+  pg.log.filter((r) => r.table === "lp_vault_positions" && r.verb === "upsert").map((r) => r.rows!.length);
+
+describe("LP-vault full reconcile: write and read boundaries (1 row, 101 positions, 501 rows)", () => {
+  // S06, S22, I03, I12: a pass with exactly one open position must still read its history and write its row.
+  it("1 vault x 1 open position: the row is reconciled in one upsert, nothing is reported", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 1, 1);
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    expect.soft(upserts(pg)).toEqual([1]);
+    expect(snapshot(pg)).toEqual(await referenceSnapshot(1, 1));
+    expect(reconciled(row(pg, "REG000", "user00"))).toBe(true);
+    expect(captured).not.toHaveBeenCalled();
+  });
+
+  // S06: 101 positions = one full `in` chunk + a chunk of 1.
+  it("101 open positions (100 + 1 in the events chunks): every one is reconciled", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 101, 1);
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    // loadEventsMany pre-fills every wanted key with [], so a chunk it never reads is folded as EMPTY (row zeroed:
+    // lp_shares 0, cost basis 0, sticky transfer flag), not caught by the indexer's "no history" guard.
+    expect.soft(row(pg, "REG100", "user00")).toMatchObject({ lp_shares: "300", cost_basis_atoms: "300", transfer_detected_slot: null });
+    expect(snapshot(pg)).toEqual(await referenceSnapshot(101, 1));
+    expect(captured).not.toHaveBeenCalled();
+  });
+
+  // I02, I03, I04: 501 rows = a full write chunk of 500 + a chunk of 1; each row in exactly one statement.
+  it("501 rows: two upserts of 500 and 1, every row reconciled", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 167, 3);
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    expect.soft(upserts(pg)).toEqual([500, 1]);
+    const written = pg.log.filter((r) => r.table === "lp_vault_positions" && r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
+    expect.soft(new Set(written).size).toBe(written.length);
+    expect(snapshot(pg).filter(reconciled)).toHaveLength(501);
+    expect(snapshot(pg)).toEqual(await referenceSnapshot(167, 3));
+  });
+
+  // #451 gate: 167 x 3 = 501 positions, 100 per events chunk. When a chunk boundary splits a vault's users, the
+  // registry IN x user IN read of one chunk also returns pairs the neighbouring chunk owns (10 rows here); each
+  // position's history must still be folded once, not twice.
+  it("a wallet with positions in vaults of different events chunks: each position's history is folded once", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 167, 3);
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    // REG033/user00 is pair 99, the last of chunk 0; REG033/user01..02 (pairs 100..101) are in chunk 1, whose
+    // REG033 x user00 read returned chunk 0's pair too.
+    expect.soft(row(pg, "REG033", "user00")).toMatchObject({ lp_shares: "300", cost_basis_atoms: "300", event_count: 2, basis_known: true, transfer_detected_slot: null });
+    const bad = snapshot(pg).filter((r) => r.lp_shares !== "300" || r.event_count !== 2);
+    expect.soft(bad.map((r) => `${r.registry}|${r.user_wallet}`)).toEqual([]);
+    expect(snapshot(pg)).toEqual(await referenceSnapshot(167, 3));
+    expect(captured).not.toHaveBeenCalled();
+  });
+});
+
+describe("LP-vault full reconcile: which rows the batched read lists and folds", () => {
+  // S15: a row with 0 indexed shares but on-chain shares (LP transferred in) is still open and must be re-reconciled.
+  it("a position open only on chain (lp_shares 0, onchain 50) is reconciled; its on-chain balance is refreshed", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 2, 1);
+    pg.tables.lp_vault_positions!.push({
+      ...row(pg, "REG000", "user00"), user_wallet: "userT", lp_shares: "0", cost_basis_atoms: "0", total_deposited_atoms: "0",
+      basis_known: false, transfer_detected_slot: 1_500, onchain_lp_shares: "50", reconciled_slot: 1_500, event_count: 0, updated_slot: null,
+    });
+    const { tick, chain } = await reconcileTick(pg, regs);
+    const getClaim = chain.getClaim.bind(chain);
+    chain.getClaim = async (user, mint, registry, programId) =>
+      user === "userT" ? { heldShares: 0n, pendingShares: 0n, contextSlot: 2_000 } : getClaim(user, mint, registry, programId);
+    await tick();
+    const t = row(pg, "REG000", "userT");
+    expect(t.onchain_lp_shares).toBe("0");
+    expect(t.reconciled_slot).toBe(2_000);
+    expect(t.transfer_detected_slot).toBeNull(); // 0 on both sides = full exit
+  });
+
+  // S16: a closed position (0 indexed, 0 on chain) is not open; the full reconcile must leave it alone.
+  it("a closed position is not reconciled (no claim read, row untouched)", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 2, 1);
+    pg.tables.lp_vault_positions!.push({
+      ...row(pg, "REG001", "user00"), user_wallet: "userC", lp_shares: "0", onchain_lp_shares: "0", reconciled_slot: 900,
+      event_count: 0, updated_at: "closed",
+    });
+    const { tick, chain } = await reconcileTick(pg, regs);
+    const asked: string[] = [];
+    const getClaim = chain.getClaim.bind(chain);
+    chain.getClaim = async (user, mint, registry, programId) => (asked.push(user), getClaim(user, mint, registry, programId));
+    await tick();
+    expect.soft(asked).not.toContain("userC");
+    expect(row(pg, "REG001", "userC")).toMatchObject({ reconciled_slot: 900, updated_at: "closed" });
+  });
+
+  // S18: lp_vault_events holds every network; another network's events of the same registry/user must not be folded.
+  it("another network's events for the same registry and user are not folded into this network's row", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 2, 1);
+    pg.tables.lp_vault_events!.push({
+      ...pg.tables.lp_vault_events!.find((e) => e.registry === "REG000" && e.user_wallet === "user00")!,
+      signature: "testnet-sig", network: "testnet", collateral_atoms: "999", lp_amount: "999", slot: 50,
+    });
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    expect(row(pg, "REG000", "user00")).toMatchObject({ lp_shares: "300", event_count: 2, reconciled_slot: 2_000 });
+  });
+
+  // S14: page under a total order. With ties shuffled per request, an order on user_wallet alone skips/repeats rows.
+  it("pages correctly when PostgREST caps responses and returns tied rows in any order", async () => {
+    const pg = fakePostgrest({ maxRows: 7, shuffleTies: true });
+    const regs = seed(pg, 6, 4);
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    const written = pg.log.filter((r) => r.table === "lp_vault_positions" && r.verb === "upsert").flatMap((r) => r.rows!.map((x) => `${x.registry}|${x.user_wallet}`));
+    expect.soft(new Set(written).size).toBe(written.length);
+    expect(snapshot(pg).filter(reconciled)).toHaveLength(24);
+  });
+});
+
+describe("LP-vault full reconcile: the batched path keeps the per-vault skip and sticky flags", () => {
+  // I15, I21: a vault tx that landed after this pass's sync: that vault's rows must not be reconciled (the claim may
+  // include it, so a mismatch would set a sticky transfer flag on a good row).
+  it("a vault whose newest signature moved after the sync is skipped; the other vaults are reconciled", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 3, 2);
+    const before = snapshot(pg);
+    const { tick, chain } = await reconcileTick(pg, regs);
+    const getSignatures = chain.getSignatures.bind(chain);
+    chain.getSignatures = async (a, o) =>
+      a === "REG002" && !o.until ? [{ signature: "landed-after-sync", slot: 1_500, failed: false }] : getSignatures(a, o);
+    await tick();
+    const isBad = (r: Row) => r.registry === "REG002";
+    expect(snapshot(pg).filter(isBad)).toEqual(before.filter(isBad));
+    expect(snapshot(pg).filter((r) => !isBad(r)).every(reconciled)).toBe(true);
+    expect(row(pg, "REG002", "user01").transfer_detected_slot).toBeNull();
+  });
+
+  // I16: transfer_detected_slot is sticky: once set, a later matching claim does not clear it (basis stays unknown).
+  it("a previously flagged position keeps its transfer flag when the claim now matches", async () => {
+    const pg = fakePostgrest();
+    const regs = seed(pg, 2, 1);
+    Object.assign(row(pg, "REG001", "user00"), { transfer_detected_slot: 1_500, basis_known: false, onchain_lp_shares: "250" });
+    const { tick } = await reconcileTick(pg, regs);
+    await tick();
+    expect(row(pg, "REG001", "user00")).toMatchObject({ transfer_detected_slot: 1_500, basis_known: false, reconciled_slot: 2_000, onchain_lp_shares: "300" });
   });
 });
