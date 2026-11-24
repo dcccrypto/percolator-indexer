@@ -7,7 +7,7 @@ const state = {
   inCalls: [] as string[][],
   ranges: [] as unknown[],
   maxRows: 0, // 0 = unlimited
-  chunkResults: [] as Array<{ data: unknown; error: null | { message: string } }>,
+  chunkResults: [] as Array<{ data: unknown; error: null | { message: string }; count?: number | null }>,
 };
 
 vi.mock("@percolatorct/shared", () => ({
@@ -15,8 +15,8 @@ vi.mock("@percolatorct/shared", () => ({
   getNetwork: () => "devnet",
   getSupabase: () => ({
     from: () => ({
-      select: () => {
-        const q: Record<string, unknown> = {};
+      select: (_cols: string, opts?: { count?: string }) => {
+        const q: Record<string, unknown> = { count: opts?.count === "exact" };
         q.eq = () => q;
         q.order = () => q;
         // PostgREST max_rows: a response never holds more than MAX_ROWS rows, whatever range is asked
@@ -44,13 +44,12 @@ vi.mock("@percolatorct/shared", () => ({
 async function run(q: Record<string, unknown>) {
   if (state.throws) throw state.throws;
   if (state.chunkResults.length) return state.chunkResults.shift()!;
-  if (state.maxRows && Array.isArray(state.result.data)) {
-    const all = state.result.data as Array<{ id?: string }>;
-    const start = q.after === undefined ? 0 : all.findIndex((r) => r.id === q.after) + 1;
-    const n = Math.min(state.maxRows, (q.lim as number | undefined) ?? Infinity);
-    return { data: all.slice(start, start + n), error: null };
-  }
-  return state.result;
+  if (!Array.isArray(state.result.data)) return state.result;
+  // PostgREST-like: keyset on id (rows are in id order), max_rows cap, count=exact when asked
+  const all = state.result.data as Array<{ id?: string }>;
+  const start = q.after === undefined ? 0 : all.findIndex((r) => r.id === q.after) + 1;
+  const n = Math.min(state.maxRows || Infinity, (q.lim as number | undefined) ?? Infinity);
+  return { data: all.slice(start, start + n), error: null, count: q.count ? all.length : null };
 }
 
 import {
@@ -78,11 +77,11 @@ beforeEach(() => {
 });
 
 describe("fetchStoredLegs", () => {
-  it("returns rows, and [] when data is null", async () => {
-    state.result = { data: [leg()], error: null };
-    expect(await fetchStoredLegs("sig")).toEqual([leg()]);
+  it("returns rows, and null (not []) when data is null with no error", async () => {
+    state.result = { data: [{ ...leg(), id: "1" }], error: null };
+    expect(await fetchStoredLegs("sig")).toEqual([{ ...leg(), id: "1" }]);
     state.result = { data: null, error: null };
-    expect(await fetchStoredLegs("sig")).toEqual([]);
+    expect(await fetchStoredLegs("sig")).toBeNull();
   });
 
   it("returns null and warns on a DB error", async () => {
@@ -100,7 +99,7 @@ describe("fetchStoredLegs", () => {
 
 describe("fetchStoredLegsMany", () => {
   it("gives every signature an entry, de-duplicated, and groups rows", async () => {
-    state.result = { data: [{ ...leg(), tx_signature: "a" }, { ...leg({ leg_index: 1 }), tx_signature: "a" }, { ...leg(), tx_signature: "zzz" }], error: null };
+    state.result = { data: [{ ...leg(), tx_signature: "a", id: "1" }, { ...leg({ leg_index: 1 }), tx_signature: "a", id: "2" }, { ...leg(), tx_signature: "zzz", id: "3" }], error: null };
     const m = await fetchStoredLegsMany(["a", "b", "a"]);
     expect(m).not.toBeNull();
     expect([...m!.keys()]).toEqual(["a", "b"]);
@@ -123,7 +122,7 @@ describe("fetchStoredLegsMany", () => {
 
   it("returns null if any chunk fails (error result)", async () => {
     const sigs = Array.from({ length: IN_CHUNK + 1 }, (_, i) => `s${i}`);
-    state.chunkResults = [{ data: [], error: null }, { data: null, error: { message: "nope" } }];
+    state.chunkResults = [{ data: [], error: null, count: 0 }, { data: null, error: { message: "nope" } }];
     expect(await fetchStoredLegsMany(sigs)).toBeNull();
     expect(state.warns).toHaveLength(1);
   });
@@ -133,9 +132,9 @@ describe("fetchStoredLegsMany", () => {
     expect(await fetchStoredLegsMany(["a"])).toBeNull();
   });
 
-  it("treats null data as no rows", async () => {
+  it("returns null for data:null with no error (an empty 2xx body is not 'no rows')", async () => {
     state.result = { data: null, error: null };
-    expect((await fetchStoredLegsMany(["a"]))!.get("a")).toEqual([]);
+    expect(await fetchStoredLegsMany(["a"])).toBeNull();
   });
 
   it("pages past PostgREST max_rows: a chunk with more rows than max_rows is not truncated", async () => {

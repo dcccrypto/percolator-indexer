@@ -10,8 +10,9 @@ vi.mock("@percolatorct/shared", () => ({
   getSupabase: () => ({
     from: () => {
       let after: string | null = null;
+      let count = false;
       const q: Record<string, unknown> = {};
-      q.select = () => q;
+      q.select = (_c: string, o?: { count?: string }) => ((count = o?.count === "exact"), q);
       q.in = () => q;
       q.eq = () => q;
       q.gt = (_c: string, v: string) => ((after = v), q);
@@ -22,6 +23,7 @@ vi.mock("@percolatorct/shared", () => ({
           .slice(0, Math.min(n, SERVER_CAP))
           .map((r) => ({ ...r, slab_address: "s", asset_index: 0, leg_index: 0, trader: "t", side: "long", size: "1", is_liquidation: false })),
         error: null,
+        count: count ? table.length : null,
       });
       return q;
     },

@@ -16,19 +16,13 @@ export interface StoredLeg {
 
 /**
  * Every row stored for `signature` (one indexed query per transaction; the unique index leads
- * with tx_signature). Returns null when the read fails, so callers fall back to the per-leg
- * dedup of the insert itself (23505 / ignoreDuplicates): a failed pre-check must never block
- * indexing.
+ * with tx_signature), paged past PostgREST max_rows like the batched read. Returns null when the
+ * read fails or cannot be shown complete, so callers fall back to the per-leg dedup of the insert
+ * itself (23505 / ignoreDuplicates): a failed pre-check must never block indexing.
  */
 export async function fetchStoredLegs(signature: string): Promise<StoredLeg[] | null> {
   try {
-    const { data, error } = await getSupabase()
-      .from("trades")
-      .select("slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
-      .eq("tx_signature", signature)
-      .eq("network", CURRENT_NETWORK);
-    if (error) throw new Error(error.message);
-    return (data ?? []) as StoredLeg[];
+    return await readAllPages((q) => q.eq("tx_signature", signature));
   } catch (err) {
     logger.warn("stored-leg lookup failed; relying on insert dedup", {
       signature: signature.slice(0, 12),
@@ -42,11 +36,66 @@ export const IN_CHUNK = 100;
 /** Rows requested per page. PostgREST may cap a response lower (max_rows); paging runs until an empty page. */
 export const STORED_LEGS_PAGE = 1000;
 
+type PagedRow = StoredLeg & { tx_signature: string; id?: string };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- postgrest's filter builder generics are not worth spelling out here
+type Filter = (q: any) => any;
+
+/**
+ * Read every `trades` row matching `filter` on this network, keyset-paged on the unique `id`
+ * (not offset: a concurrent insert must not shift rows across a page boundary and count one
+ * twice, which would make a leg look stored). Throws unless the read is provably complete: a
+ * caller treats a returned list as "these are ALL the stored rows", and a short list makes stored
+ * legs look new (inserted twice).
+ *  - Only an empty page ends the read: if PostgREST max_rows is below STORED_LEGS_PAGE every
+ *    response is capped short, and stopping on a short page would drop the remaining legs.
+ *  - The first page asks for the exact row count, so an empty page that comes before all of
+ *    them were read (a lagging replica, a dropped body) is caught instead of taken as the end.
+ *  - `data: null` with no error (postgrest-js gives that for an empty 2xx body) and a row with
+ *    no `id` (keyset cannot continue past it) are failures, not ends.
+ */
+async function readAllPages(filter: Filter): Promise<PagedRow[]> {
+  const rows: PagedRow[] = [];
+  let expected: number | null = null;
+  let lastId: string | null = null;
+  for (;;) {
+    const first = lastId === null;
+    let q = filter(
+      getSupabase()
+        .from("trades")
+        .select(
+          "id, tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation",
+          first ? { count: "exact" } : undefined,
+        ),
+    ).eq("network", CURRENT_NETWORK);
+    if (!first) q = q.gt("id", lastId);
+    const { data, error, count } = await q.order("id", { ascending: true }).limit(STORED_LEGS_PAGE);
+    if (error) throw new Error(error.message);
+    if (!Array.isArray(data)) throw new Error("stored-leg page returned no data and no error");
+    if (first) {
+      if (typeof count !== "number" || !Number.isFinite(count)) throw new Error("stored-leg read returned no row count");
+      expected = count;
+    }
+    const page = data as PagedRow[];
+    if (page.length === 0) {
+      if (rows.length < (expected ?? 0)) throw new Error(`stored-leg read ended at ${rows.length} of ${expected} rows`);
+      return rows;
+    }
+    if (page.some((r) => r.id == null)) throw new Error("stored-leg row without id");
+    const last = String(page[page.length - 1].id);
+    // gt(id) never returns the previous last id again; if it does the filter was ignored and
+    // paging would loop (or count rows twice)
+    if (last === lastId) throw new Error("stored-leg page did not advance past the previous id");
+    rows.push(...page);
+    lastId = last;
+  }
+}
+
 /**
  * Stored rows for MANY transactions in as few queries as possible (`in(tx_signature, [...])`, chunked
  * at 100). Every requested signature gets an entry (empty = nothing stored), so a caller can tell
- * "looked, none" from "not looked". Returns null if any chunk failed (callers then fall back to
- * the per-transaction read or to the insert's own dedup).
+ * "looked, none" from "not looked". Returns null if any chunk failed or could not be read
+ * completely (callers then fall back to the per-transaction read or to the insert's own dedup);
+ * never a partial map.
  */
 export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<string, StoredLeg[]> | null> {
   const out = new Map<string, StoredLeg[]>();
@@ -55,29 +104,9 @@ export async function fetchStoredLegsMany(signatures: string[]): Promise<Map<str
   try {
     for (let i = 0; i < unique.length; i += IN_CHUNK) {
       const chunk = unique.slice(i, i + IN_CHUNK);
-      // Page each chunk: PostgREST caps a response at max_rows (default 1000) and a chunk of
-      // split-order transactions can hold more rows than that. A silently truncated read would
-      // leave the cut-off signatures as "looked, none" and the legs would be inserted twice.
-      // Keyset paging on the unique `id` (not offset): a concurrent insert must not shift rows
-      // across a page boundary and count one twice (that would make a leg look stored).
-      let lastId: string | null = null;
-      for (;;) {
-        let q = getSupabase()
-          .from("trades")
-          .select("id, tx_signature, slab_address, asset_index, leg_index, trader, side, size, is_liquidation")
-          .in("tx_signature", chunk)
-          .eq("network", CURRENT_NETWORK);
-        if (lastId !== null) q = q.gt("id", lastId);
-        const { data, error } = await q.order("id", { ascending: true }).limit(STORED_LEGS_PAGE);
-        if (error) throw new Error(error.message);
-        const rows = (data ?? []) as Array<StoredLeg & { tx_signature: string; id?: string }>;
-        for (const r of rows) out.get(r.tx_signature)?.push(r);
-        const last = rows[rows.length - 1]?.id;
-        // Only an empty page ends the read: if PostgREST max_rows is below STORED_LEGS_PAGE every
-        // response is capped short, and stopping on a short page would drop the remaining legs.
-        if (rows.length === 0 || last == null || last === lastId) break;
-        lastId = last;
-      }
+      // Paged: a chunk of split-order transactions can hold more rows than max_rows, and a
+      // silently truncated read would leave the cut-off signatures as "looked, none".
+      for (const r of await readAllPages((q) => q.in("tx_signature", chunk))) out.get(r.tx_signature)?.push(r);
     }
     return out;
   } catch (err) {
