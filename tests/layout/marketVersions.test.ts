@@ -134,3 +134,70 @@ describe("IDX-BUG-MARKETVERSIONSCAP leads", () => {
     expect(marketNotesEvicted()).toBe(1);
   });
 });
+
+describe("cap value, partial trailing slot and LRU refresh on a VERSION change", () => {
+  const slotOff = (i: number) => LAYOUT_V22.marketGroupOff + LAYOUT_V22.marketGroupLen + i * LAYOUT_V22.assetSlotStride + LAYOUT_V22.wrapperSlotLen + ASSET_STATE_MARKET_ID_OFF;
+
+  it("the cap is 20,000: that many distinct markets fit with no eviction, and the 20,001st evicts exactly the oldest", () => {
+    // Every other cap test loops to MAX_MARKET_NOTES symbolically, so the VALUE is pinned only here.
+    const v22 = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("v21-first", REAL_MARKET_V21);
+    for (let i = 1; i < 20_000; i++) noteMarketLayout(`m${i}`, v22);
+    expect(marketNotesEvicted()).toBe(0);
+    expect(marketVersionOf("v21-first")).toBe(LAYOUT_V21.version);
+    noteMarketLayout("one-more", v22);
+    expect(marketNotesEvicted()).toBe(1);
+    expect(marketVersionOf("v21-first")).toBeNull();
+    expect(marketVersionOf("m1")).toBe(19);
+  });
+
+  it("a buffer cut just after slot 1's market_id (rest of slot 1 missing) records slot 0 only", () => {
+    // The earlier cut-inside-market_id test is also caught by the bounds guard; this cut is caught only by slotCount.
+    const d = withGeneration(buildMarket(LAYOUT_V22, { slots: 2 }), LAYOUT_V22, 0, 3n);
+    withGeneration(d, LAYOUT_V22, 1, 4n);
+    noteMarketLayout("T", d.subarray(0, slotOff(1) + 8));
+    expect(assetGenerationOf("T", 0)).toBe(3n);
+    expect(assetGenerationOf("T", 1)).toBeNull();
+  });
+
+  it("at the cap, a slab re-noted with a NEW VERSION (v2.1 -> v2.2) becomes most recent and survives the next eviction", () => {
+    const v22 = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("mig", REAL_MARKET_V21);
+    for (let i = 1; i < MAX_MARKET_NOTES; i++) noteMarketLayout(`c${i}`, v22);
+    noteMarketLayout("mig", withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 9n));
+    noteMarketLayout("overflow", v22);
+    expect(marketVersionOf("mig")).toBe(19);
+    expect(assetGenerationOf("mig", 0)).toBe(9n);
+    expect(marketVersionOf("c1")).toBeNull();
+    expect(marketNotesEvicted()).toBe(1);
+  });
+
+  it("below the cap, a VERSION change still moves the slab to most recent", () => {
+    const v22 = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("mig", REAL_MARKET_V21);
+    for (let i = 1; i < MAX_MARKET_NOTES - 1; i++) noteMarketLayout(`c${i}`, v22); // size MAX - 1
+    noteMarketLayout("mig", v22); // VERSION 18 -> 19, not at the cap
+    noteMarketLayout("x", v22); // size MAX
+    noteMarketLayout("overflow", v22);
+    expect(marketVersionOf("mig")).toBe(19);
+    expect(marketVersionOf("c1")).toBeNull();
+  });
+
+  it("71 markets (the devnet v2.2 count at slot 525,623,852) noted over 50 sweeps never evict", () => {
+    const v22 = buildMarket(LAYOUT_V22, { slots: 1 });
+    for (let pass = 0; pass < 50; pass++) for (let i = 0; i < 71; i++) noteMarketLayout(`live${i}`, v22);
+    expect(marketNotesEvicted()).toBe(0);
+  });
+
+  it("past the cap, a market noted first in a pass is evicted by the rest of the pass and comes back on the next note", () => {
+    const v22 = buildMarket(LAYOUT_V22, { slots: 1 });
+    noteMarketLayout("live", withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 5n));
+    for (let i = 0; i < MAX_MARKET_NOTES; i++) noteMarketLayout(`junk${i}`, v22);
+    expect(marketVersionOf("live")).toBeNull();
+    expect(assetGenerationOf("live", 0)).toBeNull();
+    noteMarketLayout("live", withGeneration(buildMarket(LAYOUT_V22, { slots: 1 }), LAYOUT_V22, 0, 5n));
+    expect(marketVersionOf("live")).toBe(19);
+    expect(assetGenerationOf("live", 0)).toBe(5n);
+    expect(marketNotesEvicted()).toBe(2);
+  });
+});
