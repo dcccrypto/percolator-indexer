@@ -547,13 +547,13 @@ describe("auto market fields: discovery -> resolver pins", () => {
     expect(creatorFromCreationTx(tx, SLAB, WRAPPER)).toBe(CREATOR.toBase58());
   });
 
-  it("initial_margin_bps is read as a full u64 (a value above u16 survives)", () => {
+  it("initial_margin_bps is read as a full u64 (a value above u32 survives; width pin, not a real margin)", () => {
     const data = new Uint8Array(4096);
     const dv = new DataView(data.buffer);
     dv.setBigUint64(0, 0x5045_5243_5631_3600n, true);
     dv.setUint16(8, 18, true);
     data[10] = 1;
-    dv.setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 70_000n, true);
-    expect(v17InitialMarginBps(data)).toBe(70_000n);
+    dv.setBigUint64(V17_INITIAL_MARGIN_BPS_OFF, 0x1_0000_0001n, true);
+    expect(v17InitialMarginBps(data)).toBe(0x1_0000_0001n);
   });
 });
