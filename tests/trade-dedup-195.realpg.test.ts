@@ -4,7 +4,7 @@
  * The existing file only regex-matches the migration SQL and the source TEXT of insertTradeRow.ts; it never
  * runs the writer and never looks at a stored row. This variant:
  *   - starts a throwaway Postgres 16 cluster (k02-pg-runner pattern: initdb in /tmp, unix socket, free port),
- *   - builds the pre-#195 trades shape (baseline columns + non-partial NULLS DISTINCT key), seeds duplicates,
+ *   - builds the pre-#195 trades shape (baseline columns + an existing uq_trades_sig_asset_leg), seeds duplicates,
  *   - applies the REAL supabase/migrations/20260903120000 file,
  *   - drives the REAL insertTradeRow / insertTradeRows through a getSupabase() stand-in that turns each call
  *     into the statement PostgREST emits (json_populate_recordset INSERT; upsert -> ON CONFLICT (on_conflict)
@@ -124,7 +124,7 @@ describe.skipIf(!HAVE_PG)("GH#195 dedup against a real Postgres (stored rows, re
       ["createdb", ["-h", sock, "-p", String(port), "-U", "td", "td"]],
     ] as [string, string[]][]) { const r = run(c, a); if (r.status !== 0) throw new Error(`${c}: ${r.stderr}`); }
     pg.sql = psql;
-    // Baseline trades + later columns, with the pre-#195 key (20260726181000: non-partial, NULLS DISTINCT).
+    // Baseline trades + later columns.
     must(`CREATE TABLE trades (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(), slab_address TEXT NOT NULL, trader TEXT NOT NULL,
       side TEXT CHECK (side IS NULL OR side IN ('long','short')), size NUMERIC, price NUMERIC, fee NUMERIC DEFAULT 0,
@@ -133,8 +133,11 @@ describe.skipIf(!HAVE_PG)("GH#195 dedup against a real Postgres (stored rows, re
       size_provenance TEXT, price_lot_exp SMALLINT, created_at TIMESTAMPTZ DEFAULT now())`);
     // Seed BEFORE any unique key exists: production reached #195 holding such rows (NULL-sig dups under the
     // NULLS DISTINCT key, older rows from before the composite key); the migration must clean them up.
+    // An index named uq_trades_sig_asset_leg already exists in production (20260726181000), so the migration
+    // must DROP it before re-creating it. It is non-unique here only because the seeded duplicates exist.
     must(`INSERT INTO trades (id, slab_address, trader, tx_signature, asset_index, leg_index) VALUES ` +
       SEED.map(([id, s, a, l, t]) => `('${id}', '${t === "slab2" ? "Slab2222" : "Slab1111"}', '${t}', ${s === null ? "NULL" : `'${s}'`}, ${a}, ${l})`).join(", "));
+    must(`CREATE INDEX uq_trades_sig_asset_leg ON trades (tx_signature, asset_index, leg_index)`);
     const m = psql(fs.readFileSync(MIG, "utf8").replace(/;\s*$/, ""));
     migErr = m.ok ? "" : m.err;
   }, 60_000);
@@ -212,7 +215,7 @@ describe.skipIf(!HAVE_PG)("GH#195 dedup against a real Postgres (stored rows, re
     expect(Number(must(`SELECT count(*) FROM trades`))).toBe(before);
   });
 
-  it("tradeKey of a returned row equals tradeKey of the submitted row, and distinct keys never collide", () => {
+  it("tradeKey never collides across signature case, separators, leg or asset", () => {
     expect(tradeKey({ tx_signature: "aB", asset_index: 0, leg_index: 0 })).not.toBe(tradeKey({ tx_signature: "ab", asset_index: 0, leg_index: 0 }));
     expect(tradeKey({ tx_signature: "x", asset_index: 1, leg_index: 23 })).not.toBe(tradeKey({ tx_signature: "x", asset_index: 12, leg_index: 3 }));
     expect(tradeKey({ tx_signature: "x", asset_index: 0, leg_index: 1 })).not.toBe(tradeKey({ tx_signature: "x", asset_index: 1, leg_index: 0 }));
