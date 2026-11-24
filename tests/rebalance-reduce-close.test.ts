@@ -65,11 +65,20 @@ function fakeSupabase() {
       }
       const q: any = {};
       let sigs: string[] | null = null;
-      for (const m of ['select', 'neq', 'order', 'gt', 'limit']) q[m] = () => q;
-      q.eq = (col: string, val: unknown) => { if (col === 'tx_signature') { sigs = [String(val)]; h.storedReads.push(1); } return q; };
-      q.in = (col: string, vals: string[]) => { if (col === 'tx_signature') { sigs = vals; h.storedReads.push(vals.length); } return q; };
+      // A stored-legs read is paged on id: the first page asks for count=exact, later pages pass gt(id).
+      // storedReads counts reads (first pages), not pages.
+      let first = false;
+      let after: string | null = null;
+      for (const m of ['neq', 'order', 'limit']) q[m] = () => q;
+      q.select = (_c: string, o?: { count?: string }) => { first = o?.count === 'exact'; return q; };
+      q.gt = (_c: string, v: string) => { after = v; return q; };
+      q.eq = (col: string, val: unknown) => { if (col === 'tx_signature') { sigs = [String(val)]; if (first) h.storedReads.push(1); } return q; };
+      q.in = (col: string, vals: string[]) => { if (col === 'tx_signature') { sigs = vals; if (first) h.storedReads.push(vals.length); } return q; };
       // Awaiting the chain without .range() is a stored-legs read (per tx via eq, or batched via in).
-      q.then = (res: (v: unknown) => unknown) => res({ data: h.rows.filter((r) => sigs?.includes(String(r.tx_signature))), error: null });
+      q.then = (res: (v: unknown) => unknown) => {
+        const all = h.rows.map((r, i) => ({ ...r, id: String(i).padStart(8, '0') })).filter((r) => sigs?.includes(String(r.tx_signature)));
+        return res({ data: all.filter((r) => after === null || r.id > after), error: null, count: first ? all.length : null });
+      };
       q.range = async () => ({ data: h.rows, error: null });
       return q;
     },
